@@ -224,6 +224,7 @@ fn run(app: &AndroidApp) -> Result<(), String> {
     want.khr_android_surface_swapchain = true;
     want.khr_opengl_es_enable = true;
     want.fb_display_refresh_rate = exts.fb_display_refresh_rate;
+    want.fb_composition_layer_image_layout = exts.fb_composition_layer_image_layout;
     let inst = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -376,9 +377,19 @@ fn run(app: &AndroidApp) -> Result<(), String> {
             (fp.wait_frame)(session.as_raw(), &wi, &mut fs);
             (fp.begin_frame)(session.as_raw(), &bi);
         }
+        // A decoder Surface stores rows top-down; OpenXR samples quads bottom-up.
+        let mut flip = sys::CompositionLayerImageLayoutFB {
+            ty: sys::CompositionLayerImageLayoutFB::TYPE,
+            next: ptr::null_mut(),
+            flags: sys::CompositionLayerImageLayoutFlagsFB::VERTICAL_FLIP,
+        };
         let quad = sys::CompositionLayerQuad {
             ty: sys::CompositionLayerQuad::TYPE,
-            next: ptr::null(),
+            next: if exts.fb_composition_layer_image_layout {
+                &mut flip as *mut _ as *const _
+            } else {
+                ptr::null()
+            },
             layer_flags: sys::CompositionLayerFlags::EMPTY,
             space: space.as_raw(),
             eye_visibility: sys::EyeVisibility::BOTH,
