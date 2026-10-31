@@ -43,6 +43,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hevc"
+version = "0.0.1"
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -68,6 +72,14 @@ dependencies = [
 [[package]]
 name = "pal-core"
 version = "0.0.1"
+
+[[package]]
+name = "pal-fec"
+version = "0.0.1"
+dependencies = [
+ "pal-wire",
+ "serde_json",
+]
 
 [[package]]
 name = "pal-ref"

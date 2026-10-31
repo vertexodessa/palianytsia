@@ -1,0 +1,9 @@
+[package]
+name = "hevc"
+description = "H.265 helpers for the GS: NAL walk, SPS/PPS, slice headers, skip-slice fill for salvage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

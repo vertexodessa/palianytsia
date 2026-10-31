@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/pal-wire", "crates/pal-core", "crates/pal-ref", "crates/devourer-sys", "crates/flightlog", "apps/pal"]
+members = ["crates/pal-wire", "crates/pal-core", "crates/pal-ref", "crates/devourer-sys", "crates/flightlog", "crates/pal-fec", "crates/hevc", "apps/pal"]
 # Android-only spikes build with their own target; keep them out of host builds.
 exclude = ["spikes"]
 
@@ -16,6 +16,8 @@ pal-core = { path = "crates/pal-core" }
 pal-ref = { path = "crates/pal-ref" }
 devourer-sys = { path = "crates/devourer-sys" }
 flightlog = { path = "crates/flightlog" }
+pal-fec = { path = "crates/pal-fec" }
+hevc = { path = "crates/hevc" }
 serde_json = "1"
 
 # Real-time video stays usable in debug builds.
