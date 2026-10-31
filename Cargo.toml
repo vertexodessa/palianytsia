@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/pal-wire", "crates/pal-core", "crates/pal-ref"]
+# Android-only spikes build with their own target; keep them out of host builds.
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.0.1"
