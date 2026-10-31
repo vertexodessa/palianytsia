@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/pal-wire", "crates/pal-core", "crates/pal-ref"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-2.0-only"
+publish = false
+
+[workspace.dependencies]
+pal-wire = { path = "crates/pal-wire" }
+pal-core = { path = "crates/pal-core" }
+serde_json = "1"
+
+# Real-time video stays usable in debug builds.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

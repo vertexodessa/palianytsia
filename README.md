@@ -21,3 +21,12 @@ git clone --recurse-submodules git@github.com:vertexodessa/palianytsia.git
 
 The drone (`maburd`) and this app are a matched pair: both are built from the
 pinned mabur commit and released together.
+
+## Build (M0)
+
+```sh
+git submodule update --init
+cargo test --workspace          # golden vectors (needs cmake, libusb-1.0-dev for pal-ref)
+tools/m0-parity.sh              # pal-ref (C++ WebGs via GsCore) == webgs replay
+PAL_FETCH_TOOLCHAIN=1 tools/build-maburd.sh   # dist/maburd-* + dist/PAIR.txt
+```

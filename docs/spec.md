@@ -110,19 +110,18 @@ mabur's wire changes without notice by design ("Compatibility policy: there isn'
 Decision C. The C++ core stays in the repo as a test dependency only (`pal-ref` crate). It never ships and no milestone flies on it. `WebGs` is already the right seam: devourer-free, single-threaded, clock-injected, `on_rx`/`tick`/`stats` plus an `Io` callback struct (`web/src/web_gs.h`). The Rust trait mirrors it.
 
 ```rust
+// As built in crates/pal-core (M0). The core calls back into `io` from
+// inside on_rx as well as tick (WebGs emits AUs from on_rx).
 pub trait GsCore {
-    fn on_rx(&mut self, body: &RxBody);          // body.mono_us = core clock
+    fn on_rx(&mut self, body: &RxBody, io: &mut dyn CoreIo);  // body.mono_us = core clock
     fn tick(&mut self, now_us: u64, io: &mut dyn CoreIo);
-    fn stats(&self) -> Stats;
-    fn set_idr_requests(&mut self, n: u32);
-    fn set_vtx_rec(&mut self, on: bool);
-    fn mav_push_outbound(&mut self, bytes: &[u8]);
-    fn mav_take_inbound(&mut self, out: &mut [u8]) -> usize;
+    fn stats_json(&self) -> String;                           // webgs::stats_json shape
+    // Added with the features that need them:
+    // set_idr_requests, set_vtx_rec, mav_push_outbound, mav_take_inbound, typed stats.
 }
 pub trait CoreIo {
     fn on_au(&mut self, au: Au);
-    fn send(&mut self, rc_body: &[u8]) -> bool;  // false = gated, never handed to a card
-    fn on_log(&mut self, line: &str);
+    fn send(&mut self, rc_body: &[u8]);
 }
 ```
 
@@ -356,6 +355,11 @@ The script never flashes, never touches MTD, and is run by the operator, not by 
 | M5 | Param client, MSP OSD, Quest hand tracking | per feature |
 
 `pal-ref` is test-only (decision 3): no milestone flies on the C++ core.
+
+M0 status (2026-10-31):
+- Done: Cargo workspace; `pal-wire` crc16 and profile pass mabur's golden vectors; `pal-ref` builds `mabur_web_core` from the submodule with mabur's own CMake and wraps WebGs behind `GsCore` through a C ABI shim; `tools/m0-parity.sh` passes 9 cases (spotter fixed/adaptive gap, gs with fake ack; drop 0/5/15 %), AU files byte-identical to `webgs replay`, send counts equal, and a changed input is detected (negative check). `tools/build-maburd.sh` builds maburd from the submodules with the pinned OpenIPC toolchain (sha256 `0588f40e...`); two clean local builds gave the same sha256 (`d309a968...`), and no build path is embedded in the binary. CI workflow written (`.github/workflows/ci.yml`), cross-runner reproducibility checked by its compare job.
+- Limits of the M0 gate: the dry-run fixture is 13 AUs; sent RC bytes are compared by count, not content (webgs replay prints only counts).
+- Open: the Quest spike.
 
 ## 11 Rough size
 

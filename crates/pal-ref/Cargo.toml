@@ -1,0 +1,15 @@
+[package]
+name = "pal-ref"
+description = "Test-only oracle: mabur's C++ WebGs behind the GsCore trait. Never ships."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "pal_ref"
+
+[dependencies]
+pal-core.workspace = true
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1"
