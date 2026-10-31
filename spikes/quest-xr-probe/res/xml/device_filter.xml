@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Realtek 0x0bda: every RTL88xx the GS drives. -->
+    <usb-device vendor-id="3034" />
+</resources>

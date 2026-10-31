@@ -200,7 +200,100 @@ fn decode_loop(surface: usize, path: String, stop: Arc<AtomicBool>) {
     let _ = codec.stop();
 }
 
+/// One UsbManager pass: every attached device, whether we hold permission,
+/// and, when we do, the fd openDevice() hands out (what libusb_wrap_sys_device
+/// will take). Returns a line per device; no permission request is made, so
+/// no dialog can come from here.
+fn usb_scan(env: &mut jni::JNIEnv, act: &jni::objects::JObject) -> jni::errors::Result<Vec<String>> {
+    use jni::objects::{JObjectArray, JString};
+    let svc = env.new_string("usb")?;
+    let mgr = env
+        .call_method(act, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[(&svc).into()])?
+        .l()?;
+    let map = env.call_method(&mgr, "getDeviceList", "()Ljava/util/HashMap;", &[])?.l()?;
+    let vals = env.call_method(&map, "values", "()Ljava/util/Collection;", &[])?.l()?;
+    let arr = JObjectArray::from(env.call_method(&vals, "toArray", "()[Ljava/lang/Object;", &[])?.l()?);
+    let mut out = Vec::new();
+    for i in 0..env.get_array_length(&arr)? {
+        let d = env.get_object_array_element(&arr, i)?;
+        let vid = env.call_method(&d, "getVendorId", "()I", &[])?.i()?;
+        let pid = env.call_method(&d, "getProductId", "()I", &[])?.i()?;
+        let name: String = {
+            let js = JString::from(env.call_method(&d, "getDeviceName", "()Ljava/lang/String;", &[])?.l()?);
+            let name: String = env.get_string(&js)?.into();
+            name
+        };
+        let has = env
+            .call_method(&mgr, "hasPermission", "(Landroid/hardware/usb/UsbDevice;)Z", &[(&d).into()])?
+            .z()?;
+        let mut line = format!("{vid:04x}:{pid:04x} {name} permission={has}");
+        if has {
+            let conn = env
+                .call_method(
+                    &mgr,
+                    "openDevice",
+                    "(Landroid/hardware/usb/UsbDevice;)Landroid/hardware/usb/UsbDeviceConnection;",
+                    &[(&d).into()],
+                )?
+                .l()?;
+            if conn.is_null() {
+                line.push_str(" open=null");
+            } else {
+                let fd = env.call_method(&conn, "getFileDescriptor", "()I", &[])?.i()?;
+                let raw = env.call_method(&conn, "getRawDescriptors", "()[B", &[])?.l()?;
+                let n = env.get_array_length(&jni::objects::JByteArray::from(raw))?;
+                line.push_str(&format!(" fd={fd} raw_descriptors={n}B"));
+                env.call_method(&conn, "close", "()V", &[])?;
+            }
+        }
+        out.push(line);
+    }
+    Ok(out)
+}
+
+/// Logs the launch intent action once, then rescans USB every 2 s and logs on change.
+fn usb_watch(act_ptr: usize) {
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.unwrap();
+    let mut env = vm.attach_current_thread_permanently().unwrap();
+    let act = unsafe { jni::objects::JObject::from_raw(act_ptr as jni::sys::jobject) };
+    let action = (|| -> jni::errors::Result<String> {
+        let intent = env.call_method(&act, "getIntent", "()Landroid/content/Intent;", &[])?.l()?;
+        let a = env.call_method(&intent, "getAction", "()Ljava/lang/String;", &[])?.l()?;
+        if a.is_null() {
+            return Ok("null".into());
+        }
+        let js = jni::objects::JString::from(a);
+        let action: String = env.get_string(&js)?.into();
+        Ok(action)
+    })();
+    info!("USB launch intent action={action:?}");
+    let mut last = Vec::new();
+    loop {
+        match env.with_local_frame(32, |env| usb_scan(env, &act)) {
+            Ok(v) if v != last => {
+                for l in &v {
+                    info!("USB {l}");
+                }
+                if v.is_empty() {
+                    info!("USB no devices");
+                }
+                last = v;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = env.exception_describe();
+                let _ = env.exception_clear();
+                warn!("USB scan failed: {e}");
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 fn run(app: &AndroidApp) -> Result<(), String> {
+    let act = app.activity_as_ptr() as usize;
+    std::thread::spawn(move || usb_watch(act));
     let entry = unsafe { xr::Entry::load() }.map_err(|e| format!("load loader: {e}"))?;
     entry
         .initialize_android_loader()

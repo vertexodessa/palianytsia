@@ -25,10 +25,15 @@ android_logger = "0.14"
 package = "org.palianytsia.xrprobe"
 build_targets = ["aarch64-linux-android"]
 runtime_libs = "libs"
+resources = "res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 32
 target_sdk_version = 34
+
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.usb.host"
+required = false
 
 [[package.metadata.android.uses_feature]]
 name = "android.hardware.vr.headtracking"
@@ -48,6 +53,13 @@ orientation = "landscape"
 [[package.metadata.android.application.activity.meta_data]]
 name = "android.app.lib_name"
 value = "quest_xr_probe"
+
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.hardware.usb.action.USB_DEVICE_ATTACHED"
+resource = "@xml/device_filter"
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.hardware.usb.action.USB_DEVICE_ATTACHED"]
 
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]
