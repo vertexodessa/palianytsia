@@ -1,0 +1,10 @@
+[package]
+name = "flightlog"
+description = "Session files: raw RxBody captures (bodies.bin), later stats/events/au logs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+pal-core.workspace = true

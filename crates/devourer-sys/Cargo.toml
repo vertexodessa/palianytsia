@@ -1,0 +1,12 @@
+[package]
+name = "devourer-sys"
+description = "C shim over the devourer userspace RTL88xx driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "devourer"
+
+[build-dependencies]
+cmake = "0.1"
+cc = "1"
