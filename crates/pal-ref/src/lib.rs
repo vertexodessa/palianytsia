@@ -43,6 +43,7 @@ extern "C" {
         mode: c_int,
         adaptive_gap: c_int,
         rz_nonce: u32,
+        channel: u8,
         user: *mut c_void,
         on_au: AuCb,
         send: SendCb,
@@ -131,6 +132,8 @@ pub struct RefOpts {
     pub adaptive_gap: bool,
     /// 0 = random; non-zero pins the DISC nonce and RCF tags.
     pub rz_nonce: u32,
+    /// Channel the radio is tuned to; 0 = first `radio.channels` member.
+    pub channel: u8,
 }
 
 pub struct RefCore {
@@ -151,6 +154,7 @@ impl RefCore {
                 if opts.mode == Mode::Gs { 0 } else { 1 },
                 c_int::from(opts.adaptive_gap),
                 opts.rz_nonce,
+                opts.channel,
                 &mut *ctx as *mut Ctx as *mut c_void,
                 on_au_tramp,
                 send_tramp,

@@ -63,6 +63,7 @@ fn main() {
             mode,
             adaptive_gap: !fixed_gap,
             rz_nonce: 1,
+            channel: 0,
         },
     )
     .unwrap_or_else(|e| panic!("pal_ref_new: {e}"));

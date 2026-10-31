@@ -3,9 +3,13 @@
 //! The core is `pal-ref` (mabur's C++ WebGs) until the Rust core lands; the
 //! capture is what the two will be diffed on.
 //!
-//!   pal live   -c gs.toml --ch 144 --width 40 [--secs 30] [--card N]
-//!              [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
-//!   pal replay <bodies.bin> -c gs.toml [--dump out.h265] [--aus out.aus]
+//!   pal live   -c gs.toml --ch 144 --width 40 [--mode gs|spotter] [--secs 30]
+//!              [--card N] [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
+//!   pal replay <bodies.bin> -c gs.toml [--mode gs|spotter] [--dump out.h265]
+//!              [--aus out.aus]
+//!
+//! Gs mode transmits: the core's RC frames (DISC, RCF, NACK, refresh) go out
+//! on the same card, and the drone follows this host.
 //!
 //! Both use a fixed frame-gap timeout and a pinned rendezvous nonce so a
 //! replay of a capture reproduces the live run's AUs exactly.
@@ -33,6 +37,7 @@ struct Opts {
     capture: Option<PathBuf>,
     dump: Option<PathBuf>,
     aus: Option<PathBuf>,
+    mode: Option<Mode>,
     pos: Vec<PathBuf>,
 }
 
@@ -58,6 +63,13 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--capture" => o.capture = Some(val().into()),
             "--dump" => o.dump = Some(val().into()),
             "--aus" => o.aus = Some(val().into()),
+            "--mode" => {
+                o.mode = Some(match val().as_str() {
+                    "gs" => Mode::Gs,
+                    "spotter" => Mode::Spotter,
+                    m => die(&format!("--mode gs|spotter, got {m}")),
+                })
+            }
             s if s.starts_with('-') => die(&format!("unknown flag {s}")),
             _ => o.pos.push(a.into()),
         }
@@ -78,6 +90,9 @@ struct Sink {
     aus: u64,
     truncated: u64,
     bytes: u64,
+    card: Option<Arc<devourer_sys::Card>>,
+    sends: u64,
+    send_fail: u64,
 }
 
 impl Sink {
@@ -96,6 +111,9 @@ impl Sink {
             aus: 0,
             truncated: 0,
             bytes: 0,
+            card: None,
+            sends: 0,
+            send_fail: 0,
         }
     }
     fn finish(&mut self) {
@@ -126,12 +144,17 @@ impl CoreIo for Sink {
             w.write_all(&a.data).unwrap();
         }
     }
-    fn send(&mut self, _rc_body: &[u8]) {
-        // Spotter never sends; Gs mode is M2.
+    fn send(&mut self, rc_body: &[u8]) {
+        self.sends += 1;
+        if let Some(c) = &self.card {
+            if !c.send_control(rc_body) {
+                self.send_fail += 1;
+            }
+        }
     }
 }
 
-fn core(o: &Opts) -> RefCore {
+fn core(o: &Opts, channel: u8) -> RefCore {
     let cfg = o
         .config
         .clone()
@@ -139,9 +162,10 @@ fn core(o: &Opts) -> RefCore {
     RefCore::new(
         &cfg,
         RefOpts {
-            mode: Mode::Spotter,
+            mode: o.mode.unwrap_or(Mode::Spotter),
             adaptive_gap: false,
             rz_nonce: RZ_NONCE,
+            channel,
         },
     )
     .unwrap_or_else(|e| die(&format!("core: {e}")))
@@ -154,7 +178,7 @@ fn mono_us(t0: Instant) -> u64 {
 }
 
 fn live(o: Opts) {
-    let mut core = core(&o);
+    let mut core = core(&o, o.ch);
     let mut sink = Sink::new(&o);
     let mut cap = o.capture.as_ref().map(|p| {
         capture::Writer::new(BufWriter::with_capacity(
@@ -217,6 +241,10 @@ fn live(o: Opts) {
         })
         .unwrap_or_else(|e| die(&e));
     }
+    let card = Arc::new(card);
+    if o.mode == Some(Mode::Gs) {
+        sink.card = Some(card.clone());
+    }
 
     let end = Duration::from_secs(o.secs);
     let mut next_tick = mono_us(t0);
@@ -255,7 +283,7 @@ fn live(o: Opts) {
         if Instant::now() >= next_report {
             next_report += Duration::from_secs(1);
             eprintln!(
-                "pal: t={:>3}s bodies={} aus/s={} truncated={} rssi={:.1} mcs={} rx_frames={} foreign={} dropped={}",
+                "pal: t={:>3}s bodies={} aus/s={} truncated={} rssi={:.1} mcs={} rx_frames={} foreign={} dropped={} sends={} send_fail={}",
                 t0.elapsed().as_secs(),
                 bodies,
                 sink.aus - last_aus,
@@ -264,14 +292,17 @@ fn live(o: Opts) {
                 mcs,
                 rx_frames.load(Ordering::Relaxed),
                 foreign.load(Ordering::Relaxed),
-                dropped.load(Ordering::Relaxed)
+                dropped.load(Ordering::Relaxed),
+                sink.sends,
+                sink.send_fail
             );
             last_aus = sink.aus;
             rssi_sum = 0.0;
             rssi_n = 0;
         }
     }
-    drop(card); // stops RX before the queue is drained
+    sink.card = None;
+    drop(card); // last Arc: stops RX before the queue is drained
     while let Ok(b) = rx.try_recv() {
         if let Some(c) = cap.as_mut() {
             c.body(&b).unwrap();
@@ -283,11 +314,13 @@ fn live(o: Opts) {
     }
     sink.finish();
     println!(
-        "live bodies={bodies} aus={} truncated={} au_bytes={} dropped={} stats={}",
+        "live bodies={bodies} aus={} truncated={} au_bytes={} dropped={} sends={} send_fail={} stats={}",
         sink.aus,
         sink.truncated,
         sink.bytes,
         dropped.load(Ordering::Relaxed),
+        sink.sends,
+        sink.send_fail,
         core.stats_json()
     );
 }
@@ -295,7 +328,7 @@ fn live(o: Opts) {
 fn replay(o: Opts) {
     let [path] = <[PathBuf; 1]>::try_from(o.pos.clone())
         .unwrap_or_else(|_| die("replay needs one <bodies.bin>"));
-    let mut core = core(&o);
+    let mut core = core(&o, 0);
     let mut sink = Sink::new(&o);
     let f = std::fs::File::open(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
     let r = capture::Reader::new(BufReader::with_capacity(1 << 20, f))

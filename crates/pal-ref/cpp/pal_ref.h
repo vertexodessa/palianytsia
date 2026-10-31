@@ -34,9 +34,13 @@ typedef struct pal_ref pal_ref;
 
 // mode: 0 = Gs, 1 = Spotter. adaptive_gap: 0 = fixed frame_gap_timeout_ms.
 // rz_nonce: 0 = random, else pinned (reproducible DISC nonce and RCF tags).
+// channel: the channel the radio is actually tuned to; 0 = the config's first
+// radio.channels member. A wrong value makes the core steer the drone to a
+// channel the card never listens on.
 // The callbacks get `user` and are called only from inside on_rx/tick.
 // Returns NULL on failure with the reason in err (always NUL-terminated).
 pal_ref* pal_ref_new(const char* config_path, int mode, int adaptive_gap, uint32_t rz_nonce,
+                     uint8_t channel,
                      void* user, pal_au_cb on_au, pal_send_cb send, char* err, size_t err_cap);
 void pal_ref_free(pal_ref* r);
 // 0 = ok, -1 = the core threw (the message goes to stderr).

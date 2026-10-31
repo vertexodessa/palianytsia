@@ -74,6 +74,7 @@ struct pal_ffs {
 extern "C" {
 
 pal_ref* pal_ref_new(const char* config_path, int mode, int adaptive_gap, uint32_t rz_nonce,
+                     uint8_t channel,
                      void* user, pal_au_cb on_au, pal_send_cb send, char* err, size_t err_cap) {
   if (!config_path || !on_au) {
     copy_err(err, err_cap, "config_path and on_au are required");
@@ -101,7 +102,8 @@ pal_ref* pal_ref_new(const char* config_path, int mode, int adaptive_gap, uint32
     webgs::Opts o;
     o.adaptive_gap = adaptive_gap != 0;
     o.rz_nonce = rz_nonce;
-    r->gs = std::make_unique<webgs::WebGs>(r->cfg, m, r->cfg.radio.channels.front(),
+    const uint8_t ch = channel ? channel : r->cfg.radio.channels.front();
+    r->gs = std::make_unique<webgs::WebGs>(r->cfg, m, ch,
                                            r->cfg.radio.width,
                                            std::vector<maburgs::LinkCard*>{}, 0, std::move(io), o);
     return r.release();
