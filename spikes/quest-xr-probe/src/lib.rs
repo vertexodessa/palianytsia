@@ -209,6 +209,16 @@ fn run(app: &AndroidApp) -> Result<(), String> {
     if !exts.khr_android_surface_swapchain {
         return Err("no XR_KHR_android_surface_swapchain".into());
     }
+    // android-activity 0.6 stores the Application in ndk_context, and openxr
+    // 0.19 hands ndk_context's object to the runtime as applicationActivity.
+    // With the Application there the Meta runtime never sees an activity it can
+    // track ("xrCreateSession: Activity is not yet in the ready state") and the
+    // session sits in IDLE. Swap in the real Activity before xrCreateInstance.
+    unsafe {
+        let vm = ndk_context::android_context().vm();
+        ndk_context::release_android_context();
+        ndk_context::initialize_android_context(vm, app.activity_as_ptr());
+    }
     let mut want = xr::ExtensionSet::default();
     want.khr_android_create_instance = true;
     want.khr_android_surface_swapchain = true;
@@ -239,6 +249,26 @@ fn run(app: &AndroidApp) -> Result<(), String> {
         "GLES req min={} max={}",
         req.min_api_version_supported, req.max_api_version_supported
     );
+    // The Meta runtime checks the activity state inside xrCreateSession and, if
+    // the activity is not resumed, focused and with a window yet, leaves the session in IDLE
+    // for good ("Activity is not yet in the ready state"). Wait for all three.
+    let (mut resumed, mut window, mut focused) = (false, false, false);
+    while !(resumed && window && focused) {
+        app.poll_events(Some(Duration::from_millis(100)), |e| {
+            if let PollEvent::Main(m) = &e {
+                info!("APP(pre) {m:?}");
+                match m {
+                    MainEvent::Resume { .. } => resumed = true,
+                    MainEvent::InitWindow { .. } => window = true,
+                    MainEvent::Pause => resumed = false,
+                    MainEvent::TerminateWindow { .. } => window = false,
+                    MainEvent::GainedFocus => focused = true,
+                    MainEvent::LostFocus => focused = false,
+                    _ => {}
+                }
+            }
+        });
+    }
     let egl = make_egl()?;
     let (session, _waiter, _stream) = unsafe {
         inst.create_session::<xr::OpenGlEs>(
@@ -255,74 +285,39 @@ fn run(app: &AndroidApp) -> Result<(), String> {
         .create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
         .map_err(|e| format!("space: {e}"))?;
 
-    let create = inst
-        .exts()
-        .khr_android_surface_swapchain
-        .as_ref()
-        .unwrap()
-        .create_swapchain_android_surface;
-    // The runtime gives no reason for ERROR_VALIDATION_FAILURE, so try the
-    // plausible field combinations and log each verdict.
-    let u_sc = sys::SwapchainUsageFlags::SAMPLED | sys::SwapchainUsageFlags::COLOR_ATTACHMENT;
-    let variants: [(&str, sys::SwapchainUsageFlags, u32, u32, u32, u32); 6] = [
-        ("usage=S|C all1", u_sc, 1, 1, 1, 1),
-        ("usage=S all1", sys::SwapchainUsageFlags::SAMPLED, 1, 1, 1, 1),
-        ("usage=0 all1", sys::SwapchainUsageFlags::EMPTY, 1, 1, 1, 1),
-        ("usage=0 all0", sys::SwapchainUsageFlags::EMPTY, 0, 0, 0, 0),
-        ("usage=S|C all0", u_sc, 0, 0, 0, 0),
-        ("usage=S|C samp0 rest1", u_sc, 0, 1, 1, 1),
-    ];
-    let mut sc = sys::Swapchain::NULL;
-    let mut surface: sys::platform::jobject = ptr::null_mut();
-    for (name, usage, samples, faces, arr, mips) in variants {
-        let ci = sys::SwapchainCreateInfo {
-            ty: sys::SwapchainCreateInfo::TYPE,
-            next: ptr::null(),
-            create_flags: sys::SwapchainCreateFlags::EMPTY,
-            usage_flags: usage,
-            format: 0,
-            sample_count: samples,
-            width: W,
-            height: H,
-            face_count: faces,
-            array_size: arr,
-            mip_count: mips,
-        };
-        let r = unsafe { create(session.as_raw(), &ci, &mut sc, &mut surface) };
-        info!("SURFACE try {name}: {r:?}");
-        if r == sys::Result::SUCCESS && !surface.is_null() {
-            break;
-        }
-    }
-    if surface.is_null() {
-        return Err("xrCreateSwapchainAndroidSurfaceKHR: every variant failed".into());
-    }
-    info!("SURFACE swapchain ok, surface={surface:p}");
-
-    let path = app
-        .external_data_path()
-        .map(|p| p.join("palxr.h265").display().to_string())
-        .unwrap_or_default();
     let stop = Arc::new(AtomicBool::new(false));
-    let surf = surface as usize;
-    let dec = {
-        let stop = stop.clone();
-        std::thread::spawn(move || decode_loop(surf, path, stop))
-    };
+    let mut sc = sys::Swapchain::NULL;
+    let mut dec = None;
+
 
     let fp = inst.fp();
     let mut ev = xr::EventDataBuffer::new();
     let mut running = false;
+    let mut idle_loops = 0u64;
     let mut quit = false;
     let mut frames = 0u64;
     let mut t = Instant::now();
     while !quit {
         app.poll_events(Some(Duration::ZERO), |e| {
-            if let PollEvent::Main(MainEvent::Destroy) = e {
-                quit = true;
+            if let PollEvent::Main(m) = &e {
+                info!("APP {m:?}");
+                if let MainEvent::Destroy = m {
+                    quit = true;
+                }
             }
         });
         while let Some(e) = inst.poll_event(&mut ev).map_err(|e| e.to_string())? {
+            if !matches!(e, xr::Event::SessionStateChanged(_)) {
+                let kind = match e {
+                    xr::Event::EventsLost(_) => "EventsLost",
+                    xr::Event::InstanceLossPending(_) => "InstanceLossPending",
+                    xr::Event::ReferenceSpaceChangePending(_) => "ReferenceSpaceChangePending",
+                    xr::Event::InteractionProfileChanged(_) => "InteractionProfileChanged",
+                    xr::Event::DisplayRefreshRateChangedFB(_) => "DisplayRefreshRateChangedFB",
+                    _ => "unknown",
+                };
+                info!("XR other event {kind}");
+            }
             if let xr::Event::SessionStateChanged(s) = e {
                 info!("XR state {:?}", s.state());
                 match s.state() {
@@ -331,6 +326,11 @@ fn run(app: &AndroidApp) -> Result<(), String> {
                             .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
                             .map_err(|e| e.to_string())?;
                         running = true;
+                        if dec.is_none() {
+                            let (c, d) = start_video(&inst, &session, app, &stop)?;
+                            sc = c;
+                            dec = Some(d);
+                        }
                         if exts.fb_display_refresh_rate {
                             let rates = session.enumerate_display_refresh_rates();
                             info!("XR refresh rates {rates:?}");
@@ -350,6 +350,10 @@ fn run(app: &AndroidApp) -> Result<(), String> {
             }
         }
         if !running {
+            idle_loops += 1;
+            if idle_loops % 200 == 0 {
+                info!("LOOP idle heartbeat {idle_loops}");
+            }
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
@@ -433,8 +437,72 @@ fn run(app: &AndroidApp) -> Result<(), String> {
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let _ = dec.join();
+    if let Some(d) = dec {
+        let _ = d.join();
+    }
     Ok(())
+}
+
+/// Surface swapchain plus decoder thread. Created only once the session runs:
+/// test of whether creating them before READY stalls the shell transition.
+fn start_video(
+    inst: &xr::Instance,
+    session: &xr::Session<xr::OpenGlEs>,
+    app: &AndroidApp,
+    stop: &Arc<AtomicBool>,
+) -> Result<(sys::Swapchain, std::thread::JoinHandle<()>), String> {
+    let create = inst
+        .exts()
+        .khr_android_surface_swapchain
+        .as_ref()
+        .unwrap()
+        .create_swapchain_android_surface;
+    // The runtime gives no reason for ERROR_VALIDATION_FAILURE, so try the
+    // plausible field combinations and log each verdict.
+    let u_sc = sys::SwapchainUsageFlags::SAMPLED | sys::SwapchainUsageFlags::COLOR_ATTACHMENT;
+    let variants: [(&str, sys::SwapchainUsageFlags, u32, u32, u32, u32); 6] = [
+        ("usage=S|C all1", u_sc, 1, 1, 1, 1),
+        ("usage=S all1", sys::SwapchainUsageFlags::SAMPLED, 1, 1, 1, 1),
+        ("usage=0 all1", sys::SwapchainUsageFlags::EMPTY, 1, 1, 1, 1),
+        ("usage=0 all0", sys::SwapchainUsageFlags::EMPTY, 0, 0, 0, 0),
+        ("usage=S|C all0", u_sc, 0, 0, 0, 0),
+        ("usage=S|C samp0 rest1", u_sc, 0, 1, 1, 1),
+    ];
+    let mut sc = sys::Swapchain::NULL;
+    let mut surface: sys::platform::jobject = ptr::null_mut();
+    for (name, usage, samples, faces, arr, mips) in variants {
+        let ci = sys::SwapchainCreateInfo {
+            ty: sys::SwapchainCreateInfo::TYPE,
+            next: ptr::null(),
+            create_flags: sys::SwapchainCreateFlags::EMPTY,
+            usage_flags: usage,
+            format: 0,
+            sample_count: samples,
+            width: W,
+            height: H,
+            face_count: faces,
+            array_size: arr,
+            mip_count: mips,
+        };
+        let r = unsafe { create(session.as_raw(), &ci, &mut sc, &mut surface) };
+        info!("SURFACE try {name}: {r:?}");
+        if r == sys::Result::SUCCESS && !surface.is_null() {
+            break;
+        }
+    }
+    if surface.is_null() {
+        return Err("xrCreateSwapchainAndroidSurfaceKHR: every variant failed".into());
+    }
+    info!("SURFACE swapchain ok, surface={surface:p}");
+
+    let path = app
+        .external_data_path()
+        .map(|p| p.join("palxr.h265").display().to_string())
+        .unwrap_or_default();
+    let surf = surface as usize;
+    let stop = stop.clone();
+    let dec = std::thread::spawn(move || decode_loop(surf, path, stop));
+    Ok((sc, dec))
 }
 
 #[no_mangle]
