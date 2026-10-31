@@ -357,9 +357,10 @@ The script never flashes, never touches MTD, and is run by the operator, not by 
 `pal-ref` is test-only (decision 3): no milestone flies on the C++ core.
 
 M0 status (2026-10-31):
-- Done: Cargo workspace; `pal-wire` crc16 and profile pass mabur's golden vectors; `pal-ref` builds `mabur_web_core` from the submodule with mabur's own CMake and wraps WebGs behind `GsCore` through a C ABI shim; `tools/m0-parity.sh` passes 9 cases (spotter fixed/adaptive gap, gs with fake ack; drop 0/5/15 %), AU files byte-identical to `webgs replay`, send counts equal, and a changed input is detected (negative check). `tools/build-maburd.sh` builds maburd from the submodules with the pinned OpenIPC toolchain (sha256 `0588f40e...`); two clean local builds gave the same sha256 (`d309a968...`), and no build path is embedded in the binary. CI workflow written (`.github/workflows/ci.yml`), cross-runner reproducibility checked by its compare job.
+- Done: Cargo workspace; `pal-wire` crc16 and profile pass mabur's golden vectors; `pal-ref` builds `mabur_web_core` from the submodule with mabur's own CMake and wraps WebGs behind `GsCore` through a C ABI shim; `tools/m0-parity.sh` passes 9 cases (spotter fixed/adaptive gap, gs with fake ack; drop 0/5/15 %), AU files byte-identical to `webgs replay`, send counts equal, and a changed input is detected (negative check). `tools/build-maburd.sh` builds maburd from the submodules with the pinned OpenIPC toolchain (sha256 `0588f40e...`); two clean local builds gave the same sha256 (`d309a968...`), and no build path is embedded in the binary. CI (`.github/workflows/ci.yml`) green on run 41227350241: fmt, clippy, tests, parity, and two runner builds of maburd with the same sha256 as the local builds (`d309a968...`).
 - Limits of the M0 gate: the dry-run fixture is 13 AUs; sent RC bytes are compared by count, not content (webgs replay prints only counts).
-- Open: the Quest spike.
+- Live check (drone on, maburd build 7bab3194 = pin plus debug-only files, no wire change): `webgs live --mode spotter` on the host 8812AU received 582 AUs in 20 s, ch 144/40 MHz, MCS3, rssi -25.5 dBm, residual loss 0.
+- Open: the Quest spike (Quest offline on 2026-10-31).
 
 ## 11 Rough size
 
