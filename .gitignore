@@ -1,0 +1,6 @@
+/target/
+**/build/
+*.apk
+*.log
+.idea/
+.vscode/
