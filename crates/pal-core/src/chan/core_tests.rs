@@ -160,6 +160,7 @@ impl Rig {
         let inp = ChannelTickIn {
             now_ms: self.ms(),
             in_session: session,
+            cal_running: false,
             tx_card: tx,
             agg: Some(&self.agg),
         };
@@ -965,6 +966,7 @@ fn shutdown_joins_threads_and_is_idempotent() {
         let inp = ChannelTickIn {
             now_ms: now_ms() as f64,
             in_session: true,
+            cal_running: false,
             tx_card: 0,
             agg: Some(&agg),
         };
@@ -985,6 +987,7 @@ fn shutdown_joins_threads_and_is_idempotent() {
     let inp = ChannelTickIn {
         now_ms: now_ms() as f64,
         in_session: true,
+        cal_running: false,
         tx_card: 0,
         agg: Some(&agg),
     };

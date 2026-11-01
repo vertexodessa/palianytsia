@@ -118,4 +118,18 @@ pub trait GsCore {
     fn ladder_json(&self) -> Option<String> {
         None
     }
+    /// Start a TX-power calibration run (maburcal start): `sweeps` empty =
+    /// the defaults for the effective width. Video stops for the run and
+    /// the drone's walls are rewritten; `Err(why)` on a refusal.
+    fn cal_start(&mut self, _sweeps: &[pal_wire::cal::SweepSpec]) -> Result<(), String> {
+        Err("calibration is not supported by this core".into())
+    }
+    /// Abandon the run; the drone restores its power table at once.
+    fn cal_abort(&mut self) {}
+    /// The run's state and result table as one JSON object (`cal::status_json`).
+    fn cal_json(&self) -> Option<String> {
+        None
+    }
+    /// Where cal.log goes (the flight-log directory); unset = no log.
+    fn set_cal_log_dir(&mut self, _dir: &std::path::Path) {}
 }

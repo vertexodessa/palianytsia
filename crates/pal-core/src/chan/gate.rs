@@ -1,14 +1,25 @@
 //! mabur `hop_burst_gate.h`: the core loop's small hop gates, pure so each
-//! has a test. Calibration is out of scope (refused at start), so its gates
-//! (`cal_cmd_clear`, the cal half of `hop_active`) are not ported.
+//! has a test.
 
 use super::hop::HopState;
 
 /// The in-session hop block (verdict window, burst, controller tick) runs
 /// only in SESSION: during the boot rendezvous the loss window reads 80-90 %
-/// and the boot scout's dwells read as raised, i.e. interfered.
-pub fn hop_active(in_session: bool) -> bool {
-    in_session
+/// and the boot scout's dwells read as raised, i.e. interfered. A
+/// calibration run deactivates it too: its sweeps silence the link on
+/// purpose, and a hop would retune off the channel being measured.
+pub fn hop_active(in_session: bool, cal_running: bool) -> bool {
+    in_session && !cal_running
+}
+
+/// Whether a due calibration SweepCmd may go out this tick. `dwell_busy`:
+/// the in-flight scout idles while a run is going, but checks that only
+/// once per dwell period, so a dwell begun just before the start is still
+/// off-channel for up to dwell_ms and that card would miss the first
+/// row's opening cells. Holding costs at most one dwell of the 3 s ack
+/// timeout; an unacked SweepCmd is repeated every 200 ms anyway.
+pub fn cal_cmd_clear(radio_silent: bool, dwell_busy: bool) -> bool {
+    !radio_silent && !dwell_busy
 }
 
 /// Keep the TX card while the in-flight scout has it off on a dwell, or
@@ -96,8 +107,12 @@ mod tests {
 
     #[test]
     fn hop_block_is_inactive_outside_session() {
-        assert!(hop_active(true));
-        assert!(!hop_active(false));
+        assert!(hop_active(true, false));
+        assert!(!hop_active(false, false));
+        assert!(!hop_active(true, true));
+        assert!(cal_cmd_clear(false, false));
+        assert!(!cal_cmd_clear(true, false));
+        assert!(!cal_cmd_clear(false, true));
     }
 
     #[test]

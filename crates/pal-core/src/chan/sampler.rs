@@ -65,6 +65,7 @@ impl Default for WindowSamplerCfg {
 #[derive(Debug)]
 pub struct WindowGates {
     pub in_session: AtomicBool,
+    pub cal_running: AtomicBool,
     pub op: AtomicU8,
     pub dwell_busy: AtomicBool,
     pub dwell_card: AtomicI32,
@@ -77,6 +78,7 @@ impl WindowGates {
     pub fn new(n_cards: usize) -> Self {
         Self {
             in_session: AtomicBool::new(false),
+            cal_running: AtomicBool::new(false),
             op: AtomicU8::new(0),
             dwell_busy: AtomicBool::new(false),
             dwell_card: AtomicI32::new(-1),
@@ -134,7 +136,7 @@ impl WindowSampler {
     }
 
     pub fn active(&self) -> bool {
-        self.gates.in_session.load(Relaxed)
+        self.gates.in_session.load(Relaxed) && !self.gates.cal_running.load(Relaxed)
     }
 
     pub fn sample_once(&self, now_ms: u64) -> WindowRecord {

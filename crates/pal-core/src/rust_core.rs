@@ -9,9 +9,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::aggregator::{Aggregator, Route};
+use crate::cal::log::CalLog;
+use crate::cal::plan::{default_sweeps, effective_width};
+use crate::cal::session::{sweep_token, CalSession, CalSessionCfg, Pick};
+use crate::cal::status_json as cal_status_json;
 use crate::chan::core::{
     ChannelCore, ChannelCoreCfg, ChannelSink, ChannelTickIn, MsClock, Sleeper, UsClock,
 };
+use crate::chan::gate::cal_cmd_clear;
 use crate::chan::hop::HopEvent;
 use crate::chan::plan::MoveEvent;
 use crate::chan::radio::LinkCard;
@@ -27,8 +32,11 @@ use crate::link_health::{LinkHealthAssembler, LinkHealthInputs, OpPoint};
 use crate::mav::{MavTunnel, ParamClient};
 use crate::nack::{NackInputs, NackTailView, NackTracker};
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
-use crate::vrx::{RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState};
+use crate::vrx::{
+    random_nonce, RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState,
+};
 use crate::{Au, CoreIo, GsCore, Mode, RxBody};
+use pal_wire::cal::{self, SweepSpec};
 use pal_wire::frame_wire::FrameHdr;
 use pal_wire::{rc, sbi, sw};
 
@@ -62,7 +70,17 @@ struct Counters {
     aus_truncated_base: u64,
     aus_salvaged: u64,
     resets: u64,
+    cal_frames: u64,
 }
+
+/// The drone's RadioTx sends calibration frames as QoS-Data (24-byte header
+/// plus 2 bytes QoS); the RX path strips it, so a capacity sweep's air bits
+/// add it and the FCS back.
+const CAL_DOT11_HEADER_LEN: usize = 26;
+const CAL_FCS_LEN: usize = 4;
+/// maburgs' MAVLink identity for the calibration kit.
+const CAL_SYSID: u8 = 255;
+const CAL_COMPID: u8 = 190;
 
 /// FrameStream's sink: builds the AU in flight and hands it to the host.
 struct AuOut<'a> {
@@ -157,11 +175,31 @@ struct Gs {
     /// Live cards; empty = send through `CoreIo`.
     cards: Vec<Arc<dyn LinkCard>>,
     chan: Option<ChannelCore>,
+    /// TX-power calibration (maburgs' CalSession); idle unless started.
+    cal: CalSession,
+    /// The GS's own radio.width: the widest sweep a run may ask for.
+    radio_width: u8,
+    ladder: Vec<crate::config::Rung>,
+    /// The linked drone's DiscAck agreed_width (0 = none heard yet).
+    peer_width: u8,
+    /// MAVLink packet seq of the cal packets.
+    cal_mav_seq: u8,
 }
 
 impl Gs {
-    /// WebGs::send_: false = the scout gate dropped it (counted by the core).
+    /// WebGs::send_: false = the scout gate dropped it (counted by the core),
+    /// or a calibration sweep owns the air (anything sent would corrupt
+    /// the measurement; the slotter's backlog must not go out either).
     fn send(&mut self, f: &SlotFrame, now_us: u64, io: &mut dyn CoreIo) -> bool {
+        if self.cal.radio_silent(now_us / 1000) {
+            return false;
+        }
+        self.send_now(f, now_us, io)
+    }
+
+    /// Past the calibration gate: the cal lane's own frames, which the
+    /// session offers only while the air is the GS's.
+    fn send_now(&mut self, f: &SlotFrame, now_us: u64, io: &mut dyn CoreIo) -> bool {
         if self
             .chan
             .as_ref()
@@ -339,6 +377,14 @@ impl RustCore {
                 rcf_sent: 0,
                 cards: Vec::new(),
                 chan: None,
+                // maburgs' defaults: margin 1 dB only predicts the verify
+                // parks, and verify tallies by rate whatever the drone's
+                // own margin parks at.
+                cal: CalSession::new(CalSessionCfg::default(), CalLog::none()),
+                radio_width: cfg.radio.width,
+                ladder: cfg.link.ladder_cfg.ladder.clone(),
+                peer_width: 0,
+                cal_mav_seq: 0,
             }
         });
         let stored_ch = Arc::new(AtomicU8::new(0));
@@ -430,6 +476,11 @@ impl RustCore {
             for pkt in g.mav.on_rc_frame(body) {
                 io.on_mav(&pkt);
                 g.params.on_packet(&pkt, self.now_us / 1000);
+                // The drone replies whatever the session's state; it
+                // ignores what does not fit.
+                for m in cal::decode_all(&pkt) {
+                    g.cal.on_mav(&m, us / 1000);
+                }
             }
             g.drain_params();
             return;
@@ -470,6 +521,11 @@ impl RustCore {
         if let Some(g) = self.gs.as_mut() {
             let was_session = g.vrx.link_state() == VrxState::Session;
             g.vrx.on_rc_frame(body, us as f64 / 1000.0);
+            if ft == Some(rc::T_DISC_ACK) {
+                if let Some(ack) = rc::parse_disc_ack(body) {
+                    g.peer_width = ack.agreed_width;
+                }
+            }
             // The ack that OPENED the session links where it was heard
             // (on_rc_body handed the core its rx channel).
             if let Some(c) = g.chan.as_mut() {
@@ -611,6 +667,25 @@ impl GsCore for RustCore {
     fn on_rx(&mut self, m: &RxBody, io: &mut dyn CoreIo) {
         self.now_us = self.now_us.max(m.mono_us);
         self.c.bodies += 1;
+        // A calibration sweep frame is its own body type: it must never
+        // reach the decoder as garbage video. CRC-bad ones too (tallied as
+        // corrupt); one whose corruption breaks the stamp fails the parse
+        // and falls through as ordinary traffic.
+        if let Some(g) = self.gs.as_mut() {
+            if let Some(info) = cal::parse_payload(&m.body) {
+                let rssi = i32::from(m.rssi[0].max(m.rssi[1])) - 110;
+                g.cal.on_cal_frame(
+                    usize::from(m.card_id),
+                    &info,
+                    rssi,
+                    m.crc_ok,
+                    CAL_DOT11_HEADER_LEN + info.len + CAL_FCS_LEN,
+                    m.mono_us / 1000,
+                );
+                self.c.cal_frames += 1;
+                return;
+            }
+        }
         // Before the aggregator routes it: the rc path reads it.
         if let Some(c) = self.gs.as_mut().and_then(|g| g.chan.as_mut()) {
             c.on_rc_body(m.rx_channel);
@@ -684,10 +759,11 @@ impl GsCore for RustCore {
         if let Some(g) = self.gs.as_mut() {
             if let Some(c) = g.chan.as_mut() {
                 // maburgs main.cpp's per-tick block; one TX card, card 0
-                // (no TxSelector, no calibration).
+                // (no TxSelector).
                 let cin = ChannelTickIn {
                     now_ms: now_ms as f64,
                     in_session: g.vrx.link_state() == VrxState::Session,
+                    cal_running: g.cal.running(),
                     tx_card: 0,
                     agg: Some(&self.agg),
                 };
@@ -736,6 +812,34 @@ impl GsCore for RustCore {
             }
             g.params.tick(now_ms);
             g.drain_params();
+            // Calibration first, so a run's message leaves this tick, ahead
+            // of any live MAVLink backlog. The one hold: a SweepCmd while a
+            // scout dwell begun just before the start is still off-channel
+            // (repeated every 200 ms, so only late).
+            let caps = g.vrx.peer_caps();
+            g.cal.set_peer(
+                linked,
+                linked && caps & rc::CAP_CALIBRATE != 0,
+                g.vrx.session_ctx(),
+            );
+            if let Some(m) = g.cal.due_mav(now_ms) {
+                let dwell_busy = g.chan.as_ref().is_some_and(|c| c.dwell_busy());
+                let held = matches!(m, cal::CalMsg::Sweep(_))
+                    && !cal_cmd_clear(g.cal.radio_silent(now_ms), dwell_busy);
+                if !held {
+                    let pkt = cal::encode(&m, CAL_SYSID, CAL_COMPID, g.cal_mav_seq);
+                    g.cal_mav_seq = g.cal_mav_seq.wrapping_add(1);
+                    g.mav.push_cal(pkt, g.cal.tag_ctx());
+                }
+            }
+            for frame in g.mav.flush_cal() {
+                let sf = SlotFrame {
+                    frame,
+                    offered_ms: now_ms,
+                    ..SlotFrame::default()
+                };
+                g.send_now(&sf, now_us, io);
+            }
             let frames = g.mav.flush();
             g.send_mav_frames(frames, now_us, io);
         }
@@ -856,6 +960,63 @@ impl GsCore for RustCore {
     fn mav_push_outbound(&mut self, bytes: &[u8]) {
         if let Some(g) = self.gs.as_mut() {
             g.mav.push_outbound(bytes);
+        }
+    }
+
+    fn cal_start(&mut self, sweeps: &[SweepSpec]) -> Result<(), String> {
+        let now_ms = self.now_us / 1000;
+        let Some(g) = self.gs.as_mut() else {
+            return Err("refused: a spotter does not transmit".into());
+        };
+        let linked = g.vrx.link_state() == VrxState::Session;
+        let width = effective_width(g.radio_width, linked, g.peer_width);
+        let sweeps = if sweeps.is_empty() {
+            default_sweeps(width, &g.ladder)
+        } else {
+            if sweeps.iter().any(|s| s.bw > width) {
+                return Err(format!("refused: the link flies {width} MHz at most"));
+            }
+            sweeps.to_vec()
+        };
+        // Refusals first, from the session's own last view of the peer.
+        let caps = g.vrx.peer_caps();
+        g.cal.set_peer(
+            linked,
+            linked && caps & rc::CAP_CALIBRATE != 0,
+            g.vrx.session_ctx(),
+        );
+        // One card: mabur's OneCard path, no channel pick.
+        let pick = if g.cards.len() >= 2 {
+            Pick::Pinned
+        } else {
+            Pick::OneCard
+        };
+        let ch = g.chan.as_ref().map_or(self.channel, |c| c.op());
+        g.cal.start(random_nonce(), sweeps, now_ms, ch, pick)?;
+        eprintln!(
+            "pal cal: started ch {ch} sweeps {:?}",
+            g.cal.sweeps().iter().map(sweep_token).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn cal_abort(&mut self) {
+        if let Some(g) = self.gs.as_mut() {
+            if g.cal.running() {
+                eprintln!("pal cal: aborted by the operator");
+            }
+            g.cal.abort("aborted by the operator");
+        }
+    }
+
+    fn cal_json(&self) -> Option<String> {
+        let g = self.gs.as_ref()?;
+        Some(cal_status_json(&g.cal.snapshot(), g.cal.sweeps()))
+    }
+
+    fn set_cal_log_dir(&mut self, dir: &std::path::Path) {
+        if let Some(g) = self.gs.as_mut() {
+            g.cal.set_log(CalLog::open(dir));
         }
     }
 
@@ -1185,6 +1346,143 @@ mod tests {
         let j = core.stats_json();
         assert!(j.contains("\"scan_pick\":40"), "{j}");
         assert!(j.contains("\"hop\":{"), "{j}");
+    }
+
+    /// The calibration lane end to end through the core: the SweepCmd
+    /// leaves through the card on the cal lane, the drone's ack (on the
+    /// tunnel) silences every other send, sweep frames are routed to the
+    /// session and never reach the video path, and an abort reopens the
+    /// air with the closing Aborts.
+    #[test]
+    fn calibration_runs_through_the_core_and_silences_the_link() {
+        let mut cfg = bundle();
+        cfg.radio.pin = Some(64);
+        let clk = FakeClock::default();
+        clk.set(1000);
+        let card = FakeCard::new(clk.clone(), 64);
+        let mut core = RustCore::with_cards(&cfg, opts(64), env(&card, &clk)).unwrap();
+        let mut io = Io::default();
+        let us = |c: &FakeClock| c.ms() * 1000;
+        core.tick(us(&clk), &mut io);
+        assert!(core.cal_start(&[]).unwrap_err().contains("link"));
+        // A drone that advertises calibration.
+        let ack = {
+            let g = core.gs.as_ref().unwrap();
+            rc::DiscAck {
+                vrx_nonce: g.vrx.rz_nonce(),
+                vtx_nonce: 9,
+                chip_caps: rc::CAP_FRAME_WIRE | rc::CAP_CALIBRATE,
+                agreed_channel: g.vrx.proposal(),
+                agreed_width: 20,
+                seq: 1,
+                ..rc::DiscAck::default()
+            }
+        };
+        let body = |b: Vec<u8>, c: &FakeClock| RxBody {
+            mono_us: us(c),
+            crc_ok: true,
+            rx_channel: 64,
+            body: b,
+            ..RxBody::default()
+        };
+        core.on_rx(&body(rc::pack_disc_ack(&ack), &clk), &mut io);
+        for _ in 0..50 {
+            clk.advance(2);
+            core.tick(us(&clk), &mut io);
+        }
+        core.cal_start(&[SweepSpec {
+            kind: cal::Kind::Power,
+            bw: 20,
+        }])
+        .unwrap();
+        assert!(core.cal_start(&[]).unwrap_err().contains("already"));
+        let n0 = card.s().sent.len();
+        clk.advance(2);
+        core.tick(us(&clk), &mut io);
+        let cal_frames = |from: usize| -> Vec<cal::CalMsg> {
+            card.s().sent[from..]
+                .iter()
+                .filter(|f| rc::frame_type(f) == Some(rc::T_MAV))
+                .filter_map(|f| rc::parse_mav(f, true))
+                .flat_map(|m| cal::decode_all(&m.payload))
+                .collect()
+        };
+        let cmds = cal_frames(n0);
+        let Some(cal::CalMsg::Sweep(cmd)) = cmds.first() else {
+            panic!("no SweepCmd went out: {cmds:?}");
+        };
+        assert_eq!((cmd.kind, cmd.bw, cmd.seq), (cal::Kind::Power, 20, 0));
+
+        // The drone accepts over the tunnel, tagged under the run's pair.
+        let ctx = core.gs.as_ref().unwrap().cal.tag_ctx();
+        let reply = cal::encode(
+            &cal::CalMsg::Ack(cal::SweepAck {
+                nonce: cmd.nonce,
+                seq: 0,
+                result: cal::AckResult::Accepted,
+                start_in_ms: 0,
+                flags: cal::FLAG_LDPC,
+            }),
+            1,
+            1,
+            0,
+        );
+        let m = rc::Mav {
+            counter: 1,
+            payload: reply,
+        };
+        core.on_rx(
+            &body(rc::pack_mav(&m, false, &cfg.link.key, &ctx), &clk),
+            &mut io,
+        );
+        assert_eq!(
+            core.gs.as_ref().unwrap().cal.state(),
+            crate::cal::session::State::Sweep
+        );
+
+        // Silent: nothing leaves while the sweep airs.
+        let n1 = card.s().sent.len();
+        for _ in 0..200 {
+            clk.advance(5);
+            core.tick(us(&clk), &mut io);
+        }
+        assert_eq!(card.s().sent.len(), n1, "a send broke the radio silence");
+
+        // Sweep frames reach the session, not the video path.
+        let p = cal::build_payload(
+            cal::Kind::Power,
+            0,
+            0,
+            20,
+            cal::FLAG_LDPC,
+            0,
+            cal::PAYLOAD_LEN,
+        );
+        let bodies = core.c.bodies;
+        core.on_rx(&body(p, &clk), &mut io);
+        assert_eq!(core.c.cal_frames, 1);
+        assert_eq!(core.c.bodies, bodies + 1);
+        assert_eq!(core.gs.as_ref().unwrap().cal.cell_received(0, 0, 0), 1);
+        let j = core.cal_json().unwrap();
+        assert!(j.contains("\"state\":\"sweep\""), "{j}");
+
+        // Abort: the air reopens and the closing Aborts go out.
+        core.cal_abort();
+        let n2 = card.s().sent.len();
+        for _ in 0..200 {
+            clk.advance(5);
+            core.tick(us(&clk), &mut io);
+        }
+        let aborts = cal_frames(n2)
+            .into_iter()
+            .filter(|m| matches!(m, cal::CalMsg::Abort(a) if a.nonce == cmd.nonce))
+            .count();
+        assert_eq!(aborts, 3);
+        // The fake drone said nothing for the sweep, so the session fell back
+        // to beaconing: the reopened air carries DISC or RCF, whichever.
+        assert!(card.s().sent[n2..]
+            .iter()
+            .any(|f| matches!(rc::frame_type(f), Some(rc::T_RCF | rc::T_DISC))));
     }
 
     #[test]

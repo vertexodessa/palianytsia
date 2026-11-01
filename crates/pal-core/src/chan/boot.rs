@@ -16,6 +16,8 @@ pub struct BootPickIn {
     /// radio.scan.max_ms
     pub max_ms: i32,
     pub in_session: bool,
+    /// A calibration run counts as linked.
+    pub cal_running: bool,
     pub one_card: bool,
     pub scout_mature: bool,
     pub scout_op_ranked: bool,
@@ -42,6 +44,7 @@ impl Default for BootPickIn {
             since_start_ms: 0,
             max_ms: 30000,
             in_session: false,
+            cal_running: false,
             one_card: false,
             scout_mature: false,
             scout_op_ranked: false,
@@ -134,7 +137,7 @@ impl BootPick {
         if k.one_card && k.link_edge {
             self.one_card_linked = true;
         }
-        let linked = k.in_session;
+        let linked = k.in_session || k.cal_running;
 
         if (self.relocating || self.resolve_now) && k.hop_idle_or_hold {
             let ok = self.relocating && self.landed;
@@ -187,6 +190,9 @@ impl BootPick {
                 }
                 if k.proposal == k.op {
                     return self.freeze("in place", true);
+                }
+                if k.cal_running {
+                    return self.freeze("calibration running", true);
                 }
                 self.pick_wanted = true;
                 self.tried = false;

@@ -389,6 +389,7 @@ impl Duo {
         let inp = ChannelTickIn {
             now_ms: now,
             in_session: session,
+            cal_running: false,
             tx_card: tx,
             agg: Some(&self.agg),
         };

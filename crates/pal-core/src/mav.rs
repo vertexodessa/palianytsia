@@ -256,6 +256,9 @@ pub struct MavTunnelStats {
     pub drop_oversize: u64,
     pub rx_dup: u64,
     pub rx_uplink_heard: u64,
+    /// Cal-lane frames sent (never in tx_frames/tx_packets).
+    pub tx_cal_frames: u64,
+    pub drop_cal_oversize: u64,
 }
 
 /// Feeds bytes through one parser channel keeping each packet's own wire
@@ -299,6 +302,10 @@ pub struct MavTunnel {
     have_rx: bool,
     rx_last: u32,
     queue: VecDeque<Vec<u8>>,
+    /// The last cal frame's vtx_nonce, for the counter restart rule.
+    cal_vtx_seen: u32,
+    cal_counter: u32,
+    cal_queue: VecDeque<(Vec<u8>, TagCtx)>,
     out_p: Parser,
     out_acc: Vec<u8>,
     in_p: Parser,
@@ -316,6 +323,9 @@ impl MavTunnel {
             have_rx: false,
             rx_last: 0,
             queue: VecDeque::new(),
+            cal_vtx_seen: 0,
+            cal_counter: 0,
+            cal_queue: VecDeque::new(),
             out_p: Parser::default(),
             out_acc: Vec::new(),
             in_p: Parser::default(),
@@ -359,6 +369,52 @@ impl MavTunnel {
             || bad.set(bad.get() + 1),
         );
         self.stats.drop_bad_packet += bad.get();
+    }
+
+    /// One calibration packet, tagged under the run's frozen pair. The cal
+    /// lane never shares a frame with a live packet: the drone hands a
+    /// mixed frame whole to its MAVLink component, which drops the cal ids.
+    /// Unlike the live lane it goes out whether or not a session is live
+    /// (every sweep outlasts the link's failsafe).
+    pub fn push_cal(&mut self, packet: Vec<u8>, run_ctx: TagCtx) {
+        if packet.len() > MAV_MAX_PAYLOAD {
+            self.stats.drop_cal_oversize += 1;
+            return;
+        }
+        self.cal_queue.push_back((packet, run_ctx));
+    }
+
+    /// Packs the cal queue into T_MAV frames, one pair per frame. The
+    /// counter restarts only on a new vtx_nonce: the drone checks it
+    /// against its per-pair high-water mark, so a second run on the same
+    /// pair must keep counting. Call before `flush`.
+    pub fn flush_cal(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some((_, run_ctx)) = self.cal_queue.front() {
+            let run_ctx = *run_ctx;
+            if run_ctx.vtx_nonce != self.cal_vtx_seen {
+                self.cal_vtx_seen = run_ctx.vtx_nonce;
+                self.cal_counter = 0;
+            }
+            let mut m = Mav::default();
+            while let Some((p, c)) = self.cal_queue.front() {
+                if c.vrx_nonce != run_ctx.vrx_nonce
+                    || c.vtx_nonce != run_ctx.vtx_nonce
+                    || m.payload.len() + p.len() > MAV_MAX_PAYLOAD
+                {
+                    break;
+                }
+                m.payload.extend_from_slice(p);
+                self.cal_queue.pop_front();
+            }
+            self.cal_counter = self.cal_counter.wrapping_add(1);
+            m.counter = self.cal_counter;
+            let mut tag = run_ctx;
+            tag.seq32 = self.cal_counter;
+            out.push(rc::pack_mav(&m, true, &self.key, &tag));
+            self.stats.tx_cal_frames += 1;
+        }
+        out
     }
 
     /// Packs the queue greedily into T_MAV frames; returns them in send order.
@@ -1042,5 +1098,42 @@ mod tests {
         assert_eq!(parse_mode_text("120@1920x1080"), Some((120, 1920, 1080)));
         assert_eq!(parse_mode_text("120@1920x"), None);
         assert_eq!(parse_mode_text("1234567@1x1"), None);
+    }
+
+    #[test]
+    fn cal_lane_keeps_its_own_counter_and_never_mixes() {
+        let mut t = MavTunnel::new(LinkKey::default());
+        let ctx = |vtx| TagCtx {
+            vrx_nonce: 7,
+            vtx_nonce: vtx,
+            ..TagCtx::default()
+        };
+        // Unlinked: the cal lane still goes out.
+        t.push_cal(vec![1, 2, 3], ctx(5));
+        t.push_cal(vec![4, 5], ctx(5));
+        let f = t.flush_cal();
+        assert_eq!(f.len(), 1);
+        let m = rc::parse_mav(&f[0], true).unwrap();
+        assert_eq!(
+            (m.counter, m.payload.as_slice()),
+            (1, &[1u8, 2, 3, 4, 5][..])
+        );
+        // Same pair: a second run keeps counting.
+        t.push_cal(vec![9], ctx(5));
+        assert_eq!(rc::parse_mav(&t.flush_cal()[0], true).unwrap().counter, 2);
+        // A new pair restarts at 1, and splits from the old pair's packets.
+        t.push_cal(vec![1], ctx(5));
+        t.push_cal(vec![2], ctx(6));
+        let f = t.flush_cal();
+        assert_eq!(f.len(), 2);
+        assert_eq!(rc::parse_mav(&f[0], true).unwrap().counter, 3);
+        assert_eq!(rc::parse_mav(&f[1], true).unwrap().counter, 1);
+        // The live lane's counter is untouched.
+        assert_eq!(t.counter(), 0);
+        assert_eq!(t.stats().tx_cal_frames, 4);
+        assert_eq!(t.stats().tx_frames, 0);
+        t.push_cal(vec![0; MAV_MAX_PAYLOAD + 1], ctx(6));
+        assert_eq!(t.stats().drop_cal_oversize, 1);
+        assert!(t.flush_cal().is_empty());
     }
 }

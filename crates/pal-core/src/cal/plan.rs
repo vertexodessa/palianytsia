@@ -1,7 +1,9 @@
 //! The GS's sweep commands and how long the drone airs each (mabur
 //! `cal_plan.h`). Pure.
 
-use pal_wire::cal::{Kind, SweepCmd, WALL_LEAVE};
+use pal_wire::cal::{Kind, SweepCmd, SweepSpec, WALL_LEAVE};
+
+use crate::config::Rung;
 
 /// One full-resolution pass over the relative index range. -41, not -40,
 /// so the last cell lands exactly on the +63 rail a no-dip row parks at:
@@ -71,6 +73,43 @@ pub fn verify_duration_ms(cells: usize) -> u32 {
     cells as u32 * per_cell
 }
 
+/// What a bare start runs: power then capacity at 20 MHz, and at 40 when
+/// the GS flies 40 and the ladder has a 40 MHz rung (maburgs
+/// `default_sweeps`).
+pub fn default_sweeps(radio_width: u8, ladder: &[Rung]) -> Vec<SweepSpec> {
+    let mut out = vec![
+        SweepSpec {
+            kind: Kind::Power,
+            bw: 20,
+        },
+        SweepSpec {
+            kind: Kind::Capacity,
+            bw: 20,
+        },
+    ];
+    if radio_width == 40 && ladder.iter().any(|r| r.bw == 40) {
+        out.push(SweepSpec {
+            kind: Kind::Power,
+            bw: 40,
+        });
+        out.push(SweepSpec {
+            kind: Kind::Capacity,
+            bw: 40,
+        });
+    }
+    out
+}
+
+/// The widest sweep a run may ask for: the narrower of the GS's width and
+/// the linked drone's agreed one (0 = not heard yet).
+pub fn effective_width(gs_width: u8, linked: bool, peer_width: u8) -> u8 {
+    if !linked || peer_width == 0 {
+        gs_width
+    } else {
+        gs_width.min(peer_width)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +148,31 @@ mod tests {
         assert_eq!(cells[0], (0, 59));
         assert_eq!(*cells.last().unwrap(), (7, -8));
         assert_eq!(verify_duration_ms(cells.len()), 175);
+    }
+
+    #[test]
+    fn default_sweeps_add_40_only_when_both_fly_it() {
+        let rung = |bw| Rung {
+            mcs: 0,
+            overhead_base: 0.0,
+            overhead_enh: 0.0,
+            bw,
+        };
+        let (r20, r40) = (rung(20), rung(40));
+        assert_eq!(default_sweeps(20, &[r20, r40]).len(), 2);
+        assert_eq!(default_sweeps(40, &[r20]).len(), 2);
+        let s = default_sweeps(40, &[r20, r40]);
+        assert_eq!(s.len(), 4);
+        assert_eq!(
+            s[2],
+            SweepSpec {
+                kind: Kind::Power,
+                bw: 40
+            }
+        );
+        assert_eq!(effective_width(40, true, 20), 20);
+        assert_eq!(effective_width(40, true, 0), 40);
+        assert_eq!(effective_width(40, false, 20), 40);
     }
 
     #[test]

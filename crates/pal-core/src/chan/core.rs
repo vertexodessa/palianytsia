@@ -136,6 +136,9 @@ pub struct ChannelTickIn<'a> {
     pub now_ms: f64,
     /// VrxState::Session
     pub in_session: bool,
+    /// CalSession::running(): a run owns the air and freezes every channel
+    /// change (the drone defers its own retunes the same way).
+    pub cal_running: bool,
     /// The send path's TX card.
     pub tx_card: usize,
     /// Per-card crc_fail/rssi/snr and the decoder stats; None reads zeros.
@@ -259,6 +262,7 @@ impl Live {
     fn inflight_body(&self) {
         if !self.reactive
             || !self.gates.in_session.load(Relaxed)
+            || self.gates.cal_running.load(Relaxed)
             || self.hopping.load(Relaxed)
             || self.scout_working.load(Relaxed)
             || self.cards.len() < 2
@@ -378,6 +382,7 @@ pub struct ChannelCore {
     shut: bool,
     now_ms_cur: f64,
     now_ms_u_cur: u64,
+    cal_running_cur: bool,
 }
 
 impl ChannelCore {
@@ -540,6 +545,7 @@ impl ChannelCore {
             shut: false,
             now_ms_cur: 0.0,
             now_ms_u_cur: 0,
+            cal_running_cur: false,
             cfg,
         }
     }
@@ -810,6 +816,7 @@ impl ChannelCore {
         self.now_ms_u_cur = inp.now_ms as u64;
         self.live.tx_card_now.store(inp.tx_card, Relaxed);
         self.live.gates.in_session.store(inp.in_session, Relaxed);
+        self.live.gates.cal_running.store(inp.cal_running, Relaxed);
         // The scout thread starts once its card is up (threaded), or one
         // step runs here (tests).
         if let (Some(s), Some(sci)) = (&self.scout, self.scout_card) {
@@ -824,7 +831,10 @@ impl ChannelCore {
         if !self.cfg.threaded && self.scout_started {
             self.run_scout_step();
         }
-        self.plan.tick(inp.now_ms, inp.in_session);
+        self.cal_running_cur = inp.cal_running;
+        // A run counts as linked: the sweeps outlast the link's failsafe.
+        self.plan
+            .tick(inp.now_ms, inp.in_session || inp.cal_running);
         self.step_scout_inputs();
         self.step_boot_pick(inp);
         self.step_store(vrx);
@@ -987,13 +997,14 @@ impl ChannelCore {
             since_start_ms: self.now_ms_u_cur.wrapping_sub(self.gs_start_ms),
             max_ms: self.cfg.radio.scan.max_ms,
             in_session: inp.in_session,
+            cal_running: inp.cal_running,
             one_card: self.one_card,
             scout_owns: self.scout_owns(),
             op: self.plan.op(),
             want: self.plan.want(),
             relocate_due: self.plan.relocate_due(),
             plan_hopping: self.plan.hopping(),
-            hop_active: hop_active(inp.in_session),
+            hop_active: hop_active(inp.in_session, inp.cal_running),
             hop_idle_or_hold: matches!(self.hopc.state(), HopState::Idle | HopState::Hold),
             link_edge: self.link_edge_seen,
             scout_card_died: self.scout_card_died_seen,
@@ -1021,7 +1032,7 @@ impl ChannelCore {
                 self.frozen_pick = Some(self.plan.want());
             }
             BootPickOut::AckPrelude(ch) => {
-                let linked = if inp.in_session {
+                let linked = if inp.in_session || inp.cal_running {
                     ", linked: not committed"
                 } else {
                     ""
@@ -1085,7 +1096,7 @@ impl ChannelCore {
     fn step_hop_edge_and_window(&mut self, inp: &ChannelTickIn, vrx: &mut VrxController) {
         let now_ms = inp.now_ms;
         let now_ms_u = self.now_ms_u_cur;
-        let active = hop_active(inp.in_session);
+        let active = hop_active(inp.in_session, inp.cal_running);
         if active != self.hop_was_active {
             self.hop_was_active = active;
             if !active {
@@ -1254,7 +1265,7 @@ impl ChannelCore {
 
     fn step_controller(&mut self, inp: &ChannelTickIn, vrx: &mut VrxController) {
         let now_ms = inp.now_ms;
-        if !hop_active(inp.in_session) {
+        if !hop_active(inp.in_session, inp.cal_running) {
             self.pending_relocate = None;
             return;
         }
@@ -1341,10 +1352,10 @@ impl ChannelCore {
         // a no-op; a member agreed != op (after a withdrawn hop) moves op as
         // a normal ack move. Held, not consumed: an edge landing on a
         // hopping tick would otherwise be dropped.
-        if self
-            .move_hold
-            .take(vrx.take_move_edge(), self.plan.hopping())
-        {
+        if self.move_hold.take(
+            vrx.take_move_edge(),
+            self.cal_running_cur || self.plan.hopping(),
+        ) {
             let proposed = vrx.proposal();
             let agreed = vrx.agreed_channel();
             if !self.plan.member(agreed) {

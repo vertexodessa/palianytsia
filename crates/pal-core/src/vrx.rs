@@ -53,7 +53,7 @@ pub struct VrxRendezvous {
     beacons_since_flagged: i32,
 }
 
-fn random_nonce() -> u32 {
+pub(crate) fn random_nonce() -> u32 {
     let mut b = [0u8; 4];
     loop {
         if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
