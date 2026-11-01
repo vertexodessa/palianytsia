@@ -7,7 +7,7 @@
 //!   pal-desktop -c gs.toml --replay bodies.bin [--mode gs|spotter] [--loop]
 //!   pal-desktop [-c gs.toml] [--live] [--ch N --width 20|40] [--bw 20|40] [--mode gs|spotter] [--card N]
 //!     --bw: video link width (every ladder rung); default the saved pref (Link tab)
-//!     live is the default; config from -c, $PAL_CONFIG, or configs/bench-ch40.toml;
+//!     live is the default; config from -c, $PAL_CONFIG, or configs/gs-auto.toml (finds the drone);
 //!     channel/width from its radio section, mode gs
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
@@ -88,7 +88,7 @@ fn die(msg: &str) -> ! {
 fn parse() -> Opts {
     let mut o = Opts {
         hwdec: "auto".into(),
-        rust: true,
+        rust: false, // mabur's core and ChannelCore, as the APKs run
         secs: 5.0,
         ..Opts::default()
     };
@@ -140,13 +140,14 @@ fn parse() -> Opts {
     // No source given: live, the everyday case (`cargo run -p pal-desktop`).
     o.live = o.replay.is_none();
     if o.config.is_none() {
-        // -c, else $PAL_CONFIG, else the bench rig's config in this repo.
+        // -c, else $PAL_CONFIG, else the APKs' config: it finds the drone on
+        // any channel of its set, where a pinned config waits on one.
         let p = std::env::var_os("PAL_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(concat!(
                     env!("CARGO_MANIFEST_DIR"),
-                    "/../../configs/bench-ch40.toml"
+                    "/../../configs/gs-auto.toml"
                 ))
             });
         eprintln!("pal-desktop: config {}", p.display());
