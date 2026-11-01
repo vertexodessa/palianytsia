@@ -9,5 +9,6 @@ pub mod pair;
 pub mod plan;
 pub mod radio;
 pub mod ranker;
+pub mod scout;
 pub mod scout_pick;
 pub mod verdict;
