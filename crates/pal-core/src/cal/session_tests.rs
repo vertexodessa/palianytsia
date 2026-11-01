@@ -1,5 +1,6 @@
-//! mabur's tests/test_cal_session.cpp, minus the channel-pick cases (the
-//! pick is not ported).
+//! mabur's tests/test_cal_session.cpp. Where mabur's due_mav(t) advances
+//! the pick, these call `step_pick(t)` then `due_mav(t)`, as RustCore's
+//! tick does.
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,7 @@ use pal_wire::rc::TagCtx;
 
 use super::analysis::*;
 use super::log::CalLog;
+use super::picker::{CalPicker, Mode};
 use super::plan::*;
 use super::session::*;
 
@@ -31,9 +33,73 @@ fn session() -> CalSession {
     s
 }
 
-fn start(s: &mut CalSession, nonce: u32, sweeps: &[SweepSpec], now: u64) {
-    s.start(nonce, sweeps.to_vec(), now, 0, Pick::Pinned)
+struct FakePicker {
+    m: Mode,
+    op_ch: u8,
+    best: Option<u8>,
+    accept_reloc: bool,
+    settled: Option<bool>,
+    measures: u32,
+    relocs: u32,
+    cancels: u32,
+    reloc_to: u8,
+}
+
+impl Default for FakePicker {
+    fn default() -> Self {
+        Self {
+            m: Mode::Auto,
+            op_ch: 36,
+            best: None,
+            accept_reloc: true,
+            settled: None,
+            measures: 0,
+            relocs: 0,
+            cancels: 0,
+            reloc_to: 0,
+        }
+    }
+}
+
+impl CalPicker for FakePicker {
+    fn mode(&self) -> Mode {
+        self.m
+    }
+    fn op(&self) -> u8 {
+        self.op_ch
+    }
+    fn begin_measure(&mut self, _now_ms: u64) {
+        self.measures += 1;
+    }
+    fn measured_best(&mut self) -> Option<u8> {
+        self.best
+    }
+    fn order_relocate(&mut self, ch: u8) -> bool {
+        self.relocs += 1;
+        self.reloc_to = ch;
+        self.accept_reloc
+    }
+    fn relocate_settled(&mut self) -> Option<bool> {
+        self.settled
+    }
+    fn cancel(&mut self) {
+        self.cancels += 1;
+    }
+}
+
+fn start_p(s: &mut CalSession, nonce: u32, now: u64, p: &mut FakePicker) {
+    s.start(nonce, vec![sp(Kind::Power, 20)], now, Some(p))
         .unwrap();
+}
+
+/// mabur's due_mav(t) with a picker: the pick steps first.
+fn due_p(s: &mut CalSession, now: u64, p: &mut FakePicker) -> Option<CalMsg> {
+    s.step_pick(now, p);
+    s.due_mav(now)
+}
+
+fn start(s: &mut CalSession, nonce: u32, sweeps: &[SweepSpec], now: u64) {
+    s.start(nonce, sweeps.to_vec(), now, None).unwrap();
 }
 
 /// Every frame goes through the real stamp codec, as the RX path does.
@@ -190,13 +256,9 @@ fn start_sorts_and_dedups_the_sweep_list() {
     assert_eq!(cmd, make_power_sweep(1, 0, 20));
 
     let mut t = session();
-    assert!(t.start(2, vec![], 0, 0, Pick::Pinned).is_err());
-    assert!(t
-        .start(2, vec![sp(Kind::Verify, 20)], 0, 0, Pick::Pinned)
-        .is_err());
-    assert!(t
-        .start(2, vec![sp(Kind::Power, 30)], 0, 0, Pick::Pinned)
-        .is_err());
+    assert!(t.start(2, vec![], 0, None).is_err());
+    assert!(t.start(2, vec![sp(Kind::Verify, 20)], 0, None).is_err());
+    assert!(t.start(2, vec![sp(Kind::Power, 30)], 0, None).is_err());
     assert_eq!(t.state(), State::Idle);
 }
 
@@ -206,34 +268,17 @@ fn start_refuses_without_capability_or_link() {
     let one = vec![sp(Kind::Power, 20)];
     s.set_peer(false, true, TagCtx::default());
     assert!(s
-        .start(1, one.clone(), 0, 0, Pick::Pinned)
+        .start(1, one.clone(), 0, None)
         .unwrap_err()
         .contains("link"));
     s.set_peer(true, false, TagCtx::default());
     assert!(s
-        .start(1, one.clone(), 0, 0, Pick::Pinned)
+        .start(1, one.clone(), 0, None)
         .unwrap_err()
         .contains("CAP_CALIBRATE"));
     s.set_peer(true, true, TagCtx::default());
-    s.start(1, one.clone(), 0, 0, Pick::Pinned).unwrap();
-    assert!(s.start(2, one, 10, 0, Pick::Pinned).is_err());
-}
-
-#[test]
-fn the_pick_word_and_channel_reach_the_snapshot() {
-    let mut s = session();
-    s.start(7, vec![sp(Kind::Power, 20)], 0, 149, Pick::Pinned)
-        .unwrap();
-    assert_eq!(s.state(), State::AwaitAck);
-    assert_eq!(
-        (s.snapshot().pick_note.as_str(), s.snapshot().channel),
-        ("pinned", 149)
-    );
-    assert!(sweep(s.due_mav(0)).is_some());
-    let mut t = session();
-    t.start(8, vec![sp(Kind::Power, 20)], 0, 36, Pick::OneCard)
-        .unwrap();
-    assert_eq!(t.snapshot().pick_note, "onecard");
+    s.start(1, one.clone(), 0, None).unwrap();
+    assert!(s.start(2, one, 10, None).is_err());
 }
 
 #[test]
@@ -959,7 +1004,7 @@ fn abort_emits_three_aborts_and_reopens_the_air() {
     assert!(s.due_mav(0).is_some());
     ack(&mut s, 25, 0, 10);
     assert!(s.radio_silent(100));
-    s.abort("operator abort");
+    s.abort("operator abort", None);
     assert!(!s.radio_silent(100));
     assert_eq!(s.state(), State::Idle);
     assert!(!s.running());
@@ -980,7 +1025,7 @@ fn abort_emits_three_aborts_and_reopens_the_air() {
 fn an_abort_before_anything_reached_the_drone_sends_nothing() {
     let mut s = session();
     start(&mut s, 27, &[sp(Kind::Power, 20)], 0);
-    s.abort("operator abort");
+    s.abort("operator abort", None);
     assert_eq!(s.state(), State::Idle);
     assert!(s.due_mav(10).is_none());
 }
@@ -1127,7 +1172,7 @@ fn tag_context_is_frozen_at_start() {
     s.set_peer(true, true, ctx(33));
     s.set_peer(false, true, ctx(33));
     assert_eq!((s.tag_ctx().vrx_nonce, s.tag_ctx().vtx_nonce), (11, 22));
-    s.abort("test");
+    s.abort("test", None);
     s.set_peer(true, true, ctx(44));
     start(&mut s, 32, &[sp(Kind::Power, 20)], 10);
     assert_eq!(s.tag_ctx().vtx_nonce, 44);
@@ -1142,8 +1187,10 @@ fn cal_log_gets_sweep_cell_wall_cap_verify_and_applied_rows() {
         77,
         vec![sp(Kind::Capacity, 20), sp(Kind::Power, 20)],
         0,
-        36,
-        Pick::Pinned,
+        Some(&mut FakePicker {
+            m: Mode::Pinned,
+            ..FakePicker::default()
+        }),
     )
     .unwrap();
     run_power(&mut s, 77, 0, 20, &WALLS, 0);
@@ -1212,4 +1259,192 @@ fn null_log_sink_is_inert() {
     applied(&mut s, 34, 0, 20, true, "", 100);
     s.due_mav(verify_close(100, 7));
     assert_eq!(s.state(), State::Done);
+}
+
+// ---- the channel pick (mabur's picking / picker cases) ----
+
+#[test]
+fn a_pick_in_progress_is_a_run_too() {
+    let mut p = FakePicker::default();
+    let mut q = session();
+    start_p(&mut q, 3, 0, &mut p);
+    assert_eq!(q.state(), State::Picking);
+    assert!(q
+        .start(4, vec![sp(Kind::Power, 20)], 10, None)
+        .unwrap_err()
+        .contains("running"));
+}
+
+#[test]
+fn picking_relocates_to_the_best_member_then_awaits_ack() {
+    let mut p = FakePicker::default();
+    let mut s = session();
+    start_p(&mut s, 5, 0, &mut p);
+    assert_eq!(s.state(), State::Picking);
+    assert_eq!(p.measures, 1);
+    assert!(!s.running());
+    assert!(!s.radio_silent(0));
+    assert!(due_p(&mut s, 100, &mut p).is_none()); // round still measuring
+
+    p.best = Some(44);
+    assert!(due_p(&mut s, 200, &mut p).is_none());
+    assert!(p.relocs == 1 && p.reloc_to == 44);
+    assert_eq!(s.state(), State::Picking);
+    assert!(due_p(&mut s, 400, &mut p).is_none()); // relocate pending
+    assert_eq!(p.relocs, 1); // ordered once
+
+    p.settled = Some(true);
+    p.op_ch = 44;
+    assert!(sweep(due_p(&mut s, 600, &mut p)).is_some());
+    assert_eq!(s.state(), State::AwaitAck);
+    assert!(s.running());
+    let snap = s.snapshot();
+    assert_eq!(snap.channel, 44);
+    assert!(snap.pick_note.contains("44"));
+    assert_eq!(p.cancels, 0);
+
+    // Already on the best member: no relocate at all.
+    let mut q = FakePicker {
+        best: Some(36),
+        ..FakePicker::default()
+    };
+    let mut t = session();
+    start_p(&mut t, 6, 0, &mut q);
+    assert!(sweep(due_p(&mut t, 10, &mut q)).is_some());
+    assert_eq!(q.relocs, 0);
+    assert_eq!(t.snapshot().channel, 36);
+    assert_eq!(t.snapshot().pick_note, "auto: 36 is the best member");
+}
+
+#[test]
+fn pinned_picker_skips_picking_with_a_note() {
+    let mut p = FakePicker {
+        m: Mode::Pinned,
+        op_ch: 149,
+        ..FakePicker::default()
+    };
+    let mut s = session();
+    start_p(&mut s, 7, 0, &mut p);
+    assert_eq!(s.state(), State::AwaitAck);
+    assert_eq!(p.measures, 0);
+    assert_eq!(s.snapshot().pick_note, "pinned");
+    assert_eq!(s.snapshot().channel, 149);
+    assert!(sweep(s.due_mav(0)).is_some());
+
+    let mut q = FakePicker {
+        m: Mode::OneCard,
+        ..FakePicker::default()
+    };
+    let mut t = session();
+    start_p(&mut t, 8, 0, &mut q);
+    assert_eq!(t.state(), State::AwaitAck);
+    assert_eq!(q.measures, 0);
+    assert_eq!(t.snapshot().pick_note, "onecard");
+
+    // No picker at all: same as pinned, the run does not choose.
+    let mut u = session();
+    start(&mut u, 9, &[sp(Kind::Power, 20)], 0);
+    assert_eq!(u.state(), State::AwaitAck);
+    assert_eq!(u.snapshot().pick_note, "pinned");
+}
+
+#[test]
+fn unconfirmed_relocate_stays_on_op_and_proceeds() {
+    let mut p = FakePicker {
+        best: Some(44),
+        ..FakePicker::default()
+    };
+    let mut s = session();
+    start_p(&mut s, 10, 0, &mut p);
+    assert!(due_p(&mut s, 10, &mut p).is_none());
+    assert_eq!(p.relocs, 1);
+    p.settled = Some(false);
+    assert!(sweep(due_p(&mut s, 20, &mut p)).is_some());
+    assert_eq!(s.state(), State::AwaitAck);
+    assert_eq!(s.snapshot().channel, 36);
+    assert_eq!(s.snapshot().pick_note, "stayed on 36, relocate unconfirmed");
+    assert_eq!(p.cancels, 1);
+
+    // A refused order stays the same way.
+    let mut q = FakePicker {
+        best: Some(44),
+        accept_reloc: false,
+        ..FakePicker::default()
+    };
+    let mut t = session();
+    start_p(&mut t, 11, 0, &mut q);
+    assert!(sweep(due_p(&mut t, 10, &mut q)).is_some());
+    assert_eq!(t.snapshot().channel, 36);
+    assert!(t.snapshot().pick_note.starts_with("stayed on 36"));
+    assert_eq!(q.cancels, 1);
+}
+
+#[test]
+fn picker_is_cancelled_on_pick_timeout_and_abort() {
+    let cfg = CalSessionCfg::default();
+    let mut p = FakePicker::default();
+    let mut s = session();
+    start_p(&mut s, 26, 0, &mut p);
+    assert!(due_p(&mut s, cfg.pick_timeout_ms - 1, &mut p).is_none());
+    assert_eq!(p.cancels, 0);
+    assert!(sweep(due_p(&mut s, cfg.pick_timeout_ms, &mut p)).is_some());
+    assert_eq!(p.cancels, 1);
+    assert_eq!(s.snapshot().channel, 36);
+    assert_eq!(s.snapshot().pick_note, "stayed on 36, measure timed out");
+
+    let mut q = FakePicker::default();
+    let mut t = session();
+    start_p(&mut t, 27, 0, &mut q);
+    t.abort("operator abort", Some(&mut q));
+    assert_eq!(q.cancels, 1);
+    assert_eq!(t.state(), State::Idle);
+    assert!(t.due_mav(10).is_none()); // nothing reached the drone: no Abort
+}
+
+/// With a pick, nothing reaches the drone until the pick ends, so the
+/// context is the one the link holds when the first SweepCmd is due.
+#[test]
+fn a_picked_run_freezes_the_context_at_its_first_command() {
+    let ctx = |vtx| TagCtx {
+        vrx_nonce: 1,
+        vtx_nonce: vtx,
+        seq32: 0,
+    };
+    let mut p = FakePicker {
+        best: Some(36),
+        ..FakePicker::default()
+    };
+    let mut t = CalSession::new(CalSessionCfg::default(), CalLog::none());
+    t.set_peer(true, true, ctx(2));
+    start_p(&mut t, 33, 0, &mut p);
+    t.set_peer(true, true, ctx(3));
+    assert!(sweep(due_p(&mut t, 10, &mut p)).is_some());
+    assert_eq!(t.tag_ctx().vtx_nonce, 3);
+    t.set_peer(true, true, ctx(4));
+    assert_eq!(t.tag_ctx().vtx_nonce, 3);
+}
+
+/// cal.log R carries the pick token: auto after a pick that kept op,
+/// stayed after one that could not move.
+#[test]
+fn the_r_line_names_the_pick() {
+    for (best, accept, word) in [(36, true, "auto"), (44, false, "stayed")] {
+        let d = fresh(&format!("pick_{word}"));
+        let mut s = CalSession::new(CalSessionCfg::default(), CalLog::open(&d));
+        s.set_peer(true, true, TagCtx::default());
+        let mut p = FakePicker {
+            best: Some(best),
+            accept_reloc: accept,
+            ..FakePicker::default()
+        };
+        start_p(&mut s, 40, 0, &mut p);
+        assert!(sweep(due_p(&mut s, 10, &mut p)).is_some());
+        ack(&mut s, 40, 0, 20);
+        s.abort("test", None);
+        let r = log_lines(&d)
+            .into_iter()
+            .find(|l| l.starts_with("R "))
+            .expect("R line");
+        assert!(r.contains(" 36 ") && r.contains(word), "{r}");
+    }
 }

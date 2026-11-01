@@ -1526,12 +1526,18 @@ impl ChannelCore {
     }
 
     /// The round's best member; None while it waits or runs, op when the
-    /// GS cannot measure.
+    /// GS cannot measure. A best other than op is held back until the
+    /// scout has parked its card again: the round stays open until then,
+    /// and the relocate the run orders next would be refused (scout_owns).
+    /// maburgs answers at MEASURED and races its scout thread there.
     pub fn cal_measure_best(&self) -> Option<u8> {
         if !self.cal_can_measure() {
             return Some(self.plan.op());
         }
-        (self.cal_meas.s == CalMeasureState::Done).then_some(self.cal_meas.best)
+        let parked = !self.scout.as_ref().is_some_and(|s| s.round_open());
+        let best = self.cal_meas.best;
+        (self.cal_meas.s == CalMeasureState::Done && (parked || best == self.plan.op()))
+            .then_some(best)
     }
 
     /// The boot pick's relocate toward ch, reason cal. false = refused: not

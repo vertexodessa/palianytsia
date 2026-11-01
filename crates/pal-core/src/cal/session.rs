@@ -10,9 +10,10 @@
 //! `on_mav`. It alone decides whether the GS may transmit while a run is in
 //! progress (`radio_silent`).
 //!
-//! Not ported: mabur's channel pick before the first sweep (`Picking`,
-//! CalPicker Mode::Auto). It needs two cards to measure with; a one-card
-//! GS runs mabur's OneCard path, which never picks.
+//! A run on an auto GS with a spare card picks its channel first
+//! (`Picking`, through a `CalPicker`): one measure round, one relocate if
+//! op is not the best member. The owner drives it with `step_pick` every
+//! tick; nothing reaches the drone until the pick ends.
 
 use pal_wire::cal::{
     park_rel_for, Abort, AckResult, Applied, ApplyCmd, CalMsg, FrameInfo, Kind, SweepCmd,
@@ -25,6 +26,7 @@ use super::analysis::{
     FLAG_LOST, FLAG_TX_BOUND, NO_WALL,
 };
 use super::log::CalLog;
+use super::picker::{CalPicker, Mode};
 use super::plan::{
     make_capacity_sweep, make_power_sweep, sweep_duration_ms, verify_cells, verify_duration_ms,
     VERIFY_FRAMES,
@@ -51,6 +53,8 @@ pub struct CalSessionCfg {
     /// its TX queue is still airing.
     pub tail_quiet_ms: u64,
     pub apply_timeout_ms: u64,
+    /// Bound on the channel pick (measure round + relocate confirm).
+    pub pick_timeout_ms: u64,
     /// The GS's copy of the wall margin: predicts the verify parks (the
     /// drone parks by its own radio.wall_margin_db) and goes on the R line.
     pub margin_db: f64,
@@ -64,6 +68,7 @@ impl Default for CalSessionCfg {
             phase_slack_ms: 1000,
             tail_quiet_ms: 50,
             apply_timeout_ms: 5000,
+            pick_timeout_ms: 8000,
             margin_db: 1.0,
         }
     }
@@ -72,6 +77,9 @@ impl Default for CalSessionCfg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Idle,
+    /// The channel pick before anything reaches the drone. Not running():
+    /// the channel machinery must keep running while the pick measures.
+    Picking,
     AwaitAck,
     Sweep,
     AwaitDone,
@@ -87,6 +95,7 @@ impl State {
     pub fn name(self) -> &'static str {
         match self {
             State::Idle => "idle",
+            State::Picking => "picking",
             State::AwaitAck => "await_ack",
             State::Sweep => "sweep",
             State::AwaitDone => "await_done",
@@ -108,22 +117,6 @@ impl State {
                 | State::Apply
                 | State::Verify
         )
-    }
-}
-
-/// cal.log R's pick word for a run without a channel pick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pick {
-    Pinned,
-    OneCard,
-}
-
-impl Pick {
-    fn word(self) -> &'static str {
-        match self {
-            Pick::Pinned => "pinned",
-            Pick::OneCard => "onecard",
-        }
     }
 }
 
@@ -243,7 +236,13 @@ pub struct CalSession {
     /// The latest stamp any entry point has seen (see `advance`).
     now: u64,
     channel: u8,
-    pick: Pick,
+    /// cal.log R's pick token: pinned, onecard, auto or stayed.
+    pick: &'static str,
+    /// The UI's one-line account of the pick.
+    pick_note: String,
+    pick_start_ms: u64,
+    reloc_ordered: bool,
+    reloc_to: u8,
     run_logged: bool,
 
     phase_start_ms: u64,
@@ -297,7 +296,11 @@ impl CalSession {
             cmd: SweepCmd::default(),
             now: 0,
             channel: 0,
-            pick: Pick::Pinned,
+            pick: "pinned",
+            pick_note: String::new(),
+            pick_start_ms: 0,
+            reloc_ordered: false,
+            reloc_to: 0,
             run_logged: false,
             phase_start_ms: 0,
             last_sent_ms: 0,
@@ -336,20 +339,22 @@ impl CalSession {
         self.now
     }
 
-    /// Starts a run over `sweeps` on `channel` (sorted per width ascending,
-    /// power before capacity, deduplicated). Refuses an empty list, a
-    /// Verify or non-20/40 entry, a run already going, a down link or a
-    /// peer without CAP_CALIBRATE.
+    /// Starts a run over `sweeps` (sorted per width ascending, power before
+    /// capacity, deduplicated). Refuses an empty list, a Verify or
+    /// non-20/40 entry, a run (or pick) already going, a down link or a
+    /// peer without CAP_CALIBRATE. An Auto `picker` starts the channel
+    /// pick; any other (or none) sweeps on its op at once.
     pub fn start(
         &mut self,
         nonce: u32,
         mut sweeps: Vec<SweepSpec>,
         now_ms: u64,
-        channel: u8,
-        pick: Pick,
+        picker: Option<&mut dyn CalPicker>,
     ) -> Result<(), String> {
         let now_ms = self.advance(now_ms);
-        if self.running() {
+        // Picking is a run too: a second start would fight the first one's
+        // pick.
+        if self.running() || self.state == State::Picking {
             return Err("a calibration session is already running".into());
         }
         if !self.linked {
@@ -385,10 +390,91 @@ impl CalSession {
         self.width = Default::default();
         // pending_abort is kept: the previous run's Abort copies still owed
         // must still go out.
-        self.channel = channel;
-        self.pick = pick;
-        self.begin_sweep(0, now_ms);
+        self.reloc_ordered = false;
+        self.channel = picker.as_ref().map_or(0, |p| p.op());
+        let mode = picker.as_ref().map(|p| p.mode());
+        let Some(p) = picker.filter(|_| mode == Some(Mode::Auto)) else {
+            self.pick = if mode == Some(Mode::OneCard) {
+                "onecard"
+            } else {
+                "pinned"
+            };
+            self.pick_note = self.pick.to_string();
+            self.begin_sweep(0, now_ms);
+            return Ok(());
+        };
+        self.pick = "auto";
+        self.pick_note = "measuring".into();
+        self.pick_start_ms = now_ms;
+        self.state = State::Picking;
+        p.begin_measure(now_ms);
         Ok(())
+    }
+
+    /// Advances the channel pick; a no-op outside Picking. The owner calls
+    /// it every tick, before `due_mav`, with the picker the run started on.
+    pub fn step_pick(&mut self, now_ms: u64, p: &mut dyn CalPicker) {
+        let now_ms = self.advance(now_ms);
+        if self.state != State::Picking {
+            return;
+        }
+        let op = p.op();
+        if now_ms - self.pick_start_ms >= self.cfg.pick_timeout_ms {
+            p.cancel();
+            self.pick_note = format!(
+                "stayed on {op}, {}",
+                if self.reloc_ordered {
+                    "relocate unconfirmed"
+                } else {
+                    "measure timed out"
+                }
+            );
+            self.finish_pick("stayed", p, now_ms);
+            return;
+        }
+        if !self.reloc_ordered {
+            let Some(best) = p.measured_best() else {
+                return;
+            };
+            if best == op {
+                self.pick_note = format!("auto: {op} is the best member");
+                self.finish_pick("auto", p, now_ms);
+                return;
+            }
+            if !p.order_relocate(best) {
+                p.cancel();
+                self.pick_note = format!("stayed on {op}, relocate refused");
+                self.finish_pick("stayed", p, now_ms);
+                return;
+            }
+            self.reloc_ordered = true;
+            self.reloc_to = best;
+            self.pick_note = format!("relocating {op} -> {best}");
+            return;
+        }
+        match p.relocate_settled() {
+            None => {}
+            Some(true) => {
+                self.pick_note = format!("auto: moved to {}", self.reloc_to);
+                self.finish_pick("auto", p, now_ms);
+                self.channel = self.reloc_to;
+            }
+            Some(false) => {
+                p.cancel();
+                self.pick_note = format!("stayed on {op}, relocate unconfirmed");
+                self.finish_pick("stayed", p, now_ms);
+            }
+        }
+    }
+
+    fn finish_pick(&mut self, pick: &'static str, p: &dyn CalPicker, now_ms: u64) {
+        self.pick = pick;
+        self.channel = p.op();
+        self.begin_sweep(0, now_ms);
+    }
+
+    pub fn picking(&self) -> bool {
+        self.state == State::Picking
     }
 
     /// The drone's SweepAck, SweepDone and Applied; anything naming another
@@ -546,8 +632,13 @@ impl CalSession {
 
     /// Abandons the run: Aborts go out through due_mav if the run reached
     /// the drone, the air reopens, Idle; the snapshot keeps `why`.
-    pub fn abort(&mut self, why: &str) {
-        if self.running() {
+    /// `picker` is the one the run started on; a pick in progress is
+    /// cancelled through it.
+    pub fn abort(&mut self, why: &str, picker: Option<&mut dyn CalPicker>) {
+        if self.running() || self.state == State::Picking {
+            if let Some(p) = picker {
+                p.cancel();
+            }
             if self.reached_drone {
                 self.queue_abort();
             }
@@ -596,7 +687,7 @@ impl CalSession {
             cell_i: self.cell_i,
             cell_n: 0,
             channel: self.channel,
-            pick_note: self.pick.word().to_string(),
+            pick_note: self.pick_note.clone(),
             flags: self.ack_flags,
             stamp_mismatch: self.stamp_mismatch,
             width: self.width.clone(),
@@ -709,7 +800,7 @@ impl CalSession {
                 self.nonce,
                 self.cfg.margin_db,
                 self.channel,
-                self.pick.word(),
+                self.pick,
                 flags & FLAG_LDPC != 0,
             );
             self.run_logged = true;

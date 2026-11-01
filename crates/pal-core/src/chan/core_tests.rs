@@ -1381,3 +1381,62 @@ fn cal_relocate_session_lost_in_flight_settles_false() {
     assert!(g.has_hop("session_lost"));
     assert_eq!(g.core.op(), 40);
 }
+
+/// A calibration run on an auto two-card core picks through the real
+/// ChannelCore: the round names 112 over a busy op, the relocate lands on
+/// the drone's confirm, and the first SweepCmd is due on 112.
+#[test]
+fn a_calibration_run_picks_its_channel_through_the_core() {
+    use crate::cal::log::CalLog;
+    use crate::cal::session::{CalSession, CalSessionCfg, State};
+    use pal_wire::cal::{CalMsg, Kind, SweepSpec};
+
+    let mut g = Rig::auto(2);
+    g.linked_auto(30, 200);
+    g.cards[1].s().foreign_per_ms_on[60] = 1;
+    g.cards[1].s().foreign_per_ms_on[64] = 1;
+    let mut s = CalSession::new(CalSessionCfg::default(), CalLog::none());
+    s.set_peer(true, true, rc::TagCtx::default());
+    let sweeps = vec![SweepSpec {
+        kind: Kind::Power,
+        bw: 20,
+    }];
+    let now = g.clk.ms();
+    s.start(1, sweeps, now, Some(&mut g.core)).unwrap();
+    assert_eq!(s.state(), State::Picking);
+    for _ in 0..100 {
+        if s.snapshot().pick_note.starts_with("relocating") {
+            break;
+        }
+        g.live_tick(200);
+        s.step_pick(g.clk.ms(), &mut g.core);
+    }
+    assert_eq!(s.snapshot().pick_note, "relocating 40 -> 112");
+    for _ in 0..20 {
+        if g.core.hopping() {
+            break;
+        }
+        g.live_tick(0);
+        s.step_pick(g.clk.ms(), &mut g.core);
+    }
+    let r = g.pump_rcf().expect("rcf");
+    assert_eq!(r.hop_ch, 112);
+    g.core.note_video(112);
+    let mut first = None;
+    for _ in 0..10 {
+        g.tick(true);
+        s.step_pick(g.clk.ms(), &mut g.core);
+        if let Some(m) = s.due_mav(g.clk.ms()) {
+            first = Some(m);
+            break;
+        }
+    }
+    assert!(matches!(first, Some(CalMsg::Sweep(_))));
+    assert_eq!(s.state(), State::AwaitAck);
+    assert_eq!(g.core.op(), 112);
+    let snap = s.snapshot();
+    assert_eq!(
+        (snap.channel, snap.pick_note.as_str()),
+        (112, "auto: moved to 112")
+    );
+}

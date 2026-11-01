@@ -366,15 +366,14 @@ M0 status (2026-10-31):
   - android-activity 0.6 puts the Application in ndk_context and openxr 0.19 passes it as applicationActivity; the runtime then holds the session in IDLE forever. The app must re-initialise ndk_context with the Activity before xrCreateInstance.
   - USB: a UsbManager scan from Rust over JNI sees 0bda:a81a; with permission it gets an fd (`openDevice().getFileDescriptor()`, 71 B raw descriptors), which is what `libusb_wrap_sys_device` takes. Permission without a dialog comes from the USB_DEVICE_ATTACHED filter plus the user's one-time "always" choice (as PixelPilot does today); for development the Horizon OS shell command `cmd usb grant-device-permission <pkg> 3034:43034` grants it persistently. The attach-chooser path is verified on the Quest for our package: after one "always" choice, a replug launches the app with USB_DEVICE_ATTACHED and permission is already granted, no dialog. The `cmd usb` grant does not survive replugs. Horizon OS traps: the chooser panel is a fixed 471 px and with four candidate apps its button bar collapses to 9 px with no buttons, so nothing can be confirmed; disabling a package clears its USB defaults; there is no settings UI to clear a default. The device filter must list RTL88xx VID:PIDs with a `0x` prefix: PixelPilot's ids without `0x` appear to be dropped as invalid decimals, which would make its filter match any device (it holds the default for an unrelated USB-C video adaptor).
 
-Next steps (set by Ihor, 2026-11-01, after two-card support landed in 8bb9f5c):
-1. TxSelector (F1): the GS transmits through card 0 always. maburgs picks the TX card by RSSI
-   (`gs/src/tx_selector.{h,cpp}`: 3 dB margin, 2000 ms hold, 1500 ms dead-card override, or
-   `radio.tx_card` pinned via `effective_tx_card`). Port it into pal-core with mabur's unit tests and
-   route `SlotFrame.card` through it; one card stays card 0, so replay parity is unchanged.
-2. Calibration channel pick: `cal_picker` / `cal_round_pick` (`gs/src/cal_picker.{h,cpp}`,
-   `cal_round_pick.h`, Mode::Auto) are not ported; with two or more cards `cal_start` uses
-   Pick::Pinned. Two cards are now live on the Quest, so this is possible: port it with mabur's
-   test_cal_session pick cases (docs/calibration-port.md row C2).
+Next steps (set by Ihor, 2026-11-01, after two-card support landed in 8bb9f5c), both done 2026-11-02:
+1. TxSelector (F1), done in 1182a86: `pal-core::tx_selector` (mabur's unit tests), RCF/DISC/NACK/MAV/cal
+   frames and the channel core's tick go to the selected card; stats `tx_card`/`tx_switches` and
+   the OSD cards chip show it. One card stays card 0, replay parity unchanged. Not yet seen on air.
+2. Calibration channel pick (docs/calibration-port.md row C2), done: `cal_round_pick` and the
+   scout's measure round (6291e7f), the ChannelCore measure round and cal relocate (102596e), `CalSession` Picking through
+   `cal::picker::CalPicker` (ChannelCore is the real one, `FixedPicker` without a channel core), the
+   panel shows the pick with an Abort. Not yet run on air (needs the field, at distance).
 
 ## 11 Rough size
 

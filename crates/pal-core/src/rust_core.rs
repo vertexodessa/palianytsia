@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use crate::aggregator::{Aggregator, Route};
 use crate::cal::log::CalLog;
+use crate::cal::picker::{CalPicker, FixedPicker, Mode as PickMode};
 use crate::cal::plan::{default_sweeps, effective_width};
-use crate::cal::session::{sweep_token, CalSession, CalSessionCfg, Pick};
+use crate::cal::session::{sweep_token, CalSession, CalSessionCfg};
 use crate::cal::status_json as cal_status_json;
 use crate::chan::core::{
     ChannelCore, ChannelCoreCfg, ChannelSink, ChannelTickIn, MsClock, Sleeper, UsClock,
@@ -870,6 +871,9 @@ impl GsCore for RustCore {
                 linked && caps & rc::CAP_CALIBRATE != 0,
                 g.vrx.session_ctx(),
             );
+            if let Some(c) = g.chan.as_mut() {
+                g.cal.step_pick(now_ms, c);
+            }
             if let Some(m) = g.cal.due_mav(now_ms) {
                 let dwell_busy = g.chan.as_ref().is_some_and(|c| c.dwell_busy());
                 let held = matches!(m, cal::CalMsg::Sweep(_))
@@ -1035,16 +1039,26 @@ impl GsCore for RustCore {
             linked && caps & rc::CAP_CALIBRATE != 0,
             g.vrx.session_ctx(),
         );
-        // One card: mabur's OneCard path, no channel pick.
-        let pick = if g.cards.len() >= 2 {
-            Pick::Pinned
-        } else {
-            Pick::OneCard
+        // The channel core picks the channel first when it can measure (auto,
+        // a spare card); without one the run sweeps on the configured channel.
+        let mut fixed = FixedPicker {
+            mode: if g.cards.len() >= 2 {
+                PickMode::Pinned
+            } else {
+                PickMode::OneCard
+            },
+            op: self.channel,
         };
-        let ch = g.chan.as_ref().map_or(self.channel, |c| c.op());
-        g.cal.start(random_nonce(), sweeps, now_ms, ch, pick)?;
+        let picker: &mut dyn CalPicker = match g.chan.as_mut() {
+            Some(c) => c,
+            None => &mut fixed,
+        };
+        g.cal.start(random_nonce(), sweeps, now_ms, Some(picker))?;
+        let snap = g.cal.snapshot();
         eprintln!(
-            "pal cal: started ch {ch} sweeps {:?}",
+            "pal cal: started ch {} ({}) sweeps {:?}",
+            snap.channel,
+            snap.pick_note,
             g.cal.sweeps().iter().map(sweep_token).collect::<Vec<_>>()
         );
         Ok(())
@@ -1052,10 +1066,11 @@ impl GsCore for RustCore {
 
     fn cal_abort(&mut self) {
         if let Some(g) = self.gs.as_mut() {
-            if g.cal.running() {
+            if g.cal.running() || g.cal.picking() {
                 eprintln!("pal cal: aborted by the operator");
             }
-            g.cal.abort("aborted by the operator");
+            let picker = g.chan.as_mut().map(|c| c as &mut dyn CalPicker);
+            g.cal.abort("aborted by the operator", picker);
         }
     }
 

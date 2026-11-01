@@ -42,6 +42,9 @@ pub struct CalView {
     pub cell_i: u64,
     pub cell_n: u64,
     pub channel: u64,
+    /// The channel pick's one-line account ("measuring", "relocating 40 ->
+    /// 112", "auto: moved to 112", "pinned", ...).
+    pub pick: String,
     pub fail_reason: String,
     pub sweeps: Vec<String>,
     pub widths: Vec<CalWidth>,
@@ -99,6 +102,7 @@ impl CalView {
             cell_i: u(v, "cell_i"),
             cell_n: u(v, "cell_n"),
             channel: u(v, "channel"),
+            pick: s(v, "pick"),
             fail_reason: s(v, "fail_reason"),
             sweeps: v
                 .get("sweeps")
@@ -168,7 +172,23 @@ pub fn ui(ui: &mut Ui, v: Option<&CalView>, confirm: &mut bool, touch: bool) -> 
         ui.label(RichText::new("not available on this core").color(Color32::GRAY));
         return None;
     };
-    if v.running {
+    if v.state == "picking" {
+        // Before the run reaches the drone: video still flows.
+        *confirm = false;
+        ui.label(
+            RichText::new(format!(
+                "choosing the channel: {} (ch {})",
+                v.pick, v.channel
+            ))
+            .color(WARN),
+        );
+        if ui
+            .add(egui::Button::new(RichText::new("Abort").color(BAD)).min_size(egui::vec2(0.0, h)))
+            .clicked()
+        {
+            cmd = Some(Cmd::CalAbort);
+        }
+    } else if v.running {
         *confirm = false;
         ui.label(
             RichText::new(format!(
@@ -322,6 +342,7 @@ mod tests {
         let v = CalView::parse(&serde_json::from_str(j).unwrap()).unwrap();
         assert!(v.running && v.capable);
         assert_eq!((v.sweep_k, v.sweep_n, v.channel), (1, 2, 144));
+        assert_eq!(v.pick, "onecard");
         assert_eq!(v.sweeps, ["power20", "cap20"]);
         let w = &v.widths[0];
         assert!(w.applied);
@@ -364,6 +385,12 @@ mod tests {
         confirm = true;
         draw(Some(&v), &mut confirm);
         assert!(confirm, "the confirm step stays until answered");
+        v.state = "picking".into();
+        v.pick = "relocating 40 -> 112".into();
+        draw(Some(&v), &mut confirm);
+        assert!(!confirm, "a pick in progress clears the confirm");
+        assert!(v.hud_line().is_none(), "video still flows while it picks");
+        confirm = true;
         v.running = true;
         v.state = "sweep".into();
         draw(Some(&v), &mut confirm);
