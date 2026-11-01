@@ -17,6 +17,9 @@ pub struct HudPrefs {
     pub stats: bool,
     /// Text size factor.
     pub scale: f32,
+    /// Video link width in MHz (20 or 40): every ladder rung's `bw`
+    /// (`pal_core::config::with_link_bw`), applied when the link starts.
+    pub link_bw: u8,
 }
 
 impl Default for HudPrefs {
@@ -30,6 +33,7 @@ impl Default for HudPrefs {
             messages: true,
             stats: false,
             scale: 1.0,
+            link_bw: 40,
         }
     }
 }
@@ -39,7 +43,7 @@ impl HudPrefs {
         json!({
             "dot": self.dot, "battery": self.battery, "timer": self.timer,
             "nav": self.nav, "link": self.link, "messages": self.messages,
-            "stats": self.stats, "scale": self.scale,
+            "stats": self.stats, "scale": self.scale, "link_bw": self.link_bw,
         })
         .to_string()
     }
@@ -62,6 +66,10 @@ impl HudPrefs {
                 .get("scale")
                 .and_then(Value::as_f64)
                 .map_or(d.scale, |x| (x as f32).clamp(0.6, 2.0)),
+            link_bw: match v.get("link_bw").and_then(Value::as_u64) {
+                Some(20) => 20,
+                _ => 40,
+            },
         }
     }
 
@@ -87,11 +95,12 @@ mod tests {
             nav: false,
             stats: true,
             scale: 1.4,
+            link_bw: 20,
             ..Default::default()
         };
         assert_eq!(HudPrefs::from_json(&p.to_json()), p);
         assert_eq!(HudPrefs::from_json("garbage"), HudPrefs::default());
         let q = HudPrefs::from_json(r#"{"dot":false,"scale":9,"unknown":1}"#);
-        assert!(!q.dot && q.battery && q.scale == 2.0);
+        assert!(!q.dot && q.battery && q.scale == 2.0 && q.link_bw == 40);
     }
 }

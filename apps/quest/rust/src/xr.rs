@@ -268,9 +268,10 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let sup = {
         let hub = hub.clone();
         let log_dir = ext_dir.join("logs");
+        let prefs = int_dir.join("hud.json");
         std::thread::Builder::new()
             .name("pal-supervisor".into())
-            .spawn(move || crate::supervisor::run(hub, act, toml, log_dir))
+            .spawn(move || crate::supervisor::run(hub, act, toml, log_dir, prefs))
             .map_err(|e| e.to_string())?
     };
 

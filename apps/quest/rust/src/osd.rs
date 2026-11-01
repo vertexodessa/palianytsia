@@ -219,14 +219,20 @@ impl Osd {
                     status = l.shared.radio_label(l.width);
                 }
             }
-            if let Err(e) = self.draw(now, &status, events) {
+            if let Err(e) = self.draw(hub, now, &status, events) {
                 log::warn!("osd: {e}");
             }
             self.last_draw = Some(Instant::now());
         }
     }
 
-    fn draw(&mut self, now: f64, status: &str, events: Vec<egui::Event>) -> Result<(), String> {
+    fn draw(
+        &mut self,
+        hub: &Hub,
+        now: f64,
+        status: &str,
+        events: Vec<egui::Event>,
+    ) -> Result<(), String> {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, points())),
             events,
@@ -320,6 +326,9 @@ impl Osd {
             if let Some(l) = &self.link {
                 let _ = l.ports.cmd_tx.send(c);
             }
+        }
+        if pout.relink {
+            hub.relink.store(true, Ordering::Relaxed);
         }
         if pout.prefs_changed {
             self.prefs.save(&self.prefs_path);

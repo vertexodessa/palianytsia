@@ -770,6 +770,37 @@ pub fn load_config(path: &Path, overlay: Option<&Path>) -> R<Config> {
     parse_config(&j)
 }
 
+/// `text` with every `[[link.ladder]]` rung and `link.static_bw` at `bw`
+/// MHz: the GS picks each rung's width (the drone airs what the RCF names),
+/// so this switches the video link between 20 and 40 MHz without touching
+/// the drone. The receiver stays at `radio.width`: tuned 40, it hears 20 MHz
+/// frames on the primary. Comments are not kept (the result is a generated
+/// copy); the result is validated as a whole.
+pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
+    if bw != 20 && bw != 40 {
+        return Err(ConfigError(format!("link width {bw}: must be 20 or 40")));
+    }
+    let mut j = text
+        .parse::<Table>()
+        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    let link = j
+        .entry("link")
+        .or_insert_with(|| Value::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError("config: link is not a table".into()))?;
+    if let Some(Value::Array(rungs)) = link.get_mut("ladder") {
+        for r in rungs.iter_mut().filter_map(Value::as_table_mut) {
+            r.insert("bw".into(), Value::Integer(bw.into()));
+        }
+    }
+    if link.contains_key("static_bw") {
+        link.insert("static_bw".into(), Value::Integer(bw.into()));
+    }
+    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
+    parse_config_str(&out)?;
+    Ok(out)
+}
+
 pub fn parse_config_str(text: &str) -> R<Config> {
     let j = text
         .parse::<Table>()
@@ -1392,6 +1423,26 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(p)
+    }
+
+    #[test]
+    fn link_bw_rewrites_every_rung() {
+        let text = std::fs::read_to_string(repo("configs/gs-auto.toml")).unwrap();
+        let orig = parse_config_str(&text).unwrap();
+        let t20 = with_link_bw(&text, 20).unwrap();
+        let c = parse_config_str(&t20).unwrap();
+        assert!(c.link.ladder_cfg.ladder.iter().all(|r| r.bw == 20));
+        assert_eq!(c.link.static_bw, 20);
+        assert_eq!(
+            c.link.ladder_cfg.ladder.len(),
+            orig.link.ladder_cfg.ladder.len()
+        );
+        assert_eq!(c.radio.width, 40);
+        assert_eq!(c.radio.channels, orig.radio.channels);
+        let t40 = with_link_bw(&t20, 40).unwrap();
+        let c = parse_config_str(&t40).unwrap();
+        assert!(c.link.ladder_cfg.ladder.iter().all(|r| r.bw == 40));
+        assert!(with_link_bw(&text, 30).is_err());
     }
 
     #[test]

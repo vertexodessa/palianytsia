@@ -532,3 +532,31 @@ impl Drop for FrameFile {
         unsafe { pal_ffs_free(self.raw) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 20/40 MHz switch hands mabur's loader a re-serialised config
+    /// (pal_core::config::with_link_bw): it must take it.
+    #[test]
+    fn mabur_loads_a_link_bw_rewrite() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("configs/gs-auto.toml")).unwrap();
+        for bw in [20, 40] {
+            let out = pal_core::config::with_link_bw(&text, bw).unwrap();
+            let p =
+                std::env::temp_dir().join(format!("pal-ref-bw{bw}-{}.toml", std::process::id()));
+            std::fs::write(&p, out).unwrap();
+            let opts = RefOpts {
+                mode: Mode::Gs,
+                adaptive_gap: true,
+                rz_nonce: 1,
+                channel: 0,
+            };
+            let r = RefCore::new(&p, opts);
+            let _ = std::fs::remove_file(&p);
+            assert!(r.is_ok(), "bw {bw}: {:?}", r.err());
+        }
+    }
+}

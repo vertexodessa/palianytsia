@@ -33,6 +33,9 @@ pub struct Hub {
     /// One line for the OSD while there is no link ("" when linked).
     pub status: Mutex<String>,
     pub quit: AtomicBool,
+    /// The OSD changed a start-time setting (the link width): restart the
+    /// link at once with the new prefs.
+    pub relink: AtomicBool,
 }
 
 impl Hub {
@@ -50,7 +53,7 @@ impl Hub {
 
 const RETRY: Duration = Duration::from_secs(3);
 
-pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf) {
+pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: PathBuf) {
     let ctx = ndk_context::android_context();
     // SAFETY: the VM pointer ndk_context holds is the process's JavaVM.
     let vm = match unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) } {
@@ -106,6 +109,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf) {
             fd: open.fd,
             toml: toml.clone(),
             log_dir: log_dir.clone(),
+            link_bw: pal_osd::prefs::HudPrefs::load(&prefs).link_bw,
         };
         let (link, ports) = match Link::start(cfg, win) {
             Ok(x) => x,
@@ -129,6 +133,9 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf) {
             if hub.quit.load(Ordering::Relaxed) {
                 break "app closing".to_string();
             }
+            if hub.relink.swap(false, Ordering::Relaxed) {
+                break "link width changed".to_string();
+            }
             if !link.running() {
                 break format!("link stopped: {}", last_error());
             }
@@ -144,7 +151,13 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf) {
         *hub.shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
         link.stop();
         Usb::close(&mut env, open);
-        hub.set_status(format!("{why}; retrying"));
-        nap(RETRY);
+        if why == "link width changed" {
+            // The card stays attached: reopen right away.
+            hub.set_status("link width changed, restarting");
+            nap(Duration::from_millis(300));
+        } else {
+            hub.set_status(format!("{why}; retrying"));
+            nap(RETRY);
+        }
     }
 }

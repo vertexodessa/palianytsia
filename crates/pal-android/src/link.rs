@@ -39,6 +39,8 @@ pub struct LinkCfg {
     pub toml: String,
     /// Flight log root; one `fl-NNNN_*` directory per start.
     pub log_dir: PathBuf,
+    /// Video link width (HudPrefs::link_bw): every ladder rung at this bw.
+    pub link_bw: u8,
 }
 
 /// What the UI side reads and sends while the link runs.
@@ -69,6 +71,12 @@ impl Link {
         c: LinkCfg,
         win: ndk::native_window::NativeWindow,
     ) -> Result<(Link, Ports), String> {
+        let mut c = c;
+        match pal_core::config::with_link_bw(&c.toml, c.link_bw) {
+            Ok(t) => c.toml = t,
+            // A 40 MHz pick on a 20 MHz radio config: fly the config as is.
+            Err(e) => log::warn!("link width {} MHz not applied: {e}", c.link_bw),
+        }
         let cfg = pal_core::config::parse_config_str(&c.toml).map_err(|e| e.to_string())?;
         let ch = cfg
             .radio

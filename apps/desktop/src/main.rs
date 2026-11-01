@@ -5,7 +5,8 @@
 //! and the newest stats line.
 //!
 //!   pal-desktop -c gs.toml --replay bodies.bin [--mode gs|spotter] [--loop]
-//!   pal-desktop [-c gs.toml] [--live] [--ch N --width 20|40] [--mode gs|spotter] [--card N]
+//!   pal-desktop [-c gs.toml] [--live] [--ch N --width 20|40] [--bw 20|40] [--mode gs|spotter] [--card N]
+//!     --bw: video link width (every ladder rung); default the saved pref (Link tab)
 //!     live is the default; config from -c, $PAL_CONFIG, or configs/bench-ch40.toml;
 //!     channel/width from its radio section, mode gs
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
@@ -55,6 +56,8 @@ struct Opts {
     /// own channel core drives the card (boot pick, relocation, hops).
     channel_core: bool,
     width: u8,
+    /// Video link width (every ladder rung's bw); 0 = the saved pref.
+    link_bw: u8,
     card: i32,
     mode: Option<Mode>,
     rust: bool,
@@ -99,6 +102,13 @@ fn parse() -> Opts {
             "-c" => o.config = Some(val().into()),
             "--replay" => o.replay = Some(val().into()),
             "--live" => o.live = true,
+            "--bw" => {
+                o.link_bw = match val().as_str() {
+                    "20" => 20,
+                    "40" => 40,
+                    _ => die("--bw 20|40"),
+                }
+            }
             "--ch" => o.ch = val().parse().unwrap_or_else(|_| die("--ch")),
             "--width" => o.width = val().parse().unwrap_or_else(|_| die("--width")),
             "--card" => o.card = val().parse().unwrap_or_else(|_| die("--card")),
@@ -459,6 +469,12 @@ impl eframe::App for App {
         if out.prefs_changed {
             self.prefs.save(&self.prefs_path);
         }
+        if out.relink {
+            eprintln!(
+                "pal-desktop: video width {} MHz saved; restart pal-desktop to apply",
+                self.prefs.link_bw
+            );
+        }
         if self.show_monitor {
             egui::SidePanel::right("monitor")
                 .default_width(320.0)
@@ -618,6 +634,31 @@ fn main() {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("palianytsia/hud.json");
+    // The video width applies when the core starts (live only): every
+    // ladder rung at --bw, else the saved pref; the core reads a copy.
+    let o = {
+        let mut o = o;
+        if o.live {
+            let bw = match o.link_bw {
+                0 => pal_osd::prefs::HudPrefs::load(&prefs_path).link_bw,
+                b => b,
+            };
+            let cfg = o.config.clone().expect("config");
+            let text = std::fs::read_to_string(&cfg)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", cfg.display())));
+            match pal_core::config::with_link_bw(&text, bw) {
+                Ok(t) => {
+                    let p = std::env::temp_dir()
+                        .join(format!("pal-desktop-{}-bw{bw}.toml", std::process::id()));
+                    std::fs::write(&p, t).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
+                    eprintln!("pal-desktop: video width {bw} MHz");
+                    o.config = Some(p);
+                }
+                Err(e) => eprintln!("pal-desktop: video width {bw} MHz not applied: {e}"),
+            }
+        }
+        o
+    };
     let log_info = match &o.log_dir {
         Some(d) => format!("flight log in {}", d.display()),
         None => "flight log off (start with --log-dir DIR)".into(),

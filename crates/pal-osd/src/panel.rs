@@ -64,6 +64,8 @@ pub struct PanelIn<'a> {
 pub struct PanelOut {
     pub cmd: Option<Cmd>,
     pub prefs_changed: bool,
+    /// `prefs.link_bw` changed: restart the link so the core picks it up.
+    pub relink: bool,
 }
 
 const OK: Color32 = Color32::from_rgb(110, 220, 140);
@@ -329,10 +331,29 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                             }
                             Tab::Link => {
                                 ui.label(RichText::new(&i.link_info).monospace());
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("Video width");
+                                    for bw in [20u8, 40] {
+                                        let on = i.prefs.link_bw == bw;
+                                        let b = egui::Button::new(format!("{bw} MHz"))
+                                            .selected(on)
+                                            .min_size(egui::vec2(
+                                                0.0,
+                                                if touch { 40.0 } else { 0.0 },
+                                            ));
+                                        if ui.add(b).clicked() && !on {
+                                            i.prefs.link_bw = bw;
+                                            out.prefs_changed = true;
+                                            out.relink = true;
+                                        }
+                                    }
+                                });
                                 ui.label(
                                     RichText::new(
-                                        "Channel and width come from the config; moving the link \
-                                         on the fly needs the channel core (M4).",
+                                        "20 MHz reaches farther at the robust rungs (4-6 dB at \
+                                         MCS0); 40 MHz carries more per rung. Switching restarts \
+                                         the link for a few seconds; the drone needs no change.",
                                     )
                                     .small()
                                     .color(Color32::GRAY),

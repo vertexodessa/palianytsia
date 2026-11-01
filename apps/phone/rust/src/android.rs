@@ -26,7 +26,16 @@ fn start(
     prefs_path: std::path::PathBuf,
     log_dir: std::path::PathBuf,
 ) -> Result<Phone, String> {
-    let (link, ports) = Link::start(LinkCfg { fd, toml, log_dir }, win)?;
+    let link_bw = pal_osd::prefs::HudPrefs::load(&prefs_path).link_bw;
+    let (link, ports) = Link::start(
+        LinkCfg {
+            fd,
+            toml,
+            log_dir,
+            link_bw,
+        },
+        win,
+    )?;
     let last = Arc::new(Mutex::new(String::new()));
     let (touch_tx, touch_rx) = mpsc::channel();
     let osd_in = crate::osd::OsdIn {

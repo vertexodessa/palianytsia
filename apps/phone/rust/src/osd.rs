@@ -269,6 +269,12 @@ pub fn run(o: OsdIn) {
         if pout.prefs_changed || stats_flip {
             prefs.save(&o.prefs_path);
         }
+        if pout.relink {
+            // The width applies at link start: end this link; the Activity
+            // sees it stop and starts a new one with the saved prefs.
+            pal_android::set_err("link width changed");
+            o.shared.quit.store(true, Ordering::Relaxed);
+        }
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         unsafe {
             gl.viewport(0, 0, w as i32, h as i32);
