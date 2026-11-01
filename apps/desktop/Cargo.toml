@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 pal-core.workspace = true
 pal-wire.workspace = true
-pal-ref.workspace = true
+pal-ref = { workspace = true, features = ["live"] }
 devourer-sys.workspace = true
 flightlog.workspace = true
 decode.workspace = true

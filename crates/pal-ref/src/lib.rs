@@ -1,8 +1,12 @@
 //! mabur's C++ `webgs::WebGs` behind [`pal_core::GsCore`]: the oracle the
-//! Rust core is diffed against. Test-only, never shipped (spec decision 3).
+//! Rust core is diffed against, and (feature `live`, [`RefCard`]) mabur's
+//! channel core on a live card until the Rust core has its own.
 //!
 //! Also exposes mabur's `FrameFileSource` (maburd `--dry-run --out` frame
 //! files) as the M0 replay input, until live captures exist.
+
+#[cfg(feature = "live")]
+pub mod live;
 
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};

@@ -1,6 +1,6 @@
 [package]
 name = "pal-ref"
-description = "Test-only oracle: mabur's C++ WebGs behind the GsCore trait. Never ships."
+description = "mabur's C++ WebGs behind the GsCore trait: the test oracle, and (feature live) mabur's channel core on a live card"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,14 @@ links = "pal_ref"
 
 [dependencies]
 pal-core.workspace = true
+runtime = { workspace = true, optional = true }
+devourer-sys = { workspace = true, optional = true }
+pal-wire = { workspace = true, optional = true }
+
+[features]
+# The glue that hands a live devourer-sys card to the C++ core
+# (runtime::Attach): pal-desktop and the Android apps.
+live = ["dep:runtime", "dep:devourer-sys", "dep:pal-wire"]
 
 [build-dependencies]
 cmake = "0.1"

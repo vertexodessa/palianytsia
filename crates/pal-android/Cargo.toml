@@ -10,6 +10,7 @@ publish.workspace = true
 pal-core.workspace = true
 pal-osd.workspace = true
 runtime.workspace = true
+pal-ref = { workspace = true, features = ["live"] }
 devourer-sys.workspace = true
 decode.workspace = true
 flightlog.workspace = true

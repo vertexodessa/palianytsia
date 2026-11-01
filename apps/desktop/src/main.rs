@@ -195,56 +195,6 @@ fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
     Box::new(RefCore::new(&cfg, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
 }
 
-/// The card handed to pal-ref's core as its LinkCard.
-struct RefTap(Arc<pal_ref::RefCard>);
-
-impl runtime::RxTap for RefTap {
-    fn on_rx(&self, f: &devourer_sys::RxFrame, v: &pal_wire::dot11::Verdict) -> Option<u8> {
-        let a = pal_ref::CardRx {
-            crc_err: u8::from(f.crc_err),
-            physt: u8::from(f.physt),
-            data_rate: f.data_rate,
-            rssi: f.rssi,
-            snr: f.snr,
-            evm: f.evm,
-            tsfl: f.tsfl,
-            bw40: u8::from(f.bw40),
-            stbc: u8::from(f.stbc),
-            sgi: u8::from(f.sgi),
-        };
-        let v = match v {
-            pal_wire::dot11::Verdict::Body(_) => 0,
-            pal_wire::dot11::Verdict::Short => 1,
-            pal_wire::dot11::Verdict::Foreign => 2,
-        };
-        self.0.on_rx(v, f.frame.len(), &a)
-    }
-    fn channel(&self) -> u8 {
-        self.0.channel()
-    }
-}
-
-fn channel_core(o: &Opts) -> runtime::Attach {
-    let (cfg, ch, w) = (o.config.clone().expect("config"), o.ch, o.width);
-    Box::new(move |card| {
-        // Weak: the card's RX handler holds this tap, so a strong ref
-        // would keep the card open forever.
-        let tx = Arc::downgrade(card);
-        let send: pal_ref::CardSend =
-            Box::new(move |body| tx.upgrade().is_some_and(|c| c.send_control(body)));
-        // SAFETY: the card outlives the tap and the core (run_live drops
-        // the core first; the tap goes with the card's RX handler).
-        let rc = Arc::new(unsafe { pal_ref::RefCard::new(card.radio_ptr(), ch, w, send)? });
-        let core = RefCore::new_with_card(&cfg, rc.clone())?;
-        eprintln!("pal-desktop: mabur channel core drives the card from ch {ch}");
-        Ok(runtime::Attached {
-            core: Box::new(core),
-            tap: Arc::new(RefTap(rc)),
-            clock: pal_ref::now_us,
-        })
-    })
-}
-
 struct Frame {
     w: usize,
     h: usize,
@@ -742,7 +692,13 @@ fn main() {
                                         eprintln!("pal-desktop: drone found on ch {ch}");
                                         Ok(make_core(&o2, ch))
                                     })),
-                                    attach: o.channel_core.then(|| channel_core(&o)),
+                                    attach: o.channel_core.then(|| {
+                                        pal_ref::live::channel_core(
+                                            o.config.clone().expect("config"),
+                                            o.ch,
+                                            o.width,
+                                        )
+                                    }),
                                 };
                                 let (ch, w) = (o.ch, o.width);
                                 if let Err(e) = runtime::run_live(cl, cfg, |chip| {
