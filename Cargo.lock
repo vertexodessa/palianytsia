@@ -1856,7 +1856,6 @@ dependencies = [
  "ndk",
  "pal-core",
  "pal-osd",
- "pal-ref",
  "runtime",
  "serde_json",
 ]

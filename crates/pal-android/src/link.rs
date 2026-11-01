@@ -147,12 +147,6 @@ impl Link {
             .spawn(move || decode_loop(dec, au_rx, &sh))
             .map_err(|e| e.to_string())?;
         let fd = c.fd;
-        let toml = c.toml.clone();
-        let core_toml = c
-            .log_dir
-            .parent()
-            .unwrap_or(&c.log_dir)
-            .join("channel-core.toml");
         let core_t = std::thread::Builder::new()
             .name("pal-core".into())
             .spawn(move || {
@@ -166,18 +160,14 @@ impl Link {
                     Ok(c) => mk_cl(Box::new(c)),
                     Err(e) => return set_err(format!("core: {e}")),
                 };
-                // radio.channel = "auto": mabur's C++ channel core drives
-                // the card (finds the drone, moves the link to the cleanest
-                // member, hops). It reads its config from a file.
-                let attach = if cfg.radio.pin.is_none() {
-                    let p = core_toml.clone();
-                    match std::fs::write(&p, &toml) {
-                        Ok(()) => Some(pal_ref::live::channel_core(p, ch, width)),
-                        Err(e) => return set_err(format!("{}: {e}", core_toml.display())),
-                    }
-                } else {
-                    None
-                };
+                // radio.channel = "auto": the channel core drives the card
+                // (finds the drone, moves the link to the cleanest member,
+                // hops), in the Rust core that replaces the one above.
+                let attach = cfg
+                    .radio
+                    .pin
+                    .is_none()
+                    .then(|| runtime::dev_card::rust_channel_core(cfg.clone(), opts, width));
                 let remake: runtime::Remake = Box::new(move |ch| {
                     let opts = RustOpts {
                         mode: Mode::Gs,

@@ -9,7 +9,7 @@ status: `docs/spec.md`; read its M1/M2 status sections first).
 | `crates/pal-wire` | wire formats: dot11, SBI, RC (RCF/DISC/Telem/NACK/MAV), MAVLink 2 framer |
 | `crates/pal-fec` | GF(256), sliding-window RLC decoder |
 | `crates/pal-core` | the Rust GS core (`rust_core.rs`, WebGs wiring), `GsCore` trait, ladder, LHA, NACK, MAV tunnel, refresh (IDR) |
-| `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle; `RefCard` (`cpp/pal_card.cpp`) lends the devourer-sys card to it as a `maburgs::LinkCard`, so it runs mabur's ChannelCore live |
+| `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle (desktop/host only); `RefCard` (`cpp/pal_card.cpp`) lends the devourer-sys card to it as a `maburgs::LinkCard`, so it runs mabur's ChannelCore live; `tests/chan_trace.rs` checks the Rust ChannelCore against it record by record |
 | `crates/devourer-sys` | devourer through a C shim (USB cards) |
 | `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
 | `crates/runtime` | shared by the apps: devourer RX thread, core loop (`CoreLoop`: GsCore + IdrDriver + log + stats/params), `run_live` |
@@ -50,14 +50,16 @@ pairing key.
 
 ## Helpers
 - `configs/bench-ch40.toml`: `gs.toml` pinned to ch 40 for the bench quad.
-- `configs/gs-auto.toml` (the APK default): `gs.toml` with `channel = "auto"`: `runtime::run_live`
-  sweeps `radio.channels` (400 ms per channel, 3 CRC-good drone data frames = found) at start and
-  after 8 s without drone frames, rebuilding the Rust core for the found channel; the core is not
-  ticked while sweeping. Events `search`, `drone_found`, `drone_lost`. Pinned configs never sweep;
-  pal-desktop sweeps only with `--core rust` and no `--ch`; with `--core ref`, an auto config and no
-  `--ch` it runs mabur's own ChannelCore on the card (`runtime::LiveCfg::attach`: prelude ranking,
-  boot pick, relocation, in-flight hops, transmitting through the card; its clock is `pal_ref::now_us`).
-  The phone/Quest APKs do the same for an auto config (`pal_ref::live`, pal-ref cross-built for aarch64).
+- `configs/gs-auto.toml` (the APK default): `gs.toml` with `channel = "auto"`. A GS on an auto
+  config (pal-desktop with no `--ch`, the phone/Quest APKs) runs the channel core on the card through
+  `runtime::LiveCfg::attach`: prelude ranking, boot pick, relocation, in-flight hops, transmitting
+  through the card. `--core rust` (and the APKs) use the Rust port (`RustCore::with_cards` +
+  `runtime::dev_card::rust_channel_core`, clock `runtime` mono); `--core ref` uses mabur's C++ one
+  (`pal_ref::live`, clock `pal_ref::now_us`). pal-ref is no longer in the Android build. A Rust
+  spotter on an auto config still uses the old `runtime::run_live` sweep (400 ms per channel, 3
+  CRC-good drone frames = found, again after 8 s without drone frames; events `search`,
+  `drone_found`, `drone_lost`). Pinned configs never search. On the bench the prelude ranking moves
+  the quad from 40 to 144 (both cores, 2026-11-01).
 - Release APKs: `PAL_RELEASE=1 tools/{phone,quest}-apk.sh`, signed from
   `~/.config/palianytsia/release-signing.properties` (key `~/.android/palianytsia-release.jks`, never in the
   repo; without it the APK is unsigned). v0.1 package: `dist/palianytsia-v0.1/` (drone maburd from mabur
