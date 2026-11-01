@@ -29,6 +29,8 @@ pub const CAP_FRAME_WIRE: u16 = 0x0001;
 pub const CAP_TELEMETRY: u16 = 0x0002;
 pub const CAP_CALIBRATE: u16 = 0x0004;
 pub const CAP_MAVLINK: u16 = 0x0008;
+/// Disc.cap_bits (GS -> drone): op_width is a proposal the drone retunes to.
+pub const DISC_CAP_WIDTH: u16 = 0x0001;
 
 pub type LinkKey = [u8; 16];
 pub const DEFAULT_LINK_KEY: LinkKey = *b"mabur-default-00";

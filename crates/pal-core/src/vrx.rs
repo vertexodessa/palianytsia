@@ -47,6 +47,7 @@ pub struct VrxRendezvous {
     seq: u16,
     nonce: u32,
     proposal: u8,
+    width: u8,
     vtx_nonce: Option<u32>,
     first_flagged_ms: Option<f64>,
     beacons_since_flagged: i32,
@@ -74,7 +75,7 @@ fn random_nonce() -> u32 {
 }
 
 impl VrxRendezvous {
-    pub fn new(op_channel: u8, nonce: u32) -> Self {
+    pub fn new(op_channel: u8, nonce: u32, width: u8) -> Self {
         Self {
             state: VrxState::Beaconing,
             last_video_ms: 0.0,
@@ -82,6 +83,7 @@ impl VrxRendezvous {
             seq: 0,
             nonce: if nonce != 0 { nonce } else { random_nonce() },
             proposal: op_channel,
+            width,
             vtx_nonce: None,
             first_flagged_ms: None,
             beacons_since_flagged: 0,
@@ -115,7 +117,9 @@ impl VrxRendezvous {
         Disc {
             vrx_nonce: self.nonce,
             op_channel: self.proposal,
-            op_width: 20,
+            // The receiver's width, as a proposal the drone retunes to.
+            op_width: self.width,
+            cap_bits: rc::DISC_CAP_WIDTH,
             seq: self.seq,
             ..Disc::default()
         }
@@ -171,6 +175,7 @@ pub struct VrxCfg {
     pub pin_overhead_enh: f64,
     pub probe_pin_mcs: i32,
     pub rz_nonce: u32,
+    pub width: u8,
 }
 
 impl VrxCfg {
@@ -188,6 +193,7 @@ impl VrxCfg {
             pin_overhead_enh: c.link.static_overhead_enh,
             probe_pin_mcs: c.link.ladder_cfg.probe.pin_mcs,
             rz_nonce,
+            width: c.radio.width,
         }
     }
 }
@@ -237,7 +243,7 @@ impl VrxController {
         let ctrl = LadderController::new(cfg.ladder.clone());
         let cur_op = op_from_rung(ctrl.op());
         Self {
-            rz: VrxRendezvous::new(cfg.op_channel, cfg.rz_nonce),
+            rz: VrxRendezvous::new(cfg.op_channel, cfg.rz_nonce, cfg.width),
             cfg,
             ctrl,
             last_fb_ms: -1e18,
