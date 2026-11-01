@@ -7,11 +7,12 @@ use crate::aggregator::{Aggregator, Route};
 use crate::config::Config;
 use crate::frame_stream::{AuLat, FragArrival, FrameOut, FrameStream, FrameStreamCfg};
 use crate::gap::{DroneRestartDetector, GapTimeoutPolicy};
+use crate::json::J;
 use crate::ladder::LinkHealth;
-use crate::link_health::{LinkHealthAssembler, LinkHealthInputs};
+use crate::link_health::{LinkHealthAssembler, LinkHealthInputs, OpPoint};
 use crate::mav::{MavTunnel, ParamClient};
 use crate::nack::{NackInputs, NackTailView, NackTracker};
-use crate::uplink::{RttEstimator, UplinkDelivery};
+use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
 use crate::vrx::{RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState};
 use crate::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_wire::frame_wire::FrameHdr;
@@ -55,6 +56,7 @@ struct AuOut<'a> {
     io: &'a mut dyn CoreIo,
     c: &'a mut Counters,
     now_us: u64,
+    lha: &'a mut LinkHealthAssembler,
     gs: Option<&'a mut Gs>,
 }
 
@@ -66,12 +68,12 @@ impl FrameOut for AuOut<'_> {
             flags: h.flags,
             ..Au::default()
         };
+        let now_ms = self.now_us / 1000;
         if let Some(g) = self.gs.as_deref_mut() {
-            let now_ms = self.now_us / 1000;
             g.slot.on_au_first(now_ms);
-            // One probe expectation per video AU.
-            g.lha.on_au_begin(sid, h.frame_id, now_ms as f64);
         }
+        // One probe expectation per video AU, both modes.
+        self.lha.on_au_begin(sid, h.frame_id, now_ms as f64);
     }
     fn data(&mut self, b: &[u8]) {
         self.cur.data.extend_from_slice(b);
@@ -80,7 +82,8 @@ impl FrameOut for AuOut<'_> {
         self.cur.complete = complete;
         self.cur.salvaged = !complete && lat.slice.salvaged;
         if let Some(g) = self.gs.as_deref_mut() {
-            let probe_follows = self.cur.sid < 2 && g.lha.probe_commanded() != rc::NO_PROBE_PROFILE;
+            let probe_follows =
+                self.cur.sid < 2 && self.lha.probe_commanded() != rc::NO_PROBE_PROFILE;
             g.slot.on_au_complete(self.now_us / 1000, probe_follows);
         }
         if self.cur.salvaged {
@@ -110,7 +113,7 @@ struct NackState {
     drone_retx_syms: u64,
     drone_retx_refused: u64,
     win_t0_ms: u64,
-    fill_pps: f64,
+    fill_pps: Option<f64>,
     late_max: u32,
     fill_p50: Option<u32>,
     fill_p90: Option<u32>,
@@ -121,7 +124,6 @@ struct NackState {
 struct Gs {
     vrx: VrxController,
     slot: RcfSlotter,
-    lha: LinkHealthAssembler,
     rtt: RttEstimator,
     uplink: UplinkDelivery,
     nack: Option<NackState>,
@@ -132,7 +134,6 @@ struct Gs {
     key: rc::LinkKey,
     sends: u64,
     rcf_sent: u64,
-    last_health: LinkHealth,
 }
 
 impl Gs {
@@ -180,11 +181,16 @@ pub struct RustCore {
     restart: DroneRestartDetector,
     telem: Option<rc::Telem>,
     air_mcs: i32,
-    bw: u8,
     key_fp: String,
     cur: Au,
     c: Counters,
     gs: Option<Gs>,
+    lha: LinkHealthAssembler,
+    last_health: LinkHealth,
+    /// A spotter drives no ladder: its link setting is the configured width.
+    spotter_op: OpPoint,
+    telem_rx_us: u64,
+    channel: u8,
 }
 
 macro_rules! au_out {
@@ -194,6 +200,7 @@ macro_rules! au_out {
             io: $io,
             c: &mut $s.c,
             now_us: $s.now_us,
+            lha: &mut $s.lha,
             gs: $s.gs.as_mut(),
         }
     };
@@ -202,12 +209,12 @@ macro_rules! au_out {
 impl RustCore {
     pub fn new(cfg: &Config, opts: RustOpts) -> Result<Self, String> {
         let layers = cfg.uep_layers();
+        let ch = if opts.channel != 0 {
+            opts.channel
+        } else {
+            cfg.radio.channels.first().copied().unwrap_or(0)
+        };
         let gs = (opts.mode == Mode::Gs).then(|| {
-            let ch = if opts.channel != 0 {
-                opts.channel
-            } else {
-                cfg.radio.channels.first().copied().unwrap_or(0)
-            };
             let vc = VrxCfg::from_config(cfg, ch, opts.rz_nonce);
             Gs {
                 vrx: VrxController::new(vc),
@@ -219,9 +226,6 @@ impl RustCore {
                     guard_ms: 1,
                     probe_tail_ms: 0,
                 }),
-                // Probe bodies ride the enh layer's geometry; blocks_per_body
-                // is 4 on decode (config.cpp).
-                lha: LinkHealthAssembler::new(1, 4, sw::HEADER_LEN + layers[1].symbol_size),
                 rtt: RttEstimator::default(),
                 uplink: UplinkDelivery::default(),
                 nack: cfg.link.nack.enable.then(|| NackState {
@@ -235,7 +239,7 @@ impl RustCore {
                     drone_retx_syms: 0,
                     drone_retx_refused: 0,
                     win_t0_ms: 0,
-                    fill_pps: 0.0,
+                    fill_pps: None,
                     late_max: 0,
                     fill_p50: None,
                     fill_p90: None,
@@ -248,7 +252,6 @@ impl RustCore {
                 key: cfg.link.key,
                 sends: 0,
                 rcf_sent: 0,
-                last_health: LinkHealth::empty(),
             }
         });
         Ok(Self {
@@ -272,11 +275,20 @@ impl RustCore {
             restart: DroneRestartDetector::default(),
             telem: None,
             air_mcs: -1,
-            bw: cfg.radio.width,
             key_fp: rc::key_fingerprint(&cfg.link.key),
             cur: Au::default(),
             c: Counters::default(),
             gs,
+            // Probe bodies ride the enh layer's geometry; blocks_per_body
+            // is 4 on decode (config.cpp).
+            lha: LinkHealthAssembler::new(1, 4, sw::HEADER_LEN + layers[1].symbol_size),
+            last_health: LinkHealth::empty(),
+            spotter_op: OpPoint {
+                bw: i32::from(cfg.radio.width),
+                ..OpPoint::default()
+            },
+            telem_rx_us: 0,
+            channel: ch,
         })
     }
 
@@ -303,6 +315,7 @@ impl RustCore {
         if ft == Some(rc::T_TELEM) {
             if let Some(t) = rc::parse_telem(body) {
                 let (seq, state, flags) = (t.tlm_seq, t.state, t.flags);
+                self.telem_rx_us = us;
                 // A maburd restart (new seqs, frame_ids from 0) is the one
                 // discontinuity a spotter can see.
                 if self.gs.is_none() && self.restart.on_telem(seq, us as f64 / 1000.0) {
@@ -410,7 +423,7 @@ impl RustCore {
         let mut w = n.t.take_window();
         let secs = (now_ms - n.win_t0_ms) as f64 / 1000.0;
         n.win_t0_ms = now_ms;
-        n.fill_pps = w.filled as f64 / secs;
+        n.fill_pps = Some(w.filled as f64 / secs);
         n.late_max = w.late_ms_max;
         w.fill_ms.sort_unstable();
         let pct = |p: f64| -> Option<u32> {
@@ -465,8 +478,8 @@ impl GsCore for RustCore {
             Route::Probe => {
                 if let Some(g) = self.gs.as_mut() {
                     g.slot.on_probe_tail(self.now_us / 1000);
-                    g.lha.on_probe_body(m.card_id, m);
                 }
+                self.lha.on_probe_body(m.card_id, m);
             }
             Route::Video(frags) if self.frame_wire => {
                 let now_ms = self.now_us / 1000;
@@ -534,61 +547,71 @@ impl GsCore for RustCore {
             self.drain_nack_window(now_ms);
         }
         let now_us = self.now_us;
-        let Some(g) = self.gs.as_mut() else { return };
-        // Tag outbound MAVLink under the live session only.
-        let linked = g.vrx.link_state() == VrxState::Session;
-        g.mav.set_session(if linked {
-            g.vrx.session_ctx()
-        } else {
-            rc::TagCtx::default()
-        });
-        // ParamClient re-lists on every session edge and on a vtx_nonce
-        // change while linked; before flush() so the request leaves this tick.
-        let nonce = g.vrx.session_ctx().vtx_nonce;
-        if linked != g.param_linked || (linked && nonce != g.param_vtx_seen) {
-            if g.param_linked {
-                g.params.set_linked(false, now_ms);
+        if let Some(g) = self.gs.as_mut() {
+            // Tag outbound MAVLink under the live session only.
+            let linked = g.vrx.link_state() == VrxState::Session;
+            g.mav.set_session(if linked {
+                g.vrx.session_ctx()
+            } else {
+                rc::TagCtx::default()
+            });
+            // ParamClient re-lists on every session edge and on a vtx_nonce
+            // change while linked; before flush() so the request leaves this tick.
+            let nonce = g.vrx.session_ctx().vtx_nonce;
+            if linked != g.param_linked || (linked && nonce != g.param_vtx_seen) {
+                if g.param_linked {
+                    g.params.set_linked(false, now_ms);
+                }
+                if linked {
+                    g.params.set_linked(true, now_ms);
+                }
+                g.param_linked = linked;
+                g.param_vtx_seen = nonce;
             }
-            if linked {
-                g.params.set_linked(true, now_ms);
-            }
-            g.param_linked = linked;
-            g.param_vtx_seen = nonce;
+            g.params.tick(now_ms);
+            g.drain_params();
+            let frames = g.mav.flush();
+            g.send_mav_frames(frames, now_us, io);
         }
-        g.params.tick(now_ms);
-        g.drain_params();
-        let frames = g.mav.flush();
-        g.send_mav_frames(frames, now_us, io);
 
-        let inp = LinkHealthInputs {
-            op: *g.vrx.cur_op(),
-            probe_profile: g.vrx.probe_profile(),
-            probe_rung: g.vrx.ctl().probe_rung(),
+        let inp = match self.gs.as_ref() {
+            Some(g) => LinkHealthInputs {
+                op: *g.vrx.cur_op(),
+                probe_profile: g.vrx.probe_profile(),
+                probe_rung: g.vrx.ctl().probe_rung(),
+            },
+            None => LinkHealthInputs {
+                op: self.spotter_op,
+                probe_profile: rc::NO_PROBE_PROFILE,
+                probe_rung: -1,
+            },
         };
-        let lh = g.lha.tick(now_ms as f64, &mut self.agg, &inp);
-        if let Some(t) = lh.probe_tail_ms {
-            g.slot.set_probe_tail_ms(t);
-        }
-        if let Some(out) = g.vrx.step(now_ms as f64, &lh.health) {
-            if !out.is_disc {
-                g.lha.on_step_sent(&self.agg);
+        let lh = self.lha.tick(now_ms as f64, &mut self.agg, &inp);
+        if let Some(g) = self.gs.as_mut() {
+            if let Some(t) = lh.probe_tail_ms {
+                g.slot.set_probe_tail_ms(t);
             }
-            // rcf_seq() IS this frame's seq; DISCs are not matchable RTT sends.
-            let mut sf = SlotFrame {
-                frame: out.frame,
-                seq: g.vrx.rcf_seq(),
-                card: 0,
-                stamp_rtt: !out.is_disc,
-                ..SlotFrame::default()
-            };
-            if !g.slot.offer(&mut sf, now_ms, false) {
-                g.send(&sf, now_us, io);
+            if let Some(out) = g.vrx.step(now_ms as f64, &lh.health) {
+                if !out.is_disc {
+                    self.lha.on_step_sent(&self.agg);
+                }
+                // rcf_seq() IS this frame's seq; DISCs are not matchable RTT sends.
+                let mut sf = SlotFrame {
+                    frame: out.frame,
+                    seq: g.vrx.rcf_seq(),
+                    card: 0,
+                    stamp_rtt: !out.is_disc,
+                    ..SlotFrame::default()
+                };
+                if !g.slot.offer(&mut sf, now_ms, false) {
+                    g.send(&sf, now_us, io);
+                }
+            }
+            for f in g.slot.take_due(now_ms) {
+                g.send(&f, now_us, io);
             }
         }
-        for f in g.slot.take_due(now_ms) {
-            g.send(&f, now_us, io);
-        }
-        g.last_health = lh.health;
+        self.last_health = lh.health;
     }
 
     fn mav_push_outbound(&mut self, bytes: &[u8]) {
@@ -597,44 +620,121 @@ impl GsCore for RustCore {
         }
     }
 
+    /// WebGs::stats() + webgs::stats_json, key for key (no channel core,
+    /// no spotter follow, no MSP sink: those fields are null or 0).
     fn stats_json(&self) -> String {
-        let card = self.agg.cards().first();
-        let num = |v: Option<f64>| v.map_or("null".to_string(), |x| format!("{x:.1}"));
-        let rssi = card.filter(|c| c.rf.has_ema).map(|c| c.rf.rssi_ema - 110.0);
-        let snr = card.filter(|c| c.rf.has_ema).map(|c| c.rf.snr_ema);
-        let fs = self.fs.stats();
         let g = self.gs.as_ref();
-        let session = g.is_some_and(|g| g.vrx.link_state() == VrxState::Session);
-        let rung = g.map_or(-1, |g| g.vrx.ctl().rung());
-        let mcs = g.map_or(self.air_mcs, |g| g.vrx.cur_op().mcs);
-        format!(
-            concat!(
-                "{{\"mode\":\"{}\",\"session\":{},\"rung\":{},\"mcs\":{},\"bw\":{},",
-                "\"key_fp\":\"{}\",\"drone_state\":{},\"snr_db\":{},\"rssi_dbm\":{},",
-                "\"bodies\":{},\"aus\":{},\"trunc\":{},\"trunc_base\":{},\"salvaged\":{},",
-                "\"sends\":{},\"resets\":{},\"fs_dropped\":{},\"fs_stall_resets\":{},\"slice_fb\":{:?}}}"
-            ),
-            if self.mode == Mode::Gs { "gs" } else { "spotter" },
-            session,
-            rung,
-            mcs,
-            self.bw,
-            self.key_fp,
-            self.telem
-                .as_ref()
-                .map_or("null".to_string(), |t| t.state.to_string()),
-            num(snr),
-            num(rssi),
-            self.c.bodies,
-            self.c.aus_complete,
-            self.c.aus_truncated,
-            self.c.aus_truncated_base,
-            self.c.aus_salvaged,
-            g.map_or(0, |g| g.sends),
-            self.c.resets,
-            fs.dropped,
-            fs.stall_resets,
-            fs.slice_fallback,
-        )
+        let mut j = J::obj();
+        j.set(
+            "mode",
+            if self.mode == Mode::Gs {
+                "gs"
+            } else {
+                "spotter"
+            },
+        );
+        j.set(
+            "session",
+            g.is_some_and(|g| g.vrx.link_state() == VrxState::Session),
+        );
+        j.set("peer_acked", g.is_some_and(|g| g.vrx.peer_acked()));
+        j.set("rung", g.map_or(-1, |g| g.vrx.ctl().rung()));
+        j.set("mcs", g.map_or(self.air_mcs, |g| g.vrx.cur_op().mcs));
+        j.set("bw", g.map_or(self.spotter_op.bw, |g| g.vrx.cur_op().bw));
+        j.set(
+            "probe",
+            g.map_or("", |g| g.vrx.ctl().probe_gate().state.as_str()),
+        );
+        j.set("key_mismatch", g.is_some_and(|g| g.vrx.key_mismatch()));
+        j.set("key_fp", self.key_fp.as_str());
+        j.set("channel", i64::from(self.channel));
+        for k in [
+            "scan_state",
+            "scan_rounds",
+            "scan_pick",
+            "hop",
+            "follow_state",
+            "follows",
+        ] {
+            j.set(k, J::Null);
+        }
+        let pre = self.lha.pre_all;
+        j.set("pre_fec_loss", pre.valid.then_some(pre.loss));
+        j.set("residual", self.lha.residual);
+        let rtt = g.map(|g| &g.rtt);
+        j.set("rtt_ms", rtt.filter(|r| r.has_rtt()).map(|r| r.rtt_ms()));
+        j.set(
+            "rtt_min_ms",
+            rtt.filter(|r| r.has_rtt()).map(|r| r.rtt_min_ms()),
+        );
+        j.set(
+            "pts_off_us",
+            rtt.filter(|r| r.has_offset()).map(|r| r.pts_off_us()),
+        );
+        let t = self.telem.as_ref();
+        j.set("drone_rcf_rx", t.map(|t| t.rcf_rx));
+        let (up, up_pct) = g.map_or((UplinkState::None, None), |g| {
+            g.uplink.view(self.now_us / 1000)
+        });
+        j.set("uplink_pct", up_pct.map(i64::from));
+        j.set("uplink", up.as_str());
+        j.set("drone_state", t.map(|t| t.state));
+        j.set(
+            "drone_temp_c",
+            t.filter(|t| t.soc_temp_c != -128)
+                .map(|t| i64::from(t.soc_temp_c)),
+        );
+        // Gs only: a spotter has no RCF for the low_power readout to drive.
+        const DRONE_LP_STALE_US: u64 = 3_000_000;
+        j.set(
+            "drone_lp",
+            t.filter(|_| {
+                g.is_some() && self.now_us.wrapping_sub(self.telem_rx_us) <= DRONE_LP_STALE_US
+            })
+            .map(|t| t.flags & 0x80 != 0),
+        );
+        j.set("rec_state", t.map(|t| t.rec_status & 0x03));
+        j.set("rec_err", t.map(|t| t.rec_status >> 2));
+        j.set("snr_db", self.last_health.rf_snr_db);
+        j.set("rssi_dbm", self.last_health.rf_rssi_dbm);
+        j.set("bodies", self.c.bodies);
+        j.set("aus", self.c.aus_complete);
+        j.set("trunc", self.c.aus_truncated);
+        j.set("trunc_base", self.c.aus_truncated_base);
+        j.set("salvaged", self.c.aus_salvaged);
+        j.set("sends", g.map_or(0, |g| g.sends));
+        j.set("rcf_sent", g.map_or(0, |g| g.rcf_sent));
+        j.set("idr_req", 0u64);
+        j.set("osd_snaps", 0u64);
+        j.set("osd_screens", 0u64);
+        j.set(
+            "nack",
+            g.and_then(|g| g.nack.as_ref()).map_or(J::Null, |n| {
+                let c = n.t.stats();
+                let mut o = J::obj();
+                o.set("req", c.requests);
+                o.set("rep", c.repeats);
+                o.set("syms", c.syms_requested);
+                o.set("tail", c.tail_requests);
+                o.set("fill", c.filled);
+                o.set("late", c.late_fill);
+                o.set("waste", c.wasted);
+                o.set("drop", c.dropped_deadline);
+                o.set("sup", c.suppressed);
+                o.set("lead", c.lead_skipped);
+                o.set("sent", n.sent);
+                o.set("settle_ms", n.t.settle_ms());
+                o.set("fill_pps", n.fill_pps);
+                o.set("fill_p50", n.fill_p50);
+                o.set("fill_p90", n.fill_p90);
+                o.set("fill_max", n.fill_max);
+                o.set("late_max", n.late_max);
+                o.set("drone_rx", n.drone_nack_rx);
+                o.set("drone_syms", n.drone_retx_syms);
+                o.set("drone_refused", n.drone_retx_refused);
+                o
+            }),
+        );
+        j.dump()
     }
 }

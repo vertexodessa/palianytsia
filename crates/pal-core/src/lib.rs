@@ -10,6 +10,7 @@ pub mod aggregator;
 pub mod config;
 pub mod frame_stream;
 pub mod gap;
+pub mod json;
 pub mod ladder;
 pub mod link_health;
 pub mod mav;
