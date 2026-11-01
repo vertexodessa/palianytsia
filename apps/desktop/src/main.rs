@@ -9,8 +9,11 @@
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
-//!           [--hwdec vdpau|vaapi|cuda]  hardware decode, software if it fails to open
+//!           [--hwdec auto|vdpau|vaapi|cuda|sw]  decoder (default auto: first hwaccel
+//!                                   that opens, else software)
 //!           [--params]              open the drone settings window (P toggles; GS only)
+//!           [--lat]                 per-second latency breakdown on stderr (printed
+//!                                   anyway while a stage is over its threshold)
 //!
 //! `--snapshot` saves one rendered window after N seconds and quits: the
 //! headless check that video and OSD actually draw.
@@ -55,6 +58,9 @@ struct Opts {
     hwdec: String,
     /// Open the settings window at start (P toggles it).
     params: bool,
+    /// Per-second latency breakdown on stderr (RX queue, capture->AU,
+    /// decode, display).
+    lat: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -64,6 +70,7 @@ fn die(msg: &str) -> ! {
 
 fn parse() -> Opts {
     let mut o = Opts {
+        hwdec: "auto".into(),
         ch: 149,
         width: 20,
         rust: true,
@@ -100,6 +107,7 @@ fn parse() -> Opts {
             "--no-idr" => o.idr = Some(false),
             "--hwdec" => o.hwdec = val(),
             "--params" => o.params = true,
+            "--lat" => o.lat = true,
             s => die(&format!("unknown argument {s}")),
         }
     }
@@ -147,6 +155,31 @@ struct Shared {
     quit: AtomicBool,
     /// The core loop has returned and dropped its Session.
     core_done: AtomicBool,
+    lat: Lat,
+}
+
+/// `--lat` probes. Stamps are `lat_us()`; *_max are per report window and
+/// reset by the report.
+#[derive(Default)]
+struct Lat {
+    rx_sent: AtomicU64,
+    rx_full: AtomicU64,
+    rx_recv: AtomicU64,
+    body_lag_max: AtomicU64,
+    cap_au_max: AtomicU64,
+    cap_au_last: AtomicU64,
+    au_dec_max: AtomicU64,
+    dec_us_sum: AtomicU64,
+    dec_n: AtomicU64,
+    aus_in: AtomicU64,
+    show_max: AtomicU64,
+    shown: AtomicU64,
+    skipped_rgba: AtomicU64,
+}
+
+fn lat_us() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
 struct Frame {
@@ -154,11 +187,16 @@ struct Frame {
     h: usize,
     rgba: Vec<u8>,
     seq: u64,
+    /// lat_us() when it came out of the decoder.
+    t_dec: u64,
 }
 
 struct Sink {
-    /// AUs to the decoder, tagged with their number (`IdrDriver::aus`).
-    au_tx: SyncSender<(u64, Vec<u8>)>,
+    /// AUs to the decoder, tagged with their number (`IdrDriver::aus`) and
+    /// the lat_us() they were queued at.
+    au_tx: SyncSender<(u64, u64, Vec<u8>)>,
+    /// The core's capture-clock offset (stats `pts_off_us`), for --lat.
+    pts_off_us: Option<i64>,
     mav_tx: SyncSender<Vec<u8>>,
     /// GCS bridge: inbound packets go to `peer`, whatever it sends comes back.
     udp: Option<(std::net::UdpSocket, std::net::SocketAddr)>,
@@ -179,8 +217,22 @@ impl CoreIo for Sink {
         if let Some(l) = self.log.as_mut() {
             let _ = l.au(self.now_us, &a);
         }
-        if let Err(TrySendError::Full(_)) = self.au_tx.try_send((n, a.data)) {
+        if let Some(off) = self.pts_off_us {
+            // webgs cap_to_complete_us: capture stamp to this AU's completion.
+            let cap = (self.now_us as i64 + off) as u32;
+            let d = cap.wrapping_sub(a.pts_us) as i32;
+            let lat = &self.shared.lat;
+            lat.cap_au_max.fetch_max(d.max(0) as u64, Ordering::Relaxed);
+            lat.cap_au_last.store(d.max(0) as u64, Ordering::Relaxed);
+        }
+        self.shared.lat.aus_in.fetch_add(1, Ordering::Relaxed);
+        if let Err(TrySendError::Full(_)) = self.au_tx.try_send((n, lat_us(), a.data)) {
             self.shared.au_dropped.fetch_add(1, Ordering::Relaxed);
+            // A dropped AU breaks the reference chain until an IRAP: ask for
+            // one now instead of waiting for the decoder to report damage.
+            if let Some(i) = self.idr.as_mut() {
+                i.r.request(pal_core::refresh::Reason::Decoder, self.now_us / 1000);
+            }
         }
     }
     fn on_mav(&mut self, pkt: &[u8]) {
@@ -205,6 +257,9 @@ struct CoreLoop {
     cmd_rx: Receiver<pal_osd::params::Cmd>,
     set_res_tx: SyncSender<(usize, Result<(), String>)>,
     last_params_us: u64,
+    lat: bool,
+    last_lat_us: u64,
+    rx_full_seen: u64,
     last_stats_us: u64,
     last_log_us: u64,
 }
@@ -266,7 +321,60 @@ impl CoreLoop {
                     let _ = l.stats(now, &line);
                 }
             }
+            self.sink.pts_off_us = line
+                .split("\"pts_off_us\":")
+                .nth(1)
+                .and_then(|r| r.split([',', '}']).next())
+                .and_then(|v| v.parse().ok());
             let _ = self.stats_tx.try_send(line);
+        }
+        if now >= self.last_lat_us + 1_000_000 {
+            self.last_lat_us = now;
+            let l = &self.sink.shared.lat;
+            // Without --lat the line still prints when a stage goes bad, so
+            // an intermittent multi-second lag leaves its breakdown behind.
+            let bad = l.body_lag_max.load(Ordering::Relaxed) > 200_000
+                || l.cap_au_max.load(Ordering::Relaxed) > 500_000
+                || l.au_dec_max.load(Ordering::Relaxed) > 300_000
+                || l.show_max.load(Ordering::Relaxed) > 300_000
+                || l.rx_full.load(Ordering::Relaxed) > self.rx_full_seen;
+            self.rx_full_seen = l.rx_full.load(Ordering::Relaxed);
+            let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+            if !self.lat && !bad {
+                for a in [
+                    &l.body_lag_max,
+                    &l.cap_au_max,
+                    &l.au_dec_max,
+                    &l.show_max,
+                    &l.dec_us_sum,
+                    &l.dec_n,
+                    &l.shown,
+                ] {
+                    take(a);
+                }
+                return;
+            }
+            let (sent, full, recv) = (
+                l.rx_sent.load(Ordering::Relaxed),
+                l.rx_full.load(Ordering::Relaxed),
+                l.rx_recv.load(Ordering::Relaxed),
+            );
+            let (dec_sum, dec_n) = (take(&l.dec_us_sum), take(&l.dec_n));
+            let frames = self.sink.shared.frames.load(Ordering::Relaxed);
+            eprintln!(
+                "lat: rx_queue={} rx_full={full} body_lag_max={}ms cap_au={}ms(max {}) au_to_frame_max={}ms dec_avg={:.1}ms dec_holds={} frame_to_screen_max={}ms shown/s={} au_drops={} rgba_skipped={}",
+                sent.saturating_sub(recv + full),
+                take(&l.body_lag_max) / 1000,
+                l.cap_au_last.load(Ordering::Relaxed) / 1000,
+                take(&l.cap_au_max) / 1000,
+                take(&l.au_dec_max) / 1000,
+                dec_sum as f64 / dec_n.max(1) as f64 / 1000.0,
+                l.aus_in.load(Ordering::Relaxed).saturating_sub(frames + self.sink.shared.au_dropped.load(Ordering::Relaxed)),
+                take(&l.show_max) / 1000,
+                take(&l.shown),
+                self.sink.shared.au_dropped.load(Ordering::Relaxed),
+                l.skipped_rgba.load(Ordering::Relaxed),
+            );
         }
     }
 }
@@ -335,9 +443,11 @@ fn run_live(mut cl: CoreLoop, o: Opts) {
     let t0 = Instant::now();
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
     let ch = o.ch;
+    let shared_rx = cl.sink.shared.clone();
     card.start_rx(move |f| {
         if let dot11::Verdict::Body(p) = dot11::parse(f.frame, f.crc_err, f.data_rate) {
-            let _ = tx.try_send(RxBody {
+            shared_rx.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
+            let r = tx.try_send(RxBody {
                 card_id: 0,
                 mono_us: mono_us(t0),
                 rssi: f.rssi,
@@ -351,6 +461,9 @@ fn run_live(mut cl: CoreLoop, o: Opts) {
                 rx_channel: ch,
                 body: f.frame[p.body_off..].to_vec(),
             });
+            if r.is_err() {
+                shared_rx.lat.rx_full.fetch_add(1, Ordering::Relaxed);
+            }
         }
     })
     .unwrap_or_else(|e| die(&e));
@@ -362,7 +475,13 @@ fn run_live(mut cl: CoreLoop, o: Opts) {
     loop {
         let wait = Duration::from_micros(next_tick.saturating_sub(mono_us(t0)));
         match rx.recv_timeout(wait) {
-            Ok(b) => cl.rx(&b),
+            Ok(b) => {
+                let l = &cl.sink.shared.lat;
+                l.rx_recv.fetch_add(1, Ordering::Relaxed);
+                l.body_lag_max
+                    .fetch_max(mono_us(t0).saturating_sub(b.mono_us), Ordering::Relaxed);
+                cl.rx(&b)
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => die("RX thread ended"),
         }
@@ -378,19 +497,36 @@ fn run_live(mut cl: CoreLoop, o: Opts) {
 }
 
 fn run_decode(
-    au_rx: Receiver<(u64, Vec<u8>)>,
+    au_rx: Receiver<(u64, u64, Vec<u8>)>,
     out: Arc<Mutex<Option<Frame>>>,
     shared: Arc<Shared>,
     repaint: egui::Context,
     hwdec: String,
 ) {
-    let mut dec =
-        decode::AvDecoder::open_or_sw(0, &hwdec).unwrap_or_else(|e| die(&format!("decode: {e}")));
+    let mut dec = decode::AvDecoder::open_or_sw(0, if hwdec == "sw" { "" } else { &hwdec })
+        .unwrap_or_else(|e| die(&format!("decode: {e}")));
     let mut buf = Vec::new();
     let mut seq = 0u64;
     let mut errs = 0;
-    while let Ok((n, au)) = au_rx.recv() {
+    // One AU of lookahead: a frame whose successor is already queued is
+    // never shown, so it skips the GPU download and RGBA conversion (the
+    // bulk of the per-frame cost at 90 fps).
+    let mut next: Option<(u64, u64, Vec<u8>)> = None;
+    while let Some((n, t_enq, au)) = next.take().or_else(|| au_rx.recv().ok()) {
+        let t_dec0 = lat_us();
         let got = dec.decode(&au);
+        let t_dec1 = lat_us();
+        shared
+            .lat
+            .dec_us_sum
+            .fetch_add(t_dec1 - t_dec0, Ordering::Relaxed);
+        shared.lat.dec_n.fetch_add(1, Ordering::Relaxed);
+        if got > 0 {
+            shared
+                .lat
+                .au_dec_max
+                .fetch_max(t_dec1.saturating_sub(t_enq), Ordering::Relaxed);
+        }
         let (f, e) = dec.counters();
         if e > errs {
             errs = e;
@@ -401,6 +537,11 @@ fn run_decode(
             continue;
         }
         shared.frames.store(f, Ordering::Relaxed);
+        if let Ok(q) = au_rx.try_recv() {
+            next = Some(q);
+            shared.lat.skipped_rgba.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         if let Some((w, h)) = dec.rgba(&mut buf) {
             seq += 1;
             let mut slot = out.lock().unwrap_or_else(|p| p.into_inner());
@@ -410,6 +551,7 @@ fn run_decode(
                 h,
                 rgba: std::mem::take(&mut buf),
                 seq,
+                t_dec: t_dec1,
             });
             if let Some(old) = old {
                 buf = old.rgba;
@@ -472,6 +614,10 @@ impl eframe::App for App {
         {
             if fr.seq != self.shown_seq {
                 self.shown_seq = fr.seq;
+                let l = &self.shared.lat;
+                l.show_max
+                    .fetch_max(lat_us().saturating_sub(fr.t_dec), Ordering::Relaxed);
+                l.shown.fetch_add(1, Ordering::Relaxed);
                 let img = egui::ColorImage::from_rgba_unmultiplied([fr.w, fr.h], &fr.rgba);
                 match self.tex.as_mut() {
                     Some(t) => t.set(img, egui::TextureOptions::LINEAR),
@@ -594,7 +740,7 @@ fn main() {
     // Every dropped AU breaks the reference chain until the next intra
     // refresh (a 2-slot queue dropped 6 AUs at replay start and the
     // decoder logged missing POCs), so the queue absorbs decoder warm-up.
-    let (au_tx, au_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(8);
+    let (au_tx, au_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(8);
     let (stats_tx, stats_rx) = mpsc::sync_channel::<String>(64);
     let (params_tx, params_rx) = mpsc::sync_channel::<String>(4);
     let (cmd_tx, cmd_rx) = mpsc::channel::<pal_osd::params::Cmd>();
@@ -629,6 +775,7 @@ fn main() {
         card: None,
         log,
         now_us: 0,
+        pts_off_us: None,
         shared: shared.clone(),
         idr: (o.mode == Some(Mode::Gs) && o.idr.unwrap_or(o.live)).then(IdrDriver::default),
     };
@@ -668,6 +815,9 @@ fn main() {
                             cmd_rx,
                             set_res_tx,
                             last_params_us: 0,
+                            lat: o.lat,
+                            last_lat_us: 0,
+                            rx_full_seen: 0,
                             last_stats_us: 0,
                             last_log_us: 0,
                         };
