@@ -9,6 +9,7 @@
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
+//!           [--hwdec vdpau|vaapi|cuda]  hardware decode, software if it fails to open
 //!
 //! `--snapshot` saves one rendered window after N seconds and quits: the
 //! headless check that video and OSD actually draw.
@@ -49,6 +50,8 @@ struct Opts {
     /// Live: IDR requests on (`--no-idr` off). Replay: off (`--idr` on),
     /// as `pal replay`, so one capture gives the same stats in both apps.
     idr: Option<bool>,
+    /// libavcodec hwaccel ("vdpau", "vaapi", "cuda"); "" = software.
+    hwdec: String,
 }
 
 fn die(msg: &str) -> ! {
@@ -92,6 +95,7 @@ fn parse() -> Opts {
             "--mav-udp" => o.mav_udp = Some(val()),
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
+            "--hwdec" => o.hwdec = val(),
             s => die(&format!("unknown argument {s}")),
         }
     }
@@ -355,8 +359,10 @@ fn run_decode(
     out: Arc<Mutex<Option<Frame>>>,
     shared: Arc<Shared>,
     repaint: egui::Context,
+    hwdec: String,
 ) {
-    let mut dec = decode::AvDecoder::open(0).unwrap_or_else(|e| die(&format!("decode: {e}")));
+    let mut dec =
+        decode::AvDecoder::open_or_sw(0, &hwdec).unwrap_or_else(|e| die(&format!("decode: {e}")));
     let mut buf = Vec::new();
     let mut seq = 0u64;
     let mut errs = 0;
@@ -581,9 +587,10 @@ fn main() {
             let ctx = cc.egui_ctx.clone();
             {
                 let (frame, shared, ctx) = (frame.clone(), shared.clone(), ctx.clone());
+                let hwdec = o.hwdec.clone();
                 std::thread::Builder::new()
                     .name("decode".into())
-                    .spawn(move || run_decode(au_rx, frame, shared, ctx))
+                    .spawn(move || run_decode(au_rx, frame, shared, ctx, hwdec))
                     .expect("decode thread");
             }
             {

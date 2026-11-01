@@ -8,7 +8,7 @@
 //!              [--log-dir DIR [--capture-mb N]] [--core ref|rust]
 //!   pal replay <bodies.bin> -c gs.toml [--mode gs|spotter] [--dump out.h265]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
-//!              [--drop-pct N --seed S] [--core ref|rust] [--decode]
+//!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
 //!   pal log    <fl-NNNN_...>   summarise one flight-log directory
 //!
 //! Gs mode transmits: the core's RC frames (DISC, RCF, NACK, refresh) go out
@@ -47,6 +47,8 @@ struct Opts {
     mav: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     decode: bool,
+    /// libavcodec hwaccel for `--decode` ("vdpau", "vaapi", "cuda"); "" = software.
+    hwdec: String,
     capture_mb: u64,
     mode: Option<Mode>,
     rust: bool,
@@ -83,6 +85,7 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--mav" => o.mav = Some(val().into()),
             "--log-dir" => o.log_dir = Some(val().into()),
             "--decode" => o.decode = true,
+            "--hwdec" => o.hwdec = val(),
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
             "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
@@ -162,7 +165,8 @@ impl Sink {
             }),
             now_us: 0,
             dec: o.decode.then(|| {
-                decode::AvDecoder::open(0).unwrap_or_else(|e| die(&format!("decode: {e}")))
+                decode::AvDecoder::open_or_sw(0, &o.hwdec)
+                    .unwrap_or_else(|e| die(&format!("decode: {e}")))
             }),
             aus: 0,
             truncated: 0,
@@ -524,7 +528,7 @@ fn replay(o: Opts) {
     );
     if let Some(d) = sink.dec.as_ref() {
         let (f, e) = decode::Decoder::counters(d);
-        println!("decode frames={f} errors={e}");
+        println!("decode frames={f} errors={e} hw_frames={}", d.hw_frames());
     }
     println!("stats {}", core.stats_json());
 }

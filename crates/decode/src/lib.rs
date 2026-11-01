@@ -1,7 +1,8 @@
 //! Video decode (spec 5.3 `decode`). Linux backend: libavcodec HEVC through
 //! a C shim (`cpp/dec.c`), low delay, slice threads, one AU in, newest frame
-//! out. The Android MediaCodec backend lands with the phone app.
-use std::ffi::{c_char, c_int, CStr};
+//! out, optionally through a libavcodec hwaccel (`open_hw`). The Android
+//! MediaCodec backend lands with the phone app.
+use std::ffi::{c_char, c_int, CStr, CString};
 
 #[repr(C)]
 struct RawDec {
@@ -9,7 +10,13 @@ struct RawDec {
 }
 
 extern "C" {
-    fn pal_dec_new(threads: c_int, err: *mut c_char, cap: usize) -> *mut RawDec;
+    fn pal_dec_new_hw(
+        threads: c_int,
+        hw: *const c_char,
+        err: *mut c_char,
+        cap: usize,
+    ) -> *mut RawDec;
+    fn pal_dec_hw_frames(d: *const RawDec) -> c_int;
     fn pal_dec_free(d: *mut RawDec);
     fn pal_dec_send(d: *mut RawDec, au: *const u8, n: usize) -> c_int;
     fn pal_dec_size(d: *const RawDec, w: *mut c_int, h: *mut c_int) -> c_int;
@@ -37,13 +44,34 @@ unsafe impl Send for AvDecoder {}
 impl AvDecoder {
     /// `threads`: slice threads, 0 = libavcodec's choice.
     pub fn open(threads: i32) -> Result<Self, String> {
+        Self::open_hw(threads, "")
+    }
+    /// `hw`: an av_hwdevice type ("vaapi", "vdpau", "cuda", ...), "" for
+    /// software. Errs when that device cannot be opened; a stream the
+    /// hwaccel refuses later decodes in software (see `hw_frames`).
+    pub fn open_hw(threads: i32, hw: &str) -> Result<Self, String> {
+        let hw = CString::new(hw).map_err(|_| "hwaccel name has a NUL".to_string())?;
         let mut err = [0 as c_char; 256];
-        let raw = unsafe { pal_dec_new(threads, err.as_mut_ptr(), err.len()) };
+        let raw = unsafe { pal_dec_new_hw(threads, hw.as_ptr(), err.as_mut_ptr(), err.len()) };
         if raw.is_null() {
             let msg = unsafe { CStr::from_ptr(err.as_ptr()) };
             return Err(msg.to_string_lossy().into_owned());
         }
         Ok(Self { raw })
+    }
+    /// Frames that came out as hardware surfaces.
+    pub fn hw_frames(&self) -> u64 {
+        unsafe { pal_dec_hw_frames(self.raw) as u64 }
+    }
+    /// `open_hw(hw)` if it opens, else software with a note on stderr.
+    pub fn open_or_sw(threads: i32, hw: &str) -> Result<Self, String> {
+        if hw.is_empty() {
+            return Self::open(threads);
+        }
+        Self::open_hw(threads, hw).or_else(|e| {
+            eprintln!("decode: {hw}: {e}; software decode");
+            Self::open(threads)
+        })
     }
 }
 
