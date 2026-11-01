@@ -2,7 +2,7 @@
 
 Status: Draft 2, 2026-10-31 (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
 The name is a choice, not decoration: the word is the 2022 shibboleth used to tell a Russian speaker from a Ukrainian one, and no Russian military unit will want it on a ground station.
-Paths like `exp-orig-backport/...` and `exp-mabur-fluke-pxp/...` refer to the devourer_stack workspace on the author's machine, where this draft was written.
+Paths like `exp-orig-backport/...`, `exp-mabur-fluke-pxp/...` and `devourer_stack/...` are on the author's machine, relative to `/mnt/sdb2/moved_from_ssd/home/ihor/build/drone/BUILD/devourer_stack/` (`devourer_stack/...` relative to its parent `BUILD/`); palianytsia itself is the sibling `BUILD/palianytsia`. Verified 2026-11-01: `exp-mabur-fluke-pxp/pixelpilot` is at e2d0c90, `exp-orig-backport/pixelpilot` at 33978f8, `devourer_stack/openipc-rs` at v0.1.40+1.
 Home: `vertexodessa/palianytsia`, a **private** GitHub repo (not OpenIPC, not this workspace). The mabur and devourer forks it pins stay public.
 
 Sources read for this draft:
