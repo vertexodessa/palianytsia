@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod cal;
 pub mod crc16;
 pub mod dot11;
 pub mod frame_wire;
