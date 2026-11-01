@@ -12,6 +12,8 @@ use pal_core::refresh::IdrDriver;
 use pal_core::{Au, CoreIo, GsCore, RxBody};
 use pal_wire::dot11;
 
+pub mod dev_card;
+
 /// Core tick period.
 pub const TICK_US: u64 = 2000;
 

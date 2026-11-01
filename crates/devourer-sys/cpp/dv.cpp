@@ -192,6 +192,103 @@ extern "C" int dv_set_channel(dv_card *c, uint8_t ch, uint8_t width_mhz) try {
   return -1;
 }
 
+namespace {
+void put_energy(const RxEnergy &e, dv_energy *o) {
+  o->valid_fa = e.valid_fa;
+  o->valid_igi = e.valid_igi;
+  o->valid_nhm = e.valid_nhm;
+  o->valid_floor = e.valid_noise_floor;
+  o->cca_ofdm = e.cca_ofdm;
+  o->fa_ofdm = e.fa_ofdm;
+  o->igi = e.igi;
+  o->floor_dbm = e.abs_noise_floor_dbm;
+}
+}  // namespace
+
+extern "C" int dv_get_caps(dv_card *c, dv_caps *o) try {
+  if (!c || !c->dev || !o) return -1;
+  *o = dv_caps{};
+  const devourer::AdapterCaps ac = c->dev->GetAdapterCaps();
+  o->supported = ac.supported;
+  std::snprintf(o->chip, sizeof o->chip, "%s", (ac.chip_name && *ac.chip_name) ? ac.chip_name : "?");
+  const char *gen = devourer::generation_name(ac.generation);
+  std::snprintf(o->gen, sizeof o->gen, "%s", (gen && *gen) ? gen : "?");
+  o->tx_chains = ac.tx_chains;
+  o->rx_chains = ac.rx_chains;
+  o->bw_mask = ac.bw_mask;
+  o->tune5g_lo = ac.tune_5g.valid ? ac.tune_5g.min_mhz : 0;
+  o->tune5g_hi = ac.tune_5g.valid ? ac.tune_5g.max_mhz : 0;
+  o->fast_retune = ac.fastretune_ok;
+  return 0;
+} catch (...) {
+  return -1;
+}
+
+extern "C" int dv_rx_energy(dv_card *c, int with_nhm, dv_energy *o) try {
+  if (!c || !c->dev || !o) return -1;
+  put_energy(c->dev->GetRxEnergy(with_nhm != 0), o);
+  return 0;
+} catch (...) {
+  return -1;
+}
+
+extern "C" int dv_rx_energy_scout(dv_card *c, dv_energy *o) try {
+  if (!c || !c->dev || !o) return -1;
+  put_energy(c->dev->GetRxEnergyScout(), o);
+  return 0;
+} catch (...) {
+  return -1;
+}
+
+extern "C" int dv_fast_retune(dv_card *c, uint8_t ch) try {
+  if (!c || !c->dev) return -1;
+  c->dev->FastRetune(ch, /*cache_rf=*/true);
+  return 0;
+} catch (...) {
+  return -1;
+}
+
+extern "C" int dv_set_monitor(dv_card *c, uint8_t ch, uint8_t width_mhz) try {
+  if (!c || !c->dev) return -1;
+  const uint8_t w = width_mhz == 40 ? 40 : 20;
+  const uint8_t off = w == 40 ? ht40_offset(ch) : 0;
+  if (w == 40 && off == 0) return -2;
+  c->dev->SetMonitorChannel(w == 40 ? SelectedChannel{ch, off, CHANNEL_WIDTH_40}
+                                    : SelectedChannel{ch, 0, CHANNEL_WIDTH_20});
+  c->width = w;
+  c->offset = off;
+  return 0;
+} catch (...) {
+  return -1;
+}
+
+extern "C" int dv_tuned_central(dv_card *c) try {
+  if (!c || !c->dev) return -1;
+  return c->dev->ReadTunedCentral();
+} catch (...) {
+  return -1;
+}
+
+extern "C" int dv_arm_nhm_busy(dv_card *c, uint16_t period_4us) try {
+  if (!c || !c->dev) return 0;
+  return c->dev->ArmNhmBusy(period_4us) ? 1 : 0;
+} catch (...) {
+  return 0;
+}
+
+extern "C" int dv_read_nhm_busy(dv_card *c, dv_nhm *o) try {
+  if (!c || !c->dev || !o) return -1;
+  *o = dv_nhm{};
+  const NhmBusy b = c->dev->ReadNhmBusy();
+  o->valid = b.valid;
+  for (int i = 0; i < 12; ++i) o->buckets[i] = b.buckets[i];
+  o->duration = b.duration;
+  o->period = b.period;
+  return 0;
+} catch (...) {
+  return -1;
+}
+
 extern "C" void *dv_radio(dv_card *c) { return c ? c->dev.get() : nullptr; }
 
 extern "C" const char *dv_chip(const dv_card *c) {

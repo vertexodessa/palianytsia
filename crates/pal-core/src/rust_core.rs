@@ -1,9 +1,23 @@
 //! The Rust receive core, wired as mabur's WebGs wires it (`web/src/web_gs.cpp`):
 //! Aggregator -> UepDecoder -> FrameStream -> Au, and in GS mode the control
 //! side: rendezvous, ladder, RCF slotting, NACK, the MAVLink tunnel and the
-//! parameter client. No ChannelCore: pal drives one card, like a page with
-//! no roster.
+//! parameter client. With cards (`with_cards`, live) the GS also runs the
+//! channel core (search, boot pick, relocation, in-flight hops) and sends
+//! through the cards; without them (replay, the parity gates) it is a page
+//! with no roster and sends through `CoreIo`.
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use crate::aggregator::{Aggregator, Route};
+use crate::chan::core::{
+    ChannelCore, ChannelCoreCfg, ChannelSink, ChannelTickIn, MsClock, Sleeper, UsClock,
+};
+use crate::chan::hop::HopEvent;
+use crate::chan::plan::MoveEvent;
+use crate::chan::radio::LinkCard;
+use crate::chan::ranker::RankEntry;
+use crate::chan::scout::ScoutDwell;
+use crate::chan::verdict::{VerdictCardIn, VerdictLinkIn, VerdictOut};
 use crate::config::Config;
 use crate::frame_stream::{AuLat, FragArrival, FrameOut, FrameStream, FrameStreamCfg};
 use crate::gap::{DroneRestartDetector, GapTimeoutPolicy};
@@ -79,6 +93,10 @@ impl FrameOut for AuOut<'_> {
         self.cur.data.extend_from_slice(b);
     }
     fn end(&mut self, complete: bool, lat: &AuLat) {
+        // Every AU end, clean or truncated (in-flight scout alignment).
+        if let Some(c) = self.gs.as_deref().and_then(|g| g.chan.as_ref()) {
+            c.note_au_end();
+        }
         self.cur.complete = complete;
         self.cur.salvaged = !complete && lat.slice.salvaged;
         self.cur.skipped_before = lat.skipped_before;
@@ -136,16 +154,36 @@ struct Gs {
     key: rc::LinkKey,
     sends: u64,
     rcf_sent: u64,
+    /// Live cards; empty = send through `CoreIo`.
+    cards: Vec<Arc<dyn LinkCard>>,
+    chan: Option<ChannelCore>,
 }
 
 impl Gs {
+    /// WebGs::send_: false = the scout gate dropped it (counted by the core).
     fn send(&mut self, f: &SlotFrame, now_us: u64, io: &mut dyn CoreIo) -> bool {
-        io.send(&f.frame);
+        if self
+            .chan
+            .as_ref()
+            .is_some_and(|c| !c.may_send(f.card as usize))
+        {
+            return false;
+        }
+        let ok = match self.cards.get(f.card as usize) {
+            Some(c) => c.send_control(&f.frame),
+            None => {
+                io.send(&f.frame);
+                true
+            }
+        };
         self.sends += 1;
         if f.stamp_rtt {
             self.rcf_sent += 1;
             self.rtt.on_rcf_sent(f.seq, now_us);
             self.uplink.on_rcf_sent(now_us / 1000);
+        }
+        if let Some(c) = self.chan.as_mut() {
+            c.note_sent(ok, f.stamp_rtt);
         }
         true
     }
@@ -194,6 +232,34 @@ pub struct RustCore {
     telem_rx_us: u64,
     channel: u8,
     idr_req: u32,
+    /// The channel core's remembered-channel store (0 = none yet).
+    stored_ch: Arc<AtomicU8>,
+}
+
+/// What `with_cards` needs beyond the config: the cards and the channel
+/// core's clock (real time when threaded; the tick clock otherwise).
+pub struct ChanEnv {
+    pub cards: Vec<Arc<dyn LinkCard>>,
+    pub now_ms: MsClock,
+    pub now_us: UsClock,
+    pub sleep: Sleeper,
+    /// WebGs Opts::core_threads: the scout and in-flight threads.
+    pub threaded: bool,
+}
+
+/// WebGs's ChannelSink: the stderr lines go out, the scan.log records
+/// have no home here.
+struct LogSink;
+
+impl ChannelSink for LogSink {
+    fn dwell(&mut self, _: f64, _: usize, _: &ScoutDwell) {}
+    fn pick(&mut self, _: f64, _: Option<u8>, _: u64, _: &[RankEntry], _: i32) {}
+    fn moved(&mut self, _: &MoveEvent) {}
+    fn verdict(&mut self, _: f64, _: &VerdictOut, _: &[VerdictCardIn], _: &VerdictLinkIn) {}
+    fn hop(&mut self, _: &HopEvent) {}
+    fn log(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
 }
 
 macro_rules! au_out {
@@ -211,6 +277,22 @@ macro_rules! au_out {
 
 impl RustCore {
     pub fn new(cfg: &Config, opts: RustOpts) -> Result<Self, String> {
+        Self::build(cfg, opts, None)
+    }
+
+    /// A GS that drives `env.cards` (WebGs with a roster): `opts.channel`
+    /// is the start channel (the card's), Mode::Gs.
+    pub fn with_cards(cfg: &Config, opts: RustOpts, env: ChanEnv) -> Result<Self, String> {
+        if opts.mode != Mode::Gs {
+            return Err("cards need Mode::Gs".into());
+        }
+        if env.cards.is_empty() {
+            return Err("with_cards needs a card".into());
+        }
+        Self::build(cfg, opts, Some(env))
+    }
+
+    fn build(cfg: &Config, opts: RustOpts, env: Option<ChanEnv>) -> Result<Self, String> {
         let layers = cfg.uep_layers();
         let ch = if opts.channel != 0 {
             opts.channel
@@ -255,8 +337,38 @@ impl RustCore {
                 key: cfg.link.key,
                 sends: 0,
                 rcf_sent: 0,
+                cards: Vec::new(),
+                chan: None,
             }
         });
+        let stored_ch = Arc::new(AtomicU8::new(0));
+        let mut gs = gs;
+        if let (Some(g), Some(env)) = (gs.as_mut(), env) {
+            let cc = ChannelCoreCfg {
+                radio: cfg.radio.clone(),
+                hop: cfg.hop.clone(),
+                key: cfg.link.key,
+                start_ch: ch,
+                // As maburgs (bench row 7, docs/channel-select.md).
+                leak_per_frame: 1.0,
+                threaded: env.threaded,
+                store_name: "CHANNEL line".into(),
+            };
+            let st = stored_ch.clone();
+            g.chan = Some(ChannelCore::new(
+                cc,
+                env.cards.clone(),
+                Box::new(LogSink),
+                Box::new(move |c| {
+                    st.store(c, Ordering::Relaxed);
+                    true
+                }),
+                env.now_ms,
+                env.now_us,
+                env.sleep,
+            ));
+            g.cards = env.cards;
+        }
         Ok(Self {
             mode: opts.mode,
             opts,
@@ -293,7 +405,13 @@ impl RustCore {
             telem_rx_us: 0,
             channel: ch,
             idr_req: 0,
+            stored_ch,
         })
+    }
+
+    /// The channel the channel core last asked to remember.
+    pub fn stored_channel(&self) -> Option<u8> {
+        Some(self.stored_ch.load(Ordering::Relaxed)).filter(|&c| c != 0)
     }
 
     fn reset_video(&mut self, io: &mut dyn CoreIo) {
@@ -350,7 +468,20 @@ impl RustCore {
             return;
         }
         if let Some(g) = self.gs.as_mut() {
+            let was_session = g.vrx.link_state() == VrxState::Session;
             g.vrx.on_rc_frame(body, us as f64 / 1000.0);
+            // The ack that OPENED the session links where it was heard
+            // (on_rc_body handed the core its rx channel).
+            if let Some(c) = g.chan.as_mut() {
+                if !was_session
+                    && g.vrx.link_state() == VrxState::Session
+                    && ft == Some(rc::T_DISC_ACK)
+                {
+                    if let Some(ack) = rc::parse_disc_ack(body) {
+                        c.on_session_opened(&ack, us as f64 / 1000.0, &mut g.vrx);
+                    }
+                }
+            }
         }
     }
 
@@ -407,8 +538,11 @@ impl RustCore {
                 offered_ms: now_ms,
                 ..SlotFrame::default()
             };
-            n.sent += 1;
-            g.send(&sf, *now_us, io);
+            if g.send(&sf, *now_us, io) {
+                if let Some(n) = g.nack.as_mut() {
+                    n.sent += 1;
+                }
+            }
         }
     }
 
@@ -477,6 +611,10 @@ impl GsCore for RustCore {
     fn on_rx(&mut self, m: &RxBody, io: &mut dyn CoreIo) {
         self.now_us = self.now_us.max(m.mono_us);
         self.c.bodies += 1;
+        // Before the aggregator routes it: the rc path reads it.
+        if let Some(c) = self.gs.as_mut().and_then(|g| g.chan.as_mut()) {
+            c.on_rc_body(m.rx_channel);
+        }
         match self.agg.on_rx_body(m) {
             Route::Rc => self.on_rc(&m.body, m.mono_us, io),
             Route::Probe => {
@@ -516,8 +654,18 @@ impl GsCore for RustCore {
             && sid != Some(sbi::MSP_STREAM_ID)
             && sid != Some(sbi::PROBE_STREAM_ID);
         if let (true, Some(g)) = (is_video, self.gs.as_mut()) {
-            // Only real video refreshes the rendezvous silence timer.
-            g.vrx.on_video(m.mono_us as f64 / 1000.0);
+            // Only real video heard where the link lives refreshes the
+            // rendezvous silence timer (ChannelPlan::is_link_video).
+            if g.chan
+                .as_ref()
+                .is_none_or(|c| c.is_link_video(m.rx_channel))
+            {
+                g.vrx.on_video(m.mono_us as f64 / 1000.0);
+            }
+            // Hop confirmation reads the stamp.
+            if let Some(c) = g.chan.as_mut() {
+                c.note_video(m.rx_channel);
+            }
         }
     }
 
@@ -531,6 +679,20 @@ impl GsCore for RustCore {
                 self.gap
                     .update(s, d.newest_seq(s), d.repair_window(s), now_ms);
                 self.fs.set_gap_timeout(s, self.gap.timeout_ms(s));
+            }
+        }
+        if let Some(g) = self.gs.as_mut() {
+            if let Some(c) = g.chan.as_mut() {
+                // maburgs main.cpp's per-tick block; one TX card, card 0
+                // (no TxSelector, no calibration).
+                let cin = ChannelTickIn {
+                    now_ms: now_ms as f64,
+                    in_session: g.vrx.link_state() == VrxState::Session,
+                    tx_card: 0,
+                    agg: Some(&self.agg),
+                };
+                c.tick(&cin, &mut g.vrx);
+                c.note_tx_card(0);
             }
         }
         if let Some(g) = self.gs.as_ref() {
@@ -599,16 +761,29 @@ impl GsCore for RustCore {
                 if !out.is_disc {
                     self.lha.on_step_sent(&self.agg);
                 }
-                // rcf_seq() IS this frame's seq; DISCs are not matchable RTT sends.
-                let mut sf = SlotFrame {
-                    frame: out.frame,
-                    seq: g.vrx.rcf_seq(),
-                    card: 0,
-                    stamp_rtt: !out.is_disc,
-                    ..SlotFrame::default()
+                // A DISC follows the scout (the core's disc targets); an RCF
+                // goes to card 0. rcf_seq() IS this frame's seq; DISCs are
+                // not matchable RTT sends.
+                let targets = match (&g.chan, out.is_disc) {
+                    (Some(c), true) => c.disc_targets(0),
+                    _ => vec![0],
                 };
-                if !g.slot.offer(&mut sf, now_ms, false) {
-                    g.send(&sf, now_us, io);
+                for t in targets {
+                    let frame = match (&g.chan, out.is_disc) {
+                        // A DISC proposes the channel it is sent on.
+                        (Some(c), true) => c.disc_for_card(&out.frame, t),
+                        _ => out.frame.clone(),
+                    };
+                    let mut sf = SlotFrame {
+                        frame,
+                        seq: g.vrx.rcf_seq(),
+                        card: t as i32,
+                        stamp_rtt: !out.is_disc,
+                        ..SlotFrame::default()
+                    };
+                    if !g.slot.offer(&mut sf, now_ms, false) {
+                        g.send(&sf, now_us, io);
+                    }
                 }
             }
             for f in g.slot.take_due(now_ms) {
@@ -684,8 +859,8 @@ impl GsCore for RustCore {
         }
     }
 
-    /// WebGs::stats() + webgs::stats_json, key for key (no channel core,
-    /// no spotter follow, no MSP sink: those fields are null or 0).
+    /// WebGs::stats() + webgs::stats_json, key for key (no spotter follow,
+    /// no MSP sink: those fields are null or 0).
     fn stats_json(&self) -> String {
         let g = self.gs.as_ref();
         let mut j = J::obj();
@@ -711,15 +886,38 @@ impl GsCore for RustCore {
         );
         j.set("key_mismatch", g.is_some_and(|g| g.vrx.key_mismatch()));
         j.set("key_fp", self.key_fp.as_str());
-        j.set("channel", i64::from(self.channel));
-        for k in [
-            "scan_state",
-            "scan_rounds",
-            "scan_pick",
-            "hop",
-            "follow_state",
-            "follows",
-        ] {
+        let channel = g
+            .and_then(|g| g.cards.first())
+            .map_or(self.channel, |c| c.channel());
+        j.set("channel", i64::from(channel));
+        match g.and_then(|g| g.chan.as_ref()) {
+            Some(c) => {
+                let cs = c.snapshot(0);
+                j.set("scan_state", cs.scan_state);
+                j.set("scan_rounds", cs.scan_rounds);
+                j.set("scan_pick", cs.scan_pick.map(i64::from));
+                let hp = &cs.hop;
+                let mut h = J::obj();
+                h.set("verdict", hp.verdict);
+                h.set("evidence", i64::from(hp.evidence));
+                h.set("ref_rung", hp.ref_rung);
+                h.set("epoch", i64::from(hp.epoch));
+                h.set("state", hp.state);
+                h.set("target", hp.target.map(i64::from));
+                h.set("hops", hp.hops);
+                h.set("holds", hp.holds);
+                h.set("last_ms", hp.last_ms);
+                // Relay sweeps only; Palianytsia has no relays.
+                h.set("sweep_timeouts", 0u64);
+                j.set("hop", h);
+            }
+            None => {
+                for k in ["scan_state", "scan_rounds", "scan_pick", "hop"] {
+                    j.set(k, J::Null);
+                }
+            }
+        }
+        for k in ["follow_state", "follows"] {
             j.set(k, J::Null);
         }
         let pre = self.lha.pre_all;
@@ -883,4 +1081,144 @@ fn params_json(pc: Option<&ParamClient>, now_ms: u64) -> String {
     }
     j.set("rows", rows);
     j.dump()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chan::fake::{FakeCard, FakeClock};
+    use crate::config::load_config;
+    use std::path::Path;
+
+    fn bundle() -> Config {
+        let mut c = load_config(
+            Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../third_party/mabur/gs/bundle/maburgs.default.toml"
+            )),
+            None,
+        )
+        .unwrap();
+        c.radio.channels = vec![40, 64, 112, 144];
+        c
+    }
+
+    #[derive(Default)]
+    struct Io {
+        sent: usize,
+    }
+    impl CoreIo for Io {
+        fn on_au(&mut self, _: Au) {}
+        fn send(&mut self, _: &[u8]) {
+            self.sent += 1;
+        }
+    }
+
+    fn opts(ch: u8) -> RustOpts {
+        RustOpts {
+            mode: Mode::Gs,
+            channel: ch,
+            ..RustOpts::default()
+        }
+    }
+
+    fn env(card: &Arc<FakeCard>, clk: &FakeClock) -> ChanEnv {
+        let (c1, c2, c3) = (clk.clone(), clk.clone(), clk.clone());
+        ChanEnv {
+            cards: vec![card.clone() as Arc<dyn LinkCard>],
+            now_ms: Arc::new(move || c1.ms()),
+            now_us: Arc::new(move || c2.ms() * 1000),
+            sleep: Arc::new(move |ms| c3.advance(ms as u64)),
+            threaded: false,
+        }
+    }
+
+    /// In session (the search no longer owns the card) the RCFs leave
+    /// through the card, none through CoreIo.
+    #[test]
+    fn with_cards_sends_through_the_card() {
+        let mut cfg = bundle();
+        cfg.radio.pin = Some(64);
+        let clk = FakeClock::default();
+        clk.set(1000);
+        let card = FakeCard::new(clk.clone(), 64);
+        let mut core = RustCore::with_cards(&cfg, opts(64), env(&card, &clk)).unwrap();
+        let mut io = Io::default();
+        core.tick(clk.ms() * 1000, &mut io);
+        core.inject_disc_ack_for_replay(clk.ms() * 1000);
+        for _ in 0..500 {
+            clk.advance(2);
+            core.tick(clk.ms() * 1000, &mut io);
+        }
+        assert_eq!(io.sent, 0);
+        let sent = card.s().sent.clone();
+        let g = core.gs.as_ref().unwrap();
+        assert!(g.rcf_sent > 0, "no RCF went out");
+        assert_eq!(sent.len() as u64, g.sends);
+        let rcfs = sent
+            .iter()
+            .filter(|f| rc::frame_type(f) == Some(rc::T_RCF))
+            .count();
+        assert_eq!(rcfs as u64, g.rcf_sent);
+        let j = core.stats_json();
+        assert!(j.contains("\"hop\":{"), "{j}");
+        assert!(j.contains("\"channel\":64"), "{j}");
+    }
+
+    /// Auto: the search runs on the card and the stats line reports it.
+    #[test]
+    fn with_cards_reports_the_search() {
+        let cfg = bundle();
+        let clk = FakeClock::default();
+        clk.set(1000);
+        let card = FakeCard::new(clk.clone(), 40);
+        let mut core = RustCore::with_cards(&cfg, opts(40), env(&card, &clk)).unwrap();
+        let mut io = Io::default();
+        // Unthreaded, the scout's dwells sleep inside tick (the clock jumps
+        // with them): a few hundred ticks cover the boot pick and beyond.
+        for _ in 0..300 {
+            clk.advance(2);
+            core.tick(clk.ms() * 1000, &mut io);
+        }
+        assert_eq!(io.sent, 0);
+        assert!(card.calls().iter().any(|c| c.starts_with("retune")));
+        let j = core.stats_json();
+        assert!(j.contains("\"scan_pick\":40"), "{j}");
+        assert!(j.contains("\"hop\":{"), "{j}");
+    }
+
+    #[test]
+    fn without_cards_the_search_fields_stay_null() {
+        let mut core = RustCore::new(&bundle(), opts(40)).unwrap();
+        let mut io = Io::default();
+        for t in 0..500u64 {
+            core.tick(1_000_000 + t * 2000, &mut io);
+        }
+        assert!(io.sent > 0, "the DISC goes out through CoreIo");
+        let j = core.stats_json();
+        assert!(j.contains("\"scan_state\":null"), "{j}");
+        assert!(j.contains("\"hop\":null"), "{j}");
+    }
+
+    #[test]
+    fn with_cards_refuses_a_spotter_and_no_cards() {
+        let clk = FakeClock::default();
+        let mk = |cards: Vec<Arc<dyn LinkCard>>| {
+            let (a, b) = (clk.clone(), clk.clone());
+            ChanEnv {
+                cards,
+                now_ms: Arc::new(move || a.ms()),
+                now_us: Arc::new(move || b.ms() * 1000),
+                sleep: Arc::new(|_| {}),
+                threaded: false,
+            }
+        };
+        let spot = RustOpts {
+            mode: Mode::Spotter,
+            ..opts(40)
+        };
+        let card = FakeCard::new(clk.clone(), 40) as Arc<dyn LinkCard>;
+        assert!(RustCore::with_cards(&bundle(), spot, mk(vec![card])).is_err());
+        assert!(RustCore::with_cards(&bundle(), opts(40), mk(vec![])).is_err());
+    }
 }

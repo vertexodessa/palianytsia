@@ -161,10 +161,11 @@ fn parse() -> Opts {
         let c = pal_core::config::load_config(cfg, None)
             .unwrap_or_else(|e| die(&format!("{}: {e}", cfg.display())));
         if o.ch == 0 && c.radio.pin.is_none() {
-            if o.rust {
+            // A GS runs the channel core on the card (either core); a Rust
+            // spotter, which has none, sweeps for the drone instead.
+            o.channel_core = o.mode == Some(Mode::Gs);
+            if o.rust && !o.channel_core {
                 o.search = c.radio.channels.clone();
-            } else {
-                o.channel_core = o.mode == Some(Mode::Gs);
             }
         }
         if o.ch == 0 {
@@ -745,11 +746,20 @@ fn main() {
                                         Ok(make_core(&o2, ch))
                                     })),
                                     attach: o.channel_core.then(|| {
-                                        pal_ref::live::channel_core(
-                                            o.config.clone().expect("config"),
-                                            o.ch,
-                                            o.width,
-                                        )
+                                        let p = o.config.clone().expect("config");
+                                        if o.rust {
+                                            let c = pal_core::config::load_config(&p, None)
+                                                .unwrap_or_else(|e| die(&e.to_string()));
+                                            let opts = RustOpts {
+                                                mode: Mode::Gs,
+                                                adaptive_gap: true,
+                                                rz_nonce: RZ_NONCE,
+                                                channel: o.ch,
+                                            };
+                                            runtime::dev_card::rust_channel_core(c, opts, o.width)
+                                        } else {
+                                            pal_ref::live::channel_core(p, o.ch, o.width)
+                                        }
                                     }),
                                 };
                                 let (ch, w) = (o.ch, o.width);

@@ -51,6 +51,44 @@ int dv_send_control(dv_card *c, const uint8_t *body, size_t len);
  * 40 MHz channel without a pair, -1 on a device error. A control-plane
  * call: never from the RX callback, never concurrent with a send. */
 int dv_set_channel(dv_card *c, uint8_t ch, uint8_t width_mhz);
+/* What the channel search reads (devourer RxEnergy / NhmBusy /
+ * AdapterCaps), for the Rust LinkCard. Control-plane calls like
+ * dv_set_channel: the caller serialises them with sends. */
+typedef struct {
+  uint8_t valid_fa, valid_igi, valid_nhm, valid_floor;
+  uint32_t cca_ofdm, fa_ofdm;
+  uint8_t igi;
+  int8_t floor_dbm;
+} dv_energy;
+
+typedef struct {
+  uint8_t valid;
+  uint8_t buckets[12];
+  uint16_t duration, period;
+} dv_nhm;
+
+typedef struct {
+  uint8_t supported;
+  char chip[32];
+  char gen[16];
+  int tx_chains, rx_chains;
+  uint8_t bw_mask;
+  uint16_t tune5g_lo, tune5g_hi; /* 0 = unknown */
+  uint8_t fast_retune;
+} dv_caps;
+
+int dv_get_caps(dv_card *c, dv_caps *out);
+/* GetRxEnergy(with_nhm) / GetRxEnergyScout (fa/cca since the last read). */
+int dv_rx_energy(dv_card *c, int with_nhm, dv_energy *out);
+int dv_rx_energy_scout(dv_card *c, dv_energy *out);
+/* FastRetune(ch, cache_rf): the RF switch only, width kept. */
+int dv_fast_retune(dv_card *c, uint8_t ch);
+/* The full SetMonitorChannel at ch / width_mhz; -2 for 40 MHz without a pair. */
+int dv_set_monitor(dv_card *c, uint8_t ch, uint8_t width_mhz);
+int dv_tuned_central(dv_card *c);
+int dv_arm_nhm_busy(dv_card *c, uint16_t period_4us);
+int dv_read_nhm_busy(dv_card *c, dv_nhm *out);
+
 /* The card's IRtlRadio (devourer), for C++ in the same binary that drives
  * the control plane itself (pal-ref's LinkCard). Valid until dv_close. */
 void *dv_radio(dv_card *c);
