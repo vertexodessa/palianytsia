@@ -62,6 +62,10 @@ pairing key.
   `~/.config/palianytsia/release-signing.properties` (key `~/.android/palianytsia-release.jks`, never in the
   repo; without it the APK is unsigned). v0.1 package: `dist/palianytsia-v0.1/` (drone maburd from mabur
   `release/v0.1` = `palianytsia/base` minus the bench `/sim` commit). `gs.toml` stays pinned for the parity gates.
+- Release desktop: `tools/ffmpeg-static.sh` once, then `PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release -p pal-desktop`
+  (HEVC + swscale linked in, no hwaccel; the system-FFmpeg build did not start on QA's machine). v0.2 package:
+  `dist/palianytsia-v0.2/` (maburd from mabur `release/v0.2` = `release/v0.1` + DISC width agreement 7c3e2cf9).
+- Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.
