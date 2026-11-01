@@ -705,9 +705,18 @@ impl ParamClient {
                     Some(idx) => match decode_wire(idx, pl[148], &pl[20..148]) {
                         None => self.stats.drop_bad += 1,
                         Some(v) => {
+                            // The drone sends the final ACCEPTED once; when
+                            // the air drops it, the re-read tick() sends
+                            // while InProgress finds the published value.
+                            let done = self.state.pending_row == Some(idx)
+                                && self.set_in_progress
+                                && self.set_value.as_ref() == Some(&v);
                             self.state.rows[idx].value = Some(v);
                             self.fresh[idx] = true;
                             changed = true;
+                            if done {
+                                self.accept_pending(idx, now);
+                            }
                             if matches!(self.state.list, ListState::Pending | ListState::Partial)
                                 && self.fresh.iter().all(|&f| f)
                             {
@@ -755,15 +764,22 @@ impl ParamClient {
                 }
                 self.state.rows[idx].st = RowState::InProgress;
             }
-            PARAM_ACK_ACCEPTED => {
-                terminal(self, RowState::Accepted);
-                if TABLE[idx].apply == Apply::Rebuild {
-                    self.begin_list(now);
-                }
-            }
+            PARAM_ACK_ACCEPTED => self.accept_pending(idx, now),
             PARAM_ACK_FAILED => terminal(self, RowState::Failed),
             PARAM_ACK_VALUE_UNSUPPORTED => terminal(self, RowState::Unsupported),
             _ => {}
+        }
+    }
+
+    fn accept_pending(&mut self, idx: usize, now: u64) {
+        let r = &mut self.state.rows[idx];
+        r.st = RowState::Accepted;
+        r.result_ms = now;
+        self.state.pending_row = None;
+        self.set_in_progress = false;
+        self.set_resends = 0;
+        if TABLE[idx].apply == Apply::Rebuild {
+            self.begin_list(now);
         }
     }
 
@@ -829,6 +845,11 @@ impl ParamClient {
                 if now >= self.set_deadline_ms {
                     self.timeout_pending(now);
                     changed = true;
+                } else if now.wrapping_sub(self.set_send_ms) >= SET_RETRY_MS {
+                    // The drone answers a read with the file as published,
+                    // so the requested value there means the apply succeeded.
+                    self.send_read_request(p);
+                    self.set_send_ms = now;
                 }
             } else if now.wrapping_sub(self.set_send_ms) >= SET_RETRY_MS {
                 if self.set_resends < SET_RETRIES {
@@ -952,6 +973,68 @@ mod tests {
         let m = rc::parse_mav(&f[0], true).expect("tagged");
         assert_eq!(m.counter, 1);
         assert_eq!(m.payload, pkt);
+    }
+
+    fn drone_pkt(msgid: u32, payload: &[u8]) -> Vec<u8> {
+        mavlink::pack_v2(msgid, DRONE_SYS, DRONE_COMP, 0, payload)
+    }
+    fn value_pkt(idx: usize, text: &str) -> Vec<u8> {
+        let mut p = [0u8; 149];
+        p[..2].copy_from_slice(&(COUNT as u16).to_le_bytes());
+        p[2..4].copy_from_slice(&(idx as u16).to_le_bytes());
+        let id = TABLE[idx].id.as_bytes();
+        p[4..4 + id.len()].copy_from_slice(id);
+        let v = parse_text(TABLE[idx].ty, text).expect("value");
+        p[20..148].copy_from_slice(&encode_wire(&v));
+        p[148] = mav_type(TABLE[idx].ty);
+        drone_pkt(MSG_PARAM_EXT_VALUE, &p)
+    }
+    fn ack_pkt(idx: usize, text: &str, result: u8) -> Vec<u8> {
+        let mut p = [0u8; 146];
+        let id = TABLE[idx].id.as_bytes();
+        p[..id.len()].copy_from_slice(id);
+        let v = parse_text(TABLE[idx].ty, text).expect("value");
+        p[16..144].copy_from_slice(&encode_wire(&v));
+        p[144] = mav_type(TABLE[idx].ty);
+        p[145] = result;
+        drone_pkt(MSG_PARAM_EXT_ACK, &p)
+    }
+
+    /// Mirrors the C++ lost_accepted_is_recovered_by_the_reread.
+    #[test]
+    fn lost_accepted_is_recovered_by_the_reread() {
+        let row = find(b"VENC_MODE\0\0\0\0\0\0\0").expect("row");
+        let mut pc = ParamClient::default();
+        pc.set_linked(true, 0);
+        pc.on_packet(&value_pkt(row, "90@1920x1080"), 10);
+        // Let the list run out its re-read rounds so only the set talks.
+        for t in [2000, 4000, 6000, 8000] {
+            pc.tick(t);
+        }
+        assert_eq!(pc.state().list, ListState::Partial);
+        let t0 = 10_000;
+        pc.set(row, "120@1280x720", t0).expect("set");
+        pc.on_packet(
+            &ack_pkt(row, "90@1920x1080", PARAM_ACK_IN_PROGRESS),
+            t0 + 100,
+        );
+        pc.take_out();
+        pc.tick(t0 + 1999);
+        assert!(pc.take_out().is_empty());
+        pc.tick(t0 + 2000);
+        let o = pc.take_out();
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0][7], 0x40); // PARAM_EXT_REQUEST_READ = 320
+        pc.on_packet(&value_pkt(row, "90@1920x1080"), t0 + 2050);
+        assert_eq!(pc.state().rows[row].st, RowState::InProgress);
+        pc.tick(t0 + 4000);
+        assert_eq!(pc.take_out().len(), 1);
+        pc.on_packet(&value_pkt(row, "120@1280x720"), t0 + 4050);
+        assert_eq!(pc.state().rows[row].st, RowState::Accepted);
+        assert_eq!(pc.state().rows[row].result_ms, t0 + 4050);
+        assert_eq!(pc.state().pending_row, None);
+        assert_eq!(pc.state().list, ListState::Pending);
+        assert_eq!(pc.stats().timeouts, 0);
     }
 
     #[test]
