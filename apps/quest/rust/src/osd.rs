@@ -143,6 +143,20 @@ impl Osd {
             }
             while let Ok(t) = l.ports.params_rx.try_recv() {
                 if let Some(t) = Table::parse(&t) {
+                    // Row state changes into logcat: a set that "hangs"
+                    // shows here whether the drone's answer arrived.
+                    for (i, r) in t.rows.iter().enumerate() {
+                        let old = self.table.as_ref().and_then(|o| o.rows.get(i));
+                        if old.is_none_or(|o| o.state != r.state || o.value != r.value) {
+                            log::info!(
+                                "param {} = {:?}: {} {}",
+                                r.id,
+                                r.value.as_deref().unwrap_or("-"),
+                                r.state,
+                                r.status
+                            );
+                        }
+                    }
                     self.table = Some(t);
                 }
             }

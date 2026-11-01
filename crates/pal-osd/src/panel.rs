@@ -91,16 +91,16 @@ fn step(id: &str) -> f64 {
     }
 }
 
-/// Choices for string rows on touch: the drone validates, so an unsupported
-/// mode comes back as a refusal rather than a broken camera.
+/// Choices for string rows on touch. VENC_MODE lists only what the quad's
+/// sensor driver offers at 16:9: its modes are 3840x2160@30,
+/// 2560x1440@60, 1920x1080@90 and 1472x816@120 (maburd's log, 2026-11-01),
+/// while maburd's mode table expects the waybeam IMX415 driver's
+/// 1728x972@100 and 1728x816@120, so every 100 and 120 fps set ends in
+/// "pipeline refused". 720p also needs venc.slices to divide its 12 CTU
+/// rows (1, 2, 3, 4, 6, 12).
 fn presets(id: &str) -> &'static [&'static str] {
     match id {
-        "VENC_MODE" => &[
-            "60@1920x1080",
-            "90@1920x1080",
-            "120@1920x1080",
-            "120@1280x720",
-        ],
+        "VENC_MODE" => &["60@1920x1080", "90@1920x1080", "60@1280x720", "90@1280x720"],
         "REC_SIZE" => &["1920x1080", "1280x720"],
         _ => &[],
     }
@@ -179,14 +179,24 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool)
                 }
             }
         }
-        if !r.state.is_empty() && r.state != "idle" {
-            let mut st = r.state.clone();
-            if !r.status.is_empty() {
-                st += &format!(": {}", r.status);
-            }
-            ui.label(RichText::new(st).small().color(state_color(&r.state)));
-        }
     });
+    // Below the controls, not beside them: a refusal reason is a sentence
+    // and a horizontal row clipped it to "does not fit sens".
+    if !r.state.is_empty() && r.state != "idle" {
+        // The drone says IN_PROGRESS once and its final answer can be lost
+        // on a lossy link; the client then waits FINAL_MS (15 s) before
+        // "timeout", which otherwise reads as a hang.
+        let mut st = match r.state.as_str() {
+            "in_progress" => "in progress: waiting for the drone's answer (up to 15 s)".to_string(),
+            "timeout" => "timeout: the drone's answer did not arrive; refresh shows the live value"
+                .to_string(),
+            s => s.to_string(),
+        };
+        if !r.status.is_empty() {
+            st += &format!(": {}", r.status);
+        }
+        ui.add(egui::Label::new(RichText::new(st).small().color(state_color(&r.state))).wrap());
+    }
     ui.add_space(6.0);
     cmd
 }

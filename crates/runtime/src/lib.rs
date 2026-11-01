@@ -186,6 +186,12 @@ impl CoreLoop {
                 pal_osd::params::Cmd::Set(row, text) => {
                     let r = self.core.param_set(row, &text);
                     eprintln!("pal: param set {row} {text:?}: {r:?}");
+                    // Android has no stderr: the flight log keeps it.
+                    self.sink.shared.event(
+                        "param_set",
+                        serde_json::json!({"row": row, "value": text,
+                            "result": match &r { Ok(()) => "sent".to_string(), Err(e) => e.clone() }}),
+                    );
                     let _ = self.set_res_tx.try_send((row, r));
                 }
                 pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
