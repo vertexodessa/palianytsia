@@ -12,6 +12,7 @@ status: `docs/spec.md`; read its M1/M2 status sections first).
 | `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle |
 | `crates/devourer-sys` | devourer through a C shim (USB cards) |
 | `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
+| `crates/runtime` | shared by the apps: devourer RX thread, core loop (`CoreLoop`: GsCore + IdrDriver + log + stats/params), `run_live` |
 | `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |
 | `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
 | `third_party/libusb` | upstream libusb v1.0.27, Android only (`tools/android-libusb.sh`; `tools/android-build.sh build -p <crate>` cross-builds for aarch64) |
