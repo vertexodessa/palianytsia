@@ -91,16 +91,22 @@ fn step(id: &str) -> f64 {
     }
 }
 
-/// Choices for string rows on touch. VENC_MODE lists only what the quad's
-/// sensor driver offers at 16:9: its modes are 3840x2160@30,
-/// 2560x1440@60, 1920x1080@90 and 1472x816@120 (maburd's log, 2026-11-01),
-/// while maburd's mode table expects the waybeam IMX415 driver's
-/// 1728x972@100 and 1728x816@120, so every 100 and 120 fps set ends in
-/// "pipeline refused". 720p also needs venc.slices to divide its 12 CTU
-/// rows (1, 2, 3, 4, 6, 12).
+/// Choices for string rows on touch. maburd picks the sensor mode from the
+/// driver's own list: the widest 2x2-binned mode that reaches the fps
+/// (1920x1080 up to 90; above it 1472x816 on OpenIPC's stock IMX415 driver,
+/// 1728x972 / 1728x816 on waybeam's). 1280x720 fits 1472x816 after a 1.5 %
+/// crop, but not waybeam's 2.12:1 120 fps mode, where the drone refuses it.
+/// 720p also needs venc.slices to divide its 12 CTU rows (1, 2, 3, 4, 6, 12).
 fn presets(id: &str) -> &'static [&'static str] {
     match id {
-        "VENC_MODE" => &["60@1920x1080", "90@1920x1080", "60@1280x720", "90@1280x720"],
+        "VENC_MODE" => &[
+            "60@1920x1080",
+            "90@1920x1080",
+            "60@1280x720",
+            "90@1280x720",
+            "100@1280x720",
+            "120@1280x720",
+        ],
         "REC_SIZE" => &["1920x1080", "1280x720"],
         _ => &[],
     }
