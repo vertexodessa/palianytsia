@@ -6,7 +6,13 @@
 //! Single-threaded by contract, like WebGs: `on_rx`, `tick` and `stats` from
 //! one thread, one clock (monotonic microseconds) for RX stamps and ticks.
 
+pub mod aggregator;
 pub mod config;
+pub mod frame_stream;
+pub mod gap;
+pub mod rust_core;
+pub mod slice_asm;
+pub mod uep;
 
 /// One received 802.11 body with its RX metadata. Mirrors
 /// `mabur::node::RxBody` field for field.

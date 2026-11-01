@@ -14,6 +14,7 @@
 //! Both use a fixed frame-gap timeout and a pinned rendezvous nonce so a
 //! replay of a capture reproduces the live run's AUs exactly.
 use flightlog::capture::{self, Record};
+use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_ref::{RefCore, RefOpts};
 use pal_wire::dot11;
@@ -38,6 +39,9 @@ struct Opts {
     dump: Option<PathBuf>,
     aus: Option<PathBuf>,
     mode: Option<Mode>,
+    rust: bool,
+    drop_pct: u32,
+    seed: u64,
     pos: Vec<PathBuf>,
 }
 
@@ -69,6 +73,15 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
                     "spotter" => Mode::Spotter,
                     m => die(&format!("--mode gs|spotter, got {m}")),
                 })
+            }
+            "--drop-pct" => o.drop_pct = val().parse().unwrap_or_else(|_| die("--drop-pct")),
+            "--seed" => o.seed = val().parse().unwrap_or_else(|_| die("--seed")),
+            "--core" => {
+                o.rust = match val().as_str() {
+                    "rust" => true,
+                    "ref" => false,
+                    c => die(&format!("--core rust|ref, got {c}")),
+                }
             }
             s if s.starts_with('-') => die(&format!("unknown flag {s}")),
             _ => o.pos.push(a.into()),
@@ -154,21 +167,37 @@ impl CoreIo for Sink {
     }
 }
 
-fn core(o: &Opts, channel: u8) -> RefCore {
+fn core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
     let cfg = o
         .config
         .clone()
         .unwrap_or_else(|| die("-c <gs.toml> is required"));
-    RefCore::new(
-        &cfg,
-        RefOpts {
-            mode: o.mode.unwrap_or(Mode::Spotter),
-            adaptive_gap: false,
-            rz_nonce: RZ_NONCE,
-            channel,
-        },
+    let mode = o.mode.unwrap_or(Mode::Spotter);
+    if o.rust {
+        let c = pal_core::config::load_config(&cfg, None).unwrap_or_else(|e| die(&e.to_string()));
+        return Box::new(
+            RustCore::new(
+                &c,
+                RustOpts {
+                    mode,
+                    adaptive_gap: false,
+                },
+            )
+            .unwrap_or_else(|e| die(&e)),
+        );
+    }
+    Box::new(
+        RefCore::new(
+            &cfg,
+            RefOpts {
+                mode,
+                adaptive_gap: false,
+                rz_nonce: RZ_NONCE,
+                channel,
+            },
+        )
+        .unwrap_or_else(|e| die(&format!("core: {e}"))),
     )
-    .unwrap_or_else(|e| die(&format!("core: {e}")))
 }
 
 /// Monotonic microseconds, the one clock for RX stamps and ticks.
@@ -333,10 +362,24 @@ fn replay(o: Opts) {
     let f = std::fs::File::open(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
     let r = capture::Reader::new(BufReader::with_capacity(1 << 20, f))
         .unwrap_or_else(|e| die(&e.to_string()));
-    let (mut bodies, mut ticks) = (0u64, 0u64);
+    let (mut bodies, mut ticks, mut dropped) = (0u64, 0u64, 0u64);
+    // Synthetic loss: splitmix64 on a fixed seed, so both cores see the
+    // same surviving bodies.
+    let mut rng = o.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut next = move || {
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
     for rec in r {
         match rec.unwrap_or_else(|e| die(&format!("capture: {e}"))) {
             Record::Body(b) => {
+                if o.drop_pct > 0 && (next() % 100) < u64::from(o.drop_pct) {
+                    dropped += 1;
+                    continue;
+                }
                 bodies += 1;
                 core.on_rx(&b, &mut sink);
             }
@@ -348,9 +391,10 @@ fn replay(o: Opts) {
     }
     sink.finish();
     println!(
-        "replay bodies={bodies} ticks={ticks} aus={} truncated={} au_bytes={}",
+        "replay bodies={bodies} dropped={dropped} ticks={ticks} aus={} truncated={} au_bytes={}",
         sink.aus, sink.truncated, sink.bytes
     );
+    println!("stats {}", core.stats_json());
 }
 
 fn main() {

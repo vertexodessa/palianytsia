@@ -517,11 +517,11 @@ impl Config {
 
 /// 0 = no standard HT40 pair; 1 = secondary above; 2 = below.
 pub fn ht40_offset(ch: u8) -> u8 {
-    if (36..=144).contains(&ch) && (ch - 36) % 4 == 0 {
-        return if ((ch - 36) / 4) % 2 == 0 { 1 } else { 2 };
+    if (36..=144).contains(&ch) && (ch - 36).is_multiple_of(4) {
+        return if ((ch - 36) / 4).is_multiple_of(2) { 1 } else { 2 };
     }
-    if (149..=161).contains(&ch) && (ch - 149) % 4 == 0 {
-        return if ((ch - 149) / 4) % 2 == 0 { 1 } else { 2 };
+    if (149..=161).contains(&ch) && (ch - 149).is_multiple_of(4) {
+        return if ((ch - 149) / 4).is_multiple_of(2) { 1 } else { 2 };
     }
     0
 }
@@ -691,7 +691,10 @@ fn channel_set_issue(set: &[u8], width: u8, field: &str) -> R<()> {
         for &ch in set {
             let off = ht40_offset(ch);
             if off == 0 {
-                return fail(field, &format!("channel {ch} has no 40 MHz pair (docs/bw40.md)"));
+                return fail(
+                    field,
+                    &format!("channel {ch} has no 40 MHz pair (docs/bw40.md)"),
+                );
             }
             if off != off0 {
                 return fail(
@@ -709,7 +712,10 @@ fn channel_set_issue(set: &[u8], width: u8, field: &str) -> R<()> {
 
 pub fn radio_width_issue(channel: u8, width: i32) -> Option<(String, String)> {
     if width != 20 && width != 40 {
-        return Some(("radio.width".into(), "must be 20 or 40 (HT20 / HT40)".into()));
+        return Some((
+            "radio.width".into(),
+            "must be 20 or 40 (HT20 / HT40)".into(),
+        ));
     }
     if width == 40 && ht40_offset(channel) == 0 {
         return Some((
@@ -730,7 +736,10 @@ pub fn link_width_issue(link: &LinkCfg, width: i32) -> Option<(String, String)> 
         }
     }
     if link.static_bw == 40 && width != 40 {
-        return Some(("link.static_bw".into(), "40 MHz pin but radio.width is 20".into()));
+        return Some((
+            "link.static_bw".into(),
+            "40 MHz pin but radio.width is 20".into(),
+        ));
     }
     None
 }
@@ -741,7 +750,8 @@ fn is_ipv4(s: &str) -> bool {
 
 pub fn load_config(path: &Path, overlay: Option<&Path>) -> R<Config> {
     let read = |p: &Path| -> R<Table> {
-        let text = std::fs::read_to_string(p).map_err(|e| ConfigError(format!("config: {}: {e}", p.display())))?;
+        let text = std::fs::read_to_string(p)
+            .map_err(|e| ConfigError(format!("config: {}: {e}", p.display())))?;
         text.parse::<Table>()
             .map_err(|e| ConfigError(format!("config: {}: {e}", p.display())))
     };
@@ -763,12 +773,29 @@ fn parse_config(j: &Table) -> R<Config> {
     check_keys(
         j,
         "",
-        &["radio", "fec", "link", "video", "msp", "stats", "au_ring", "debug_log", "hop", "mavlink"],
+        &[
+            "radio",
+            "fec",
+            "link",
+            "video",
+            "msp",
+            "stats",
+            "au_ring",
+            "debug_log",
+            "hop",
+            "mavlink",
+        ],
     )?;
     let mut c = Config::default();
     let mut cards_absent = false;
     if let Some(r) = section(j, "radio")? {
-        check_keys(r, "radio", &["channel", "channels", "width", "cards", "tx_card", "scan", "relays"])?;
+        check_keys(
+            r,
+            "radio",
+            &[
+                "channel", "channels", "width", "cards", "tx_card", "scan", "relays",
+            ],
+        )?;
         c.radio.width = get_int(r, "width", 20, 20, 40, "radio")? as u8;
         if let Some(v) = r.get("channels") {
             let Value::Array(a) = v else {
@@ -795,20 +822,34 @@ fn parse_config(j: &Table) -> R<Config> {
             None => {}
             Some(Value::String(s)) => {
                 if s != "auto" {
-                    return fail("radio.channel", "must be \"auto\" or a member of radio.channels");
+                    return fail(
+                        "radio.channel",
+                        "must be \"auto\" or a member of radio.channels",
+                    );
                 }
                 c.radio.pin = None;
             }
             Some(Value::Integer(ch)) => {
                 if !(1..=177).contains(ch) {
-                    return fail("radio.channel", &format!("{ch} is not a channel in [1,177]"));
+                    return fail(
+                        "radio.channel",
+                        &format!("{ch} is not a channel in [1,177]"),
+                    );
                 }
                 if !c.radio.channels.contains(&(*ch as u8)) {
-                    return fail("radio.channel", &format!("{ch} is not a member of radio.channels"));
+                    return fail(
+                        "radio.channel",
+                        &format!("{ch} is not a member of radio.channels"),
+                    );
                 }
                 c.radio.pin = Some(*ch as u8);
             }
-            Some(_) => return fail("radio.channel", "must be \"auto\" or a member of radio.channels"),
+            Some(_) => {
+                return fail(
+                    "radio.channel",
+                    "must be \"auto\" or a member of radio.channels",
+                )
+            }
         }
         c.radio.tx_card = get_i32(r, "tx_card", -1, -1, 15, "radio")?;
         if let Some(v) = r.get("relays") {
@@ -824,7 +865,10 @@ fn parse_config(j: &Table) -> R<Config> {
                     return fail(&w, "must be ipv4:port");
                 };
                 if !is_ipv4(&s[..colon]) {
-                    return fail(&w, "host must be a dotted IPv4 address (the UDP transport resolves nothing)");
+                    return fail(
+                        &w,
+                        "host must be a dotted IPv4 address (the UDP transport resolves nothing)",
+                    );
                 }
                 let port = &s[colon + 1..];
                 if port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()) {
@@ -899,7 +943,8 @@ fn parse_config(j: &Table) -> R<Config> {
     }
     let _ = cards_absent;
     c.radio.auto_scan = c.radio.cards.is_empty();
-    if !c.radio.auto_scan && c.radio.tx_card >= (c.radio.cards.len() + c.radio.relays.len()) as i32 {
+    if !c.radio.auto_scan && c.radio.tx_card >= (c.radio.cards.len() + c.radio.relays.len()) as i32
+    {
         return fail("radio.tx_card", "no such card");
     }
     if let Some(h) = section(j, "hop")? {
@@ -1110,7 +1155,15 @@ fn parse_config(j: &Table) -> R<Config> {
             check_keys(
                 p,
                 w,
-                &["enable", "rung_offset", "clean_bodies", "max_util", "min_syms", "silence_ms", "pin_mcs"],
+                &[
+                    "enable",
+                    "rung_offset",
+                    "clean_bodies",
+                    "max_util",
+                    "min_syms",
+                    "silence_ms",
+                    "pin_mcs",
+                ],
             )?;
             let pc = &mut lc.probe;
             pc.enable = get_bool(p, "enable", pc.enable, w)?;
@@ -1133,7 +1186,16 @@ fn parse_config(j: &Table) -> R<Config> {
             check_keys(
                 f,
                 w,
-                &["cascade", "predict", "hold_ms", "confirm_ms", "rssi_db", "snr_db", "trigger_ms", "min_rung"],
+                &[
+                    "cascade",
+                    "predict",
+                    "hold_ms",
+                    "confirm_ms",
+                    "rssi_db",
+                    "snr_db",
+                    "trigger_ms",
+                    "min_rung",
+                ],
             )?;
             let fc = &mut lc.fade;
             fc.cascade = get_bool(f, "cascade", fc.cascade, w)?;
@@ -1147,7 +1209,17 @@ fn parse_config(j: &Table) -> R<Config> {
         }
         if let Some(n) = section(r, "nack")? {
             let w = "link.nack";
-            check_keys(n, w, &["enable", "lookback", "repeat_ms", "max_tries", "min_lead_ms"])?;
+            check_keys(
+                n,
+                w,
+                &[
+                    "enable",
+                    "lookback",
+                    "repeat_ms",
+                    "max_tries",
+                    "min_lead_ms",
+                ],
+            )?;
             let nc = &mut l.nack;
             nc.enable = get_bool(n, "enable", nc.enable, w)?;
             nc.lookback = get_i32(n, "lookback", 256, 8, 4096, w)?;
@@ -1195,9 +1267,19 @@ fn parse_config(j: &Table) -> R<Config> {
         return fail(&f, &w);
     }
     if let Some(r) = section(j, "video")? {
-        check_keys(r, "video", &["frame_gap_timeout_ms", "frame_gap_timeout_max_ms", "frame_lookahead"])?;
-        c.video.frame_gap_timeout_ms = get_int(r, "frame_gap_timeout_ms", 50, 10, 1000, "video")? as u64;
-        c.video.frame_gap_timeout_max_ms = get_int(r, "frame_gap_timeout_max_ms", 150, 0, 400, "video")? as u64;
+        check_keys(
+            r,
+            "video",
+            &[
+                "frame_gap_timeout_ms",
+                "frame_gap_timeout_max_ms",
+                "frame_lookahead",
+            ],
+        )?;
+        c.video.frame_gap_timeout_ms =
+            get_int(r, "frame_gap_timeout_ms", 50, 10, 1000, "video")? as u64;
+        c.video.frame_gap_timeout_max_ms =
+            get_int(r, "frame_gap_timeout_max_ms", 150, 0, 400, "video")? as u64;
         c.video.frame_lookahead = get_int(r, "frame_lookahead", 8, 2, 64, "video")? as u64;
     }
     if let Some(r) = section(j, "msp")? {
@@ -1212,13 +1294,20 @@ fn parse_config(j: &Table) -> R<Config> {
         c.msp.window = get_int(r, "window", 16, 2, 255, "msp")? as usize;
     }
     if let Some(r) = section(j, "stats")? {
-        check_keys(r, "stats", &["enable", "host", "port", "interval_ms", "out"])?;
+        check_keys(
+            r,
+            "stats",
+            &["enable", "host", "port", "interval_ms", "out"],
+        )?;
         c.stats.enable = get_bool(r, "enable", c.stats.enable, "stats")?;
         c.stats.interval_ms = get_i32(r, "interval_ms", 500, 100, 10000, "stats")?;
         let legacy = r.contains_key("host") || r.contains_key("port");
         if let Some(v) = r.get("out") {
             if legacy {
-                return fail("stats.out", "cannot be combined with stats.host / stats.port");
+                return fail(
+                    "stats.out",
+                    "cannot be combined with stats.host / stats.port",
+                );
             }
             let Value::Array(a) = v else {
                 return fail("stats.out", "not an array");
@@ -1248,7 +1337,11 @@ fn parse_config(j: &Table) -> R<Config> {
         }
     }
     if let Some(r) = section(j, "au_ring")? {
-        check_keys(r, "au_ring", &["enable", "path", "socket", "slot_kb", "slot_count"])?;
+        check_keys(
+            r,
+            "au_ring",
+            &["enable", "path", "socket", "slot_kb", "slot_count"],
+        )?;
         let a = &mut c.au_ring;
         a.enable = get_bool(r, "enable", a.enable, "au_ring")?;
         a.path = get_str(r, "path", "/dev/shm/mabur-au", "au_ring")?;
@@ -1257,7 +1350,11 @@ fn parse_config(j: &Table) -> R<Config> {
         a.slot_count = get_i32(r, "slot_count", 16, 4, 256, "au_ring")?;
     }
     if let Some(r) = section(j, "debug_log")? {
-        check_keys(r, "debug_log", &["enable", "dir", "ctl_period_ms", "rung_period_s"])?;
+        check_keys(
+            r,
+            "debug_log",
+            &["enable", "dir", "ctl_period_ms", "rung_period_s"],
+        )?;
         let d = &mut c.debug_log;
         d.enable = get_bool(r, "enable", d.enable, "debug_log")?;
         d.dir = get_str(r, "dir", "/media/dvr/log", "debug_log")?;
@@ -1284,7 +1381,9 @@ mod tests {
     use super::*;
 
     fn repo(p: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(p)
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(p)
     }
 
     #[test]
@@ -1292,7 +1391,11 @@ mod tests {
         let c = load_config(&repo("configs/gs.toml"), None).unwrap();
         assert_eq!(c.radio.pin, Some(144));
         assert_eq!(c.radio.width, 40);
-        let m = load_config(&repo("third_party/mabur/gs/bundle/maburgs.default.toml"), None).unwrap();
+        let m = load_config(
+            &repo("third_party/mabur/gs/bundle/maburgs.default.toml"),
+            None,
+        )
+        .unwrap();
         assert!(m.link.ladder_cfg.ladder.len() >= 2);
         assert_eq!(m.uep_layers()[0].window, 128);
     }
@@ -1309,7 +1412,10 @@ mod tests {
 
     #[test]
     fn ht40_table() {
-        assert_eq!((ht40_offset(36), ht40_offset(40), ht40_offset(144)), (1, 2, 2));
+        assert_eq!(
+            (ht40_offset(36), ht40_offset(40), ht40_offset(144)),
+            (1, 2, 2)
+        );
         assert_eq!((ht40_offset(149), ht40_offset(165)), (1, 0));
         assert_eq!((ht40_pair_other(136), ht40_pair_other(165)), (132, 0));
     }

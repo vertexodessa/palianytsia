@@ -4,7 +4,11 @@
 //! wrapper end to end.
 //!
 //! usage: pal-ref-replay <frames.bin> <out.aus> -c <gs.toml> [--mode gs|spotter]
-//!        [--drop-pct N] [--seed N] [--fixed-gap] [--fake-ack]
+//!        [--drop-pct N] [--seed N] [--fixed-gap] [--fake-ack] [--core ref|rust]
+//!
+//! `--core rust` runs pal-core's RustCore instead (Spotter only), for the
+//! port's parity gate against the same frames.
+use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{Au, CoreIo, GsCore, Mode};
 use pal_ref::{FrameFile, RefCore, RefOpts};
 use std::io::Write;
@@ -36,7 +40,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut pos = Vec::new();
     let (mut config, mut mode, mut drop_pct, mut seed) = (None, Mode::Spotter, 0, 1u32);
-    let (mut fixed_gap, mut fake_ack) = (false, false);
+    let (mut fixed_gap, mut fake_ack, mut rust) = (false, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-c" => config = args.next().map(PathBuf::from),
@@ -51,12 +55,16 @@ fn main() {
             "--seed" => seed = args.next().unwrap().parse().unwrap(),
             "--fixed-gap" => fixed_gap = true,
             "--fake-ack" => fake_ack = true,
+            "--core" => rust = args.next().as_deref() == Some("rust"),
             _ => pos.push(PathBuf::from(a)),
         }
     }
     let [frames, out] = <[PathBuf; 2]>::try_from(pos).expect("need <frames.bin> <out.aus>");
     let config = config.expect("-c <gs.toml> is required");
 
+    if rust {
+        return run_rust(&config, &frames, &out, mode, !fixed_gap, drop_pct, seed);
+    }
     let mut core = RefCore::new(
         &config,
         RefOpts {
@@ -87,6 +95,43 @@ fn main() {
     }
     // The dry-run's final poll on the ms clock: last_ms + gap + 1.
     let gap = u64::from(core.frame_gap_timeout_ms());
+    core.tick((last_us / 1000 + gap + 1) * 1000, &mut sink);
+    sink.out.flush().unwrap();
+    eprintln!(
+        "pal-ref replay: frames={} dropped={} aus_out={} sends={} {}",
+        src.frames_read(),
+        src.dropped(),
+        sink.aus,
+        sink.sends,
+        core.stats_json()
+    );
+}
+
+fn run_rust(
+    config: &std::path::Path,
+    frames: &std::path::Path,
+    out: &std::path::Path,
+    mode: Mode,
+    adaptive_gap: bool,
+    drop_pct: i32,
+    seed: u32,
+) {
+    let cfg = pal_core::config::load_config(config, None).unwrap_or_else(|e| panic!("{e}"));
+    let mut core =
+        RustCore::new(&cfg, RustOpts { mode, adaptive_gap }).unwrap_or_else(|e| panic!("{e}"));
+    let mut src = FrameFile::open(frames, 1, drop_pct, seed).unwrap();
+    let mut sink = Sink {
+        out: std::io::BufWriter::new(std::fs::File::create(out).unwrap()),
+        aus: 0,
+        sends: 0,
+    };
+    let mut last_us = 0u64;
+    for body in src.by_ref() {
+        core.on_rx(&body, &mut sink);
+        core.tick(body.mono_us, &mut sink);
+        last_us = body.mono_us;
+    }
+    let gap = cfg.video.frame_gap_timeout_ms;
     core.tick((last_us / 1000 + gap + 1) * 1000, &mut sink);
     sink.out.flush().unwrap();
     eprintln!(
