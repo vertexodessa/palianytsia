@@ -157,6 +157,18 @@ impl History {
             })
             .collect()
     }
+    /// The newest (rssi, snr) pair no older than `hold_s` before the last
+    /// row. A stats window with no drone frame in it reports both as null,
+    /// so taking only the last row made the chip blink "no signal" on a
+    /// healthy link.
+    pub fn signal(&self, hold_s: f64) -> Option<(f64, f64)> {
+        let t_last = self.rows.back()?.0;
+        self.rows
+            .iter()
+            .rev()
+            .take_while(|(t, _)| t_last - t <= hold_s)
+            .find_map(|(_, s)| s.rssi_dbm.zip(s.snr_db))
+    }
     fn series(&self, f: impl Fn(&Snapshot) -> Option<f64>) -> Vec<(f64, f64)> {
         self.rows
             .iter()
@@ -226,6 +238,9 @@ fn pct(v: f64) -> String {
     format!("{:.1} %", 100.0 * v)
 }
 
+/// How long the signal chip keeps the last rssi/SNR through null windows.
+const SIGNAL_HOLD_S: f64 = 1.5;
+
 /// The top OSD row: link, signal, loss, uplink side.
 pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
     let Some(s) = h.last() else {
@@ -243,15 +258,16 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
             ("beaconing".to_string(), WARN)
         };
         chip(ui, "link", &link, c);
-        let sig = match (s.rssi_dbm, s.snr_db) {
-            (Some(r), Some(n)) => format!("{r:.0} dBm  SNR {n:.0}"),
-            _ => "no signal".into(),
+        let held = h.signal(SIGNAL_HOLD_S);
+        let sig = match held {
+            Some((r, n)) => format!("{r:.0} dBm  SNR {n:.0}"),
+            None => "no signal".into(),
         };
         chip(
             ui,
             "signal",
             &sig,
-            if s.snr_db.unwrap_or(0.0) > 15.0 {
+            if held.is_some_and(|(_, n)| n > 15.0) {
                 OK
             } else {
                 WARN
@@ -421,5 +437,17 @@ mod tests {
             ..s
         };
         assert!(key_warning(&own).is_none());
+    }
+
+    #[test]
+    fn signal_holds_through_null_windows() {
+        let mut h = History::default();
+        let row = |r: &str| Snapshot::parse(&format!(r#"{{"mode":"gs"{r}}}"#)).expect("row");
+        h.push(0.0, row(r#","rssi_dbm":-40.0,"snr_db":30.0"#));
+        h.push(0.1, row(""));
+        h.push(1.0, row(""));
+        assert_eq!(h.signal(SIGNAL_HOLD_S), Some((-40.0, 30.0)));
+        h.push(1.6, row(""));
+        assert_eq!(h.signal(SIGNAL_HOLD_S), None);
     }
 }
