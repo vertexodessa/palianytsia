@@ -366,6 +366,16 @@ M0 status (2026-10-31):
   - android-activity 0.6 puts the Application in ndk_context and openxr 0.19 passes it as applicationActivity; the runtime then holds the session in IDLE forever. The app must re-initialise ndk_context with the Activity before xrCreateInstance.
   - USB: a UsbManager scan from Rust over JNI sees 0bda:a81a; with permission it gets an fd (`openDevice().getFileDescriptor()`, 71 B raw descriptors), which is what `libusb_wrap_sys_device` takes. Permission without a dialog comes from the USB_DEVICE_ATTACHED filter plus the user's one-time "always" choice (as PixelPilot does today); for development the Horizon OS shell command `cmd usb grant-device-permission <pkg> 3034:43034` grants it persistently. The attach-chooser path is verified on the Quest for our package: after one "always" choice, a replug launches the app with USB_DEVICE_ATTACHED and permission is already granted, no dialog. The `cmd usb` grant does not survive replugs. Horizon OS traps: the chooser panel is a fixed 471 px and with four candidate apps its button bar collapses to 9 px with no buttons, so nothing can be confirmed; disabling a package clears its USB defaults; there is no settings UI to clear a default. The device filter must list RTL88xx VID:PIDs with a `0x` prefix: PixelPilot's ids without `0x` appear to be dropped as invalid decimals, which would make its filter match any device (it holds the default for an unrelated USB-C video adaptor).
 
+Next steps (set by Ihor, 2026-11-01, after two-card support landed in 8bb9f5c):
+1. TxSelector (F1): the GS transmits through card 0 always. maburgs picks the TX card by RSSI
+   (`gs/src/tx_selector.{h,cpp}`: 3 dB margin, 2000 ms hold, 1500 ms dead-card override, or
+   `radio.tx_card` pinned via `effective_tx_card`). Port it into pal-core with mabur's unit tests and
+   route `SlotFrame.card` through it; one card stays card 0, so replay parity is unchanged.
+2. Calibration channel pick: `cal_picker` / `cal_round_pick` (`gs/src/cal_picker.{h,cpp}`,
+   `cal_round_pick.h`, Mode::Auto) are not ported; with two or more cards `cal_start` uses
+   Pick::Pinned. Two cards are now live on the Quest, so this is possible: port it with mabur's
+   test_cal_session pick cases (docs/calibration-port.md row C2).
+
 ## 11 Rough size
 
 C++ units the Rust core replaces (h+cpp lines, pinned tree): rc_proto 787, sbi 140+, uep_decoder 162+, sw_decoder 451, gf256 325, aggregator 443, frame_stream 460, vrx_controller 345, rendezvous 141, rcf_slot 287, ladder_controller 1135, link_health 479, mav_tunnel 312, param_client 574. About 6k lines for M1-M2. The channel core (channel_core 1448, channel_scout 416, hop_*) is M4. PixelPilot's `MaburReceivePath` alone is 7.2k lines plus 3.1k of tests; most of that is unify-only and is not ported.
