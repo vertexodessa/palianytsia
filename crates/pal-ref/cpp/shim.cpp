@@ -153,6 +153,14 @@ int pal_ref_inject_disc_ack_for_replay(pal_ref* r, uint64_t now_us) {
   return -1;
 }
 
+size_t pal_ref_mav_take(pal_ref* r, uint8_t* out, size_t cap) {
+  return r->gs->mav_take_inbound(out, cap);
+}
+
+void pal_ref_mav_push(pal_ref* r, const uint8_t* p, size_t n) {
+  r->gs->mav_push_outbound(p, n);
+}
+
 uint32_t pal_ref_frame_gap_timeout_ms(const pal_ref* r) {
   return static_cast<uint32_t>(r->cfg.video.frame_gap_timeout_ms);
 }

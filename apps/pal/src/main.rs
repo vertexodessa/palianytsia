@@ -43,6 +43,7 @@ struct Opts {
     dump: Option<PathBuf>,
     aus: Option<PathBuf>,
     sends: Option<PathBuf>,
+    mav: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     decode: bool,
     capture_mb: u64,
@@ -76,6 +77,7 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--dump" => o.dump = Some(val().into()),
             "--aus" => o.aus = Some(val().into()),
             "--sends" => o.sends = Some(val().into()),
+            "--mav" => o.mav = Some(val().into()),
             "--log-dir" => o.log_dir = Some(val().into()),
             "--decode" => o.decode = true,
             "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
@@ -114,6 +116,9 @@ struct Sink {
     aus_file: Option<BufWriter<std::fs::File>>,
     /// Every RC body handed to `send`, LP (u32 len | bytes), for `cmp`.
     sends_file: Option<BufWriter<std::fs::File>>,
+    /// Inbound MAVLink packets from the drone, LP (u32 len | bytes).
+    mav_file: Option<BufWriter<std::fs::File>>,
+    mav: u64,
     log: Option<Session>,
     /// `--decode`: every AU through libavcodec (frames/errors in the summary).
     dec: Option<decode::AvDecoder>,
@@ -141,6 +146,8 @@ impl Sink {
             dump: mk(&o.dump),
             aus_file: mk(&o.aus),
             sends_file: mk(&o.sends),
+            mav_file: mk(&o.mav),
+            mav: 0,
             log: o.log_dir.as_ref().map(|d| {
                 let s = Session::create(d, std::time::SystemTime::now(), o.capture_mb << 20)
                     .unwrap_or_else(|e| die(&format!("{}: {e}", d.display())));
@@ -164,6 +171,7 @@ impl Sink {
             self.dump.as_mut(),
             self.aus_file.as_mut(),
             self.sends_file.as_mut(),
+            self.mav_file.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -190,6 +198,13 @@ impl Sink {
 }
 
 impl CoreIo for Sink {
+    fn on_mav(&mut self, pkt: &[u8]) {
+        self.mav += 1;
+        if let Some(w) = self.mav_file.as_mut() {
+            w.write_all(&(pkt.len() as u32).to_le_bytes()).unwrap();
+            w.write_all(pkt).unwrap();
+        }
+    }
     fn on_au(&mut self, a: Au) {
         if let Some(l) = self.log.as_mut() {
             l.au(self.now_us, &a).unwrap();
@@ -468,8 +483,8 @@ fn replay(o: Opts) {
     }
     sink.finish();
     println!(
-        "replay bodies={bodies} dropped={dropped} ticks={ticks} aus={} truncated={} au_bytes={} sends={}",
-        sink.aus, sink.truncated, sink.bytes, sink.sends
+        "replay bodies={bodies} dropped={dropped} ticks={ticks} aus={} truncated={} au_bytes={} sends={} mav={}",
+        sink.aus, sink.truncated, sink.bytes, sink.sends, sink.mav
     );
     if let Some(d) = sink.dec.as_ref() {
         let (f, e) = decode::Decoder::counters(d);

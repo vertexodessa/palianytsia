@@ -48,6 +48,10 @@ int pal_ref_on_rx(pal_ref* r, const pal_rx_body* b);
 int pal_ref_tick(pal_ref* r, uint64_t now_us);
 int pal_ref_inject_disc_ack_for_replay(pal_ref* r, uint64_t now_us);
 uint32_t pal_ref_frame_gap_timeout_ms(const pal_ref* r);
+// One inbound MAVLink packet from the drone into out; its length, 0 = none.
+size_t pal_ref_mav_take(pal_ref* r, uint8_t* out, size_t cap);
+// Local MAVLink peer bytes toward the drone (any boundary).
+void pal_ref_mav_push(pal_ref* r, const uint8_t* p, size_t n);
 // Writes the stats JSON line; returns its full length (excluding NUL). The
 // output is truncated (and NUL-terminated) when cap is too small.
 size_t pal_ref_stats_json(const pal_ref* r, char* buf, size_t cap);

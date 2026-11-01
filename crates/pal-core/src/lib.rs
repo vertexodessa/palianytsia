@@ -75,6 +75,8 @@ pub trait CoreIo {
     fn on_au(&mut self, au: Au);
     /// One RC body to wrap and transmit. Gs mode only.
     fn send(&mut self, rc_body: &[u8]);
+    /// One whole MAVLink 2 packet from the drone (T_MAV tunnel). Gs mode only.
+    fn on_mav(&mut self, _pkt: &[u8]) {}
 }
 
 pub trait GsCore {
@@ -82,4 +84,7 @@ pub trait GsCore {
     fn tick(&mut self, now_us: u64, io: &mut dyn CoreIo);
     /// One line of JSON, the `webgs::stats_json` shape.
     fn stats_json(&self) -> String;
+    /// Bytes from a local MAVLink peer (a GCS), cut at any boundary; tunneled
+    /// to the drone under the live session. Gs mode only.
+    fn mav_push_outbound(&mut self, _bytes: &[u8]) {}
 }

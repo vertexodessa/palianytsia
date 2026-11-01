@@ -7,6 +7,7 @@
 //!   pal-desktop -c gs.toml --replay bodies.bin [--mode gs|spotter] [--loop]
 //!   pal-desktop -c gs.toml --live --ch 144 --width 40 [--mode gs] [--card N]
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
+//!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!
 //! `--snapshot` saves one rendered window after N seconds and quits: the
 //! headless check that video and OSD actually draw.
@@ -42,6 +43,7 @@ struct Opts {
     log_dir: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     secs: f64,
+    mav_udp: Option<String>,
 }
 
 fn die(msg: &str) -> ! {
@@ -82,6 +84,7 @@ fn parse() -> Opts {
             "--log-dir" => o.log_dir = Some(val().into()),
             "--snapshot" => o.snapshot = Some(val().into()),
             "--secs" => o.secs = val().parse().unwrap_or_else(|_| die("--secs")),
+            "--mav-udp" => o.mav_udp = Some(val()),
             s => die(&format!("unknown argument {s}")),
         }
     }
@@ -134,6 +137,9 @@ struct Frame {
 
 struct Sink {
     au_tx: SyncSender<Vec<u8>>,
+    mav_tx: SyncSender<Vec<u8>>,
+    /// GCS bridge: inbound packets go to `peer`, whatever it sends comes back.
+    udp: Option<(std::net::UdpSocket, std::net::SocketAddr)>,
     card: Option<Arc<devourer_sys::Card>>,
     log: Option<Session>,
     now_us: u64,
@@ -147,6 +153,12 @@ impl CoreIo for Sink {
         }
         if let Err(TrySendError::Full(_)) = self.au_tx.try_send(a.data) {
             self.shared.au_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn on_mav(&mut self, pkt: &[u8]) {
+        let _ = self.mav_tx.try_send(pkt.to_vec());
+        if let Some((sock, peer)) = &self.udp {
+            let _ = sock.send_to(pkt, peer);
         }
     }
     fn send(&mut self, rc_body: &[u8]) {
@@ -174,6 +186,12 @@ impl CoreLoop {
     }
     fn tick(&mut self, now: u64) {
         self.sink.now_us = now;
+        if let Some((sock, _)) = &self.sink.udp {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, _)) = sock.recv_from(&mut buf) {
+                self.core.mav_push_outbound(&buf[..n]);
+            }
+        }
         if let Some(l) = self.sink.log.as_mut() {
             let _ = l.tick(now);
         }
@@ -328,6 +346,8 @@ fn run_decode(
 }
 
 struct App {
+    mav_rx: Receiver<Vec<u8>>,
+    telem: pal_osd::telem::Telemetry,
     frame: Arc<Mutex<Option<Frame>>>,
     shared: Arc<Shared>,
     stats_rx: Receiver<String>,
@@ -355,6 +375,9 @@ fn write_ppm(path: &PathBuf, img: &egui::ColorImage) -> std::io::Result<()> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         let now = self.t0.elapsed().as_secs_f64();
+        while let Ok(p) = self.mav_rx.try_recv() {
+            self.telem.on_packet(&p, now);
+        }
         while let Ok(line) = self.stats_rx.try_recv() {
             if let Some(s) = Snapshot::parse(&line) {
                 self.hist.push(now, s);
@@ -427,6 +450,9 @@ impl eframe::App for App {
                     pal_osd::chips(ui, &self.hist, self.fps, decode);
                 });
             });
+        egui::Area::new(egui::Id::new("telem"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+            .show(ctx, |ui| pal_osd::telem::widget(ui, &self.telem, now));
         if let Some((path, secs)) = self.snapshot.clone() {
             if !self.snapshot_sent && now >= secs {
                 self.snapshot_sent = true;
@@ -460,6 +486,19 @@ fn main() {
     // decoder logged missing POCs), so the queue absorbs decoder warm-up.
     let (au_tx, au_rx) = mpsc::sync_channel::<Vec<u8>>(8);
     let (stats_tx, stats_rx) = mpsc::sync_channel::<String>(64);
+    let (mav_tx, mav_rx) = mpsc::sync_channel::<Vec<u8>>(256);
+    let udp = o.mav_udp.as_ref().map(|a| {
+        let peer: std::net::SocketAddr = a.parse().unwrap_or_else(|_| die("--mav-udp HOST:PORT"));
+        let sock =
+            std::net::UdpSocket::bind("0.0.0.0:0").unwrap_or_else(|e| die(&format!("udp: {e}")));
+        sock.set_nonblocking(true)
+            .unwrap_or_else(|e| die(&format!("udp: {e}")));
+        eprintln!(
+            "pal-desktop: MAVLink bridge {} -> {peer}",
+            sock.local_addr().map_or("?".into(), |a| a.to_string())
+        );
+        (sock, peer)
+    });
     let shared = Arc::new(Shared::default());
     let frame = Arc::new(Mutex::new(None));
     let log = o.log_dir.as_ref().map(|d| {
@@ -472,6 +511,8 @@ fn main() {
     let channel = if o.live { o.ch } else { 0 };
     let sink = Sink {
         au_tx,
+        mav_tx,
+        udp,
         card: None,
         log,
         now_us: 0,
@@ -518,6 +559,8 @@ fn main() {
                     .expect("core thread");
             }
             Ok(Box::new(App {
+                mav_rx,
+                telem: Default::default(),
                 frame,
                 shared,
                 stats_rx,

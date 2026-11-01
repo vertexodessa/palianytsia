@@ -55,6 +55,8 @@ extern "C" {
     fn pal_ref_tick(r: *mut PalRefRaw, now_us: u64) -> c_int;
     fn pal_ref_inject_disc_ack_for_replay(r: *mut PalRefRaw, now_us: u64) -> c_int;
     fn pal_ref_frame_gap_timeout_ms(r: *const PalRefRaw) -> u32;
+    fn pal_ref_mav_take(r: *mut PalRefRaw, out: *mut u8, cap: usize) -> usize;
+    fn pal_ref_mav_push(r: *mut PalRefRaw, p: *const u8, n: usize);
     fn pal_ref_stats_json(r: *const PalRefRaw, buf: *mut c_char, cap: usize) -> usize;
 
     fn pal_ffs_open(
@@ -212,10 +214,23 @@ impl GsCore for RefCore {
             body_len: b.body.len(),
         };
         self.with_io(io, |raw| unsafe { pal_ref_on_rx(raw, &raw_body) });
+        // WebGs queues inbound MAVLink for the page; hand it on at once.
+        let mut buf = [0u8; 300];
+        loop {
+            let n = unsafe { pal_ref_mav_take(self.raw, buf.as_mut_ptr(), buf.len()) };
+            if n == 0 {
+                break;
+            }
+            io.on_mav(&buf[..n]);
+        }
     }
 
     fn tick(&mut self, now_us: u64, io: &mut dyn CoreIo) {
         self.with_io(io, |raw| unsafe { pal_ref_tick(raw, now_us) });
+    }
+
+    fn mav_push_outbound(&mut self, bytes: &[u8]) {
+        unsafe { pal_ref_mav_push(self.raw, bytes.as_ptr(), bytes.len()) };
     }
 
     fn stats_json(&self) -> String {

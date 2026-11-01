@@ -1,6 +1,8 @@
 //! OSD widgets (spec section 6) drawn from the core's `stats_json` line, so
 //! every app and both cores share one OSD. Reads only the snapshot it is
 //! handed: no locks toward the RX or core path.
+pub mod telem;
+
 use std::collections::VecDeque;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Ui, Vec2};

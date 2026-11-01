@@ -294,6 +294,7 @@ impl RustCore {
         let ft = rc::frame_type(body);
         if let (Some(rc::T_MAV), Some(g)) = (ft, self.gs.as_mut()) {
             for pkt in g.mav.on_rc_frame(body) {
+                io.on_mav(&pkt);
                 g.params.on_packet(&pkt, self.now_us / 1000);
             }
             g.drain_params();
@@ -588,6 +589,12 @@ impl GsCore for RustCore {
             g.send(&f, now_us, io);
         }
         g.last_health = lh.health;
+    }
+
+    fn mav_push_outbound(&mut self, bytes: &[u8]) {
+        if let Some(g) = self.gs.as_mut() {
+            g.mav.push_outbound(bytes);
+        }
     }
 
     fn stats_json(&self) -> String {
