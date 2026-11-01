@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cargo for aarch64 Android with the NDK's clang as cc/c++/linker:
 #   tools/android-build.sh build -p devourer-sys
-# Needs LIBUSB_SRC on the first run (tools/android-libusb.sh).
+# libusb comes from third_party/libusb via tools/android-libusb.sh.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 export ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$(ls -d "$HOME"/Android/Sdk/ndk/* | sort -V | tail -1)}
