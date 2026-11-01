@@ -994,3 +994,390 @@ fn shutdown_joins_threads_and_is_idempotent() {
     assert!(!core.tick(&inp, &mut vrx).dwell_busy);
     assert_eq!(core.snapshot(0).dwell[1].unwrap().visits, visits);
 }
+
+// ---- calibration channel pick (mabur test_channel_core.cpp, the cal_* cases) ----
+
+impl Rig {
+    fn tick_cal(&mut self, session: bool, cal: bool) {
+        let inp = ChannelTickIn {
+            now_ms: self.ms(),
+            in_session: session,
+            cal_running: cal,
+            tx_card: 0,
+            agg: Some(&self.agg),
+        };
+        self.core.tick(&inp, &mut self.vrx);
+        self.clk.advance(10);
+    }
+    /// One linked tick with the TX card (card 0) on op hearing its own
+    /// video and `op_foreign` foreign frames: own frames keep the verdict
+    /// out of starved, foreign frames are what op's live reading scores.
+    fn live_tick(&mut self, op_foreign: u64) {
+        {
+            let mut s = self.cards[0].s();
+            s.fr.own += 5;
+            s.fr.foreign += op_foreign;
+        }
+        self.vrx.on_video(self.ms());
+        self.tick(true);
+    }
+    fn linked_auto(&mut self, ticks: usize, op_foreign: u64) {
+        self.freeze_auto();
+        self.link_up();
+        for _ in 0..ticks {
+            self.live_tick(op_foreign);
+        }
+    }
+    /// Starts a round; it is running once the scout card is owned.
+    fn start_round(&mut self) {
+        let now = self.ms();
+        self.core.begin_cal_measure(now);
+        for _ in 0..5 {
+            if self.has_line("calibration measure round on card") {
+                break;
+            }
+            self.live_tick(0);
+        }
+        assert!(self.has_line("calibration measure round on card 1"));
+        self.live_tick(0);
+        assert!(self.core.scout_owns_card(1));
+    }
+    fn cal_move(&mut self, ch: u8) {
+        assert!(self.core.order_cal_relocate(ch));
+        for _ in 0..20 {
+            if self.core.hopping() {
+                break;
+            }
+            self.live_tick(0);
+        }
+        assert!(self.core.hopping());
+        let r = self.pump_rcf().expect("rcf");
+        assert_eq!(r.hop_ch, ch);
+        self.core.note_video(ch);
+        for _ in 0..5 {
+            if self.core.cal_relocate_settled().is_some() {
+                break;
+            }
+            self.tick(true);
+        }
+        assert_eq!(self.core.cal_relocate_settled(), Some(true));
+        for _ in 0..3 {
+            self.live_tick(0);
+        }
+        assert_eq!(self.core.op(), ch);
+    }
+}
+
+/// Auto, two cards, linked, the boot pick long closed: one round dwells
+/// every half outside op's pair exactly once, reads op from the verdict
+/// window, emits one K record and names the best member. Op reads busy,
+/// 64's pair reads busy: 112 is the first clean member in config order.
+#[test]
+fn cal_measure_round_ranks_the_set_once() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(30, 200);
+    g.cards[1].s().foreign_per_ms_on[60] = 1;
+    g.cards[1].s().foreign_per_ms_on[64] = 1;
+    assert!(g.core.cal_can_measure());
+    assert_eq!(g.core.op(), 40);
+    let (picks0, dwells0) = {
+        let r = g.rec();
+        (r.picks.len(), r.dwells.len())
+    };
+    let now = g.ms();
+    g.core.begin_cal_measure(now);
+    assert_eq!(g.core.cal_measure_best(), None);
+    for _ in 0..50 {
+        if g.core.cal_measure_best().is_some() {
+            break;
+        }
+        g.live_tick(200);
+    }
+    assert_eq!(g.core.cal_measure_best(), Some(112));
+    assert_eq!(g.rec().picks.len(), picks0 + 1);
+    assert_eq!(*g.rec().picks.last().unwrap(), Some(112));
+    let mut chs: Vec<u8> = g.rec().dwells[dwells0..]
+        .iter()
+        .map(|(card, d)| {
+            assert_eq!(*card, 1);
+            d.ch
+        })
+        .collect();
+    chs.sort();
+    assert_eq!(chs, vec![60, 64, 108, 112, 140, 144]); // op's 36/40 never dwelt on
+    assert_eq!(g.core.op(), 40); // measuring moves nothing
+    for _ in 0..3 {
+        g.live_tick(200);
+    }
+    assert!(!g.core.scout_owns_card(1)); // parked again ...
+    assert!(g.ch(1) == 40 && g.cards[1].s().width_mhz == 40); // ... on op at the link width
+    let dwells1 = g.rec().dwells.len();
+    for _ in 0..20 {
+        g.live_tick(200);
+    }
+    assert_eq!(g.rec().dwells.len(), dwells1); // one round, not a loop
+    assert_eq!(g.rec().picks.len(), picks0 + 1);
+    assert_eq!(g.core.cal_measure_best(), Some(112));
+}
+
+/// Over a quiet op a candidate must beat op by pick_margin: op stays.
+#[test]
+fn cal_measure_round_keeps_a_clean_op() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(30, 0);
+    g.cards[1].s().foreign_per_ms_on[60] = 1;
+    g.cards[1].s().foreign_per_ms_on[64] = 1;
+    let now = g.ms();
+    g.core.begin_cal_measure(now);
+    for _ in 0..50 {
+        if g.core.cal_measure_best().is_some() {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert_eq!(g.core.cal_measure_best(), Some(40));
+}
+
+/// The boot pick's relocate tagged cal: H relocate with reason "cal", the
+/// confirm lands it (no verify window), the store follows op.
+#[test]
+fn cal_relocate_orders_a_move_and_settles_on_confirm() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(5, 0);
+    assert_eq!(g.core.cal_relocate_settled(), None);
+    assert!(!g.core.order_cal_relocate(40)); // already there
+    assert!(!g.core.order_cal_relocate(36)); // not a member
+    assert!(g.core.order_cal_relocate(112));
+    assert!(!g.core.order_cal_relocate(144)); // one relocate at a time
+    for _ in 0..20 {
+        if g.has_line("relocate 40 -> 112 placed") {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert!(g.has_line("maburgs channel: relocate 40 -> 112 placed (cal)"));
+    let h = g
+        .rec()
+        .hops
+        .iter()
+        .find(|e| e.kind == "relocate")
+        .cloned()
+        .unwrap();
+    assert_eq!(h.target, 112);
+    assert_eq!(h.reason, "cal");
+    assert_eq!(g.core.cal_relocate_settled(), None);
+    assert!(!g.core.order_cal_relocate(144)); // a hop in flight
+    let r = g.pump_rcf().expect("rcf");
+    assert_eq!(r.hop_ch, 112);
+    g.core.note_video(112);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    for _ in 0..3 {
+        if g.core.cal_relocate_settled().is_some() {
+            break;
+        }
+        g.tick(true);
+    }
+    assert_eq!(g.core.cal_relocate_settled(), Some(true));
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.core.snapshot(0).hop.state, "idle");
+    assert_eq!(g.core.op(), 112);
+    assert_eq!(g.stored.lock().unwrap().last(), Some(&112));
+    for e in &g.rec().hops {
+        if e.kind != "relocate" {
+            assert!(e.reason.is_empty(), "{}: {}", e.kind, e.reason);
+        }
+    }
+}
+
+/// The drone never shows up on the target: withdraw at confirm_ms, settled
+/// false, the link stays on op, no retry behind the run's back.
+#[test]
+fn cal_relocate_settles_false_when_the_drone_does_not_follow() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(5, 0);
+    assert!(g.core.order_cal_relocate(112));
+    for _ in 0..20 {
+        if g.has_line("relocate 40 -> 112 placed") {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert!(g.has_line("relocate 40 -> 112 placed (cal)"));
+    for _ in 0..g.cfg.hop.confirm_ms / 10 + 20 {
+        if g.core.cal_relocate_settled().is_some() {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert_eq!(g.core.cal_relocate_settled(), Some(false));
+    assert!(g.has_hop("withdraw"));
+    assert_eq!(g.core.op(), 40);
+    for _ in 0..20 {
+        g.live_tick(0);
+    }
+    assert!(g.has_line("relocation to 112 did not land; staying on 40"));
+    assert!(g.ch(0) == 40 && g.ch(1) == 40);
+    assert_eq!(g.count_lines("relocate 40 -> 112 placed"), 1);
+}
+
+/// Pinned and one-card GSs cannot measure: op is the answer at once.
+#[test]
+fn pinned_core_has_no_measure() {
+    let mut g = Rig::new(2, true, 64);
+    g.link_up();
+    for _ in 0..10 {
+        g.live_tick(0);
+    }
+    assert!(!g.core.cal_can_measure() && g.core.pinned());
+    let (dwells0, picks0) = {
+        let r = g.rec();
+        (r.dwells.len(), r.picks.len())
+    };
+    let now = g.ms();
+    g.core.begin_cal_measure(now);
+    assert_eq!(g.core.cal_measure_best(), Some(64));
+    for _ in 0..20 {
+        g.live_tick(0);
+    }
+    assert_eq!(g.rec().dwells.len(), dwells0);
+    assert_eq!(g.rec().picks.len(), picks0);
+    assert!(!g.core.scout_owns_card(1));
+
+    let mut h = Rig::auto(1);
+    assert!(!h.core.cal_can_measure() && !h.core.pinned());
+    let now = h.ms();
+    h.core.begin_cal_measure(now);
+    assert_eq!(h.core.cal_measure_best(), Some(h.core.op()));
+}
+
+#[test]
+fn cal_cancel_releases_the_card_and_withdraws_an_unplaced_relocate() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(10, 0);
+    g.start_round();
+    g.core.cancel_cal_measure();
+    for _ in 0..3 {
+        g.live_tick(0);
+    }
+    assert!(!g.core.scout_owns_card(1));
+    assert!(g.ch(1) == 40 && g.cards[1].s().width_mhz == 40);
+    assert_eq!(g.core.cal_measure_best(), None);
+    let (dwells, picks) = {
+        let r = g.rec();
+        (r.dwells.len(), r.picks.len())
+    };
+    for _ in 0..20 {
+        g.live_tick(0);
+    }
+    assert_eq!(g.rec().dwells.len(), dwells);
+    assert_eq!(g.rec().picks.len(), picks);
+    // A relocate accepted but not yet placed is withdrawn with it.
+    assert!(g.core.order_cal_relocate(112));
+    g.core.cancel_cal_measure();
+    for _ in 0..20 {
+        g.live_tick(0);
+    }
+    assert!(!g.has_line("relocate 40 -> 112 placed"));
+    assert!(!g.has_hop("relocate"));
+    assert_eq!(g.core.op(), 40);
+    assert_eq!(g.core.cal_relocate_settled(), None);
+}
+
+#[test]
+fn cal_waiting_round_is_dropped_once_a_run_calibrates() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(10, 0);
+    let now = g.ms();
+    g.core.begin_cal_measure(now);
+    g.tick_cal(true, true);
+    assert!(g.has_line("calibration measure round dropped"));
+    let dwells = g.rec().dwells.len();
+    for _ in 0..30 {
+        g.live_tick(0);
+    }
+    assert!(!g.has_line("calibration measure round on card"));
+    assert!(!g.core.scout_owns_card(1));
+    assert_eq!(g.rec().dwells.len(), dwells);
+    assert_eq!(g.core.cal_measure_best(), None);
+}
+
+#[test]
+fn cal_round_never_starts_without_a_running_scout() {
+    let mut g = Rig::auto(2);
+    g.cards[1].s().is_ready = false; // the scout card never comes up
+    g.linked_auto(10, 0);
+    let now = g.ms();
+    g.core.begin_cal_measure(now);
+    for _ in 0..50 {
+        g.live_tick(0);
+    }
+    assert!(!g.has_line("calibration measure round on card"));
+    assert!(!g.core.scout_owns_card(1));
+    assert_eq!(g.core.cal_measure_best(), None);
+    g.core.cancel_cal_measure();
+}
+
+#[test]
+fn cal_running_round_ends_at_its_bound_with_op() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(10, 200);
+    g.start_round();
+    assert_eq!(g.core.cal_measure_best(), None);
+    g.clk.advance(10_000); // the scout made no progress for 10 s
+    g.live_tick(200);
+    assert_eq!(g.core.cal_measure_best(), Some(40));
+    assert!(g.has_line("calibration measure round overran"));
+    for _ in 0..3 {
+        g.live_tick(200);
+    }
+    assert!(!g.core.scout_owns_card(1));
+    assert!(g.ch(1) == 40 && g.cards[1].s().width_mhz == 40);
+}
+
+#[test]
+fn cal_relocate_refused_at_the_hop_cap() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(5, 0);
+    assert_eq!(g.cfg.hop.max_hops_per_min, 4);
+    g.cal_move(112);
+    g.cal_move(144);
+    g.cal_move(64);
+    g.cal_move(40);
+    assert!(!g.core.order_cal_relocate(112));
+    assert!(g.has_line("calibration relocate to 112 refused: hop cap"));
+    assert_eq!(g.core.op(), 40);
+}
+
+#[test]
+fn cal_relocate_never_placed_settles_false() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(5, 0);
+    assert!(g.core.order_cal_relocate(112));
+    g.tick_cal(true, true); // no longer hop-active before the order leaves
+    assert_eq!(g.core.cal_relocate_settled(), Some(false));
+    assert!(g.has_line("calibration relocate to 112 never placed"));
+    for _ in 0..20 {
+        g.live_tick(0);
+    }
+    assert!(!g.has_hop("relocate"));
+    assert_eq!(g.core.op(), 40);
+}
+
+#[test]
+fn cal_relocate_session_lost_in_flight_settles_false() {
+    let mut g = Rig::auto(2);
+    g.linked_auto(5, 0);
+    assert!(g.core.order_cal_relocate(112));
+    for _ in 0..20 {
+        if g.has_line("relocate 40 -> 112 placed") {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert!(g.has_line("relocate 40 -> 112 placed (cal)"));
+    g.tick(false); // session lost before the confirm
+    assert_eq!(g.core.cal_relocate_settled(), Some(false));
+    assert!(g.has_hop("session_lost"));
+    assert_eq!(g.core.op(), 40);
+}

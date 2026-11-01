@@ -24,6 +24,7 @@ use std::thread::JoinHandle;
 use pal_wire::rc::{self, DiscAck, LinkKey};
 
 use super::boot::{BootPick, BootPickIn, BootPickOut};
+use super::cal_pick::{cal_round_pick, CalReading};
 use super::gate::{hop_active, hop_burst_due, tx_selection_frozen, MoveEdgeHold};
 use super::hop::{
     hop_store_blank_until, hop_verdict_loss_blank_until, HopAction, HopActionKind, HopController,
@@ -31,7 +32,7 @@ use super::hop::{
 };
 use super::hop_ranker::{HopRanker, HopVisit};
 use super::inflight::{InflightScout, InflightScoutCfg};
-use super::pair::any_pair_ranked;
+use super::pair::{any_pair_ranked, scan_half_set};
 use super::plan::{ChannelPlan, ChannelPlanCfg, MoveEvent};
 use super::radio::{
     needs_width_fix, nhm_period_4us, width_resync_open, LinkCard, ScoutFrames, ScoutRadio,
@@ -293,6 +294,11 @@ impl Live {
             }
         }
         let mut ilk = self.inflight.lock().unwrap();
+        // A calibration measure round may have taken the scout card since
+        // the checks above (step_cal starts the round under this lock).
+        if self.scout_working.load(Relaxed) {
+            return;
+        }
         let Some(sc) = ilk.as_mut() else { return };
         let (d, v) = {
             // The sampler skips a dwelling card, but its dwell_busy check and
@@ -383,6 +389,54 @@ pub struct ChannelCore {
     now_ms_cur: f64,
     now_ms_u_cur: u64,
     cal_running_cur: bool,
+    in_session_cur: bool,
+
+    // ---- a calibration run's channel pick ----
+    cal_meas: CalMeasure,
+    cal_reloc: CalReloc,
+    /// This tick's Relocate is the calibration's.
+    cal_reloc_tick: bool,
+    /// The latest verdict window's reading of op: the worst valid card on
+    /// op, foreign frames scaled to radio.scan.dwell_ms.
+    op_live: Option<CalReading>,
+    op_live_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum CalMeasureState {
+    #[default]
+    Off,
+    Waiting,
+    Running,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CalMeasure {
+    s: CalMeasureState,
+    /// Round start (op's reading must be newer).
+    t0: f64,
+    /// Running: the round ends here with op as the answer.
+    bound_ms: f64,
+    best: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum CalRelocState {
+    #[default]
+    Off,
+    Waiting,
+    InFlight,
+    Settled,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CalReloc {
+    s: CalRelocState,
+    ch: u8,
+    t0: f64,
+    confirmed: bool,
+    ok: bool,
 }
 
 impl ChannelCore {
@@ -544,6 +598,12 @@ impl ChannelCore {
             inflight_thread: None,
             shut: false,
             now_ms_cur: 0.0,
+            in_session_cur: false,
+            cal_meas: CalMeasure::default(),
+            cal_reloc: CalReloc::default(),
+            cal_reloc_tick: false,
+            op_live: None,
+            op_live_ms: -1.0,
             now_ms_u_cur: 0,
             cal_running_cur: false,
             cfg,
@@ -552,7 +612,10 @@ impl ChannelCore {
 
     fn scout_owns(&self) -> bool {
         self.scout.as_ref().is_some_and(|s| {
-            s.working() || self.scout_search_req || (!self.pinned && s.pick_open())
+            s.working()
+                || self.scout_search_req
+                || (!self.pinned && s.pick_open())
+                || s.round_open()
         })
     }
 
@@ -813,6 +876,7 @@ impl ChannelCore {
 
     pub fn tick(&mut self, inp: &ChannelTickIn, vrx: &mut VrxController) -> ChannelTickOut {
         self.now_ms_cur = inp.now_ms;
+        self.in_session_cur = inp.in_session;
         self.now_ms_u_cur = inp.now_ms as u64;
         self.live.tx_card_now.store(inp.tx_card, Relaxed);
         self.live.gates.in_session.store(inp.in_session, Relaxed);
@@ -840,6 +904,7 @@ impl ChannelCore {
         self.step_store(vrx);
         self.step_gates();
         self.step_hop_edge_and_window(inp, vrx);
+        self.step_cal(inp);
         self.step_controller(inp, vrx);
         self.step_move_edge(inp.now_ms, vrx);
         self.step_drains();
@@ -942,6 +1007,22 @@ impl ChannelCore {
     ) {
         self.apply_hop_action(act, now_ms, vrx);
         self.boot_pick.note_hop_action(act.kind, relocate_tick);
+        let cal_order = relocate_tick && self.cal_reloc_tick;
+        if cal_order {
+            if act.kind == HopActionKind::Order {
+                self.cal_reloc.s = CalRelocState::InFlight;
+            } else {
+                self.settle_cal_reloc(false, "refused (hop cap)");
+            }
+        } else if self.cal_reloc.s == CalRelocState::InFlight {
+            match act.kind {
+                HopActionKind::Confirm => self.cal_reloc.confirmed = true,
+                HopActionKind::VerifyPass => self.settle_cal_reloc(true, "landed"),
+                HopActionKind::Withdraw => self.settle_cal_reloc(false, "withdrawn"),
+                HopActionKind::Hold => self.settle_cal_reloc(false, "held"),
+                _ => {}
+            }
+        }
         if let Some(b) = hop_verdict_loss_blank_until(act, now_ms) {
             self.s1_hop_loss.blank_until(b);
         }
@@ -955,7 +1036,10 @@ impl ChannelCore {
             }
             _ => {}
         }
-        for e in self.hopc.take_events() {
+        for mut e in self.hopc.take_events() {
+            if cal_order && e.kind == "relocate" {
+                e.reason = "cal".into();
+            }
             self.sink.hop(&e);
             let reason = if e.reason.is_empty() {
                 String::new()
@@ -1057,7 +1141,11 @@ impl ChannelCore {
                     "maburgs channel: boot pick wants {ch}, link on {op}: relocating"
                 ));
             }
-            BootPickOut::Relocate(ch) => self.pending_relocate = Some(ch),
+            BootPickOut::Relocate(ch) => {
+                self.pending_relocate = Some(ch);
+                self.cal_reloc_tick =
+                    self.cal_reloc.s == CalRelocState::Waiting && ch == self.cal_reloc.ch;
+            }
             BootPickOut::Freeze { reason, accept_op } => {
                 if accept_op {
                     self.plan.set_want(now_ms, op);
@@ -1137,6 +1225,8 @@ impl ChannelCore {
         let mut vc = vec![VerdictCardIn::default(); self.n_cards];
         let mut starved_valid = 0;
         let mut starved_all_zero = true;
+        // The worst valid card's reading of op this window.
+        let mut op_read: Option<CalReading> = None;
         for (si, cs) in rec.cards.iter().enumerate().take(self.n_cards) {
             if !cs.valid || cs.channel != self.plan.op() {
                 self.window_prev_ok[si] = false;
@@ -1188,11 +1278,33 @@ impl ChannelCore {
                     busy_pct: cs.nhm_busy_pct,
                     own_air_pct: Some(own_pct),
                 });
+                // Op's reading for a calibration run's pick (the scout never
+                // dwells on op's halves while linked): foreign frames scaled
+                // from this window's span to one dwell_ms observe, and the
+                // foreign share of the NHM busy airtime. The worst card on
+                // each term, as the scout keeps a half's worst visit.
+                if win_us > 0.0 {
+                    let k = f64::from(self.cfg.radio.scan.dwell_ms) * 1000.0 / win_us;
+                    let f = (foreign as f64 * k).round() as u32;
+                    let r = op_read.get_or_insert(CalReading {
+                        ch: self.plan.op(),
+                        ..CalReading::default()
+                    });
+                    r.foreign = r.foreign.max(f);
+                    if let Some(b) = cs.nhm_busy_pct {
+                        r.busy_valid = true;
+                        r.busy_pct = r.busy_pct.max((b - own_pct).max(0.0));
+                    }
+                }
             }
             self.window_prev[si] = cs.frames;
             self.window_prev_crc[si] = crc_fail;
             self.window_prev_ms[si] = t_ms;
             self.window_prev_ok[si] = true;
+        }
+        if op_read.is_some() {
+            self.op_live = op_read;
+            self.op_live_ms = now_ms;
         }
         let s1 = self.s1_hop_loss.sample(now_ms);
         let recovered_now = Self::recovered_total(inp.agg);
@@ -1267,6 +1379,7 @@ impl ChannelCore {
         let now_ms = inp.now_ms;
         if !hop_active(inp.in_session, inp.cal_running) {
             self.pending_relocate = None;
+            self.cal_reloc_tick = false;
             return;
         }
         let mut ht = HopTick {
@@ -1320,8 +1433,10 @@ impl ChannelCore {
         } else if let Some(to) = self.pending_relocate {
             ht.verdict.trigger = true;
             ht.relocate = true;
-            // Onto the pin: the confirm lands it, no verify.
-            ht.no_verify = !self.reactive;
+            // Onto the pin, or where a calibration run is about to
+            // calibrate: the confirm lands it, no verify (the run's
+            // cal_running would cut the verify window short anyway).
+            ht.no_verify = !self.reactive || self.cal_reloc_tick;
             ht.best = Some(to);
             ht.best_score = 0;
             ht.escape = None;
@@ -1339,9 +1454,266 @@ impl ChannelCore {
             } else {
                 "refused (hop cap)"
             };
-            self.log(format!("maburgs channel: relocate {op} -> {to} {what}"));
+            let cal = if self.cal_reloc_tick { " (cal)" } else { "" };
+            self.log(format!(
+                "maburgs channel: relocate {op} -> {to} {what}{cal}"
+            ));
         }
         self.pending_relocate = None;
+        self.cal_reloc_tick = false;
+    }
+
+    // ---- a calibration run's channel pick (CalPicker; core thread) ----
+    //
+    // begin_cal_measure arms one measure round of the boot scout: once the
+    // boot pick has closed and nothing else holds the scout card, a hop or
+    // the controller, the scout measures every 20 MHz half of the set once
+    // on a fresh ranker, skipping op's own halves (they carry the drone's
+    // video). Op is read from the verdict window instead. The pick
+    // (cal_round_pick) is logged as a K record. The round needs the scout
+    // thread up and its card alive, is dropped once a run already
+    // calibrates, and ends at a bound (twice a full round's dwell time)
+    // with op as the answer. order_cal_relocate is the boot pick's own
+    // relocate order (reason cal), landed by the confirm without a verify
+    // window. Pinned or one card: nothing is measured, op is the answer.
+
+    /// Auto mode with a spare card that can measure (two or more cards).
+    pub fn cal_can_measure(&self) -> bool {
+        self.scout.is_some() && !self.pinned && !self.one_card && self.n_cards >= 2
+    }
+
+    /// Arms one measure round (restarts nothing while one is pending or
+    /// running). Not measurable: a no-op, cal_measure_best() is op.
+    pub fn begin_cal_measure(&mut self, now_ms: f64) {
+        if !matches!(
+            self.cal_reloc.s,
+            CalRelocState::Waiting | CalRelocState::InFlight
+        ) {
+            self.cal_reloc = CalReloc::default();
+        }
+        if !self.cal_can_measure()
+            || matches!(
+                self.cal_meas.s,
+                CalMeasureState::Waiting | CalMeasureState::Running
+            )
+        {
+            return;
+        }
+        self.cal_meas = CalMeasure {
+            s: CalMeasureState::Waiting,
+            t0: now_ms,
+            ..CalMeasure::default()
+        };
+    }
+
+    /// The run is done with the pick: drop a pending round, end a running
+    /// one (the scout parks), stop tracking a cal relocate (one not yet
+    /// placed is withdrawn by want following op).
+    pub fn cancel_cal_measure(&mut self) {
+        if self.cal_meas.s == CalMeasureState::Running {
+            if let Some(s) = &self.scout {
+                s.cancel_round(!self.scout_started);
+            }
+            self.log("maburgs channel: calibration measure round cancelled".into());
+        }
+        self.cal_meas = CalMeasure::default();
+        if self.cal_reloc.s == CalRelocState::Waiting && !self.plan.hopping() {
+            let op = self.plan.op();
+            self.plan.set_want(self.now_ms_cur, op);
+        }
+        self.cal_reloc = CalReloc::default();
+        self.cal_reloc_tick = false;
+    }
+
+    /// The round's best member; None while it waits or runs, op when the
+    /// GS cannot measure.
+    pub fn cal_measure_best(&self) -> Option<u8> {
+        if !self.cal_can_measure() {
+            return Some(self.plan.op());
+        }
+        (self.cal_meas.s == CalMeasureState::Done).then_some(self.cal_meas.best)
+    }
+
+    /// The boot pick's relocate toward ch, reason cal. false = refused: not
+    /// a member, already op, link not live, a hop or relocation in flight
+    /// or the pick still open, the scout on its card, the hop rate limit.
+    pub fn order_cal_relocate(&mut self, ch: u8) -> bool {
+        let now_ms = self.now_ms_cur;
+        if matches!(
+            self.cal_reloc.s,
+            CalRelocState::Waiting | CalRelocState::InFlight
+        ) || !self.plan.member(ch)
+            || ch == self.plan.op()
+            || !hop_active(self.in_session_cur, self.cal_running_cur)
+            || self.plan.hopping()
+            || matches!(self.hopc.state(), HopState::Ordered | HopState::Verifying)
+            || self.boot_pick.open()
+            || self.boot_pick.relocating()
+            || self.scout_owns()
+        {
+            return false;
+        }
+        if self.hopc.hop_cap_reached(now_ms) {
+            self.log(format!(
+                "maburgs channel: calibration relocate to {ch} refused: hop cap"
+            ));
+            return false;
+        }
+        self.plan.set_want(now_ms, ch);
+        self.boot_pick.rearm_relocation();
+        self.cal_reloc = CalReloc {
+            s: CalRelocState::Waiting,
+            ch,
+            t0: now_ms,
+            ..CalReloc::default()
+        };
+        let op = self.plan.op();
+        self.log(format!(
+            "maburgs channel: calibration wants {ch}, link on {op}: relocating"
+        ));
+        true
+    }
+
+    /// true once the confirm landed it, false when withdrawn, held at the
+    /// cap, lost with the session or never placed; None pending / none.
+    pub fn cal_relocate_settled(&self) -> Option<bool> {
+        (self.cal_reloc.s == CalRelocState::Settled).then_some(self.cal_reloc.ok)
+    }
+
+    fn settle_cal_reloc(&mut self, ok: bool, why: &str) {
+        self.cal_reloc.s = CalRelocState::Settled;
+        self.cal_reloc.ok = ok;
+        let ch = self.cal_reloc.ch;
+        self.log(format!(
+            "maburgs channel: calibration relocate to {ch} {why}"
+        ));
+    }
+
+    fn step_cal(&mut self, inp: &ChannelTickIn) {
+        let now_ms = inp.now_ms;
+        let active = hop_active(inp.in_session, inp.cal_running);
+        if self.cal_reloc.s == CalRelocState::Waiting
+            && (!active || now_ms - self.cal_reloc.t0 > self.cfg.hop.confirm_ms as f64)
+        {
+            // BootPick never handed the order out: nothing will move, so
+            // want follows op.
+            self.settle_cal_reloc(false, "never placed");
+            if !self.plan.hopping() {
+                let op = self.plan.op();
+                self.plan.set_want(now_ms, op);
+            }
+        } else if self.cal_reloc.s == CalRelocState::InFlight
+            && self.cal_reloc.confirmed
+            && self.hopc.state() == HopState::Idle
+        {
+            // Confirmed, then the session's falling edge dropped the verify
+            // state before its VerifyPass: the link is on the target.
+            self.settle_cal_reloc(true, "landed");
+        }
+        // A round still pending once the run calibrates has missed its
+        // moment: it must never take the scout card later.
+        if self.cal_meas.s == CalMeasureState::Waiting && inp.cal_running {
+            self.cal_meas = CalMeasure::default();
+            self.log(
+                "maburgs channel: calibration measure round dropped: a run is calibrating".into(),
+            );
+        }
+        let Some(scout) = self.scout.clone() else {
+            return;
+        };
+        let sci = self.scout_card.expect("a scout has a card");
+        // Only with the scout thread up and its card alive: a round on a
+        // scout that never steps would hold the card for good.
+        if self.cal_meas.s == CalMeasureState::Waiting
+            && active
+            && self.scout_started
+            && !self.scout_card_down
+            && !self.scout_owns()
+            && !self.boot_pick.open()
+            && !self.boot_pick.relocating()
+            && !self.plan.hopping()
+            && !self.dwell_busy()
+            && matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
+        {
+            {
+                // inflight then the card's device-use lock, the order every
+                // holder of both follows: no in-flight dwell is on the scout
+                // card while it changes hands, and the sampler sees the card
+                // blocked before the scout's first retune lands under it.
+                let live = self.live.clone();
+                let _ilk = live.inflight.lock().unwrap();
+                let _hold = live.sampler.hold_card(sci);
+                scout.begin_round();
+                self.live.scout_working.store(true, Relaxed);
+                self.step_gates();
+            }
+            self.cal_meas.s = CalMeasureState::Running;
+            self.cal_meas.t0 = now_ms;
+            // Twice a full round's dwell time (every dwell channel, op's
+            // included, at dwell_ms + settle_ms), never under a second.
+            let chans = &self.cfg.radio.channels;
+            let n = if self.cfg.radio.width == 40 {
+                scan_half_set(chans).len()
+            } else {
+                chans.len()
+            };
+            let scan = &self.cfg.radio.scan;
+            self.cal_meas.bound_ms =
+                (2.0 * n as f64 * f64::from(scan.dwell_ms + scan.settle_ms)).max(1000.0);
+            let op = self.plan.op();
+            self.log(format!(
+                "maburgs channel: calibration measure round on card {sci} (op {op})"
+            ));
+        } else if self.cal_meas.s == CalMeasureState::Running && !scout.round_measuring() {
+            self.finish_cal_measure(now_ms, &scout);
+        } else if self.cal_meas.s == CalMeasureState::Running
+            && now_ms - self.cal_meas.t0 >= self.cal_meas.bound_ms
+        {
+            scout.cancel_round(!self.scout_started);
+            self.cal_meas.s = CalMeasureState::Done;
+            self.cal_meas.best = self.plan.op();
+            let (b, op) = (self.cal_meas.bound_ms, self.plan.op());
+            self.log(format!(
+                "maburgs channel: calibration measure round overran {b:.0} ms; staying on {op}"
+            ));
+        }
+    }
+
+    fn finish_cal_measure(&mut self, now_ms: f64, scout: &Scout) {
+        let op = self.plan.op();
+        // Op's row is the verdict's live reading taken during the round;
+        // without one op is unmeasured and a working link is not moved on a
+        // one-sided comparison.
+        let have_op = self.op_live.is_some() && self.op_live_ms >= self.cal_meas.t0;
+        let halves: Vec<CalReading> = scout
+            .round_samples()
+            .iter()
+            .map(|s| CalReading {
+                ch: s.ch,
+                foreign: s.foreign,
+                busy_valid: s.busy_valid,
+                busy_pct: s.busy_pct,
+            })
+            .collect();
+        let scan = &self.cfg.radio.scan;
+        let pick = cal_round_pick(
+            &halves,
+            if have_op { self.op_live } else { None },
+            op,
+            &self.cfg.radio.channels,
+            self.cfg.radio.width,
+            scan.pick_margin as u32,
+            scan.busy.blocked_pct,
+        );
+        self.sink
+            .pick(now_ms, Some(pick.best), scout.rounds(), &pick.rows, 1);
+        let unread = if have_op { "" } else { " unread: staying" };
+        self.log(format!(
+            "maburgs channel: calibration measure picks {} (op {op}{unread})",
+            pick.best
+        ));
+        self.cal_meas.s = CalMeasureState::Done;
+        self.cal_meas.best = pick.best;
     }
 
     fn step_move_edge(&mut self, now_ms: f64, vrx: &mut VrxController) {

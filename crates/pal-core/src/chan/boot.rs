@@ -251,6 +251,11 @@ impl BootPick {
     pub fn relocating(&self) -> bool {
         self.relocating
     }
+    /// A calibration run's relocate: the next due relocation may go out
+    /// again this link-up.
+    pub fn rearm_relocation(&mut self) {
+        self.tried = false;
+    }
     /// A relocation is due and untried this link-up: no reactive order may
     /// take the controller first.
     pub fn relocation_pending(&self, k: &BootPickIn) -> bool {
