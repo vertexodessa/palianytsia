@@ -35,6 +35,8 @@ pub struct OsdIn {
     pub set_res_rx: Receiver<(usize, Result<(), String>)>,
     /// "ch 40 / 40 MHz", for the Link tab.
     pub radio: String,
+    /// Where this session's flight log goes, for the Logs tab.
+    pub log_info: String,
     /// HUD prefs file in the app's files dir.
     pub prefs_path: std::path::PathBuf,
 }
@@ -220,7 +222,10 @@ pub fn run(o: OsdIn) {
                         o.radio,
                         hist.last().map_or("?", |s| s.key_fp.as_str())
                     ),
-                    log_info: "flight logs: not recorded on the phone yet".into(),
+                    log_info: format!(
+                        "{}\n\nadb pull /sdcard/Android/data/org.palianytsia.phone/files/logs",
+                        o.log_info
+                    ),
                 },
             );
             egui::CentralPanel::default()

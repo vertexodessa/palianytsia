@@ -12,7 +12,7 @@ final class Native {
 
     /** Returns a handle, or 0 with the reason in {@link #lastError()}. */
     static native long start(int usbFd, Surface video, Surface osd, float density,
-            String configToml, String filesDir);
+            String configToml, String filesDir, String logDir);
 
     /** Newest core stats line (JSON), "" before the first. */
     static native String stats(long handle);
@@ -20,6 +20,9 @@ final class Native {
     /** A touch for the Rust-drawn OSD: action 0 down, 1 up, 2 move,
      *  3 cancel; x, y in Surface pixels. */
     static native void touch(long handle, int action, float x, float y);
+
+    /** False once the core thread has returned (card gone, USB error). */
+    static native boolean running(long handle);
 
     static native String lastError();
 

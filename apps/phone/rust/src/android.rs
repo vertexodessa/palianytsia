@@ -1,36 +1,17 @@
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use decode::mediacodec::MediaCodecDecoder;
-use decode::Decoder;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
-use pal_core::refresh::IdrDriver;
-use pal_core::rust_core::{RustCore, RustOpts};
-use pal_core::Mode;
-use runtime::{CoreLoop, LiveCfg, Shared, Sink};
-
-/// Same rendezvous nonce as the desktop: replays stay comparable.
-const RZ_NONCE: u32 = 0x5041_4c31;
-
-static LAST_ERR: Mutex<String> = Mutex::new(String::new());
-
-fn set_err(e: impl Into<String>) {
-    let e = e.into();
-    log::error!("{e}");
-    *LAST_ERR.lock().unwrap_or_else(|p| p.into_inner()) = e;
-}
+use pal_android::{clear_err, last_error, set_err, Link, LinkCfg};
 
 struct Phone {
-    shared: Arc<Shared>,
+    link: Option<Link>,
     /// Newest stats line, written by the OSD thread.
     last: Arc<Mutex<String>>,
-    core: Option<JoinHandle<()>>,
-    dec: Option<JoinHandle<()>>,
     osd: Option<JoinHandle<()>>,
     /// Touches from the Activity (pixels) into the OSD thread's egui.
     touch_tx: mpsc::Sender<crate::osd::Touch>,
@@ -41,157 +22,44 @@ fn start(
     win: ndk::native_window::NativeWindow,
     osd_win: ndk::native_window::NativeWindow,
     density: f32,
-    toml: &str,
+    toml: String,
     prefs_path: std::path::PathBuf,
+    log_dir: std::path::PathBuf,
 ) -> Result<Phone, String> {
-    let cfg = pal_core::config::parse_config_str(toml).map_err(|e| e.to_string())?;
-    let ch = cfg
-        .radio
-        .pin
-        .or(cfg.radio.channels.first().copied())
-        .ok_or("config: no channel")?;
-    let width = cfg.radio.width;
-    let dec = MediaCodecDecoder::new(win, 1920, 1080)?;
-
-    let (au_tx, au_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(8);
-    let (stats_tx, stats_rx) = mpsc::sync_channel(4);
-    let (params_tx, params_rx) = mpsc::sync_channel(2);
-    let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (set_res_tx, set_res_rx) = mpsc::sync_channel(8);
-    let (mav_tx, mav_rx) = mpsc::sync_channel(256);
-    let shared = Arc::new(Shared::default());
-    let sink = Sink {
-        au_tx,
-        mav_tx,
-        udp: None,
-        card: None,
-        log: None,
-        now_us: 0,
-        pts_off_us: None,
-        shared: shared.clone(),
-        idr: Some(IdrDriver::default()),
-    };
-    // RustCore is built on the core thread (GsCore is not Send); a config
-    // it refuses still shows up in lastError().
-    let mk_cl = move |core: Box<dyn pal_core::GsCore>| CoreLoop {
-        core,
-        sink,
-        stats_tx,
-        params_tx,
-        cmd_rx,
-        set_res_tx,
-        last_params_us: 0,
-        lat: false,
-        last_lat_us: 0,
-        rx_full_seen: 0,
-        stall_mark: (0, 0),
-        last_stats_us: 0,
-        last_log_us: 0,
-    };
-
+    let (link, ports) = Link::start(LinkCfg { fd, toml, log_dir }, win)?;
     let last = Arc::new(Mutex::new(String::new()));
     let (touch_tx, touch_rx) = mpsc::channel();
     let osd_in = crate::osd::OsdIn {
-        mav_rx,
+        mav_rx: ports.mav_rx,
         touch_rx,
-        params_rx,
-        cmd_tx,
-        set_res_rx,
+        params_rx: ports.params_rx,
+        cmd_tx: ports.cmd_tx,
+        set_res_rx: ports.set_res_rx,
         prefs_path,
-        radio: format!("ch {ch} / {width} MHz"),
+        radio: link.radio.clone(),
+        log_info: link.log_info.clone(),
         win: osd_win,
         density,
-        stats_rx,
+        stats_rx: ports.stats_rx,
         last: last.clone(),
-        shared: shared.clone(),
+        shared: link.shared.clone(),
     };
-    let osd_t = std::thread::Builder::new()
+    let osd_t = match std::thread::Builder::new()
         .name("pal-osd".into())
         .spawn(move || crate::osd::run(osd_in))
-        .map_err(|e| e.to_string())?;
-    let sh = shared.clone();
-    let dec_t = std::thread::Builder::new()
-        .name("pal-decode".into())
-        .spawn(move || decode_loop(dec, au_rx, &sh))
-        .map_err(|e| e.to_string())?;
-    let core_t = std::thread::Builder::new()
-        .name("pal-core".into())
-        .spawn(move || {
-            let opts = RustOpts {
-                mode: Mode::Gs,
-                adaptive_gap: true,
-                rz_nonce: RZ_NONCE,
-                channel: ch,
-            };
-            let cl = match RustCore::new(&cfg, opts) {
-                Ok(c) => mk_cl(Box::new(c)),
-                Err(e) => return set_err(format!("core: {e}")),
-            };
-            let lc = LiveCfg {
-                select: devourer_sys::Select::Fd(fd),
-                ch,
-                width,
-                gs: true,
-            };
-            match runtime::run_live(cl, lc, |chip| {
-                log::info!("card {chip} on ch {ch} / {width} MHz")
-            }) {
-                Ok(()) => log::info!("core loop ended"),
-                Err(e) => set_err(e),
-            }
-        })
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(t) => t,
+        Err(e) => {
+            link.stop();
+            return Err(e.to_string());
+        }
+    };
     Ok(Phone {
-        shared,
+        link: Some(link),
         last,
-        core: Some(core_t),
-        dec: Some(dec_t),
         osd: Some(osd_t),
         touch_tx,
     })
-}
-
-/// AUs into MediaCodec; decoder errors go back to the IDR driver the same
-/// way the desktop's decode thread reports them.
-fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>, sh: &Shared) {
-    let mut errs = 0;
-    // Once a second: a line when AUs came in but no frame came out, so a
-    // stall on the glass leaves its cause in logcat.
-    let (mut t, mut aus, mut f0, mut s0, mut n0) = (Instant::now(), 0u64, 0u64, 0u64, 0u64);
-    loop {
-        let got = match au_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(x) => Some(x),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        if let Some((n, _t, au)) = got {
-            aus += 1;
-            dec.decode(&au);
-            let (_, e) = dec.counters();
-            if e > errs {
-                errs = e;
-                sh.dec_err_au.store(n, Ordering::Relaxed);
-                sh.dec_errors.store(e, Ordering::Release);
-            }
-        }
-        let (f, _) = dec.counters();
-        sh.frames.store(f, Ordering::Relaxed);
-        if t.elapsed() >= Duration::from_secs(1) {
-            let (st, ni) = (dec.stale(), dec.no_input());
-            if aus > 0 && f == f0 {
-                log::warn!(
-                    "video stalled: {aus} AUs in, 0 frames out; stale {} no_input {} errors {errs} au_drops {}",
-                    st - s0,
-                    ni - n0,
-                    sh.au_dropped.load(Ordering::Relaxed)
-                );
-            } else if aus == 0 && sh.frames.load(Ordering::Relaxed) > 0 {
-                log::warn!("video stalled: no AUs from the core for 1 s");
-            }
-            (t, aus, f0, s0, n0) = (Instant::now(), 0, f, st, ni);
-        }
-    }
-    log::info!("decode loop ended ({} stale frames dropped)", dec.stale());
 }
 
 fn jstr(env: &mut JNIEnv, s: &str) -> jstring {
@@ -210,12 +78,15 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
     density: jni::sys::jfloat,
     toml: JString,
     files_dir: JString,
+    log_dir: JString,
 ) -> jlong {
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
             .with_tag("palianytsia"),
     );
+    // A retry starts clean: the previous run's error is no longer news.
+    clear_err();
     let toml: String = match env.get_string(&toml) {
         Ok(s) => s.into(),
         Err(e) => {
@@ -228,6 +99,7 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
         .map(Into::into)
         .unwrap_or_default();
     let prefs_path = std::path::Path::new(&dir).join("hud.json");
+    let log_dir: String = env.get_string(&log_dir).map(Into::into).unwrap_or_default();
     // SAFETY: a live android.view.Surface from the Activity's SurfaceHolder.
     let win = unsafe {
         ndk::native_window::NativeWindow::from_surface(
@@ -247,7 +119,7 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
         set_err("OSD ANativeWindow_fromSurface returned null");
         return 0;
     };
-    match start(fd, win, osd_win, density, &toml, prefs_path) {
+    match start(fd, win, osd_win, density, toml, prefs_path, log_dir.into()) {
         Ok(p) => Box::into_raw(Box::new(p)) as jlong,
         Err(e) => {
             set_err(e);
@@ -289,13 +161,28 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_touch(
     let _ = p.touch_tx.send(crate::osd::Touch { action, x, y });
 }
 
+/// False once the core thread has returned (card gone, USB error): the
+/// Activity then stops this handle and starts over.
+#[no_mangle]
+pub extern "system" fn Java_org_palianytsia_phone_Native_running(
+    _env: JNIEnv,
+    _c: JClass,
+    h: jlong,
+) -> jni::sys::jboolean {
+    if h == 0 {
+        return 0;
+    }
+    // SAFETY: as in stats().
+    let p = unsafe { &*(h as *mut Phone) };
+    u8::from(p.link.as_ref().is_some_and(Link::running))
+}
+
 #[no_mangle]
 pub extern "system" fn Java_org_palianytsia_phone_Native_lastError(
     mut env: JNIEnv,
     _c: JClass,
 ) -> jstring {
-    let e = LAST_ERR.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    jstr(&mut env, &e)
+    jstr(&mut env, &last_error())
 }
 
 #[no_mangle]
@@ -305,22 +192,11 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_stop(_env: JNIEnv, _c: 
     }
     // SAFETY: as in stats(); ownership returns here exactly once.
     let mut p = unsafe { Box::from_raw(h as *mut Phone) };
-    p.shared.quit.store(true, Ordering::Relaxed);
-    // Bounded join (spec 5.5: 3 s): a wedged USB run is left behind rather
-    // than hanging the UI thread.
-    let t0 = Instant::now();
-    if let Some(c) = p.core.take() {
-        while !c.is_finished() && t0.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if c.is_finished() {
-            let _ = c.join();
-        } else {
-            log::warn!("core thread did not stop in 3 s; leaving it");
-        }
+    if let Some(l) = p.link.as_ref() {
+        l.request_quit();
     }
     // The OSD thread draws into a Surface the Activity is about to destroy:
-    // it checks quit every 250 ms at most.
+    // it checks quit every 100 ms at most.
     if let Some(o) = p.osd.take() {
         let t1 = Instant::now();
         while !o.is_finished() && t1.elapsed() < Duration::from_secs(1) {
@@ -330,10 +206,7 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_stop(_env: JNIEnv, _c: 
             let _ = o.join();
         }
     }
-    if let Some(d) = p.dec.take() {
-        if d.is_finished() || p.core.is_none() {
-            // The decoder ends when the core loop drops the AU sender.
-            let _ = d.join();
-        }
+    if let Some(l) = p.link.take() {
+        l.stop();
     }
 }

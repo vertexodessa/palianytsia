@@ -53,9 +53,25 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private SurfaceHolder osdHolder;
     private long handle;
 
+    /** Delay between start attempts while there is no card or it failed. */
+    private static final int RETRY_MS = 3000;
+    /** Name of the card the running handle uses, to match detach events. */
+    private String cardName;
+
     private final BroadcastReceiver permission = new BroadcastReceiver() {
         @Override
         public void onReceive(Context c, Intent i) {
+            if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(i.getAction())) {
+                UsbDevice d = i.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (d != null && handle != 0 && d.getDeviceName().equals(cardName)) {
+                    // The card left the bus: stop before libusb calls on a
+                    // dead fd pile up, then look for it again.
+                    stopLink();
+                    show("card detached, waiting for it");
+                    retry();
+                }
+                return;
+            }
             if (!ACTION_USB.equals(i.getAction())) return;
             if (i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                 tryStart();
@@ -64,6 +80,13 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             }
         }
     };
+
+    private final Runnable retryStart = this::tryStart;
+
+    private void retry() {
+        ui.removeCallbacks(retryStart);
+        ui.postDelayed(retryStart, RETRY_MS);
+    }
 
     @Override
     protected void onCreate(Bundle b) {
@@ -103,6 +126,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         });
         setContentView(root);
         IntentFilter f = new IntentFilter(ACTION_USB);
+        f.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(permission, f, Context.RECEIVER_NOT_EXPORTED);
         } else {
@@ -113,6 +137,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacks(retryStart);
         stopLink();
         unregisterReceiver(permission);
         super.onDestroy();
@@ -163,7 +188,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         UsbDevice d = findCard();
         if (d == null) {
             show("no RTL8812 card");
-            ui.postDelayed(this::tryStart, 3000);
+            retry();
             return;
         }
         if (!usb.hasPermission(d)) {
@@ -178,6 +203,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         conn = usb.openDevice(d);
         if (conn == null) {
             show("openDevice failed");
+            retry();
             return;
         }
         String cfg;
@@ -190,14 +216,18 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         String name = String.format("%04x:%04x", d.getVendorId(), d.getProductId());
         Log.i(TAG, "starting on " + name + " fd " + conn.getFileDescriptor());
         float density = getResources().getDisplayMetrics().density;
+        java.io.File logs = new java.io.File(getExternalFilesDir(null), "logs");
         handle = Native.start(conn.getFileDescriptor(), holder.getSurface(),
-                osdHolder.getSurface(), density, cfg, getFilesDir().getAbsolutePath());
+                osdHolder.getSurface(), density, cfg, getFilesDir().getAbsolutePath(),
+                logs.getAbsolutePath());
         if (handle == 0) {
             show("start failed: " + Native.lastError());
             conn.close();
             conn = null;
+            retry();
             return;
         }
+        cardName = d.getDeviceName();
         show("card " + name + " up");
         ui.postDelayed(tick, 500);
     }
@@ -208,6 +238,13 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             if (handle == 0) return;
             // The Rust OSD shows the link; this text is only for errors.
             String err = Native.lastError();
+            if (!Native.running(handle)) {
+                // The core gave up (USB error, card wedged): start over.
+                stopLink();
+                show("link stopped: " + err + "; retrying");
+                retry();
+                return;
+            }
             osd.setText(err.isEmpty() ? "" : "error: " + err);
             ui.postDelayed(this, 500);
         }
@@ -218,6 +255,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         if (handle != 0) {
             Native.stop(handle);
             handle = 0;
+            cardName = null;
         }
         if (conn != null) {
             conn.close();

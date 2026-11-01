@@ -12,3 +12,4 @@ pal-wire.workspace = true
 pal-osd.workspace = true
 devourer-sys.workspace = true
 flightlog.workspace = true
+serde_json.workspace = true

@@ -4,7 +4,7 @@
 //! decoder feeds back. Decoding and drawing stay in the apps.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flightlog::session::Session;
@@ -35,6 +35,19 @@ pub struct Shared {
     /// The core loop has returned and dropped its Session.
     pub core_done: AtomicBool,
     pub lat: Lat,
+    /// Events from other threads (decoder stalls) for the flight log; the
+    /// core loop drains them on its tick.
+    pub events: Mutex<Vec<(&'static str, serde_json::Value)>>,
+}
+
+impl Shared {
+    pub fn event(&self, ev: &'static str, detail: serde_json::Value) {
+        let mut q = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        // A wedged core loop must not grow this without bound.
+        if q.len() < 256 {
+            q.push((ev, detail));
+        }
+    }
 }
 
 /// `--lat` probes. Stamps are `lat_us()`; *_max are per report window and
@@ -147,8 +160,19 @@ impl CoreLoop {
                 self.core.mav_push_outbound(&buf[..n]);
             }
         }
+        let evs = std::mem::take(
+            &mut *self
+                .sink
+                .shared
+                .events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
         if let Some(l) = self.sink.log.as_mut() {
             let _ = l.tick(now);
+            for (ev, d) in evs {
+                let _ = l.event(now, ev, d);
+            }
         }
         if let Some(i) = self.sink.idr.as_mut() {
             // Errors first (Acquire pairs with the decoder's Release): the AU
@@ -186,6 +210,9 @@ impl CoreLoop {
                 self.last_log_us = now;
                 if let Some(l) = self.sink.log.as_mut() {
                     let _ = l.stats(now, &line);
+                    // A killed app (Android swipe, OOM) skips Drop: at most
+                    // one second of log is lost, a few writes a second.
+                    let _ = l.flush();
                 }
             }
             self.sink.pts_off_us = line

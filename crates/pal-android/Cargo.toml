@@ -1,0 +1,18 @@
+[package]
+name = "pal-android"
+description = "The Android GS link shared by the phone and Quest apps: core thread on a UsbManager fd, MediaCodec decode thread, flight log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+pal-core.workspace = true
+pal-osd.workspace = true
+runtime.workspace = true
+devourer-sys.workspace = true
+decode.workspace = true
+flightlog.workspace = true
+serde_json.workspace = true
+ndk = { version = "0.9", features = ["media", "api-level-29"] }
+log = "0.4"
