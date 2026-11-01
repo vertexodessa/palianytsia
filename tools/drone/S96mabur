@@ -1,0 +1,89 @@
+#!/bin/sh
+DAEMON=/usr/bin/maburd
+CONF=/etc/mabur.toml
+PIDFILE=/var/run/mabur-loop.pid
+LOGPIDFILE=/var/run/mabur-logwatch.pid
+LOG=/tmp/mabur.log
+LOG_MAX=$((4 * 1024 * 1024))
+LOG_KEEP=${LOG_KEEP:-1048576}
+
+loop() {
+  while true; do
+    # Truncate on every (re)start rather than appending across runs: /tmp is
+    # RAM-backed, so an ever-growing log over a long respawn loop can exhaust
+    # it. This keeps only the current run's log, which is also what
+    # install.sh/README document ("cat /tmp/mabur.log") — without this
+    # redirection there was no log at all.
+    #
+    # The redirect is O_APPEND (>>) with an explicit truncate first, NOT a
+    # plain >. Both start the run at an empty file, but only O_APPEND lets
+    # logwatch() truncate underneath a running daemon: with a plain >, the
+    # daemon's file offset survives the truncate and the next write recreates
+    # a sparse file of the old size instead of restarting at zero.
+    # Keep the tail of the previous run in $LOG.prev before wiping: the
+    # daemon's own watchdog abort()s on a wedged thread, and on 2026-08-28
+    # 22:15 the wipe took the "watchdog: hot thread stalled" line and the
+    # last diag seconds with it.
+    if [ -s "$LOG" ]; then
+      tail -c "$LOG_KEEP" "$LOG" > "$LOG.prev" 2>/dev/null
+    fi
+    : > "$LOG"
+    "$DAEMON" -c "$CONF" >> "$LOG" 2>&1
+    rc=$?
+    # Into the log only, never stderr: started from an ssh session the stderr
+    # echo is a SIGPIPE once the session is gone and it kills this loop
+    # (ld 2026-09-07, no respawn after the first crash).
+    echo "maburd exited ($rc) at $(date +%s) - respawn in 2s" >> "$LOG.prev" 2>/dev/null
+    sleep 2
+  done
+}
+
+# Defence in depth for the 45 MB RAM-backed /tmp: cap the log independent of
+# what the daemon (or a library it links) decides to print. A chatty line at
+# URB rate once filled /tmp in ~30 min, after which every log write failed
+# silently and the log froze — losing exactly the tail you would debug from.
+# Losing the oldest 4 MB is strictly better than losing the newest everything.
+logwatch() {
+  while true; do
+    sleep 60
+    if [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
+      # Keep the newest LOG_KEEP bytes instead of wiping the file: on
+      # 2026-08-28 22:24 the wipe landed in the same second as a session
+      # drop and took the drone's side of the incident with it. The daemon
+      # writes with O_APPEND, so rewriting the file in place (cat >, same
+      # inode) keeps its stream intact.
+      tail -c "$LOG_KEEP" "$LOG" > "$LOG.keep" 2>/dev/null
+      cat "$LOG.keep" > "$LOG"
+      rm -f "$LOG.keep"
+      echo "mabur: log exceeded $LOG_MAX bytes - kept the last $LOG_KEEP" >> "$LOG"
+    fi
+  done
+}
+
+running() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+case "$1" in
+  start)
+    running "$PIDFILE" || { loop & echo $! > "$PIDFILE"; }
+    # Checked independently of the respawn loop: a live daemon must not mask a
+    # dead logwatch, since an uncapped log is the failure this guards against.
+    running "$LOGPIDFILE" || { logwatch & echo $! > "$LOGPIDFILE"; }
+    ;;
+  stop)
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+    rm -f "$PIDFILE"
+    [ -f "$LOGPIDFILE" ] && kill "$(cat "$LOGPIDFILE")" 2>/dev/null
+    rm -f "$LOGPIDFILE"
+    # The PID kill only stops the respawn-loop subshell; the foreground daemon survives without this.
+    killall maburd 2>/dev/null || true
+    ;;
+  restart)
+    "$0" stop
+    sleep 1
+    "$0" start
+    ;;
+  *)
+    echo "usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac

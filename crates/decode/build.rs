@@ -36,6 +36,12 @@ fn pkg(args: &[&str]) -> Vec<String> {
 fn main() {
     println!("cargo:rerun-if-changed=cpp/dec.c");
     println!("cargo:rerun-if-env-changed=PAL_FFMPEG_STATIC");
+    if let Some(p) = static_prefix() {
+        // A rebuilt FFmpeg under the same prefix must relink.
+        for l in ["avcodec", "avutil", "swscale"] {
+            println!("cargo:rerun-if-changed={p}/lib/lib{l}.a");
+        }
+    }
     // Android decodes with MediaCodec (src/mediacodec.rs): no libavcodec.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         println!("cargo:rustc-link-lib=dylib=mediandk");
