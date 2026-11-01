@@ -5,7 +5,9 @@
 //! and the newest stats line.
 //!
 //!   pal-desktop -c gs.toml --replay bodies.bin [--mode gs|spotter] [--loop]
-//!   pal-desktop -c gs.toml --live --ch 144 --width 40 [--mode gs] [--card N]
+//!   pal-desktop [-c gs.toml] [--live] [--ch N --width 20|40] [--mode gs|spotter] [--card N]
+//!     live is the default; config from -c, $PAL_CONFIG, or configs/bench-ch40.toml;
+//!     channel/width from its radio section, mode gs
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
@@ -71,8 +73,6 @@ fn die(msg: &str) -> ! {
 fn parse() -> Opts {
     let mut o = Opts {
         hwdec: "auto".into(),
-        ch: 149,
-        width: 20,
         rust: true,
         secs: 5.0,
         ..Opts::default()
@@ -111,8 +111,41 @@ fn parse() -> Opts {
             s => die(&format!("unknown argument {s}")),
         }
     }
-    if o.live == o.replay.is_some() {
-        die("exactly one of --live or --replay FILE");
+    if o.live && o.replay.is_some() {
+        die("--live and --replay are exclusive");
+    }
+    // No source given: live, the everyday case (`cargo run -p pal-desktop`).
+    o.live = o.replay.is_none();
+    if o.config.is_none() {
+        // -c, else $PAL_CONFIG, else the bench rig's config in this repo.
+        let p = std::env::var_os("PAL_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../configs/bench-ch40.toml"
+                ))
+            });
+        eprintln!("pal-desktop: config {}", p.display());
+        o.config = Some(p);
+    }
+    if o.live {
+        o.mode.get_or_insert(Mode::Gs);
+        // Channel and width from the config unless given: radio.channel's
+        // pin, else the first of radio.channels.
+        let cfg = o.config.as_ref().expect("config");
+        let c = pal_core::config::load_config(cfg, None)
+            .unwrap_or_else(|e| die(&format!("{}: {e}", cfg.display())));
+        if o.ch == 0 {
+            o.ch = c
+                .radio
+                .pin
+                .or(c.radio.channels.first().copied())
+                .unwrap_or(0);
+        }
+        if o.width == 0 {
+            o.width = c.radio.width;
+        }
     }
     o
 }
@@ -260,6 +293,8 @@ struct CoreLoop {
     lat: bool,
     last_lat_us: u64,
     rx_full_seen: u64,
+    /// (frames, au drops) at the last report, for the stall warning.
+    stall_mark: (u64, u64),
     last_stats_us: u64,
     last_log_us: u64,
 }
@@ -333,6 +368,16 @@ impl CoreLoop {
             let l = &self.sink.shared.lat;
             // Without --lat the line still prints when a stage goes bad, so
             // an intermittent multi-second lag leaves its breakdown behind.
+            // A decoder that stopped returning (a hung hwaccel driver) shows
+            // as AUs dropping while the frame count stands still.
+            let frames_now = self.sink.shared.frames.load(Ordering::Relaxed);
+            let drops_now = self.sink.shared.au_dropped.load(Ordering::Relaxed);
+            if drops_now > self.stall_mark.1 && frames_now == self.stall_mark.0 {
+                eprintln!(
+                    "pal-desktop: decoder stalled ({frames_now} frames, AUs dropping); a hung hwaccel driver? try --hwdec sw or another backend"
+                );
+            }
+            self.stall_mark = (frames_now, drops_now);
             let bad = l.body_lag_max.load(Ordering::Relaxed) > 200_000
                 || l.cap_au_max.load(Ordering::Relaxed) > 500_000
                 || l.au_dec_max.load(Ordering::Relaxed) > 300_000
@@ -818,6 +863,7 @@ fn main() {
                             lat: o.lat,
                             last_lat_us: 0,
                             rx_full_seen: 0,
+                            stall_mark: (0, 0),
                             last_stats_us: 0,
                             last_log_us: 0,
                         };

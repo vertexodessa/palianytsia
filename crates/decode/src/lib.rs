@@ -64,14 +64,17 @@ impl AvDecoder {
         unsafe { pal_dec_hw_frames(self.raw) as u64 }
     }
     /// `open_hw(hw)` if it opens, else software with a note on stderr.
-    /// "auto" tries vaapi, vdpau, cuda in that order (cheapest CPU first
-    /// on the hosts measured: vdpau 0.4 ms vs cuda 0.8 ms per 1080p frame).
+    /// "auto" tries vdpau, vaapi, cuda in that order. vdpau first: on NVIDIA
+    /// the VA-API path is nvidia-vaapi-driver, which hung (default and egl
+    /// backends) or crashed (direct) on this HEVC stream after a few frames,
+    /// while vdpau decodes at 0.4 ms per 1080p frame (cuda 0.8 ms). Intel
+    /// and AMD hosts usually lack vdpau and land on vaapi.
     pub fn open_or_sw(threads: i32, hw: &str) -> Result<Self, String> {
         if hw.is_empty() {
             return Self::open(threads);
         }
         if hw == "auto" {
-            for h in ["vaapi", "vdpau", "cuda"] {
+            for h in ["vdpau", "vaapi", "cuda"] {
                 if let Ok(d) = Self::open_hw(threads, h) {
                     eprintln!("decode: hwaccel {h}");
                     return Ok(d);
