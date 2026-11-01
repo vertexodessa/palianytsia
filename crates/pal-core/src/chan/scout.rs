@@ -170,7 +170,18 @@ pub type SleepFn = Box<dyn Fn(i32) + Send + Sync>;
 struct Shared {
     ranker: ChannelRanker,
     dwells: Vec<ScoutDwell>,
+    /// Dwells taken this round (bounds a dead half).
+    round_dwells: usize,
+    round_samples: Vec<RankSample>,
 }
+
+/// The one-round state (a calibration run's channel pick): measuring ->
+/// measured (no work, not yet parked) -> idle once parked. One atomic
+/// moved by compare-exchange, so a begin_round racing the run thread's
+/// park is never lost.
+const ROUND_IDLE: u8 = 0;
+const ROUND_MEASURING: u8 = 1;
+const ROUND_MEASURED: u8 = 2;
 
 /// Run-thread state (mabur keeps it unlocked; the lock only makes `&self`
 /// sound and is never contended).
@@ -203,6 +214,7 @@ pub struct ChannelScout<R: ScoutRadio + ?Sized> {
     prelude_ack: AtomicBool,
     done: AtomicBool,
     rounds: AtomicU64,
+    round: AtomicU8,
 }
 
 /// Pinned or width 20: the members; measuring at 40: both halves of every
@@ -224,6 +236,8 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             sh: Mutex::new(Shared {
                 ranker: ChannelRanker::new(&dc, cfg.min_rounds, cfg.pick_margin, cfg.blocked_pct),
                 dwells: Vec::new(),
+                round_dwells: 0,
+                round_samples: Vec::new(),
             }),
             run: Mutex::new(RunState {
                 sched: FlatScheduler::new(&dc),
@@ -244,6 +258,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             prelude_ack: AtomicBool::new(!prelude),
             done: AtomicBool::new(false),
             rounds: AtomicU64::new(0),
+            round: AtomicU8::new(ROUND_IDLE),
             cfg,
             radio,
             now,
@@ -315,7 +330,80 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         self.search.load(Acquire) || self.measuring()
     }
     fn measuring(&self) -> bool {
-        self.cfg.measure && !self.frozen.load(Acquire)
+        self.cfg.measure && (!self.frozen.load(Acquire) || self.round_measuring())
+    }
+
+    // ---- one measure round (a calibration run's channel pick) ----
+
+    /// One measure round now, the pick already frozen and the scout parked
+    /// (the core checks both). A fresh ranker: the round ranks only what it
+    /// measures. round_open() reads true from here until the scout has
+    /// parked again, so the core never touches the card in between.
+    pub fn begin_round(&self) {
+        {
+            let mut sh = self.sh.lock().unwrap();
+            sh.ranker = ChannelRanker::new(
+                &dwell_channels(&self.cfg),
+                self.cfg.min_rounds,
+                self.cfg.pick_margin,
+                self.cfg.blocked_pct,
+            );
+            sh.round_dwells = 0;
+            sh.round_samples.clear();
+        }
+        self.round.store(ROUND_MEASURING, Release);
+    }
+
+    /// Ends a round early: no more measuring; the run thread parks the card
+    /// on its next step. force_idle: the run thread is not running, so
+    /// nothing will park: release the card at once.
+    pub fn cancel_round(&self, force_idle: bool) {
+        self.end_round_measuring();
+        if force_idle {
+            let _ = self
+                .round
+                .compare_exchange(ROUND_MEASURED, ROUND_IDLE, AcqRel, Acquire);
+        }
+    }
+
+    pub fn round_measuring(&self) -> bool {
+        self.round.load(Acquire) == ROUND_MEASURING
+    }
+    pub fn round_open(&self) -> bool {
+        self.round.load(Acquire) != ROUND_IDLE
+    }
+    /// Every observed sample of the current (or last) round, in dwell order.
+    pub fn round_samples(&self) -> Vec<RankSample> {
+        self.sh.lock().unwrap().round_samples.clone()
+    }
+
+    fn end_round_measuring(&self) {
+        let _ = self
+            .round
+            .compare_exchange(ROUND_MEASURING, ROUND_MEASURED, AcqRel, Acquire);
+    }
+
+    /// The round is over once every dwell channel it does not skip has a
+    /// visit, or after two passes' worth of dwells (a half whose retune or
+    /// read keeps failing must not hold the run's pick forever).
+    fn note_round_dwell(&self) {
+        if !self.round_measuring() {
+            return;
+        }
+        let cap = 2 * dwell_channels(&self.cfg).len();
+        let (all, taken) = {
+            let mut sh = self.sh.lock().unwrap();
+            sh.round_dwells += 1;
+            let all = sh
+                .ranker
+                .all()
+                .iter()
+                .all(|e| self.skip_op_half(e.ch) || e.visits != 0);
+            (all, sh.round_dwells)
+        };
+        if all || taken >= cap {
+            self.end_round_measuring();
+        }
     }
     fn member(&self, ch: u8) -> bool {
         ch != 0 && self.cfg.channels.contains(&ch)
@@ -410,8 +498,13 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             let ok = self.dwell(rs, ch, round, burst, observe);
             rs.sched.complete(i, (self.now)(), ok);
             self.rounds.store(rs.sched.rounds, Release);
+            if observe {
+                self.note_round_dwell();
+            }
             return true;
         }
+        // Every bin is one of op's (a one-member set): nothing to visit.
+        self.end_round_measuring();
         false
     }
 
@@ -423,6 +516,10 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             if self.working.load(Acquire) {
                 self.park(&mut rs);
             }
+            // A round that just ended is over once parked.
+            let _ = self
+                .round
+                .compare_exchange(ROUND_MEASURED, ROUND_IDLE, AcqRel, Acquire);
             return false;
         }
         self.working.store(true, Release);
@@ -559,6 +656,9 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             let mut sh = self.sh.lock().unwrap();
             if e.fa_valid {
                 sh.ranker.add(&rs_);
+                if self.round_measuring() {
+                    sh.round_samples.push(rs_);
+                }
             }
             sh.dwells.push(d);
         }

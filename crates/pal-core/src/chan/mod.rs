@@ -2,6 +2,7 @@
 //! module with each module's mabur tests. Plan and status:
 //! `docs/channel-core-port.md`.
 pub mod boot;
+pub mod cal_pick;
 pub mod core;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
