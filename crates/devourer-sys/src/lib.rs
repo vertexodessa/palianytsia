@@ -17,6 +17,8 @@ struct DvRx {
     evm: [i8; 2],
     tsfl: u32,
     bw40: u8,
+    stbc: u8,
+    sgi: u8,
 }
 
 #[repr(C)]
@@ -42,6 +44,7 @@ extern "C" {
     fn dv_send_control(c: *mut DvCard, body: *const u8, len: usize) -> c_int;
     fn dv_set_channel(c: *mut DvCard, ch: u8, width_mhz: u8) -> c_int;
     fn dv_chip(c: *const DvCard) -> *const c_char;
+    fn dv_radio(c: *mut DvCard) -> *mut c_void;
     fn dv_close(c: *mut DvCard);
 }
 
@@ -57,6 +60,8 @@ pub struct RxFrame<'a> {
     pub evm: [i8; 2],
     pub tsfl: u32,
     pub bw40: bool,
+    pub stbc: bool,
+    pub sgi: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +121,8 @@ extern "C" fn rx_tramp(user: *mut c_void, rx: *const DvRx) {
             evm: rx.evm,
             tsfl: rx.tsfl,
             bw40: rx.bw40 != 0,
+            stbc: rx.stbc != 0,
+            sgi: rx.sgi != 0,
         });
     }));
     if r.is_err() {
@@ -150,6 +157,12 @@ impl Card {
             tx: Mutex::new(()),
             handler: None,
         })
+    }
+
+    /// devourer's IRtlRadio behind this card, for a C++ control plane in
+    /// the same binary (pal-ref's LinkCard). Valid while the Card lives.
+    pub fn radio_ptr(&self) -> *mut c_void {
+        unsafe { dv_radio(self.raw) }
     }
 
     pub fn chip(&self) -> Option<String> {

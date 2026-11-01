@@ -31,6 +31,7 @@ fn main() {
         .cpp(true)
         .std("c++20")
         .file("cpp/shim.cpp")
+        .file("cpp/pal_card.cpp")
         .include("cpp")
         .include(mabur.join("web/src"))
         .include(mabur.join("gs/src"))

@@ -143,6 +143,8 @@ extern "C" int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user) {
       r.evm[1] = a.evm[1];
       r.tsfl = a.tsfl;
       r.bw40 = a.bw == 1;
+      r.stbc = a.stbc != 0;
+      r.sgi = a.sgi != 0;
       cb(user, &r);
     });
     c->alive = false;
@@ -189,6 +191,8 @@ extern "C" int dv_set_channel(dv_card *c, uint8_t ch, uint8_t width_mhz) try {
 } catch (...) {
   return -1;
 }
+
+extern "C" void *dv_radio(dv_card *c) { return c ? c->dev.get() : nullptr; }
 
 extern "C" const char *dv_chip(const dv_card *c) {
   return c && !c->chip.empty() ? c->chip.c_str() : nullptr;

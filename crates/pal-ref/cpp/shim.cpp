@@ -1,5 +1,7 @@
 #include "pal_ref.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -10,6 +12,7 @@
 
 #include "config.h"
 #include "frame_file_source.h"
+#include "link_card.h"
 #include "mabur/node.h"
 #include "web_gs.h"
 
@@ -63,8 +66,11 @@ void from_cpp(const mabur::node::RxBody& m, pal_rx_body* out) {
 
 struct pal_ref {
   maburgs::Config cfg;
-  std::unique_ptr<webgs::WebGs> gs;
+  std::atomic<uint8_t> stored_ch{0};
+  std::unique_ptr<webgs::WebGs> gs;   // last: its threads die before the rest
 };
+
+maburgs::LinkCard* pal_card_link(pal_card* c);   // pal_card.cpp
 
 struct pal_ffs {
   std::unique_ptr<maburgs::FrameFileSource> src;
@@ -113,6 +119,52 @@ pal_ref* pal_ref_new(const char* config_path, int mode, int adaptive_gap, uint32
     copy_err(err, err_cap, "unknown C++ exception");
   }
   return nullptr;
+}
+
+pal_ref* pal_ref_new_with_card(const char* config_path, pal_card* card, void* user,
+                               pal_au_cb on_au, char* err, size_t err_cap) {
+  if (!config_path || !on_au || !card) {
+    copy_err(err, err_cap, "config_path, card and on_au are required");
+    return nullptr;
+  }
+  try {
+    auto r = std::make_unique<pal_ref>();
+    r->cfg = maburgs::load_config(config_path, nullptr, "");
+    if (r->cfg.radio.channels.empty()) {
+      copy_err(err, err_cap, "config has no radio.channels");
+      return nullptr;
+    }
+    webgs::Io io;
+    io.on_au = [user, on_au](webgs::Au&& a) {
+      on_au(user, a.sid, a.flags, a.complete ? 1 : 0, a.salvaged ? 1 : 0, a.pts_us,
+            a.skipped_before, a.vcl_nal, a.data.data(), a.data.size());
+    };
+    pal_ref* raw = r.get();
+    io.on_channel_store = [raw](uint8_t ch) { raw->stored_ch.store(ch, std::memory_order_relaxed); };
+    io.on_log = [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); };
+    webgs::Opts o;   // live: adaptive gap, random nonce, the scout thread
+    maburgs::LinkCard* lc = pal_card_link(card);
+    r->gs = std::make_unique<webgs::WebGs>(r->cfg, webgs::Mode::Gs, lc->channel(), lc->width(),
+                                           std::vector<maburgs::LinkCard*>{lc}, 1, std::move(io),
+                                           o);
+    return r.release();
+  } catch (const std::exception& e) {
+    copy_err(err, err_cap, e.what());
+  } catch (...) {
+    copy_err(err, err_cap, "unknown C++ exception");
+  }
+  return nullptr;
+}
+
+// WebGs::now_us_for_core_ with core_threads.
+uint64_t pal_ref_now_us(void) {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+
+uint8_t pal_ref_stored_channel(const pal_ref* r) {
+  return r ? r->stored_ch.load(std::memory_order_relaxed) : 0;
 }
 
 void pal_ref_free(pal_ref* r) { delete r; }

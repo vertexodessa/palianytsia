@@ -9,7 +9,7 @@ status: `docs/spec.md`; read its M1/M2 status sections first).
 | `crates/pal-wire` | wire formats: dot11, SBI, RC (RCF/DISC/Telem/NACK/MAV), MAVLink 2 framer |
 | `crates/pal-fec` | GF(256), sliding-window RLC decoder |
 | `crates/pal-core` | the Rust GS core (`rust_core.rs`, WebGs wiring), `GsCore` trait, ladder, LHA, NACK, MAV tunnel, refresh (IDR) |
-| `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle |
+| `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle; `RefCard` (`cpp/pal_card.cpp`) lends the devourer-sys card to it as a `maburgs::LinkCard`, so it runs mabur's ChannelCore live |
 | `crates/devourer-sys` | devourer through a C shim (USB cards) |
 | `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
 | `crates/runtime` | shared by the apps: devourer RX thread, core loop (`CoreLoop`: GsCore + IdrDriver + log + stats/params), `run_live` |
@@ -54,7 +54,9 @@ pairing key.
   sweeps `radio.channels` (400 ms per channel, 3 CRC-good drone data frames = found) at start and
   after 8 s without drone frames, rebuilding the Rust core for the found channel; the core is not
   ticked while sweeping. Events `search`, `drone_found`, `drone_lost`. Pinned configs never sweep;
-  pal-desktop sweeps only with `--core rust` and no `--ch`. `gs.toml` stays pinned for the parity gates.
+  pal-desktop sweeps only with `--core rust` and no `--ch`; with `--core ref`, an auto config and no
+  `--ch` it runs mabur's own ChannelCore on the card (`runtime::LiveCfg::attach`: prelude ranking,
+  boot pick, relocation, in-flight hops, transmitting through the card; its clock is `pal_ref::now_us`). `gs.toml` stays pinned for the parity gates.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.

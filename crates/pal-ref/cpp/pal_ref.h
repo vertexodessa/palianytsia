@@ -64,6 +64,48 @@ void pal_ref_param_refresh(pal_ref* r);
 // output is truncated (and NUL-terminated) when cap is too small.
 size_t pal_ref_stats_json(const pal_ref* r, char* buf, size_t cap);
 
+// A card devourer-sys opened, lent to the core as a maburgs::LinkCard
+// (pal_card.cpp). With it the core is mabur's full GS: the ChannelCore picks,
+// relocates and hops the channel itself and transmits through the card.
+typedef struct pal_card pal_card;
+typedef struct pal_card_rx {
+  uint8_t crc_err;
+  uint8_t physt;
+  uint16_t data_rate;
+  uint8_t rssi[2];
+  int8_t snr[2];
+  int8_t evm[2];
+  uint32_t tsfl;
+  uint8_t bw40;
+  uint8_t stbc;
+  uint8_t sgi;
+} pal_card_rx;
+// send: transmit one RC body as a GS control frame, nonzero = sent (the host
+// owns the frame builder: devourer-sys dv_send_control). Called under the
+// card's control lock, from the core's thread.
+typedef int (*pal_card_send_cb)(void* user, const uint8_t* body, size_t len);
+// radio: devourer's IRtlRadio* (dv_radio), already started at channel/width.
+// It must outlive the card, and the card every pal_ref built on it.
+pal_card* pal_card_new(void* radio, uint8_t channel, uint8_t width_mhz, void* user,
+                       pal_card_send_cb send, char* err, size_t err_cap);
+void pal_card_free(pal_card* c);
+// From the RX thread, every frame, with the host's maburgs::fill_rx_body
+// verdict (pal-wire dot11::parse): 0 = body, 1 = short, 2 = foreign.
+// Returns -1 = not a body for the core, else the rx_channel to stamp on it
+// (0 = unknown, mid-retune).
+int pal_card_on_rx(pal_card* c, int verdict, size_t len, const pal_card_rx* a);
+// The channel the card is tuned to now.
+uint8_t pal_card_channel(const pal_card* c);
+// pal_ref_new in Gs mode with the card as its roster (no send callback: the
+// core transmits through the card). Its clock is pal_ref_now_us: stamp
+// on_rx and tick with it, since the core's scout thread reads it directly.
+pal_ref* pal_ref_new_with_card(const char* config_path, pal_card* card, void* user,
+                               pal_au_cb on_au, char* err, size_t err_cap);
+uint64_t pal_ref_now_us(void);
+// The channel the core asked to remember for the next start (ChannelCore's
+// store), 0 = none yet.
+uint8_t pal_ref_stored_channel(const pal_ref* r);
+
 // maburd --dry-run --out frame file as N virtual cards with deterministic loss.
 typedef struct pal_ffs pal_ffs;
 pal_ffs* pal_ffs_open(const char* path, int cards, int drop_pct, uint32_t seed);

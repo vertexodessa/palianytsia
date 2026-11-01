@@ -318,6 +318,27 @@ pub fn mono_us(t0: Instant) -> u64 {
 /// Builds a core for the channel the drone was found on.
 pub type Remake = Box<dyn FnMut(u8) -> Result<Box<dyn GsCore>, String>>;
 
+/// A core that drives the card itself (mabur's C++ GS with its channel
+/// core): it retunes, hops and transmits through the card, and every
+/// received frame passes through it first for its counters.
+pub trait RxTap: Send + Sync {
+    /// Every frame with its parse verdict. None = not a body for the core;
+    /// else the rx_channel to stamp (0 = mid-retune, unknown).
+    fn on_rx(&self, f: &devourer_sys::RxFrame, v: &dot11::Verdict) -> Option<u8>;
+    /// The channel the card is on now.
+    fn channel(&self) -> u8;
+}
+
+pub struct Attached {
+    pub core: Box<dyn GsCore>,
+    pub tap: Arc<dyn RxTap>,
+    /// The core's own clock; RX stamps and ticks use it.
+    pub clock: fn() -> u64,
+}
+
+/// Builds such a core once the card is open and receiving.
+pub type Attach = Box<dyn FnOnce(&Arc<devourer_sys::Card>) -> Result<Attached, String>>;
+
 /// Where the card comes from and how to tune it.
 pub struct LiveCfg {
     pub select: devourer_sys::Select,
@@ -331,6 +352,17 @@ pub struct LiveCfg {
     /// was built for, and a core on the wrong one would steer the drone.
     pub search: Vec<u8>,
     pub remake: Option<Remake>,
+    /// Replaces the CoreLoop's core with one that owns the card (see
+    /// `RxTap`); `search` and `gs` are then ignored: the core finds the
+    /// drone and transmits itself.
+    pub attach: Option<Attach>,
+}
+
+type TapClock = (Arc<dyn RxTap>, fn() -> u64);
+
+fn mono_default() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    1_000_000 + START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
 
 /// Listening time per channel. The drone sends video frames continuously
@@ -411,27 +443,42 @@ pub fn run_live(
     })
     .map_err(|e| format!("card: {e}"))?;
     on_open(&card.chip().unwrap_or("?".into()));
-    let t0 = Instant::now();
+    let attach = o.attach.take();
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
     // The channel RX frames are stamped with; 0 while the card retunes.
     let cur = Arc::new(AtomicU8::new(o.ch));
     // CRC-good drone data frames (SA-matched by dot11::parse) since open.
     let hits = Arc::new(AtomicU32::new(0));
+    // Set once an attached core exists; frames before it are dropped.
+    let tap: Arc<std::sync::OnceLock<TapClock>> = Arc::default();
+    let attached = attach.is_some();
     let shared_rx = cl.sink.shared.clone();
-    let (cur_rx, hits_rx) = (cur.clone(), hits.clone());
+    let (cur_rx, hits_rx, tap_rx) = (cur.clone(), hits.clone(), tap.clone());
     card.start_rx(move |f| {
-        let ch = cur_rx.load(Ordering::Relaxed);
-        if ch == 0 {
-            return;
-        }
-        if let dot11::Verdict::Body(p) = dot11::parse(f.frame, f.crc_err, f.data_rate) {
+        let v = dot11::parse(f.frame, f.crc_err, f.data_rate);
+        let (ch, now) = if attached {
+            let Some((t, clock)) = tap_rx.get() else {
+                return;
+            };
+            match t.on_rx(f, &v) {
+                Some(ch) => (ch, clock()),
+                None => return,
+            }
+        } else {
+            let ch = cur_rx.load(Ordering::Relaxed);
+            if ch == 0 {
+                return;
+            }
+            (ch, mono_default())
+        };
+        if let dot11::Verdict::Body(p) = v {
             if !f.crc_err && f.frame[0] & 0xFC == 0x88 {
                 hits_rx.fetch_add(1, Ordering::Relaxed);
             }
             shared_rx.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
             let r = tx.try_send(RxBody {
                 card_id: 0,
-                mono_us: mono_us(t0),
+                mono_us: now,
                 rssi: f.rssi,
                 snr: f.snr,
                 evm: f.evm,
@@ -451,12 +498,49 @@ pub fn run_live(
     let card = Arc::new(card);
     let shared = cl.sink.shared.clone();
     shared.channel.store(o.ch, Ordering::Relaxed);
-    let searching = !o.search.is_empty() && o.remake.is_some();
+    let mut clock: fn() -> u64 = mono_default;
+    let mut tap_now: Option<Arc<dyn RxTap>> = None;
+    if let Some(a) = attach {
+        let at = a(&card)?;
+        cl.core = at.core;
+        clock = at.clock;
+        tap_now = Some(at.tap.clone());
+        let _ = tap.set((at.tap, at.clock));
+    }
+    let r = live_loop(
+        &mut cl,
+        &mut o,
+        &card,
+        &cur,
+        &hits,
+        &rx,
+        clock,
+        tap_now.as_deref(),
+    );
+    // The attached core's threads use the card: they stop before it closes.
+    drop(cl);
+    drop(tap_now);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_loop(
+    cl: &mut CoreLoop,
+    o: &mut LiveCfg,
+    card: &Arc<devourer_sys::Card>,
+    cur: &AtomicU8,
+    hits: &AtomicU32,
+    rx: &Receiver<RxBody>,
+    clock: fn() -> u64,
+    tap: Option<&dyn RxTap>,
+) -> Result<(), String> {
+    let shared = cl.sink.shared.clone();
+    let searching = tap.is_none() && !o.search.is_empty() && o.remake.is_some();
     let mut core_ch = o.ch;
     // Sweeps, then rebuilds the core when the drone is elsewhere.
     let mut find = |cl: &mut CoreLoop, core_ch: &mut u8| -> Result<bool, String> {
         let from = *core_ch;
-        let Some(ch) = search(&card, &o.search, from, o.width, &cur, &hits, &rx, &shared)? else {
+        let Some(ch) = search(card, &o.search, from, o.width, cur, hits, rx, &shared)? else {
             return Ok(false);
         };
         if ch != *core_ch {
@@ -466,31 +550,34 @@ pub fn run_live(
         }
         Ok(true)
     };
-    if searching && !find(&mut cl, &mut core_ch)? {
+    if searching && !find(cl, &mut core_ch)? {
         return Ok(());
     }
-    if o.gs {
+    if o.gs && tap.is_none() {
         cl.sink.card = Some(card.clone());
     }
-    let mut seen = (hits.load(Ordering::Relaxed), mono_us(t0));
-    let mut next_tick = mono_us(t0);
+    let mut seen = (hits.load(Ordering::Relaxed), clock());
+    let mut next_tick = clock();
     loop {
-        let wait = Duration::from_micros(next_tick.saturating_sub(mono_us(t0)));
+        let wait = Duration::from_micros(next_tick.saturating_sub(clock()));
         match rx.recv_timeout(wait) {
             Ok(b) => {
                 let l = &cl.sink.shared.lat;
                 l.rx_recv.fetch_add(1, Ordering::Relaxed);
                 l.body_lag_max
-                    .fetch_max(mono_us(t0).saturating_sub(b.mono_us), Ordering::Relaxed);
+                    .fetch_max(clock().saturating_sub(b.mono_us), Ordering::Relaxed);
                 cl.rx(&b)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err("RX thread ended".into()),
         }
-        let now = mono_us(t0);
+        let now = clock();
         if now >= next_tick {
             cl.tick(now);
             next_tick = now + TICK_US;
+            if let Some(t) = tap {
+                shared.channel.store(t.channel(), Ordering::Relaxed);
+            }
         }
         if cl.sink.shared.quit.load(Ordering::Relaxed) {
             return Ok(());
@@ -505,11 +592,11 @@ pub fn run_live(
                 .shared
                 .event("drone_lost", serde_json::json!({"ch": core_ch}));
             let card_tx = cl.sink.card.take();
-            if !find(&mut cl, &mut core_ch)? {
+            if !find(cl, &mut core_ch)? {
                 return Ok(());
             }
             cl.sink.card = card_tx;
-            seen = (hits.load(Ordering::Relaxed), mono_us(t0));
+            seen = (hits.load(Ordering::Relaxed), clock());
         }
     }
 }

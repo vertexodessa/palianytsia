@@ -28,6 +28,23 @@ struct PalRxBody {
 // user, sid, flags, complete, salvaged, pts_us, skipped_before, vcl_nal, data, len
 type AuCb = extern "C" fn(*mut c_void, u8, u8, u8, u8, u32, u32, u8, *const u8, usize);
 type SendCb = extern "C" fn(*mut c_void, *const u8, usize);
+type CardSendCb = extern "C" fn(*mut c_void, *const u8, usize) -> c_int;
+/// Transmits one RC body as a GS control frame; true = sent.
+pub type CardSend = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
+extern "C" fn card_send_tramp(user: *mut c_void, data: *const u8, len: usize) -> c_int {
+    let r = std::panic::catch_unwind(|| {
+        // SAFETY: `user` is the boxed CardSend owned by the RefCard.
+        let f = unsafe { &*(user as *const CardSend) };
+        let bytes = if len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }
+        };
+        c_int::from(f(bytes))
+    });
+    r.unwrap_or_else(|_| std::process::abort())
+}
 
 #[repr(C)]
 struct PalRefRaw {
@@ -36,6 +53,26 @@ struct PalRefRaw {
 #[repr(C)]
 struct PalFfsRaw {
     _p: [u8; 0],
+}
+#[repr(C)]
+struct PalCardRaw {
+    _p: [u8; 0],
+}
+
+/// One received frame's PHY attributes, as devourer reported them.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CardRx {
+    pub crc_err: u8,
+    pub physt: u8,
+    pub data_rate: u16,
+    pub rssi: [u8; 2],
+    pub snr: [i8; 2],
+    pub evm: [i8; 2],
+    pub tsfl: u32,
+    pub bw40: u8,
+    pub stbc: u8,
+    pub sgi: u8,
 }
 
 extern "C" {
@@ -70,6 +107,29 @@ extern "C" {
     ) -> c_int;
     fn pal_ref_param_refresh(r: *mut PalRefRaw);
     fn pal_ref_stats_json(r: *const PalRefRaw, buf: *mut c_char, cap: usize) -> usize;
+
+    fn pal_card_new(
+        radio: *mut c_void,
+        channel: u8,
+        width_mhz: u8,
+        user: *mut c_void,
+        send: CardSendCb,
+        err: *mut c_char,
+        err_cap: usize,
+    ) -> *mut PalCardRaw;
+    fn pal_card_free(c: *mut PalCardRaw);
+    fn pal_card_on_rx(c: *mut PalCardRaw, verdict: c_int, len: usize, a: *const CardRx) -> c_int;
+    fn pal_card_channel(c: *const PalCardRaw) -> u8;
+    fn pal_ref_new_with_card(
+        config_path: *const c_char,
+        card: *mut PalCardRaw,
+        user: *mut c_void,
+        on_au: AuCb,
+        err: *mut c_char,
+        err_cap: usize,
+    ) -> *mut PalRefRaw;
+    fn pal_ref_now_us() -> u64;
+    fn pal_ref_stored_channel(r: *const PalRefRaw) -> u8;
 
     fn pal_ffs_open(
         path: *const c_char,
@@ -154,9 +214,83 @@ pub struct RefOpts {
     pub channel: u8,
 }
 
+fn err_text(err: &[c_char]) -> String {
+    unsafe { CStr::from_ptr(err.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A card devourer opened, lent to the C++ core as its LinkCard: with it
+/// the core runs mabur's ChannelCore (boot pick, relocation, in-flight hop)
+/// and transmits through the card itself.
+pub struct RefCard {
+    raw: *mut PalCardRaw,
+    _send: Box<CardSend>,
+}
+
+// SAFETY: the C++ side keeps every counter atomic and serialises its device
+// calls under one mutex (pal_card.cpp); on_rx takes no lock.
+unsafe impl Send for RefCard {}
+unsafe impl Sync for RefCard {}
+
+impl RefCard {
+    /// # Safety
+    /// `radio` is devourer's started `IRtlRadio*` and outlives the card and
+    /// every core built on it.
+    pub unsafe fn new(
+        radio: *mut c_void,
+        channel: u8,
+        width: u8,
+        send: CardSend,
+    ) -> Result<Self, String> {
+        let send = Box::new(send);
+        let mut err = vec![0 as c_char; 256];
+        let user = &*send as *const CardSend as *mut c_void;
+        let raw = pal_card_new(
+            radio,
+            channel,
+            width,
+            user,
+            card_send_tramp,
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        if raw.is_null() {
+            return Err(err_text(&err));
+        }
+        Ok(Self { raw, _send: send })
+    }
+
+    /// Every received frame, from the RX thread, with its fill_rx_body
+    /// verdict (0 body, 1 short, 2 foreign): None = not a body for the
+    /// core, else the rx_channel to stamp (0 = mid-retune, unknown).
+    pub fn on_rx(&self, verdict: i32, len: usize, a: &CardRx) -> Option<u8> {
+        let rc = unsafe { pal_card_on_rx(self.raw, verdict, len, a) };
+        u8::try_from(rc).ok()
+    }
+
+    pub fn channel(&self) -> u8 {
+        unsafe { pal_card_channel(self.raw) }
+    }
+}
+
+impl Drop for RefCard {
+    fn drop(&mut self) {
+        unsafe { pal_card_free(self.raw) };
+    }
+}
+
+/// The clock of a core built with a card: its scout thread reads it
+/// directly, so on_rx stamps and ticks must come from it too.
+pub fn now_us() -> u64 {
+    unsafe { pal_ref_now_us() }
+}
+
 pub struct RefCore {
     raw: *mut PalRefRaw,
     ctx: Box<Ctx>,
+    /// Dropped after `raw` (Drop runs first): the core's threads use it.
+    _card: Option<std::sync::Arc<RefCard>>,
 }
 
 impl RefCore {
@@ -186,7 +320,44 @@ impl RefCore {
                 .into_owned();
             return Err(msg);
         }
-        Ok(Self { raw, ctx })
+        Ok(Self {
+            raw,
+            ctx,
+            _card: None,
+        })
+    }
+
+    /// Gs mode with `card` as the roster: mabur's whole GS, channel core
+    /// included. Stamp on_rx and tick with [`now_us`].
+    pub fn new_with_card(config: &Path, card: std::sync::Arc<RefCard>) -> Result<Self, String> {
+        let path =
+            CString::new(config.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        let mut ctx = Box::new(Ctx { io: None });
+        let mut err = vec![0 as c_char; 512];
+        // SAFETY: as in new; the card outlives raw (field order + Drop).
+        let raw = unsafe {
+            pal_ref_new_with_card(
+                path.as_ptr(),
+                card.raw,
+                &mut *ctx as *mut Ctx as *mut c_void,
+                on_au_tramp,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        if raw.is_null() {
+            return Err(err_text(&err));
+        }
+        Ok(Self {
+            raw,
+            ctx,
+            _card: Some(card),
+        })
+    }
+
+    /// The channel the channel core asked to remember for the next start.
+    pub fn stored_channel(&self) -> Option<u8> {
+        Some(unsafe { pal_ref_stored_channel(self.raw) }).filter(|&c| c != 0)
     }
 
     pub fn frame_gap_timeout_ms(&self) -> u32 {

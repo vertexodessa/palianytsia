@@ -24,6 +24,8 @@ typedef struct {
   int8_t evm[2];
   uint32_t tsfl;
   uint8_t bw40;
+  uint8_t stbc;
+  uint8_t sgi;
 } dv_rx;
 
 typedef void (*dv_rx_cb)(void *user, const dv_rx *rx);
@@ -49,6 +51,9 @@ int dv_send_control(dv_card *c, const uint8_t *body, size_t len);
  * 40 MHz channel without a pair, -1 on a device error. A control-plane
  * call: never from the RX callback, never concurrent with a send. */
 int dv_set_channel(dv_card *c, uint8_t ch, uint8_t width_mhz);
+/* The card's IRtlRadio (devourer), for C++ in the same binary that drives
+ * the control plane itself (pal-ref's LinkCard). Valid until dv_close. */
+void *dv_radio(dv_card *c);
 /* Chip name, NULL if unknown. */
 const char *dv_chip(const dv_card *c);
 void dv_close(dv_card *c);

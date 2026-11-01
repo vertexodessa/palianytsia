@@ -174,6 +174,7 @@ impl Link {
                     gs: true,
                     search,
                     remake: Some(remake),
+                    attach: None,
                 };
                 match runtime::run_live(cl, lc, |chip| {
                     log::info!("card {chip} on ch {ch} / {width} MHz")
