@@ -1,9 +1,13 @@
 [package]
 name = "pal-core"
-description = "The ground-station core contract: RxBody, Au, GsCore"
+description = "The ground-station core: contract (RxBody, Au, GsCore), config, and the Rust receive path"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+pal-wire.workspace = true
+pal-fec.workspace = true
+hevc.workspace = true
+toml = "0.8"
