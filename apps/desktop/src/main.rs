@@ -39,7 +39,7 @@ use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{GsCore, Mode};
 use pal_osd::{History, Snapshot};
 use pal_ref::{RefCore, RefOpts};
-use runtime::{lat_us, CoreLoop, LiveCfg, LoopPorts, Shared, Sink};
+use runtime::{lat_us, CoreLoop, Drive, LiveCfg, LoopPorts, Search, Shared, Sink};
 
 const RZ_NONCE: u32 = 0x5041_4c31;
 
@@ -184,6 +184,43 @@ fn parse() -> Opts {
         }
     }
     o
+}
+
+/// Who tunes the card(s) on a live run: on an auto config a GS hands the
+/// cards to its channel core (either core); otherwise the runtime holds
+/// the channel, sweeping for the drone when `o.search` is set.
+fn drive(o: &Opts) -> Drive {
+    if o.channel_core {
+        let p = o.config.clone().expect("config");
+        let attach = if o.rust {
+            let c = pal_core::config::load_config(&p, None).unwrap_or_else(|e| die(&e.to_string()));
+            let opts = RustOpts {
+                mode: Mode::Gs,
+                adaptive_gap: true,
+                rz_nonce: RZ_NONCE,
+                channel: o.ch,
+            };
+            runtime::dev_card::rust_channel_core(c, opts, o.width)
+        } else {
+            pal_ref::live::channel_core(p, o.ch, o.width)
+        };
+        let extra = o.card2.map(|index| devourer_sys::Select::Scan { index });
+        return Drive::Core {
+            attach,
+            extra: extra.into_iter().collect(),
+        };
+    }
+    let o2 = o.clone();
+    Drive::Runtime {
+        gs: o.mode == Some(Mode::Gs),
+        search: Some(Search {
+            set: o.search.clone(),
+            remake: Box::new(move |ch| {
+                eprintln!("pal-desktop: drone found on ch {ch}");
+                Ok(make_core(&o2, ch))
+            }),
+        }),
+    }
 }
 
 fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
@@ -735,38 +772,11 @@ fn main() {
                         match o.replay.clone() {
                             Some(p) => run_replay(cl, &o, p, ctx),
                             None => {
-                                let o2 = o.clone();
                                 let cfg = LiveCfg {
                                     select: devourer_sys::Select::Scan { index: o.card },
-                                    extra: o
-                                        .card2
-                                        .map(|index| devourer_sys::Select::Scan { index })
-                                        .into_iter()
-                                        .collect(),
                                     ch: o.ch,
                                     width: o.width,
-                                    gs: o.mode == Some(Mode::Gs),
-                                    search: o.search.clone(),
-                                    remake: Some(Box::new(move |ch| {
-                                        eprintln!("pal-desktop: drone found on ch {ch}");
-                                        Ok(make_core(&o2, ch))
-                                    })),
-                                    attach: o.channel_core.then(|| {
-                                        let p = o.config.clone().expect("config");
-                                        if o.rust {
-                                            let c = pal_core::config::load_config(&p, None)
-                                                .unwrap_or_else(|e| die(&e.to_string()));
-                                            let opts = RustOpts {
-                                                mode: Mode::Gs,
-                                                adaptive_gap: true,
-                                                rz_nonce: RZ_NONCE,
-                                                channel: o.ch,
-                                            };
-                                            runtime::dev_card::rust_channel_core(c, opts, o.width)
-                                        } else {
-                                            pal_ref::live::channel_core(p, o.ch, o.width)
-                                        }
-                                    }),
+                                    drive: drive(&o),
                                 };
                                 let (ch, w) = (o.ch, o.width);
                                 if let Err(e) = runtime::run_live(cl, cfg, |chip| {

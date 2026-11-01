@@ -161,32 +161,22 @@ impl Link {
                 // radio.channel = "auto": the channel core drives the card
                 // (finds the drone, moves the link to the cleanest member,
                 // hops), in the Rust core that replaces the one above.
-                let attach = cfg
-                    .radio
-                    .pin
-                    .is_none()
-                    .then(|| runtime::dev_card::rust_channel_core(cfg.clone(), opts, width));
-                let remake: runtime::Remake = Box::new(move |ch| {
-                    let opts = RustOpts {
-                        mode: Mode::Gs,
-                        adaptive_gap: true,
-                        rz_nonce: RZ_NONCE,
-                        channel: ch,
-                    };
-                    log::info!("drone found on ch {ch}");
-                    RustCore::new(&cfg, opts)
-                        .map(|c| Box::new(c) as Box<dyn pal_core::GsCore>)
-                        .map_err(|e| format!("core: {e}"))
-                });
+                // Pinned: the runtime holds the card on `ch` and transmits.
+                let drive = match cfg.radio.pin {
+                    None => runtime::Drive::Core {
+                        attach: runtime::dev_card::rust_channel_core(cfg.clone(), opts, width),
+                        extra,
+                    },
+                    Some(_) => runtime::Drive::Runtime {
+                        gs: true,
+                        search: None,
+                    },
+                };
                 let lc = LiveCfg {
                     select: devourer_sys::Select::Fd(fd),
-                    extra,
                     ch,
                     width,
-                    gs: true,
-                    search: Vec::new(),
-                    remake: Some(remake),
-                    attach,
+                    drive,
                 };
                 match runtime::run_live(cl, lc, |chip| {
                     log::info!("card {chip} on ch {ch} / {width} MHz")

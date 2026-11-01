@@ -482,23 +482,35 @@ pub type Attach = Box<dyn FnOnce(&[Arc<devourer_sys::Card>]) -> Result<Attached,
 /// Where the card comes from and how to tune it.
 pub struct LiveCfg {
     pub select: devourer_sys::Select,
-    /// More cards for an attached core (mabur's multi-card GS: every card
-    /// receives, the channel core scouts on one). Ignored without `attach`.
-    pub extra: Vec<devourer_sys::Select>,
     pub ch: u8,
     pub width: u8,
-    /// GS mode: the card also transmits the core's RC frames.
-    pub gs: bool,
-    /// The channel set to sweep for the drone (radio.channel = "auto"):
-    /// at start, and again after `LOST_US` without a drone frame. Empty =
-    /// stay on `ch`. Needs `remake`: a core's DISC proposes the channel it
-    /// was built for, and a core on the wrong one would steer the drone.
-    pub search: Vec<u8>,
-    pub remake: Option<Remake>,
-    /// Replaces the CoreLoop's core with one that owns the card (see
-    /// `RxTap`); `search` and `gs` are then ignored: the core finds the
-    /// drone and transmits itself.
-    pub attach: Option<Attach>,
+    pub drive: Drive,
+}
+
+/// Who tunes the card(s), decided once by the app.
+pub enum Drive {
+    /// The runtime: the card stays on `LiveCfg::ch`, or sweeps for the
+    /// drone when `search` is given. `gs`: the card also transmits the
+    /// core's RC frames.
+    Runtime { gs: bool, search: Option<Search> },
+    /// A core that owns the cards (see `RxTap`): it finds the drone,
+    /// retunes and transmits itself. `extra`: more cards next to the
+    /// first (mabur's multi-card GS: every card receives, the channel core
+    /// scouts on one).
+    Core {
+        attach: Attach,
+        extra: Vec<devourer_sys::Select>,
+    },
+}
+
+/// The channel set to sweep for the drone (radio.channel = "auto"): at
+/// start, and again after `LOST_US` without a drone frame. An empty set =
+/// stay on the channel. `remake` builds the core for the channel found: a
+/// core's DISC proposes the channel it was built for, and a core on the
+/// wrong one would steer the drone.
+pub struct Search {
+    pub set: Vec<u8>,
+    pub remake: Remake,
 }
 
 type TapClock = (Vec<Arc<dyn RxTap>>, fn() -> u64);
@@ -574,17 +586,14 @@ fn search(
 
 /// Opens the card(s) and runs the core loop on this thread until
 /// `shared.quit`; `on_open` gets the chip names once the cards are up.
-pub fn run_live(
-    mut cl: CoreLoop,
-    mut o: LiveCfg,
-    on_open: impl FnOnce(&str),
-) -> Result<(), String> {
-    let attach = o.attach.take();
+pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<(), String> {
+    let (attach, extra, gs, mut search) = match o.drive {
+        Drive::Core { attach, extra } => (Some(attach), extra, false, None),
+        Drive::Runtime { gs, search } => (None, Vec::new(), gs, search),
+    };
     let attached = attach.is_some();
-    let mut selects = vec![o.select.clone()];
-    if attached {
-        selects.extend(o.extra.iter().cloned());
-    }
+    let mut selects = vec![o.select];
+    selects.extend(extra);
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
     // The channel RX frames are stamped with; 0 while the card retunes.
     let cur = Arc::new(AtomicU8::new(o.ch));
@@ -681,7 +690,12 @@ pub fn run_live(
     }
     let r = live_loop(
         &mut cl,
-        &mut o,
+        Live {
+            ch: o.ch,
+            width: o.width,
+            gs,
+            search: search.as_mut(),
+        },
         &cards[0],
         &cur,
         &hits,
@@ -696,10 +710,18 @@ pub fn run_live(
     r
 }
 
+/// What live_loop needs from the config once the cards are open.
+struct Live<'a> {
+    ch: u8,
+    width: u8,
+    gs: bool,
+    search: Option<&'a mut Search>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn live_loop(
     cl: &mut CoreLoop,
-    o: &mut LiveCfg,
+    o: Live,
     card: &Arc<devourer_sys::Card>,
     cur: &AtomicU8,
     hits: &AtomicU32,
@@ -708,17 +730,18 @@ fn live_loop(
     tap: Option<&dyn RxTap>,
 ) -> Result<(), String> {
     let shared = cl.sink.shared.clone();
-    let searching = tap.is_none() && !o.search.is_empty() && o.remake.is_some();
+    let mut srch = o.search.filter(|s| tap.is_none() && !s.set.is_empty());
+    let searching = srch.is_some();
     let mut core_ch = o.ch;
     // Sweeps, then rebuilds the core when the drone is elsewhere.
     let mut find = |cl: &mut CoreLoop, core_ch: &mut u8| -> Result<bool, String> {
+        let s = srch.as_mut().expect("searching");
         let from = *core_ch;
-        let Some(ch) = search(card, &o.search, from, o.width, cur, hits, rx, &shared)? else {
+        let Some(ch) = search(card, &s.set, from, o.width, cur, hits, rx, &shared)? else {
             return Ok(false);
         };
         if ch != *core_ch {
-            let remake = o.remake.as_mut().expect("remake");
-            let core = remake(ch)?;
+            let core = (s.remake)(ch)?;
             cl.set_core(core);
             *core_ch = ch;
         }
