@@ -42,16 +42,23 @@ pub struct Shared {
     pub channel: AtomicU8,
     /// The card is sweeping the channel set for the drone.
     pub searching: AtomicBool,
+    /// The video link's width (the ladder's bw); 0 = the receiver's width.
+    /// The card stays tuned 40 for a 20 MHz link, so the label shows this.
+    pub video_bw: AtomicU8,
 }
 
 impl Shared {
-    /// "ch 40 / 40 MHz", or "searching for the drone: ch 64 / 40 MHz".
+    /// "ch 40 / 40 MHz" (the video width), or "searching for the drone:
+    /// ch 64 / 40 MHz" (the receiver's width while it sweeps).
     pub fn radio_label(&self, width: u8) -> String {
         let ch = self.channel.load(Ordering::Relaxed);
         if self.searching.load(Ordering::Relaxed) {
-            format!("searching for the drone: ch {ch} / {width} MHz")
-        } else {
-            format!("ch {ch} / {width} MHz")
+            return format!("searching for the drone: ch {ch} / {width} MHz");
+        }
+        match self.video_bw.load(Ordering::Relaxed) {
+            0 => format!("ch {ch} / {width} MHz"),
+            v if v == width => format!("ch {ch} / {v} MHz"),
+            v => format!("ch {ch} / {v} MHz video (RX {width})"),
         }
     }
 

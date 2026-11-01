@@ -618,6 +618,14 @@ fn main() {
         (sock, peer)
     });
     let shared = Arc::new(Shared::default());
+    if let Some(r) = o
+        .config
+        .as_ref()
+        .and_then(|c| pal_core::config::load_config(c, None).ok())
+        .and_then(|c| c.link.ladder_cfg.ladder.last().cloned())
+    {
+        shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
+    }
     let frame = Arc::new(Mutex::new(None));
     let yuv: Option<Arc<Mutex<Option<gl_video::YuvFrame>>>> =
         (!o.cpu_rgba).then(|| Arc::new(Mutex::new(None)));

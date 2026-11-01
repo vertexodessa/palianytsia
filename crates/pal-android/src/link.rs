@@ -93,6 +93,9 @@ impl Link {
         let (set_res_tx, set_res_rx) = mpsc::sync_channel(8);
         let (mav_tx, mav_rx) = mpsc::sync_channel(256);
         let shared = Arc::new(Shared::default());
+        if let Some(r) = cfg.link.ladder_cfg.ladder.last() {
+            shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
+        }
         // Same layout as pal-desktop --log-dir (pal log reads it), bodies
         // capped at 256 MB per session so a replay can rerun a bad flight.
         let (log, log_info) = match flightlog::session::Session::create(
