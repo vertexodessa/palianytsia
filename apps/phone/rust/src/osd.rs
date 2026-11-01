@@ -256,7 +256,7 @@ pub fn run(o: OsdIn) {
                                 );
                             }
                             if stats {
-                                pal_osd::chips(ui, &hist, fps, dec);
+                                pal_osd::chips(ui, &hist, fps, o.shared.rx_kbps(), dec);
                             }
                             pal_osd::key_banner(ui, &hist);
                         });

@@ -43,8 +43,12 @@ pub struct Shared {
     /// The card is sweeping the channel set for the drone.
     pub searching: AtomicBool,
     /// The video link's width (the ladder's bw); 0 = the receiver's width.
-    /// The card stays tuned 40 for a 20 MHz link, so the label shows this.
+    /// Equal to it unless a config flies 20 MHz rungs on a 40 MHz card.
     pub video_bw: AtomicU8,
+    /// Video bytes out of the core (completed AUs), for the bitrate readout.
+    pub au_bytes: AtomicU64,
+    /// (window start, au_bytes then, last rate) behind rx_kbps().
+    rate: Mutex<Option<(Instant, u64, f64)>>,
 }
 
 impl Shared {
@@ -60,6 +64,20 @@ impl Shared {
             v if v == width => format!("ch {ch} / {v} MHz"),
             v => format!("ch {ch} / {v} MHz video (RX {width})"),
         }
+    }
+
+    /// Received video bitrate, kbit/s, over the last full second (UI rate).
+    pub fn rx_kbps(&self) -> f64 {
+        let bytes = self.au_bytes.load(Ordering::Relaxed);
+        let mut r = self.rate.lock().unwrap_or_else(|p| p.into_inner());
+        let (t0, b0, last) = *r.get_or_insert((Instant::now(), bytes, 0.0));
+        let dt = t0.elapsed().as_secs_f64();
+        if dt >= 1.0 {
+            let k = bytes.saturating_sub(b0) as f64 * 8.0 / dt / 1000.0;
+            *r = Some((Instant::now(), bytes, k));
+            return k;
+        }
+        last
     }
 
     pub fn event(&self, ev: &'static str, detail: serde_json::Value) {
@@ -125,6 +143,9 @@ impl CoreIo for Sink {
             lat.cap_au_last.store(d.max(0) as u64, Ordering::Relaxed);
         }
         self.shared.lat.aus_in.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .au_bytes
+            .fetch_add(a.data.len() as u64, Ordering::Relaxed);
         if let Err(TrySendError::Full(_)) = self.au_tx.try_send((n, lat_us(), a.data)) {
             self.shared.au_dropped.fetch_add(1, Ordering::Relaxed);
             // A dropped AU breaks the reference chain until an IRAP: ask for

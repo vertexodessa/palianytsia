@@ -290,6 +290,7 @@ fn chip_hover(ui: &mut Ui, label: &str, text: &str, color: Color32, hover: &str)
 }
 
 fn chip_frame(ui: &mut Ui, label: &str, text: &str, color: Color32) -> egui::Response {
+    let text = &steady(ui, label, text);
     // horizontal_wrapped cannot see a Frame's width before it is drawn, so
     // on a narrow screen (the phone, ~890 points) the last chips ran off
     // the edge. Measure the two labels and break the row ourselves.
@@ -323,6 +324,20 @@ fn chip_frame(ui: &mut Ui, label: &str, text: &str, color: Color32) -> egui::Res
             });
         })
         .response
+}
+
+/// `text` padded to the longest text this chip has shown: a chip that
+/// shrinks when a number loses a digit moves every chip after it, so a chip
+/// only ever grows (monospace, so characters are columns).
+fn steady(ui: &Ui, label: &str, text: &str) -> String {
+    let id = egui::Id::new(("chip-width", label));
+    let n = text.chars().count();
+    let w = ui.ctx().data_mut(|d| {
+        let m = d.get_temp_mut_or(id, 0usize);
+        *m = (*m).max(n);
+        *m
+    });
+    format!("{text:<w$}")
 }
 
 /// What the pairing-key banner says, if anything (F5): a mismatch is an
@@ -381,7 +396,8 @@ const UP_WIDTH: usize = 46;
 pub(crate) const SIGNAL_HOLD_S: f64 = 1.5;
 
 /// The top OSD row: link, signal, loss, uplink side.
-pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
+/// `kbps`: the received video bitrate (runtime::Shared::rx_kbps).
+pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) {
     let Some(s) = h.last() else {
         chip(ui, "core", "waiting for stats", WARN);
         return;
@@ -399,7 +415,7 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
         chip(ui, "link", &link, c);
         let held = h.signal(SIGNAL_HOLD_S);
         let sig = match held {
-            Some((r, n)) => format!("{r:.0} dBm  SNR {n:.0}"),
+            Some((r, n)) => format!("{r:>4.0} dBm  SNR {n:>2.0}"),
             None => "no signal".into(),
         };
         chip(
@@ -418,7 +434,7 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
         } else {
             0.0
         };
-        let mut loss = format!("trunc {pct:.1} %  salv {}", s.salvaged);
+        let mut loss = format!("trunc {pct:>4.1} %  salv {:>4}", s.salvaged);
         if let Some(p) = s.pre_fec_loss {
             loss += &format!("  pre {}", self::pct(p));
         }
@@ -440,7 +456,11 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
         chip(
             ui,
             "video",
-            &format!("{fps:.0} fps  dec err {}", decode.1),
+            &format!(
+                "{fps:>3.0} fps  {:>4.1} Mbit/s  dec err {:>3}",
+                kbps / 1000.0,
+                decode.1
+            ),
             OK,
         );
         if let Some(d) = s.drone_state {
@@ -458,11 +478,11 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
         }
         if s.mode == "gs" {
             let mut up = match s.uplink_pct {
-                Some(p) => format!("{} {p} %", s.uplink),
+                Some(p) => format!("{} {p:>3} %", s.uplink),
                 None => s.uplink.clone(),
             };
             if let Some(r) = s.rtt_ms {
-                up += &format!("  rtt {r:.0} ms");
+                up += &format!("  rtt {r:>4.0} ms");
             }
             let c = match (s.uplink.as_str(), s.uplink_pct) {
                 ("ok", Some(p)) if p >= 80 => OK,
@@ -470,9 +490,9 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
                 _ => BAD,
             };
             chip(ui, "uplink", &up, c);
-            let mut nack = format!("fill {}", s.nack_fill);
+            let mut nack = format!("fill {:>5}", s.nack_fill);
             if let Some(r) = s.nack_fill_pps {
-                nack += &format!("  {r:.0}/s");
+                nack += &format!("  {r:>4.0}/s");
             }
             chip(ui, "nack", &nack, OK);
         }

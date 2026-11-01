@@ -240,6 +240,7 @@ impl Osd {
         };
         self.ctx.set_pixels_per_point(PPP);
         let (hist, telem, fps) = (&self.hist, &self.telem, self.fps.0);
+        let kbps = self.link.as_ref().map_or(0.0, |l| l.shared.rx_kbps());
         let (panel, edits, prefs, table) = (
             &mut self.panel,
             &mut self.edits,
@@ -301,7 +302,7 @@ impl Osd {
                                 );
                             }
                             if prefs.stats {
-                                pal_osd::chips(ui, hist, fps, dec);
+                                pal_osd::chips(ui, hist, fps, kbps, dec);
                             }
                             pal_osd::key_banner(ui, hist);
                         });

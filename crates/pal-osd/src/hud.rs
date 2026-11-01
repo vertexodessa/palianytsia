@@ -102,7 +102,7 @@ pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f6
                 ui,
                 tr,
                 Align2::RIGHT_TOP,
-                &format!("{rssi:.0}dBm MCS{mcs}"),
+                &format!("{rssi:>4.0}dBm MCS{mcs}"),
                 base * 0.9,
                 col,
             );
@@ -137,13 +137,13 @@ fn battery(ui: &Ui, r: Rect, t: &Telemetry, base: f32, pad: f32) {
     };
     let mut line2 = Vec::new();
     if let Some(v) = cell {
-        line2.push(format!("{v:.2}V/c"));
+        line2.push(format!("{v:>4.2}V/c"));
     }
     if let Some(a) = t.batt_a {
-        line2.push(format!("{a:.1}A"));
+        line2.push(format!("{a:>5.1}A"));
     }
     if let Some(m) = t.batt_mah {
-        line2.push(format!("{m}mAh"));
+        line2.push(format!("{m:>5}mAh"));
     }
     let l2 = text(
         ui,
@@ -153,7 +153,7 @@ fn battery(ui: &Ui, r: Rect, t: &Telemetry, base: f32, pad: f32) {
         base * 0.85,
         WHITE,
     );
-    let pack = t.batt_v.map_or("--.-V".into(), |v| format!("{v:.1}V"));
+    let pack = t.batt_v.map_or("--.-V".into(), |v| format!("{v:>4.1}V"));
     text(
         ui,
         l2.left_top() - Vec2::new(0.0, base * 0.15),
@@ -168,16 +168,16 @@ fn nav(ui: &Ui, r: Rect, t: &Telemetry, base: f32, pad: f32) {
     // Bottom right: altitude, speed, home, sats (top to bottom).
     let mut rows = Vec::new();
     if let Some(a) = t.alt_rel_m {
-        rows.push(format!("ALT {a:.0}m"));
+        rows.push(format!("ALT {a:>5.0}m"));
     }
     if let Some(v) = t.groundspeed_ms {
-        rows.push(format!("SPD {:.0}km/h", v * 3.6));
+        rows.push(format!("SPD {:>3.0}km/h", v * 3.6));
     }
     if let Some(d) = t.home_distance_m() {
-        rows.push(format!("HOME {d:.0}m"));
+        rows.push(format!("HOME {d:>5.0}m"));
     }
     if let Some(s) = t.sats {
-        rows.push(format!("SAT {s}"));
+        rows.push(format!("SAT {s:>2}"));
     }
     let mut y = r.bottom() - pad;
     for row in rows.iter().rev() {

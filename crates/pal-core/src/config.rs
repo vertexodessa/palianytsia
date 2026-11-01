@@ -770,12 +770,12 @@ pub fn load_config(path: &Path, overlay: Option<&Path>) -> R<Config> {
     parse_config(&j)
 }
 
-/// `text` with every `[[link.ladder]]` rung and `link.static_bw` at `bw`
-/// MHz: the GS picks each rung's width (the drone airs what the RCF names),
-/// so this switches the video link between 20 and 40 MHz without touching
-/// the drone. The receiver stays at `radio.width`: tuned 40, it hears 20 MHz
-/// frames on the primary. Comments are not kept (the result is a generated
-/// copy); the result is validated as a whole.
+/// `text` with the GS card (`radio.width`), every `[[link.ladder]]` rung and
+/// `link.static_bw` at `bw` MHz: the drone airs each rung at the width the
+/// RCF names, and a 20 MHz link wants a 20 MHz receiver too (tuned 40 it
+/// would take the pair's other half, its noise and interference, into the
+/// same filter). Comments are not kept (the result is a generated copy);
+/// the result is validated as a whole.
 pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     if bw != 20 && bw != 40 {
         return Err(ConfigError(format!("link width {bw}: must be 20 or 40")));
@@ -783,6 +783,11 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     let mut j = text
         .parse::<Table>()
         .map_err(|e| ConfigError(format!("config: {e}")))?;
+    j.entry("radio")
+        .or_insert_with(|| Value::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError("config: radio is not a table".into()))?
+        .insert("width".into(), Value::Integer(bw.into()));
     let link = j
         .entry("link")
         .or_insert_with(|| Value::Table(Table::new()))
@@ -1437,11 +1442,12 @@ mod tests {
             c.link.ladder_cfg.ladder.len(),
             orig.link.ladder_cfg.ladder.len()
         );
-        assert_eq!(c.radio.width, 40);
+        assert_eq!(c.radio.width, 20);
         assert_eq!(c.radio.channels, orig.radio.channels);
         let t40 = with_link_bw(&t20, 40).unwrap();
         let c = parse_config_str(&t40).unwrap();
         assert!(c.link.ladder_cfg.ladder.iter().all(|r| r.bw == 40));
+        assert_eq!(c.radio.width, 40);
         assert!(with_link_bw(&text, 30).is_err());
     }
 

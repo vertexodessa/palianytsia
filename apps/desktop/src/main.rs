@@ -557,7 +557,7 @@ impl eframe::App for App {
                     let top = vr.shrink(8.0).translate(egui::vec2(0.0, 40.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
                         if self.prefs.stats {
-                            pal_osd::chips(ui, &self.hist, self.fps, decode);
+                            pal_osd::chips(ui, &self.hist, self.fps, self.shared.rx_kbps(), decode);
                         }
                         pal_osd::key_banner(ui, &self.hist);
                     });
@@ -661,6 +661,8 @@ fn main() {
                     std::fs::write(&p, t).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
                     eprintln!("pal-desktop: video width {bw} MHz");
                     o.config = Some(p);
+                    // The card opens at the link's width, not the original config's.
+                    o.width = bw;
                 }
                 Err(e) => eprintln!("pal-desktop: video width {bw} MHz not applied: {e}"),
             }
