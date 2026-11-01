@@ -2,7 +2,9 @@
 //! every app and both cores share one OSD. Reads only the snapshot it is
 //! handed: no locks toward the RX or core path.
 pub mod hud;
+pub mod panel;
 pub mod params;
+pub mod prefs;
 pub mod telem;
 
 use std::collections::VecDeque;

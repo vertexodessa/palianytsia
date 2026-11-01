@@ -336,7 +336,13 @@ struct App {
     set_res_rx: Receiver<(usize, Result<(), String>)>,
     params: Option<pal_osd::params::Table>,
     edits: pal_osd::params::Edits,
-    show_params: bool,
+    /// Settings panel (gear button, P opens it on the Drone tab).
+    panel: pal_osd::panel::Panel,
+    prefs: pal_osd::prefs::HudPrefs,
+    prefs_path: PathBuf,
+    /// Channel and width the card runs on, for the Link tab.
+    radio: (u8, u8),
+    log_info: String,
     hist: History,
     tex: Option<egui::TextureHandle>,
     shown_seq: u64,
@@ -344,9 +350,6 @@ struct App {
     fps: f64,
     fps_mark: (Instant, u64),
     show_monitor: bool,
-    /// Link statistics over the video (S); off by default, the flight HUD
-    /// is what stays on.
-    show_stats: bool,
     snapshot: Option<(PathBuf, f64)>,
     snapshot_sent: bool,
 }
@@ -406,10 +409,15 @@ impl eframe::App for App {
             self.show_monitor = !self.show_monitor;
         }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::S)) {
-            self.show_stats = !self.show_stats;
+            self.prefs.stats = !self.prefs.stats;
+            self.prefs.save(&self.prefs_path);
         }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::P)) {
-            self.show_params = !self.show_params;
+            self.panel.open = !self.panel.open;
+            self.panel.tab = pal_osd::panel::Tab::Drone;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.panel.open = false;
         }
         while let Ok(l) = self.params_rx.try_recv() {
             if let Some(t) = pal_osd::params::Table::parse(&l) {
@@ -419,19 +427,24 @@ impl eframe::App for App {
         while let Ok(r) = self.set_res_rx.try_recv() {
             self.edits.last = Some(r);
         }
-        if self.show_params {
-            if let Some(t) = &self.params {
-                let mut open = true;
-                egui::Window::new("drone settings (P)")
-                    .open(&mut open)
-                    .default_pos([24.0, 120.0])
-                    .show(ctx, |ui| {
-                        if let Some(c) = pal_osd::params::widget(ui, t, &mut self.edits) {
-                            let _ = self.cmd_tx.send(c);
-                        }
-                    });
-                self.show_params = open;
-            }
+        pal_osd::panel::gear(ctx, &mut self.panel);
+        let key = self.hist.last().map_or("?".into(), |s| s.key_fp.clone());
+        let out = pal_osd::panel::show(
+            ctx,
+            &mut self.panel,
+            pal_osd::panel::PanelIn {
+                table: self.params.as_ref(),
+                edits: &mut self.edits,
+                prefs: &mut self.prefs,
+                link_info: format!("ch {} / {} MHz, key {key}", self.radio.0, self.radio.1),
+                log_info: self.log_info.clone(),
+            },
+        );
+        if let Some(c) = out.cmd {
+            let _ = self.cmd_tx.send(c);
+        }
+        if out.prefs_changed {
+            self.prefs.save(&self.prefs_path);
         }
         if self.show_monitor {
             egui::SidePanel::right("monitor")
@@ -499,20 +512,21 @@ impl eframe::App for App {
                     let scale = (area.width() / w).min(area.height() / h);
                     egui::Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale))
                 });
-                pal_osd::hud::hud(ui, vr, &self.telem, &self.hist, now);
+                let hr = pal_osd::panel::hud_rect(ctx, &self.panel, vr);
+                pal_osd::hud::hud(ui, hr, &self.telem, &self.hist, now, &self.prefs);
                 let mismatch = self.hist.last().is_some_and(|s| s.key_mismatch);
-                if self.show_stats || mismatch {
+                if self.prefs.stats || mismatch {
                     let decode = (frames, self.shared.dec_errors.load(Ordering::Relaxed));
                     let top = vr.shrink(8.0).translate(egui::vec2(0.0, 40.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
-                        if self.show_stats {
+                        if self.prefs.stats {
                             pal_osd::chips(ui, &self.hist, self.fps, decode);
                         }
                         pal_osd::key_banner(ui, &self.hist);
                     });
                 }
             });
-        if self.show_stats {
+        if self.prefs.stats {
             egui::Area::new(egui::Id::new("telem"))
                 .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -120.0))
                 .show(ctx, |ui| pal_osd::telem::widget(ui, &self.telem, now));
@@ -578,6 +592,15 @@ fn main() {
         s
     });
     let channel = if o.live { o.ch } else { 0 };
+    let prefs_path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("palianytsia/hud.json");
+    let log_info = match &o.log_dir {
+        Some(d) => format!("flight log in {}", d.display()),
+        None => "flight log off (start with --log-dir DIR)".into(),
+    };
     let sink = Sink {
         au_tx,
         mav_tx,
@@ -669,7 +692,19 @@ fn main() {
                 set_res_rx,
                 params: None,
                 edits: Default::default(),
-                show_params: o.params,
+                panel: pal_osd::panel::Panel {
+                    open: o.params,
+                    tab: if o.params {
+                        pal_osd::panel::Tab::Drone
+                    } else {
+                        Default::default()
+                    },
+                    touch: false,
+                },
+                prefs: pal_osd::prefs::HudPrefs::load(&prefs_path),
+                prefs_path: prefs_path.clone(),
+                radio: (o.ch, o.width),
+                log_info: log_info.clone(),
                 hist: History::default(),
                 tex: None,
                 shown_seq: 0,
@@ -677,7 +712,6 @@ fn main() {
                 fps: 0.0,
                 fps_mark: (Instant::now(), 0),
                 show_monitor: false,
-                show_stats: false,
                 snapshot,
                 snapshot_sent: false,
             }))

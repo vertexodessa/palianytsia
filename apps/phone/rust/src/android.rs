@@ -32,11 +32,8 @@ struct Phone {
     core: Option<JoinHandle<()>>,
     dec: Option<JoinHandle<()>>,
     osd: Option<JoinHandle<()>>,
-    show_stats: Arc<std::sync::atomic::AtomicBool>,
-    // Kept alive for the core loop's F18 channels.
-    _params_rx: Receiver<String>,
-    _cmd_tx: mpsc::Sender<pal_osd::params::Cmd>,
-    _set_res_rx: Receiver<(usize, Result<(), String>)>,
+    /// Touches from the Activity (pixels) into the OSD thread's egui.
+    touch_tx: mpsc::Sender<crate::osd::Touch>,
 }
 
 fn start(
@@ -45,6 +42,7 @@ fn start(
     osd_win: ndk::native_window::NativeWindow,
     density: f32,
     toml: &str,
+    prefs_path: std::path::PathBuf,
 ) -> Result<Phone, String> {
     let cfg = pal_core::config::parse_config_str(toml).map_err(|e| e.to_string())?;
     let ch = cfg
@@ -92,10 +90,15 @@ fn start(
     };
 
     let last = Arc::new(Mutex::new(String::new()));
-    let show_stats = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (touch_tx, touch_rx) = mpsc::channel();
     let osd_in = crate::osd::OsdIn {
         mav_rx,
-        show_stats: show_stats.clone(),
+        touch_rx,
+        params_rx,
+        cmd_tx,
+        set_res_rx,
+        prefs_path,
+        radio: format!("ch {ch} / {width} MHz"),
         win: osd_win,
         density,
         stats_rx,
@@ -144,10 +147,7 @@ fn start(
         core: Some(core_t),
         dec: Some(dec_t),
         osd: Some(osd_t),
-        show_stats,
-        _params_rx: params_rx,
-        _cmd_tx: cmd_tx,
-        _set_res_rx: set_res_rx,
+        touch_tx,
     })
 }
 
@@ -209,6 +209,7 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
     osd: JObject,
     density: jni::sys::jfloat,
     toml: JString,
+    files_dir: JString,
 ) -> jlong {
     android_logger::init_once(
         android_logger::Config::default()
@@ -222,6 +223,11 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
             return 0;
         }
     };
+    let dir: String = env
+        .get_string(&files_dir)
+        .map(Into::into)
+        .unwrap_or_default();
+    let prefs_path = std::path::Path::new(&dir).join("hud.json");
     // SAFETY: a live android.view.Surface from the Activity's SurfaceHolder.
     let win = unsafe {
         ndk::native_window::NativeWindow::from_surface(
@@ -241,7 +247,7 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
         set_err("OSD ANativeWindow_fromSurface returned null");
         return 0;
     };
-    match start(fd, win, osd_win, density, &toml) {
+    match start(fd, win, osd_win, density, &toml, prefs_path) {
         Ok(p) => Box::into_raw(Box::new(p)) as jlong,
         Err(e) => {
             set_err(e);
@@ -267,17 +273,20 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_stats(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_palianytsia_phone_Native_toggleStats(
+pub extern "system" fn Java_org_palianytsia_phone_Native_touch(
     _env: JNIEnv,
     _c: JClass,
     h: jlong,
+    action: jint,
+    x: jni::sys::jfloat,
+    y: jni::sys::jfloat,
 ) {
     if h == 0 {
         return;
     }
     // SAFETY: as in stats().
     let p = unsafe { &*(h as *mut Phone) };
-    p.show_stats.fetch_xor(true, Ordering::Relaxed);
+    let _ = p.touch_tx.send(crate::osd::Touch { action, x, y });
 }
 
 #[no_mangle]

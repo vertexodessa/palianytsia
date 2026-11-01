@@ -3,14 +3,17 @@
 //! chips as pal-desktop and the Quest can reuse this for its OSD layer.
 //! One thread owns the EGL context; it redraws when a stats line arrives
 //! (10 Hz) and clears to transparent around the widgets.
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use glow::HasContext;
 use khronos_egl as egl;
 use ndk::native_window::NativeWindow;
+use pal_osd::panel::{Panel, PanelIn};
+use pal_osd::params::{Cmd, Edits, Table};
+use pal_osd::prefs::HudPrefs;
 use pal_osd::{History, Snapshot};
 use runtime::Shared;
 
@@ -24,8 +27,49 @@ pub struct OsdIn {
     pub shared: Arc<Shared>,
     /// The drone's MAVLink packets (CoreIo::on_mav) for the flight HUD.
     pub mav_rx: Receiver<Vec<u8>>,
-    /// Link statistics over the HUD; a tap on the screen toggles it.
-    pub show_stats: Arc<AtomicBool>,
+    /// Touches from the Activity, in Surface pixels.
+    pub touch_rx: Receiver<Touch>,
+    /// F18 drone settings: table snapshots in, commands out, answers in.
+    pub params_rx: Receiver<String>,
+    pub cmd_tx: Sender<Cmd>,
+    pub set_res_rx: Receiver<(usize, Result<(), String>)>,
+    /// "ch 40 / 40 MHz", for the Link tab.
+    pub radio: String,
+    /// HUD prefs file in the app's files dir.
+    pub prefs_path: std::path::PathBuf,
+}
+
+/// One MotionEvent: action 0 down, 1 up, 2 move, 3 cancel.
+pub struct Touch {
+    pub action: i32,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Touches as egui pointer events (points).
+fn touch_events(rx: &Receiver<Touch>, ppp: f32, ev: &mut Vec<egui::Event>) {
+    while let Ok(t) = rx.try_recv() {
+        let pos = egui::pos2(t.x / ppp, t.y / ppp);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        match t.action {
+            0 => {
+                ev.push(egui::Event::PointerMoved(pos));
+                ev.push(button(true));
+            }
+            1 => {
+                ev.push(egui::Event::PointerMoved(pos));
+                ev.push(button(false));
+                ev.push(egui::Event::PointerGone);
+            }
+            2 => ev.push(egui::Event::PointerMoved(pos)),
+            _ => ev.push(egui::Event::PointerGone),
+        }
+    }
 }
 
 struct Gl {
@@ -103,11 +147,21 @@ pub fn run(o: OsdIn) {
     let mut telem = pal_osd::telem::Telemetry::default();
     let t0 = Instant::now();
     let (mut fps, mut last_frames, mut fps_t) = (0.0, 0u64, Instant::now());
+    let mut prefs = HudPrefs::load(&o.prefs_path);
+    let mut panel = Panel {
+        touch: true,
+        ..Default::default()
+    };
+    let mut table: Option<Table> = None;
+    let mut edits = Edits::default();
     loop {
         if o.shared.quit.load(Ordering::Relaxed) {
             break;
         }
-        match o.stats_rx.recv_timeout(Duration::from_millis(250)) {
+        // Stats lines pace the redraw at 10 Hz; with the panel open, 30 Hz
+        // keeps scrolling and steppers responsive.
+        let wait = if panel.open { 33 } else { 100 };
+        match o.stats_rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(s) => {
                 if let Some(snap) = Snapshot::parse(&s) {
                     hist.push(t0.elapsed().as_secs_f64(), snap);
@@ -121,6 +175,14 @@ pub fn run(o: OsdIn) {
         while let Ok(p) = o.mav_rx.try_recv() {
             telem.on_packet(&p, now);
         }
+        while let Ok(l) = o.params_rx.try_recv() {
+            if let Some(t) = Table::parse(&l) {
+                table = Some(t);
+            }
+        }
+        while let Ok(r) = o.set_res_rx.try_recv() {
+            edits.last = Some(r);
+        }
         let frames = o.shared.frames.load(Ordering::Relaxed);
         let dt = fps_t.elapsed().as_secs_f64();
         if dt >= 1.0 {
@@ -130,24 +192,52 @@ pub fn run(o: OsdIn) {
         }
         let (w, h) = (o.win.width().max(1) as u32, o.win.height().max(1) as u32);
         let ppp = o.density.max(1.0);
+        let mut events = Vec::new();
+        touch_events(&o.touch_rx, ppp, &mut events);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(w as f32 / ppp, h as f32 / ppp),
             )),
+            events,
             ..Default::default()
         };
         ctx.set_pixels_per_point(ppp);
         let dec = (frames, o.shared.dec_errors.load(Ordering::Relaxed));
+        let mut pout = pal_osd::panel::PanelOut::default();
+        let mut stats_flip = false;
         let out = ctx.run(input, |ctx| {
+            pal_osd::panel::gear(ctx, &mut panel);
+            pout = pal_osd::panel::show(
+                ctx,
+                &mut panel,
+                PanelIn {
+                    table: table.as_ref(),
+                    edits: &mut edits,
+                    prefs: &mut prefs,
+                    link_info: format!(
+                        "{}, key {}",
+                        o.radio,
+                        hist.last().map_or("?", |s| s.key_fp.as_str())
+                    ),
+                    log_info: "flight logs: not recorded on the phone yet".into(),
+                },
+            );
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
                     // The video SurfaceView fills the same rect, and
                     // MediaCodec scales the picture to it.
-                    let r = ui.max_rect();
-                    pal_osd::hud::hud(ui, r, &telem, &hist, now);
-                    let stats = o.show_stats.load(Ordering::Relaxed);
+                    // A tap on the bare video toggles link statistics; the
+                    // gear and the panel are Areas above, so they win.
+                    let bg = ui.interact(ui.max_rect(), egui::Id::new("bg"), egui::Sense::click());
+                    if bg.clicked() && !panel.open {
+                        prefs.stats = !prefs.stats;
+                        stats_flip = true;
+                    }
+                    let r = pal_osd::panel::hud_rect(ctx, &panel, ui.max_rect());
+                    pal_osd::hud::hud(ui, r, &telem, &hist, now, &prefs);
+                    let stats = prefs.stats;
                     let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
                     if stats || mismatch {
                         let top = r.shrink(8.0).translate(egui::vec2(0.0, 36.0));
@@ -160,6 +250,12 @@ pub fn run(o: OsdIn) {
                     }
                 });
         });
+        if let Some(c) = pout.cmd {
+            let _ = o.cmd_tx.send(c);
+        }
+        if pout.prefs_changed || stats_flip {
+            prefs.save(&o.prefs_path);
+        }
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         unsafe {
             gl.viewport(0, 0, w as i32, h as i32);

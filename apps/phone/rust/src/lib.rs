@@ -4,10 +4,11 @@
 //! MediaCodec on a decode thread, and hands the newest stats line back.
 //!
 //! JNI (class org.palianytsia.phone.Native):
-//!   long start(int fd, Surface video, Surface osd, float density, String configToml)
+//!   long start(int fd, Surface video, Surface osd, float density, String configToml,
+//!              String filesDir)
 //!                             0 = failed, see lastError()
 //!   String stats(long h)      newest stats JSON ("" before the first)
-//!   void toggleStats(long h)  link statistics over the flight HUD (tap)
+//!   void touch(long h, int action, float x, float y)  touches for the OSD (gear, panel, tap toggles stats)
 //!   String lastError()
 //!   void stop(long h)
 #[cfg(target_os = "android")]

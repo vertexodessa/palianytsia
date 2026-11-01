@@ -17,6 +17,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.WindowManager;
@@ -85,9 +86,20 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         osd.setTextSize(13);
         osd.setPadding(24, 16, 24, 16);
         root.addView(osd, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
-        // A tap shows or hides the link statistics over the flight HUD.
-        root.setOnClickListener(v -> {
-            if (handle != 0) Native.toggleStats(handle);
+        // The OSD (egui in Rust) takes every touch: the gear opens the
+        // settings panel, a tap on the bare video toggles link statistics.
+        osdView.setOnTouchListener((v, e) -> {
+            if (handle == 0) return false;
+            int a;
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN: a = 0; break;
+                case MotionEvent.ACTION_UP: a = 1; break;
+                case MotionEvent.ACTION_MOVE: a = 2; break;
+                case MotionEvent.ACTION_CANCEL: a = 3; break;
+                default: return true;
+            }
+            Native.touch(handle, a, e.getX(), e.getY());
+            return true;
         });
         setContentView(root);
         IntentFilter f = new IntentFilter(ACTION_USB);
@@ -179,7 +191,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         Log.i(TAG, "starting on " + name + " fd " + conn.getFileDescriptor());
         float density = getResources().getDisplayMetrics().density;
         handle = Native.start(conn.getFileDescriptor(), holder.getSurface(),
-                osdHolder.getSurface(), density, cfg);
+                osdHolder.getSurface(), density, cfg, getFilesDir().getAbsolutePath());
         if (handle == 0) {
             show("start failed: " + Native.lastError());
             conn.close();

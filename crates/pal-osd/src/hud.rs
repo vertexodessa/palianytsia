@@ -5,6 +5,7 @@
 //! off-by-default view.
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Ui, Vec2};
 
+use crate::prefs::HudPrefs;
 use crate::telem::Telemetry;
 use crate::{History, SIGNAL_HOLD_S};
 
@@ -37,14 +38,15 @@ fn mmss(s: f64) -> String {
 }
 
 /// Paints the HUD into `r` (the video rect, in points).
-pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64) {
-    let base = (r.height() / 22.0).clamp(11.0, 22.0);
+pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64, pf: &HudPrefs) {
+    let base = (r.height() / 22.0).clamp(11.0, 22.0) * pf.scale;
     let pad = base * 0.8;
     let p = ui.painter();
 
-    // Centre dot.
     let c = r.center();
-    p.circle(c, base * 0.18, WHITE, Stroke::new(1.0_f32, Color32::BLACK));
+    if pf.dot {
+        p.circle(c, base * 0.18, WHITE, Stroke::new(1.0_f32, Color32::BLACK));
+    }
 
     let fresh = t.last_s.is_some_and(|s| now_s - s <= STALE_S);
     let link = h.last();
@@ -52,7 +54,8 @@ pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64) {
 
     // Top left: arm state and flight timer.
     let tl = r.left_top() + Vec2::new(pad, pad);
-    if t.last_s.is_none() {
+    if !pf.timer {
+    } else if t.last_s.is_none() {
         text(ui, tl, Align2::LEFT_TOP, "NO TELEMETRY", base, WARN);
     } else {
         let (arm, col) = if t.armed {
@@ -85,6 +88,7 @@ pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64) {
     // stats view.
     let tr = r.right_top() + Vec2::new(-pad, pad);
     match (session, h.signal(SIGNAL_HOLD_S)) {
+        (true, _) if !pf.link => {}
         (true, Some((rssi, snr))) => {
             let mcs = link.map_or(-1, |s| s.mcs);
             let col = if snr > 15.0 { WHITE } else { WARN };
@@ -106,6 +110,18 @@ pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64) {
     }
 
     // Bottom left: battery, large.
+    if pf.battery {
+        battery(ui, r, t, base, pad);
+    }
+    if pf.nav {
+        nav(ui, r, t, base, pad);
+    }
+    if pf.messages {
+        messages(ui, c, r, t, base, now_s);
+    }
+}
+
+fn battery(ui: &Ui, r: Rect, t: &Telemetry, base: f32, pad: f32) {
     let bl = r.left_bottom() + Vec2::new(pad, -pad);
     let cell = t.cell_v();
     let bcol = match cell {
@@ -140,7 +156,9 @@ pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64) {
         base * 1.6,
         bcol,
     );
+}
 
+fn nav(ui: &Ui, r: Rect, t: &Telemetry, base: f32, pad: f32) {
     // Bottom right: altitude, speed, home, sats (top to bottom).
     let mut rows = Vec::new();
     if let Some(a) = t.alt_rel_m {
@@ -167,7 +185,9 @@ pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64) {
         );
         y = b.top() - base * 0.15;
     }
+}
 
+fn messages(ui: &Ui, c: Pos2, r: Rect, t: &Telemetry, base: f32, now_s: f64) {
     // Below centre: the newest FC message, red for warnings and worse.
     if let Some((ts, sev, msg)) = t.texts.back() {
         if now_s - ts <= TEXT_S {
