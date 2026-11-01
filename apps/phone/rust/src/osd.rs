@@ -34,7 +34,7 @@ pub struct OsdIn {
     pub cmd_tx: Sender<Cmd>,
     pub set_res_rx: Receiver<(usize, Result<(), String>)>,
     /// "ch 40 / 40 MHz", for the Link tab.
-    pub radio: String,
+    pub width: u8,
     /// Where this session's flight log goes, for the Logs tab.
     pub log_info: String,
     /// HUD prefs file in the app's files dir.
@@ -219,7 +219,7 @@ pub fn run(o: OsdIn) {
                     prefs: &mut prefs,
                     link_info: format!(
                         "{}, key {}",
-                        o.radio,
+                        o.shared.radio_label(o.width),
                         hist.last().map_or("?", |s| s.key_fp.as_str())
                     ),
                     log_info: format!(
@@ -244,9 +244,17 @@ pub fn run(o: OsdIn) {
                     pal_osd::hud::hud(ui, r, ui.max_rect().center(), &telem, &hist, now, &prefs);
                     let stats = prefs.stats;
                     let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
-                    if stats || mismatch {
+                    let searching = o.shared.searching.load(Ordering::Relaxed);
+                    if stats || mismatch || searching {
                         let top = r.shrink(8.0).translate(egui::vec2(0.0, 36.0));
                         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
+                            if searching {
+                                ui.label(
+                                    egui::RichText::new(o.shared.radio_label(o.width))
+                                        .size(20.0)
+                                        .color(egui::Color32::YELLOW),
+                                );
+                            }
                             if stats {
                                 pal_osd::chips(ui, &hist, fps, dec);
                             }

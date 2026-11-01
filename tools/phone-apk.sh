@@ -5,7 +5,7 @@
 # Out: apps/phone/android/app/build/outputs/apk/debug/app-debug.apk
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-CFG=${1:-$ROOT/configs/bench-ch40.toml}
+CFG=${1:-$ROOT/configs/gs-auto.toml}
 NDK=${ANDROID_NDK_HOME:-$(ls -d "$HOME"/Android/Sdk/ndk/* | sort -V | tail -1)}
 export ANDROID_NDK_HOME=$NDK
 "$ROOT/tools/android-build.sh" build --release -p pal-phone

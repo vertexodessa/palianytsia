@@ -123,7 +123,11 @@ impl Osd {
             changed = true;
         }
         if let Some(l) = hub.ui.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            log::info!("osd: link {}, {}", l.radio, l.log_info);
+            log::info!(
+                "osd: link {}, {}",
+                l.shared.radio_label(l.width),
+                l.log_info
+            );
             // A new link is a new session: fresh history.
             self.hist = History::default();
             self.telem = Default::default();
@@ -209,7 +213,12 @@ impl Osd {
             .last_draw
             .is_none_or(|t| t.elapsed() >= Duration::from_millis(every));
         if fresh || due || changed {
-            let status = hub.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let mut status = hub.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(l) = self.link.as_ref() {
+                if status.is_empty() && l.shared.searching.load(Ordering::Relaxed) {
+                    status = l.shared.radio_label(l.width);
+                }
+            }
             if let Err(e) = self.draw(now, &status, events) {
                 log::warn!("osd: {e}");
             }
@@ -236,7 +245,7 @@ impl Osd {
             |l| {
                 format!(
                     "{}, key {}",
-                    l.radio,
+                    l.shared.radio_label(l.width),
                     hist.last().map_or("?", |s| s.key_fp.as_str())
                 )
             },

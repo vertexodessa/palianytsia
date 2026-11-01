@@ -40,7 +40,8 @@ pairing key.
   off the bus; `authorized` toggling does not fix it, a physical replug did.
 - Drone `ld` (192.168.1.10): RTL8822E quad, maburd RC 18, default key, parked on
   ch 40 / 40 MHz. `configs/gs.toml` pins ch 144, so live runs use a copy with
-  `channel = 40` and `pal live --ch 40 --width 40 --mode gs`.
+  `channel = 40` and `pal live --ch 40 --width 40 --mode gs`; the phone/Quest APKs
+  (`gs-auto.toml`) find it on their own.
 - maburd respawns 2 s after it exits (S96mabur loop); `kill $(pidof maburd)`
   is a drone restart. Ihor allowed drone actions; device commands still carry a
   `# predict:` claim.
@@ -49,6 +50,11 @@ pairing key.
 
 ## Helpers
 - `configs/bench-ch40.toml`: `gs.toml` pinned to ch 40 for the bench quad.
+- `configs/gs-auto.toml` (the APK default): `gs.toml` with `channel = "auto"`: `runtime::run_live`
+  sweeps `radio.channels` (400 ms per channel, 3 CRC-good drone data frames = found) at start and
+  after 8 s without drone frames, rebuilding the Rust core for the found channel; the core is not
+  ticked while sweeping. Events `search`, `drone_found`, `drone_lost`. Pinned configs never sweep;
+  pal-desktop sweeps only with `--core rust` and no `--ch`. `gs.toml` stays pinned for the parity gates.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.

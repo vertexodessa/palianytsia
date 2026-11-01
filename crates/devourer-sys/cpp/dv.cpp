@@ -48,6 +48,8 @@ struct dv_card {
   uint16_t tx_seq = 0;
   std::string chip;
   std::vector<uint8_t> radiotap;
+  uint8_t width = 20;
+  uint8_t offset = 0;
 };
 
 extern "C" dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap) try {
@@ -100,6 +102,8 @@ extern "C" dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap) try {
     c->dev.reset(static_cast<IRtlRadio *>(r.release()));
   if (!c->dev) { set_err(err, err_cap, "unsupported chip"); dv_close(c.release()); return nullptr; }
 
+  c->width = cfg->width_mhz == 40 ? 40 : 20;
+  c->offset = c->width == 40 ? ht40_offset(cfg->channel) : 0;
   c->dev->InitWrite(cfg->width_mhz == 40
                         ? SelectedChannel{cfg->channel, ht40_offset(cfg->channel), CHANNEL_WIDTH_40}
                         : SelectedChannel{cfg->channel, 0, CHANNEL_WIDTH_20});
@@ -162,6 +166,26 @@ extern "C" int dv_send_control(dv_card *c, const uint8_t *body, size_t len) try 
   if (len) std::memcpy(d + 24, body, len);
   c->tx_seq = static_cast<uint16_t>((c->tx_seq + 1) & 0xFFF);
   return c->dev->send_packet(f.data(), f.size()) ? 0 : -1;
+} catch (...) {
+  return -1;
+}
+
+extern "C" int dv_set_channel(dv_card *c, uint8_t ch, uint8_t width_mhz) try {
+  if (!c || !c->dev) return -1;
+  const uint8_t w = width_mhz == 40 ? 40 : 20;
+  const uint8_t off = w == 40 ? ht40_offset(ch) : 0;
+  if (w == 40 && off == 0) return -2;
+  if (w == c->width && off == c->offset) {
+    // Intra-band, same width and offset; FastRetune itself falls back to
+    // the full path on a band change.
+    c->dev->FastRetune(ch, /*cache_rf=*/true);
+  } else {
+    c->dev->SetMonitorChannel(w == 40 ? SelectedChannel{ch, off, CHANNEL_WIDTH_40}
+                                      : SelectedChannel{ch, 0, CHANNEL_WIDTH_20});
+  }
+  c->width = w;
+  c->offset = off;
+  return 0;
 } catch (...) {
   return -1;
 }

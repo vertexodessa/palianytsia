@@ -55,8 +55,9 @@ pub struct Ports {
 
 pub struct Link {
     pub shared: Arc<Shared>,
-    /// "ch 40 / 40 MHz".
-    pub radio: String,
+    /// Channel width; the channel itself is `shared.radio_label(width)`,
+    /// which follows the drone search.
+    pub width: u8,
     /// Where the flight log goes, or why there is none.
     pub log_info: String,
     core: Option<JoinHandle<()>>,
@@ -148,11 +149,31 @@ impl Link {
                     Ok(c) => mk_cl(Box::new(c)),
                     Err(e) => return set_err(format!("core: {e}")),
                 };
+                // radio.channel = "auto": find the drone in the set.
+                let search = if cfg.radio.pin.is_none() {
+                    cfg.radio.channels.clone()
+                } else {
+                    Vec::new()
+                };
+                let remake: runtime::Remake = Box::new(move |ch| {
+                    let opts = RustOpts {
+                        mode: Mode::Gs,
+                        adaptive_gap: true,
+                        rz_nonce: RZ_NONCE,
+                        channel: ch,
+                    };
+                    log::info!("drone found on ch {ch}");
+                    RustCore::new(&cfg, opts)
+                        .map(|c| Box::new(c) as Box<dyn pal_core::GsCore>)
+                        .map_err(|e| format!("core: {e}"))
+                });
                 let lc = LiveCfg {
                     select: devourer_sys::Select::Fd(fd),
                     ch,
                     width,
                     gs: true,
+                    search,
+                    remake: Some(remake),
                 };
                 match runtime::run_live(cl, lc, |chip| {
                     log::info!("card {chip} on ch {ch} / {width} MHz")
@@ -165,7 +186,7 @@ impl Link {
         Ok((
             Link {
                 shared,
-                radio: format!("ch {ch} / {width} MHz"),
+                width,
                 log_info,
                 core: Some(core_t),
                 dec: Some(dec_t),

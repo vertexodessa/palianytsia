@@ -36,7 +36,7 @@ fn start(
         cmd_tx: ports.cmd_tx,
         set_res_rx: ports.set_res_rx,
         prefs_path,
-        radio: link.radio.clone(),
+        width: link.width,
         log_info: link.log_info.clone(),
         win: osd_win,
         density,

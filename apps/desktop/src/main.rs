@@ -48,6 +48,9 @@ struct Opts {
     replay: Option<PathBuf>,
     live: bool,
     ch: u8,
+    /// radio.channel = "auto" and no --ch: sweep radio.channels for the
+    /// drone (Rust core only; pal-ref's channel core would steer it).
+    search: Vec<u8>,
     width: u8,
     card: i32,
     mode: Option<Mode>,
@@ -143,6 +146,9 @@ fn parse() -> Opts {
         let cfg = o.config.as_ref().expect("config");
         let c = pal_core::config::load_config(cfg, None)
             .unwrap_or_else(|e| die(&format!("{}: {e}", cfg.display())));
+        if o.ch == 0 && c.radio.pin.is_none() && o.rust {
+            o.search = c.radio.channels.clone();
+        }
         if o.ch == 0 {
             o.ch = c
                 .radio
@@ -436,7 +442,7 @@ impl eframe::App for App {
                 table: self.params.as_ref(),
                 edits: &mut self.edits,
                 prefs: &mut self.prefs,
-                link_info: format!("ch {} / {} MHz, key {key}", self.radio.0, self.radio.1),
+                link_info: format!("{}, key {key}", self.shared.radio_label(self.radio.1)),
                 log_info: self.log_info.clone(),
             },
         );
@@ -668,11 +674,17 @@ fn main() {
                         match o.replay.clone() {
                             Some(p) => run_replay(cl, &o, p, ctx),
                             None => {
+                                let o2 = o.clone();
                                 let cfg = LiveCfg {
                                     select: devourer_sys::Select::Scan { index: o.card },
                                     ch: o.ch,
                                     width: o.width,
                                     gs: o.mode == Some(Mode::Gs),
+                                    search: o.search.clone(),
+                                    remake: Some(Box::new(move |ch| {
+                                        eprintln!("pal-desktop: drone found on ch {ch}");
+                                        Ok(make_core(&o2, ch))
+                                    })),
                                 };
                                 let (ch, w) = (o.ch, o.width);
                                 if let Err(e) = runtime::run_live(cl, cfg, |chip| {

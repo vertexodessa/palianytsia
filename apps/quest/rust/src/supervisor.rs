@@ -17,7 +17,7 @@ use crate::usb::{Find, Usb};
 pub struct LinkUi {
     pub ports: Ports,
     pub shared: Arc<Shared>,
-    pub radio: String,
+    pub width: u8,
     pub log_info: String,
 }
 
@@ -120,7 +120,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf) {
         *hub.ui.lock().unwrap_or_else(|p| p.into_inner()) = Some(LinkUi {
             ports,
             shared: link.shared.clone(),
-            radio: link.radio.clone(),
+            width: link.width,
             log_info: link.log_info.clone(),
         });
         hub.set_status("");

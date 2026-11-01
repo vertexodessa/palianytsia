@@ -40,6 +40,7 @@ extern "C" {
     fn dv_open(cfg: *const DvCfg, err: *mut c_char, cap: usize) -> *mut DvCard;
     fn dv_start_rx(c: *mut DvCard, cb: RxCb, user: *mut c_void) -> c_int;
     fn dv_send_control(c: *mut DvCard, body: *const u8, len: usize) -> c_int;
+    fn dv_set_channel(c: *mut DvCard, ch: u8, width_mhz: u8) -> c_int;
     fn dv_chip(c: *const DvCard) -> *const c_char;
     fn dv_close(c: *mut DvCard);
 }
@@ -169,6 +170,18 @@ impl Card {
         }
         self.handler = Some(h);
         Ok(())
+    }
+
+    /// Moves the card to `ch` / `width_mhz` (FastRetune when only the
+    /// channel changes). Shares the TX lock, so it never overlaps a send;
+    /// never call it from the RX handler.
+    pub fn set_channel(&self, ch: u8, width_mhz: u8) -> Result<(), String> {
+        let _g = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        match unsafe { dv_set_channel(self.raw, ch, width_mhz) } {
+            0 => Ok(()),
+            -2 => Err(format!("channel {ch} has no 40 MHz pair")),
+            r => Err(format!("set_channel({ch}, {width_mhz}) failed ({r})")),
+        }
     }
 
     /// GS uplink control frame around an RC body. Thread-safe.

@@ -2,7 +2,7 @@
 //! `runtime`): the devourer RX thread, the core loop (GsCore + IdrDriver +
 //! flight log + stats/params out, commands in) and the counters a platform
 //! decoder feeds back. Decoding and drawing stay in the apps.
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,9 +38,23 @@ pub struct Shared {
     /// Events from other threads (decoder stalls) for the flight log; the
     /// core loop drains them on its tick.
     pub events: Mutex<Vec<(&'static str, serde_json::Value)>>,
+    /// The channel the card listens on; 0 before the card is up.
+    pub channel: AtomicU8,
+    /// The card is sweeping the channel set for the drone.
+    pub searching: AtomicBool,
 }
 
 impl Shared {
+    /// "ch 40 / 40 MHz", or "searching for the drone: ch 64 / 40 MHz".
+    pub fn radio_label(&self, width: u8) -> String {
+        let ch = self.channel.load(Ordering::Relaxed);
+        if self.searching.load(Ordering::Relaxed) {
+            format!("searching for the drone: ch {ch} / {width} MHz")
+        } else {
+            format!("ch {ch} / {width} MHz")
+        }
+    }
+
     pub fn event(&self, ev: &'static str, detail: serde_json::Value) {
         let mut q = self.events.lock().unwrap_or_else(|p| p.into_inner());
         // A wedged core loop must not grow this without bound.
@@ -301,6 +315,9 @@ pub fn mono_us(t0: Instant) -> u64 {
     1_000_000 + t0.elapsed().as_micros() as u64
 }
 
+/// Builds a core for the channel the drone was found on.
+pub type Remake = Box<dyn FnMut(u8) -> Result<Box<dyn GsCore>, String>>;
+
 /// Where the card comes from and how to tune it.
 pub struct LiveCfg {
     pub select: devourer_sys::Select,
@@ -308,13 +325,87 @@ pub struct LiveCfg {
     pub width: u8,
     /// GS mode: the card also transmits the core's RC frames.
     pub gs: bool,
+    /// The channel set to sweep for the drone (radio.channel = "auto"):
+    /// at start, and again after `LOST_US` without a drone frame. Empty =
+    /// stay on `ch`. Needs `remake`: a core's DISC proposes the channel it
+    /// was built for, and a core on the wrong one would steer the drone.
+    pub search: Vec<u8>,
+    pub remake: Option<Remake>,
+}
+
+/// Listening time per channel. The drone sends video frames continuously
+/// (and its 1 Hz telemetry when idle), so 3 frames in 400 ms is certain
+/// on its channel and impossible elsewhere: SA-matched and CRC-good.
+pub const DWELL_MS: u64 = 400;
+pub const FOUND_HITS: u32 = 3;
+/// No drone frame for this long while searching is enabled: sweep again.
+pub const LOST_US: u64 = 8_000_000;
+
+/// Sweeps `set` (starting at `first`) until `hits` grows by FOUND_HITS
+/// within one dwell. Bodies queued meanwhile are dropped: none may reach a
+/// core built for another channel. None when asked to quit.
+#[allow(clippy::too_many_arguments)]
+fn search(
+    card: &devourer_sys::Card,
+    set: &[u8],
+    first: u8,
+    width: u8,
+    cur: &AtomicU8,
+    hits: &AtomicU32,
+    rx: &Receiver<RxBody>,
+    shared: &Shared,
+) -> Result<Option<u8>, String> {
+    let mut order = vec![first];
+    order.extend(set.iter().copied().filter(|&c| c != first));
+    shared.searching.store(true, Ordering::Relaxed);
+    let t = Instant::now();
+    let mut rounds = 0u32;
+    let found = 'sweep: loop {
+        for &ch in &order {
+            if shared.quit.load(Ordering::Relaxed) {
+                break 'sweep None;
+            }
+            // Blind the RX stamp across the move, as maburgs' retune does.
+            cur.store(0, Ordering::Relaxed);
+            card.set_channel(ch, width)?;
+            shared.channel.store(ch, Ordering::Relaxed);
+            // Frames already in the USB pipeline belong to the old channel.
+            std::thread::sleep(Duration::from_millis(5));
+            while rx.try_recv().is_ok() {}
+            let h0 = hits.load(Ordering::Relaxed);
+            cur.store(ch, Ordering::Relaxed);
+            let end = Instant::now() + Duration::from_millis(DWELL_MS);
+            while Instant::now() < end {
+                let _ = rx.recv_timeout(Duration::from_millis(20));
+                if hits.load(Ordering::Relaxed).wrapping_sub(h0) >= FOUND_HITS {
+                    break 'sweep Some(ch);
+                }
+            }
+        }
+        rounds += 1;
+        if rounds == 1 {
+            shared.event("search", serde_json::json!({"set": set, "first": first}));
+        }
+    };
+    shared.searching.store(false, Ordering::Relaxed);
+    if let Some(ch) = found {
+        shared.event(
+            "drone_found",
+            serde_json::json!({"ch": ch, "ms": t.elapsed().as_millis() as u64, "rounds": rounds}),
+        );
+    }
+    Ok(found)
 }
 
 /// Opens the card and runs the core loop on this thread until
 /// `shared.quit`; `on_open` gets the chip name once the card is up.
-pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<(), String> {
+pub fn run_live(
+    mut cl: CoreLoop,
+    mut o: LiveCfg,
+    on_open: impl FnOnce(&str),
+) -> Result<(), String> {
     let mut card = devourer_sys::Card::open(&devourer_sys::Config {
-        select: o.select,
+        select: o.select.clone(),
         channel: o.ch,
         width_mhz: o.width,
     })
@@ -322,10 +413,21 @@ pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Res
     on_open(&card.chip().unwrap_or("?".into()));
     let t0 = Instant::now();
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
-    let ch = o.ch;
+    // The channel RX frames are stamped with; 0 while the card retunes.
+    let cur = Arc::new(AtomicU8::new(o.ch));
+    // CRC-good drone data frames (SA-matched by dot11::parse) since open.
+    let hits = Arc::new(AtomicU32::new(0));
     let shared_rx = cl.sink.shared.clone();
+    let (cur_rx, hits_rx) = (cur.clone(), hits.clone());
     card.start_rx(move |f| {
+        let ch = cur_rx.load(Ordering::Relaxed);
+        if ch == 0 {
+            return;
+        }
         if let dot11::Verdict::Body(p) = dot11::parse(f.frame, f.crc_err, f.data_rate) {
+            if !f.crc_err && f.frame[0] & 0xFC == 0x88 {
+                hits_rx.fetch_add(1, Ordering::Relaxed);
+            }
             shared_rx.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
             let r = tx.try_send(RxBody {
                 card_id: 0,
@@ -347,9 +449,30 @@ pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Res
         }
     })?;
     let card = Arc::new(card);
+    let shared = cl.sink.shared.clone();
+    shared.channel.store(o.ch, Ordering::Relaxed);
+    let searching = !o.search.is_empty() && o.remake.is_some();
+    let mut core_ch = o.ch;
+    // Sweeps, then rebuilds the core when the drone is elsewhere.
+    let mut find = |cl: &mut CoreLoop, core_ch: &mut u8| -> Result<bool, String> {
+        let from = *core_ch;
+        let Some(ch) = search(&card, &o.search, from, o.width, &cur, &hits, &rx, &shared)? else {
+            return Ok(false);
+        };
+        if ch != *core_ch {
+            let remake = o.remake.as_mut().expect("remake");
+            cl.core = remake(ch)?;
+            *core_ch = ch;
+        }
+        Ok(true)
+    };
+    if searching && !find(&mut cl, &mut core_ch)? {
+        return Ok(());
+    }
     if o.gs {
         cl.sink.card = Some(card.clone());
     }
+    let mut seen = (hits.load(Ordering::Relaxed), mono_us(t0));
     let mut next_tick = mono_us(t0);
     loop {
         let wait = Duration::from_micros(next_tick.saturating_sub(mono_us(t0)));
@@ -371,6 +494,22 @@ pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Res
         }
         if cl.sink.shared.quit.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        let h = hits.load(Ordering::Relaxed);
+        if h != seen.0 {
+            seen = (h, now);
+        } else if searching && now.saturating_sub(seen.1) >= LOST_US {
+            // The core stays silent while the card sweeps: its DISC on a
+            // foreign channel could move a drone that is listening there.
+            cl.sink
+                .shared
+                .event("drone_lost", serde_json::json!({"ch": core_ch}));
+            let card_tx = cl.sink.card.take();
+            if !find(&mut cl, &mut core_ch)? {
+                return Ok(());
+            }
+            cl.sink.card = card_tx;
+            seen = (hits.load(Ordering::Relaxed), mono_us(t0));
         }
     }
 }
