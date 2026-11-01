@@ -37,15 +37,21 @@ fn mmss(s: f64) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
-/// Paints the HUD into `r` (the video rect, in points).
-pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64, pf: &HudPrefs) {
+/// Paints the HUD into `r` (the video rect, or the part of it left of an
+/// open settings panel, in points). `centre` is the video's centre: the dot
+/// marks the camera axis, so it must not follow `r` when the panel narrows it.
+pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f64, pf: &HudPrefs) {
     let base = (r.height() / 22.0).clamp(11.0, 22.0) * pf.scale;
     let pad = base * 0.8;
     let p = ui.painter();
 
-    let c = r.center();
     if pf.dot {
-        p.circle(c, base * 0.18, WHITE, Stroke::new(1.0_f32, Color32::BLACK));
+        p.circle(
+            centre,
+            base * 0.18,
+            WHITE,
+            Stroke::new(1.0_f32, Color32::BLACK),
+        );
     }
 
     let fresh = t.last_s.is_some_and(|s| now_s - s <= STALE_S);
@@ -117,7 +123,7 @@ pub fn hud(ui: &Ui, r: Rect, t: &Telemetry, h: &History, now_s: f64, pf: &HudPre
         nav(ui, r, t, base, pad);
     }
     if pf.messages {
-        messages(ui, c, r, t, base, now_s);
+        messages(ui, centre, r, t, base, now_s);
     }
 }
 

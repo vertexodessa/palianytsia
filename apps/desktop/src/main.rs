@@ -513,7 +513,15 @@ impl eframe::App for App {
                     egui::Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale))
                 });
                 let hr = pal_osd::panel::hud_rect(ctx, &self.panel, vr);
-                pal_osd::hud::hud(ui, hr, &self.telem, &self.hist, now, &self.prefs);
+                pal_osd::hud::hud(
+                    ui,
+                    hr,
+                    vr.center(),
+                    &self.telem,
+                    &self.hist,
+                    now,
+                    &self.prefs,
+                );
                 let mismatch = self.hist.last().is_some_and(|s| s.key_mismatch);
                 if self.prefs.stats || mismatch {
                     let decode = (frames, self.shared.dec_errors.load(Ordering::Relaxed));

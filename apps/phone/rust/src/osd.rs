@@ -241,7 +241,7 @@ pub fn run(o: OsdIn) {
                         stats_flip = true;
                     }
                     let r = pal_osd::panel::hud_rect(ctx, &panel, ui.max_rect());
-                    pal_osd::hud::hud(ui, r, &telem, &hist, now, &prefs);
+                    pal_osd::hud::hud(ui, r, ui.max_rect().center(), &telem, &hist, now, &prefs);
                     let stats = prefs.stats;
                     let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
                     if stats || mismatch {

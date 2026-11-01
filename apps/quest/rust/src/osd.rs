@@ -272,7 +272,7 @@ impl Osd {
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
                     let r = pal_osd::panel::hud_rect(ctx, panel, ui.max_rect());
-                    pal_osd::hud::hud(ui, r, telem, hist, now, prefs);
+                    pal_osd::hud::hud(ui, r, ui.max_rect().center(), telem, hist, now, prefs);
                     let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
                     if prefs.stats || mismatch || !status.is_empty() {
                         let top = r.shrink(8.0).translate(egui::vec2(0.0, 36.0));
