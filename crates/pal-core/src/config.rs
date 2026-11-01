@@ -20,6 +20,15 @@ pub struct BusyCfg {
     pub blocked_pct: f64,
 }
 
+impl Default for BusyCfg {
+    fn default() -> Self {
+        Self {
+            busy_dbm: -83,
+            blocked_pct: 50.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanCfg {
     pub dwell_ms: i32,
@@ -46,10 +55,7 @@ impl Default for ScanCfg {
             pick_margin: 20,
             one_card_ms: 5000,
             max_ms: 30000,
-            busy: BusyCfg {
-                busy_dbm: -83,
-                blocked_pct: 50.0,
-            },
+            busy: BusyCfg::default(),
         }
     }
 }
