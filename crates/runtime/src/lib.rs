@@ -586,37 +586,50 @@ fn search(
 
 /// Opens the card(s) and runs the core loop on this thread until
 /// `shared.quit`; `on_open` gets the chip names once the cards are up.
-pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<(), String> {
-    let (attach, extra, gs, mut search) = match o.drive {
-        Drive::Core { attach, extra } => (Some(attach), extra, false, None),
-        Drive::Runtime { gs, search } => (None, Vec::new(), gs, search),
-    };
-    let attached = attach.is_some();
-    let mut selects = vec![o.select];
-    selects.extend(extra);
-    let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
-    // The channel RX frames are stamped with; 0 while the card retunes.
-    let cur = Arc::new(AtomicU8::new(o.ch));
-    // CRC-good drone data frames (SA-matched by dot11::parse) since open.
-    let hits = Arc::new(AtomicU32::new(0));
-    // Set once an attached core exists; frames before it are dropped.
-    let tap: Arc<std::sync::OnceLock<TapClock>> = Arc::default();
-    let shared_rx = cl.sink.shared.clone();
+pub fn run_live(cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<(), String> {
+    match o.drive {
+        Drive::Core { attach, extra } => {
+            let mut selects = vec![o.select];
+            selects.extend(extra);
+            run_core_owned(cl, selects, o.ch, o.width, attach, on_open)
+        }
+        Drive::Runtime { gs, search } => {
+            run_runtime_owned(cl, o.select, o.ch, o.width, gs, search, on_open)
+        }
+    }
+}
+
+/// Says what a received frame's body is stamped with: Some((rx_channel,
+/// mono_us)) forwards it to the core, None drops it. Called on the card's
+/// RX thread with the card's roster index.
+type Stamp =
+    Arc<dyn Fn(u8, &devourer_sys::RxFrame, &dot11::Verdict) -> Option<(u8, u64)> + Send + Sync>;
+
+/// Opens the cards; each RX thread hands its bodies, as `stamp` stamps
+/// them, to `tx`. Card 0 must open; a further card that will not come up
+/// costs diversity, not the link: it is skipped. Ids stay contiguous over
+/// the cards that opened (the core's roster).
+fn open_cards(
+    selects: Vec<devourer_sys::Select>,
+    ch: u8,
+    width: u8,
+    stamp: Stamp,
+    tx: SyncSender<RxBody>,
+    shared: &Arc<Shared>,
+) -> Result<(Vec<Arc<devourer_sys::Card>>, String), String> {
     let mut cards = Vec::with_capacity(selects.len());
     let mut chips = Vec::with_capacity(selects.len());
     for (i, sel) in selects.into_iter().enumerate() {
         let mut card = match devourer_sys::Card::open(&devourer_sys::Config {
             select: sel,
-            channel: o.ch,
-            width_mhz: o.width,
+            channel: ch,
+            width_mhz: width,
         }) {
             Ok(c) => c,
             Err(e) if i == 0 => return Err(format!("card: {e}")),
-            // A second card that will not come up costs diversity, not
-            // the link: fly on the ones that did.
             Err(e) => {
                 eprintln!("pal: card {i} skipped: {e}");
-                shared_rx.event(
+                shared.event(
                     "card_skipped",
                     serde_json::json!({"card": i, "err": e.to_string()}),
                 );
@@ -624,35 +637,15 @@ pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Res
             }
         };
         chips.push(card.chip().unwrap_or("?".into()));
-        let (cur_rx, hits_rx, tap_rx) = (cur.clone(), hits.clone(), tap.clone());
-        let (tx, shared_rx) = (tx.clone(), shared_rx.clone());
-        // Contiguous ids over the cards that opened: the core's roster.
+        let (tx, shared, stamp) = (tx.clone(), shared.clone(), stamp.clone());
         let card_id = cards.len() as u8;
         card.start_rx(move |f| {
             let v = dot11::parse(f.frame, f.crc_err, f.data_rate);
-            let (ch, now) = if attached {
-                let Some((taps, clock)) = tap_rx.get() else {
-                    return;
-                };
-                let Some(t) = taps.get(usize::from(card_id)) else {
-                    return;
-                };
-                match t.on_rx(f, &v) {
-                    Some(ch) => (ch, clock()),
-                    None => return,
-                }
-            } else {
-                let ch = cur_rx.load(Ordering::Relaxed);
-                if ch == 0 {
-                    return;
-                }
-                (ch, mono_default())
+            let Some((ch, now)) = stamp(card_id, f, &v) else {
+                return;
             };
             if let dot11::Verdict::Body(p) = v {
-                if !f.crc_err && f.frame[0] & 0xFC == 0x88 {
-                    hits_rx.fetch_add(1, Ordering::Relaxed);
-                }
-                shared_rx.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
+                shared.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
                 let r = tx.try_send(RxBody {
                     card_id,
                     mono_us: now,
@@ -668,76 +661,103 @@ pub fn run_live(mut cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Res
                     body: f.frame[p.body_off..].to_vec(),
                 });
                 if r.is_err() {
-                    shared_rx.lat.rx_full.fetch_add(1, Ordering::Relaxed);
+                    shared.lat.rx_full.fetch_add(1, Ordering::Relaxed);
                 }
             }
         })?;
         cards.push(Arc::new(card));
     }
-    drop(tx);
-    on_open(&chips.join(" + "));
+    Ok((cards, chips.join(" + ")))
+}
+
+/// A core that owns the cards: every frame passes its card's tap first
+/// (counters, the channel stamp), the core retunes and transmits itself.
+fn run_core_owned(
+    mut cl: CoreLoop,
+    selects: Vec<devourer_sys::Select>,
+    ch: u8,
+    width: u8,
+    attach: Attach,
+    on_open: impl FnOnce(&str),
+) -> Result<(), String> {
+    let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
+    // Set once the core exists; frames before it are dropped.
+    let tap: Arc<std::sync::OnceLock<TapClock>> = Arc::default();
+    let tap_rx = tap.clone();
+    let stamp: Stamp = Arc::new(move |card_id, f, v| {
+        let (taps, clock) = tap_rx.get()?;
+        let ch = taps.get(usize::from(card_id))?.on_rx(f, v)?;
+        Some((ch, clock()))
+    });
     let shared = cl.sink.shared.clone();
-    shared.channel.store(o.ch, Ordering::Relaxed);
-    let mut clock: fn() -> u64 = mono_default;
-    let mut tap_now: Option<Arc<dyn RxTap>> = None;
-    if let Some(a) = attach {
-        let at = a(&cards)?;
-        cl.set_core(at.core);
-        clock = at.clock;
-        // The link card's channel is the one the UI shows.
-        tap_now = at.taps.first().cloned();
-        let _ = tap.set((at.taps, at.clock));
-    }
-    let r = live_loop(
+    let (cards, chips) = open_cards(selects, ch, width, stamp, tx, &shared)?;
+    on_open(&chips);
+    shared.channel.store(ch, Ordering::Relaxed);
+    let at = attach(&cards)?;
+    cl.set_core(at.core);
+    let clock = at.clock;
+    // The link card's channel is the one the UI shows.
+    let link = at.taps.first().cloned();
+    let _ = tap.set((at.taps, at.clock));
+    let r = pump(
         &mut cl,
-        Live {
-            ch: o.ch,
-            width: o.width,
-            gs,
-            search: search.as_mut(),
-        },
-        &cards[0],
-        &cur,
-        &hits,
         &rx,
         clock,
-        tap_now.as_deref(),
+        |_, _| {
+            if let Some(t) = &link {
+                shared.channel.store(t.channel(), Ordering::Relaxed);
+            }
+        },
+        |_, _| Ok(true),
     );
-    // The attached core's threads use the cards: they stop before those close.
+    // The core's threads use the cards: they stop before those close.
     drop(cl);
-    drop(tap_now);
+    drop(link);
     drop(cards);
     r
 }
 
-/// What live_loop needs from the config once the cards are open.
-struct Live<'a> {
+/// The runtime holds the card: on `ch`, or sweeping `search` for the
+/// drone and rebuilding the core for the channel it is found on.
+fn run_runtime_owned(
+    mut cl: CoreLoop,
+    select: devourer_sys::Select,
     ch: u8,
     width: u8,
     gs: bool,
-    search: Option<&'a mut Search>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn live_loop(
-    cl: &mut CoreLoop,
-    o: Live,
-    card: &Arc<devourer_sys::Card>,
-    cur: &AtomicU8,
-    hits: &AtomicU32,
-    rx: &Receiver<RxBody>,
-    clock: fn() -> u64,
-    tap: Option<&dyn RxTap>,
+    search: Option<Search>,
+    on_open: impl FnOnce(&str),
 ) -> Result<(), String> {
+    let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
+    // The channel RX frames are stamped with; 0 while the card retunes.
+    let cur = Arc::new(AtomicU8::new(ch));
+    // CRC-good drone data frames (SA-matched by dot11::parse) since open.
+    let hits = Arc::new(AtomicU32::new(0));
+    let (cur_rx, hits_rx) = (cur.clone(), hits.clone());
+    let stamp: Stamp = Arc::new(move |_, f, v| {
+        let ch = cur_rx.load(Ordering::Relaxed);
+        if ch == 0 {
+            return None;
+        }
+        if matches!(v, dot11::Verdict::Body(_)) && !f.crc_err && f.frame[0] & 0xFC == 0x88 {
+            hits_rx.fetch_add(1, Ordering::Relaxed);
+        }
+        Some((ch, mono_default()))
+    });
     let shared = cl.sink.shared.clone();
-    let mut srch = o.search.filter(|s| tap.is_none() && !s.set.is_empty());
+    let (cards, chips) = open_cards(vec![select], ch, width, stamp, tx, &shared)?;
+    on_open(&chips);
+    shared.channel.store(ch, Ordering::Relaxed);
+    let card = &cards[0];
+    let clock: fn() -> u64 = mono_default;
+    let mut srch = search.filter(|s| !s.set.is_empty());
     let searching = srch.is_some();
-    let mut core_ch = o.ch;
+    let mut core_ch = ch;
     // Sweeps, then rebuilds the core when the drone is elsewhere.
     let mut find = |cl: &mut CoreLoop, core_ch: &mut u8| -> Result<bool, String> {
         let s = srch.as_mut().expect("searching");
         let from = *core_ch;
-        let Some(ch) = search(card, &s.set, from, o.width, cur, hits, rx, &shared)? else {
+        let Some(ch) = self::search(card, &s.set, from, width, &cur, &hits, &rx, &shared)? else {
             return Ok(false);
         };
         if ch != *core_ch {
@@ -747,13 +767,50 @@ fn live_loop(
         }
         Ok(true)
     };
-    if searching && !find(cl, &mut core_ch)? {
+    if searching && !find(&mut cl, &mut core_ch)? {
         return Ok(());
     }
-    if o.gs && tap.is_none() {
+    if gs {
         cl.sink.card = Some(card.clone());
     }
     let mut seen = (hits.load(Ordering::Relaxed), clock());
+    pump(
+        &mut cl,
+        &rx,
+        clock,
+        |_, _| {},
+        |cl, now| {
+            let h = hits.load(Ordering::Relaxed);
+            if h != seen.0 {
+                seen = (h, now);
+            } else if searching && now.saturating_sub(seen.1) >= LOST_US {
+                // The core stays silent while the card sweeps: its DISC on a
+                // foreign channel could move a drone that is listening there.
+                cl.sink
+                    .shared
+                    .event("drone_lost", serde_json::json!({"ch": core_ch}));
+                let card_tx = cl.sink.card.take();
+                if !find(cl, &mut core_ch)? {
+                    return Ok(false);
+                }
+                cl.sink.card = card_tx;
+                seen = (hits.load(Ordering::Relaxed), clock());
+            }
+            Ok(true)
+        },
+    )
+}
+
+/// Bodies into the core and its ticks on `clock` until `shared.quit`.
+/// `on_tick` runs right after each tick; `after` once per wake past the
+/// quit check, and ends the loop by returning false.
+fn pump(
+    cl: &mut CoreLoop,
+    rx: &Receiver<RxBody>,
+    clock: fn() -> u64,
+    mut on_tick: impl FnMut(&mut CoreLoop, u64),
+    mut after: impl FnMut(&mut CoreLoop, u64) -> Result<bool, String>,
+) -> Result<(), String> {
     let mut next_tick = clock();
     loop {
         let wait = Duration::from_micros(next_tick.saturating_sub(clock()));
@@ -772,28 +829,13 @@ fn live_loop(
         if now >= next_tick {
             cl.tick(now);
             next_tick = now + TICK_US;
-            if let Some(t) = tap {
-                shared.channel.store(t.channel(), Ordering::Relaxed);
-            }
+            on_tick(cl, now);
         }
         if cl.sink.shared.quit.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let h = hits.load(Ordering::Relaxed);
-        if h != seen.0 {
-            seen = (h, now);
-        } else if searching && now.saturating_sub(seen.1) >= LOST_US {
-            // The core stays silent while the card sweeps: its DISC on a
-            // foreign channel could move a drone that is listening there.
-            cl.sink
-                .shared
-                .event("drone_lost", serde_json::json!({"ch": core_ch}));
-            let card_tx = cl.sink.card.take();
-            if !find(cl, &mut core_ch)? {
-                return Ok(());
-            }
-            cl.sink.card = card_tx;
-            seen = (hits.load(Ordering::Relaxed), clock());
+        if !after(cl, now)? {
+            return Ok(());
         }
     }
 }
