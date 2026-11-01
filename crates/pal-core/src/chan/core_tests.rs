@@ -1,0 +1,993 @@
+//! mabur `tests/test_channel_core.cpp`, minus the calibration and relay
+//! cases (neither is ported).
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use pal_wire::rc::{self, DiscAck, Rcf};
+
+use super::*;
+use crate::chan::fake::{FakeCard, FakeClock};
+use crate::chan::plan::MoveReason;
+use crate::config::{load_config, Config};
+use crate::ladder::LinkHealth;
+use crate::vrx::{VrxCfg, VrxState};
+
+fn bundle() -> Config {
+    load_config(
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../third_party/mabur/gs/bundle/maburgs.default.toml"
+        )),
+        None,
+    )
+    .unwrap()
+}
+
+#[derive(Default)]
+struct Rec {
+    lines: Vec<String>,
+    moves: Vec<MoveEvent>,
+    hops: Vec<HopEvent>,
+    dwells: Vec<(usize, ScoutDwell)>,
+    picks: Vec<Option<u8>>,
+    verdicts: usize,
+}
+
+impl ChannelSink for Rec {
+    fn dwell(&mut self, _: f64, card: usize, d: &ScoutDwell) {
+        self.dwells.push((card, *d));
+    }
+    fn pick(&mut self, _: f64, p: Option<u8>, _: u64, _: &[RankEntry], _: i32) {
+        self.picks.push(p);
+    }
+    fn moved(&mut self, e: &MoveEvent) {
+        self.moves.push(*e);
+    }
+    fn verdict(&mut self, _: f64, _: &VerdictOut, _: &[VerdictCardIn], _: &VerdictLinkIn) {
+        self.verdicts += 1;
+    }
+    fn hop(&mut self, e: &HopEvent) {
+        self.hops.push(e.clone());
+    }
+    fn log(&mut self, l: &str) {
+        self.lines.push(l.to_string());
+    }
+}
+
+/// N fake cards, the bundle config, a VrxController, a recording sink, an
+/// injected clock, no threads.
+struct Rig {
+    clk: FakeClock,
+    cfg: Config,
+    cards: Vec<Arc<FakeCard>>,
+    sink: Arc<Mutex<Rec>>,
+    stored: Arc<Mutex<Vec<u8>>>,
+    store_ok: Arc<AtomicBool>,
+    vrx: VrxController,
+    core: ChannelCore,
+    agg: Aggregator,
+    /// {may_send(0), may_send(1)} sampled inside the scout's sleep: the
+    /// synchronous stand-in for the core thread reading the gate while the
+    /// scout thread is mid-dwell.
+    gate_obs: Arc<Mutex<Vec<(bool, bool)>>>,
+}
+
+impl Rig {
+    fn new(n: usize, pinned: bool, start: u8) -> Self {
+        let mut cfg = bundle();
+        cfg.radio.channels = vec![40, 64, 112, 144];
+        cfg.radio.width = 40;
+        if pinned {
+            cfg.radio.pin = Some(if start != 0 { start } else { 40 });
+        }
+        let start_ch = if start != 0 { start } else { 40 };
+        let clk = FakeClock::default();
+        let cards: Vec<Arc<FakeCard>> = (0..n)
+            .map(|i| {
+                let c = FakeCard::new(clk.clone(), start_ch);
+                // The boot scout card opens at 20, every other at radio.width.
+                c.s().width_mhz = if i == n - 1 { 20 } else { cfg.radio.width };
+                c
+            })
+            .collect();
+        let vrx = VrxController::new(VrxCfg::from_config(&cfg, start_ch, 0));
+        let cc = ChannelCoreCfg {
+            radio: cfg.radio.clone(),
+            hop: cfg.hop.clone(),
+            key: cfg.link.key,
+            start_ch,
+            threaded: false,
+            store_name: "the-store".into(),
+            ..Default::default()
+        };
+        let sink = Arc::new(Mutex::new(Rec::default()));
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let store_ok = Arc::new(AtomicBool::new(true));
+        let gate_obs = Arc::new(Mutex::new(Vec::new()));
+        let scout_slot: Arc<OnceLock<(Arc<Scout>, usize)>> = Arc::new(OnceLock::new());
+        let (st, ok) = (stored.clone(), store_ok.clone());
+        let (c1, c2, c3) = (clk.clone(), clk.clone(), clk.clone());
+        let (obs, slot) = (gate_obs.clone(), scout_slot.clone());
+        let core = ChannelCore::new(
+            cc,
+            cards
+                .iter()
+                .map(|c| c.clone() as Arc<dyn LinkCard>)
+                .collect(),
+            Box::new(sink.clone()),
+            Box::new(move |ch| {
+                st.lock().unwrap().push(ch);
+                ok.load(SeqCst)
+            }),
+            Arc::new(move || c1.ms()),
+            Arc::new(move || c2.ms() * 1000),
+            Arc::new(move |ms| {
+                c3.advance(ms as u64);
+                // The gate while the scout owns its card (it always does
+                // inside its own sleep).
+                if let Some((s, sc)) = slot.get() {
+                    let may = |card| !((card == *sc && !s.beaconing()) || s.quiet());
+                    obs.lock().unwrap().push((may(0), may(1)));
+                }
+            }),
+        );
+        if let (Some(s), Some(sc)) = (core.scout(), core.scout_card()) {
+            let _ = scout_slot.set((s.clone(), sc));
+        }
+        Rig {
+            agg: Aggregator::new(&cfg.uep_layers(), 32, n, 0),
+            clk,
+            cfg,
+            cards,
+            sink,
+            stored,
+            store_ok,
+            vrx,
+            core,
+            gate_obs,
+        }
+    }
+    fn auto(n: usize) -> Self {
+        Self::new(n, false, 0)
+    }
+    fn ms(&self) -> f64 {
+        self.clk.ms() as f64
+    }
+    fn tick_tx(&mut self, session: bool, tx: usize) -> ChannelTickOut {
+        let inp = ChannelTickIn {
+            now_ms: self.ms(),
+            in_session: session,
+            tx_card: tx,
+            agg: Some(&self.agg),
+        };
+        self.core.tick(&inp, &mut self.vrx)
+    }
+    /// One tick, then the clock steps 10 ms.
+    fn tick(&mut self, session: bool) -> ChannelTickOut {
+        let out = self.tick_tx(session, 0);
+        self.clk.advance(10);
+        out
+    }
+    fn rec(&self) -> std::sync::MutexGuard<'_, Rec> {
+        self.sink.lock().unwrap()
+    }
+    fn has_line(&self, needle: &str) -> bool {
+        self.rec().lines.iter().any(|l| l.contains(needle))
+    }
+    fn count_lines(&self, needle: &str) -> usize {
+        self.rec()
+            .lines
+            .iter()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+    fn has_hop(&self, kind: &str) -> bool {
+        self.rec().hops.iter().any(|e| e.kind == kind)
+    }
+    fn has_move(&self, r: MoveReason) -> bool {
+        self.rec().moves.iter().any(|e| e.reason == r)
+    }
+    fn ack(&self, agreed: u8) -> DiscAck {
+        DiscAck {
+            vrx_nonce: self.vrx.rz_nonce(),
+            vtx_nonce: 1,
+            agreed_channel: agreed,
+            seq: 1,
+            ..Default::default()
+        }
+    }
+    /// The DISC_ACK that opened the session arrived on `rx_ch`.
+    fn session_opened_on(&mut self, rx_ch: u8, agreed: u8) {
+        self.core.on_rc_body(rx_ch);
+        let ack = self.ack(agreed);
+        let now = self.ms();
+        self.core.on_session_opened(&ack, now, &mut self.vrx);
+    }
+    /// The vrx to SESSION on op (a synthetic ack).
+    fn link_up(&mut self) {
+        let mut ack = self.ack(self.core.op());
+        ack.chip_caps = rc::CAP_FRAME_WIRE;
+        self.vrx.on_rc_frame(&rc::pack_disc_ack(&ack), self.ms());
+        let healthy = LinkHealth {
+            sample_valid: true,
+            ..Default::default()
+        };
+        for _ in 0..200 {
+            if self.vrx.link_state() == VrxState::Session {
+                break;
+            }
+            self.clk.advance(10);
+            self.vrx.on_video(self.ms());
+            self.vrx.step(self.ms(), &healthy);
+        }
+        assert_eq!(self.vrx.link_state(), VrxState::Session);
+    }
+    /// One RCF built and "sent".
+    fn pump_rcf(&mut self) -> Option<Rcf> {
+        let healthy = LinkHealth {
+            sample_valid: true,
+            ..Default::default()
+        };
+        for _ in 0..20 {
+            self.clk.advance(self.cfg.link.feedback_ms as u64);
+            self.vrx.on_video(self.ms());
+            let out = self.vrx.step(self.ms(), &healthy);
+            self.tick_tx(true, 0);
+            match out {
+                Some(o) if !o.is_disc => {
+                    self.core.note_sent(true, true);
+                    return rc::parse_rcf(&o.frame);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    /// Interfered verdict windows: foreign >> foreign_pps on every card and
+    /// impaired through `starved` (own frames never bump; this rig's
+    /// aggregator decodes nothing, so loss/recovered stay 0).
+    fn interfere(&mut self, windows: usize) {
+        for _ in 0..windows {
+            for c in &self.cards {
+                c.s().fr.foreign += 40;
+            }
+            for _ in 0..self.cfg.hop.window_ms / 10 + 1 {
+                self.vrx.on_video(self.ms());
+                self.tick_tx(true, 0);
+                self.clk.advance(10);
+            }
+        }
+    }
+    /// An auto rig frozen on 40 without a hop. Two cards: no dwell ever
+    /// completes, so max_ms freezes op in place. One card: link-up freezes
+    /// it ("one-card linked").
+    fn freeze_auto(&mut self) {
+        if self.cards.len() >= 2 {
+            self.cards.last().unwrap().s().retune_ok = false;
+            for _ in 0..4000 {
+                if !self.core.pick_open() {
+                    break;
+                }
+                self.tick(false);
+            }
+            self.cards.last().unwrap().s().retune_ok = true;
+        } else {
+            self.link_up();
+            for _ in 0..100 {
+                if !self.core.pick_open() {
+                    break;
+                }
+                self.tick(true);
+            }
+        }
+        assert!(!self.core.pick_open());
+        assert_eq!(self.core.op(), 40);
+    }
+    /// Linked healthy ticks past verify_ms.
+    fn verify_window(&mut self) {
+        for _ in 0..self.cfg.hop.verify_ms / 10 + 30 {
+            self.vrx.on_video(self.ms());
+            self.tick(true);
+        }
+    }
+    fn busy_op(&self) {
+        for c in &self.cards {
+            c.s().cca_per_ms_on[40] = 50;
+        }
+    }
+    fn ch(&self, i: usize) -> u8 {
+        self.cards[i].s().ch
+    }
+    fn until(&mut self, n: usize, session: bool, needle: &str) {
+        for _ in 0..n {
+            if self.has_line(needle) {
+                break;
+            }
+            self.tick(session);
+        }
+    }
+}
+
+#[test]
+fn constructs_two_cards_auto_scouting() {
+    let g = Rig::auto(2);
+    let s = g.core.snapshot(0);
+    assert_eq!(s.scan_state, "scouting");
+    assert_eq!(s.scan_rounds, 0);
+    assert!(s.scan_pick.is_none());
+    assert_eq!(s.hop.state, "idle");
+    assert!(s.energy.len() == 2 && s.dwell.len() == 2);
+    assert_eq!(g.core.op(), 40);
+    assert!(!g.core.hopping());
+}
+
+#[test]
+fn constructs_pinned_is_off_with_pick_latched() {
+    let g = Rig::new(2, true, 64);
+    let s = g.core.snapshot(0);
+    assert_eq!(s.scan_state, "off");
+    assert_eq!(s.scan_pick, Some(64));
+    assert!(!g.core.pick_open());
+}
+
+#[test]
+fn hop_state_name_covers_every_state() {
+    assert_eq!(hop_state_name(HopState::Idle), "idle");
+    assert_eq!(hop_state_name(HopState::Ordered), "ordered");
+    assert_eq!(hop_state_name(HopState::Verifying), "verifying");
+    assert_eq!(hop_state_name(HopState::Hold), "hold");
+}
+
+/// Drop when the scout owns a card AND (the frame is for the scout card
+/// while it is not beaconing, OR any card while the scout is in a quiet
+/// observe).
+#[test]
+fn may_send_two_cards_drops_scout_card_unless_beaconing() {
+    let g = Rig::auto(2);
+    assert!(g.core.may_send(0));
+    assert!(!g.core.may_send(1));
+    assert_eq!(g.core.snapshot(0).scout_gated_sends, 1);
+    for _ in 0..6 {
+        g.core.run_scout_step();
+    }
+    let obs = g.gate_obs.lock().unwrap();
+    assert!(obs.iter().any(|o| o.1), "scout card beaconing passes");
+    assert!(
+        obs.iter().any(|o| !o.0),
+        "quiet observe holds the link card too"
+    );
+}
+
+#[test]
+fn may_send_counts_gated_sends() {
+    let g = Rig::auto(1);
+    assert!(!g.core.may_send(0)); // prelude: silent
+    assert_eq!(g.core.snapshot(0).scout_gated_sends, 1);
+    assert!(!g.core.may_send(0));
+    assert_eq!(g.core.snapshot(0).scout_gated_sends, 2);
+}
+
+#[test]
+fn disc_targets_follow_scan_disc_targets_while_scout_owns() {
+    let g = Rig::auto(2);
+    // The link card always; the scout card only while beaconing.
+    assert_eq!(g.core.disc_targets(0), vec![0]);
+}
+
+#[test]
+fn disc_for_card_retags_only_members() {
+    let g = Rig::auto(2);
+    let d = rc::Disc {
+        vrx_nonce: 7,
+        op_channel: 40,
+        op_width: 40,
+        seq: 1,
+        ..Default::default()
+    };
+    let frame = rc::pack_disc(&d, &g.cfg.link.key);
+    g.cards[1].s().ch = 64;
+    let f1 = g.core.disc_for_card(&frame, 1);
+    assert_eq!(rc::parse_disc(&f1).unwrap().op_channel, 64);
+    let ok = |f: &[u8]| rc::verify_control(f, &g.cfg.link.key, &rc::TagCtx::default());
+    assert_eq!(ok(&f1), ok(&frame)); // re-tagged, not just patched
+    g.cards[1].s().ch = 60; // a 20 MHz half, not a member
+    assert_eq!(g.core.disc_for_card(&frame, 1), frame);
+}
+
+#[test]
+fn session_opened_elsewhere_moves_op_there() {
+    let mut g = Rig::auto(2);
+    g.session_opened_on(64, 64);
+    assert_eq!(g.core.op(), 64);
+    assert_eq!(g.vrx.proposal(), 64);
+    assert!(g.has_line("drone found on 64 (op 40): the link forms there"));
+    g.tick(true);
+    assert!(g.has_move(MoveReason::LinkFound));
+}
+
+#[test]
+fn session_opened_with_key_mismatch_or_foreign_nonce_is_ignored() {
+    let mut g = Rig::auto(2);
+    g.core.on_rc_body(64);
+    let mut ack = g.ack(64);
+    ack.flags = rc::ACK_KEY_MISMATCH;
+    g.core.on_session_opened(&ack, 1000.0, &mut g.vrx);
+    assert_eq!(g.core.op(), 40);
+    ack.flags = 0;
+    ack.vrx_nonce = g.vrx.rz_nonce().wrapping_add(1);
+    g.core.on_session_opened(&ack, 1000.0, &mut g.vrx);
+    assert_eq!(g.core.op(), 40);
+    g.core.on_rc_body(60); // not a member
+    ack.vrx_nonce = g.vrx.rz_nonce();
+    g.core.on_session_opened(&ack, 1000.0, &mut g.vrx);
+    assert_eq!(g.core.op(), 40);
+}
+
+#[test]
+fn disc_targets_is_tx_when_scout_owns_nothing() {
+    let mut g = Rig::new(2, true, 40);
+    g.tick_tx(true, 1); // linked: release_scout() false, search off
+    g.tick_tx(true, 1);
+    assert_eq!(g.core.disc_targets(1), vec![1]);
+}
+
+/// One card, auto: silent one_card_ms, then AckPrelude commits the prelude
+/// ranking (no link) and the first op window runs.
+#[test]
+fn one_card_prelude_commits_before_first_disc() {
+    let mut g = Rig::auto(1);
+    g.cards[0].s().cca_per_ms_on[40] = 5;
+    g.until(800, false, "one-card prelude ranking picks");
+    assert!(g.has_line("one-card prelude ranking picks"));
+    assert_ne!(g.core.op(), 40);
+    assert_eq!(g.stored.lock().unwrap().last(), Some(&g.core.op()));
+    assert_eq!(g.vrx.proposal(), g.core.op());
+    assert!(g.has_move(MoveReason::Commit));
+    assert_eq!(g.core.snapshot(0).scan_state, "scouting");
+}
+
+#[test]
+fn two_card_no_link_commits_at_maturity() {
+    let mut g = Rig::auto(2);
+    g.cards[1].s().cca_per_ms_on[40] = 5;
+    g.cards[1].s().cca_per_ms_on[36] = 5;
+    g.until(3000, false, "pick frozen on");
+    assert!(g.has_line("pick frozen on"));
+    assert!(g.has_line("(commit)"));
+    assert!(g.has_line("maburgs channel: commit 40 -> "));
+    assert_ne!(g.core.op(), 40);
+    assert!(g.rec().picks.last().unwrap().is_some());
+    assert_eq!(g.ch(0), g.core.op()); // the mechanical retune
+}
+
+#[test]
+fn store_failure_is_logged_not_fatal() {
+    let mut g = Rig::auto(2);
+    g.store_ok.store(false, SeqCst);
+    g.cards[1].s().cca_per_ms_on[40] = 5;
+    g.cards[1].s().cca_per_ms_on[36] = 5;
+    g.until(3000, false, "pick frozen on");
+    assert!(g.has_line("pick frozen on"));
+    assert!(g.has_line("maburgs channel: could not write the-store"));
+    assert_ne!(g.core.op(), 40);
+}
+
+#[test]
+fn max_ms_freezes_unmeasured_in_place() {
+    let mut g = Rig::auto(2);
+    g.cards[1].s().retune_ok = false; // the scout never completes a dwell
+    g.until(4000, false, "pick frozen on");
+    assert!(g.has_line("(max_ms)"));
+    assert_eq!(g.core.op(), 40);
+}
+
+#[test]
+fn scout_card_death_while_working_freezes_pick() {
+    let mut g = Rig::auto(2);
+    g.tick(false);
+    g.cards[1].s().is_alive = false;
+    g.core.on_card_died(1);
+    assert!(g.has_line("scout card 1 died at"));
+    g.tick(false);
+    assert!(g.has_line("(scout card died)"));
+    assert!(!g.core.pick_open());
+}
+
+/// Pinned + linked: the scout parks and gives up the card, so the core's
+/// width resync is the only thing that can fix a card reopened at 20 MHz.
+#[test]
+fn reopened_scout_card_at_20_gets_width_resync() {
+    let mut g = Rig::new(2, true, 40);
+    for _ in 0..10 {
+        g.tick(true);
+    }
+    assert_eq!(g.cards[1].s().width_mhz, 40); // parked at radio.width by the scout
+    g.cards[1].s().is_alive = false;
+    g.core.on_card_died(1);
+    {
+        let mut s = g.cards[1].s();
+        s.is_alive = true;
+        s.ch = 40;
+        s.width_mhz = 20;
+        s.calls.clear();
+    }
+    g.core.on_card_reopened(1);
+    for _ in 0..50 {
+        g.tick(true);
+    }
+    assert!(g.cards[1]
+        .calls()
+        .iter()
+        .any(|c| c.starts_with("set_width")));
+    assert_eq!(g.cards[1].s().width_mhz, 40);
+}
+
+#[test]
+fn mechanical_retune_skips_scout_card_and_follows_desired() {
+    let mut g = Rig::auto(2);
+    g.tick(false);
+    g.tick(false);
+    assert!(g.core.scout_owns_card(1));
+    g.session_opened_on(64, 64);
+    g.cards[1].s().calls.clear();
+    g.tick_tx(true, 0);
+    assert_eq!(g.ch(0), 64);
+    assert!(!g.cards[1].calls().iter().any(|c| c == "retune 64"));
+    assert!(g.core.scout_owns_card(1));
+}
+
+/// Pinned = static: an interfered op produces a verdict but no order, no
+/// escape, no exhausted hold.
+#[test]
+fn pinned_two_card_never_hops_on_interference() {
+    let mut g = Rig::new(2, true, 40);
+    g.link_up();
+    for _ in 0..5 {
+        g.tick(true);
+    }
+    g.busy_op();
+    g.interfere(6);
+    assert_eq!(g.core.snapshot(0).hop.verdict, "interfered");
+    assert!(g.rec().hops.is_empty());
+    assert_eq!(g.core.snapshot(0).hop.state, "idle");
+    assert!(g.ch(0) == 40 && g.ch(1) == 40);
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, 0);
+    let dwells = g.rec().dwells.len();
+    g.core.run_inflight_step();
+    g.tick(true);
+    assert_eq!(g.rec().dwells.len(), dwells);
+    assert_eq!(g.ch(1), 40);
+}
+
+#[test]
+fn pinned_one_card_never_hops_on_interference() {
+    let mut g = Rig::new(1, true, 40);
+    g.link_up();
+    for _ in 0..5 {
+        g.tick(true);
+    }
+    g.busy_op();
+    g.interfere(6);
+    assert_eq!(g.core.snapshot(0).hop.verdict, "interfered");
+    assert!(g.rec().hops.is_empty());
+    assert_eq!(g.ch(0), 40);
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, 0);
+}
+
+/// The relocation onto the pin landed, then the verify window read the pin
+/// interfered: pinned, the confirm lands it with no verify.
+#[test]
+fn pinned_relocation_is_not_failed_by_a_dirty_pin() {
+    let mut g = Rig::new(2, true, 40);
+    g.session_opened_on(64, 64);
+    g.link_up();
+    g.until(200, true, "relocate 64 -> 40 placed");
+    assert!(g.has_line("relocate 64 -> 40 placed"));
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, 40);
+    g.core.note_video(40);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    g.busy_op();
+    g.interfere(8);
+    assert!(g.has_hop("verify_pass"));
+    assert!(!g.has_hop("verify_fail"));
+    assert!(!g.has_line("did not land"));
+    let s = g.core.snapshot(0);
+    assert_eq!(s.hop.holds, 0);
+    assert_eq!(s.hop.state, "idle");
+    assert!(g.core.op() == 40 && g.ch(0) == 40 && g.ch(1) == 40);
+    assert_eq!(s.hop.verdict, "interfered");
+}
+
+/// Auto, frozen, linked, interfered: an order to a ranked candidate.
+fn order_rig(n: usize) -> Rig {
+    let mut g = Rig::auto(n);
+    g.freeze_auto();
+    if n >= 2 {
+        g.link_up();
+    }
+    for _ in 0..5 {
+        g.tick(true);
+    }
+    g.busy_op();
+    g.interfere(4);
+    assert!(g.has_hop("order"));
+    g
+}
+
+#[test]
+fn two_card_order_rcf_carries_hop_and_plan_leads_then_follows() {
+    let mut g = order_rig(2);
+    let r = g.pump_rcf().unwrap();
+    assert!(r.hop_ch != 0 && r.hop_ch != 40);
+    assert_eq!(r.hop_epoch, 1);
+    assert!(g.has_move(MoveReason::HopLead));
+    assert_eq!(g.vrx.ctl().last_event().reason.as_str(), "hop_restore");
+    g.core.note_video(r.hop_ch);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    assert!(g.has_move(MoveReason::HopFollow));
+    assert_eq!(g.core.op(), r.hop_ch);
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.core.snapshot(0).hop.hops, 1);
+}
+
+/// After Confirm the cached verdict (measured on the old channel) is
+/// re-fed until the next window: the controller stays in Verifying.
+#[test]
+fn stale_pre_hop_verdict_does_not_break_verify() {
+    let mut g = order_rig(2);
+    let r = g.pump_rcf().unwrap();
+    g.core.note_video(r.hop_ch);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    g.tick(true);
+    assert_eq!(g.core.snapshot(0).hop.state, "verifying");
+    assert!(!g.has_hop("withdraw"));
+}
+
+#[test]
+fn one_card_order_rides_repeats_then_retunes() {
+    let mut g = order_rig(1);
+    assert_eq!(g.ch(0), 40); // the radio stays until one_card_repeats RCFs
+                             // The order's own control pass sends one RCF (interfere() ticks only).
+    g.pump_rcf();
+    let mut sent = 0;
+    let mut r = None;
+    for _ in 0..10 {
+        if g.has_hop("one_card_retune") {
+            break;
+        }
+        r = g.pump_rcf();
+        sent += 1;
+    }
+    assert!(g.has_hop("one_card_retune"));
+    assert_eq!(sent, g.cfg.hop.one_card_repeats);
+    let r = r.unwrap();
+    assert_eq!(g.ch(0), r.hop_ch);
+    assert!(g.has_move(MoveReason::HopOneCard));
+    for e in g.rec().hops.iter().filter(|e| e.kind == "one_card_retune") {
+        assert!((200.0..=400.0).contains(&e.elapsed_ms), "{}", e.elapsed_ms);
+    }
+    g.core.note_video(r.hop_ch);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    assert!(g.has_move(MoveReason::HopFollow));
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+}
+
+#[test]
+fn withdraw_on_no_video_restores_cards() {
+    let mut g = order_rig(2);
+    g.pump_rcf().unwrap();
+    for _ in 0..g.cfg.hop.confirm_extend_ms / 10 + 20 {
+        g.vrx.on_video(g.ms());
+        g.tick(true);
+    }
+    assert!(g.has_hop("withdraw"));
+    assert!(g.has_move(MoveReason::HopWithdraw));
+    assert_eq!(g.ch(1), 40);
+    assert_eq!(g.core.op(), 40);
+}
+
+#[test]
+fn lead_card_dies_mid_order_withdraws_to_op() {
+    let mut g = order_rig(2);
+    g.cards[1].s().is_ready = false;
+    g.tick(true);
+    assert_eq!(g.core.snapshot(0).hop.state, "ordered"); // latched lead
+    for _ in 0..g.cfg.hop.confirm_extend_ms / 10 + 20 {
+        g.vrx.on_video(g.ms());
+        g.tick(true);
+    }
+    assert!(g.has_hop("withdraw"));
+    assert_eq!(g.core.op(), 40);
+    g.cards[1].s().is_ready = true;
+    g.tick(true);
+    assert_eq!(g.ch(1), 40);
+}
+
+#[test]
+fn session_loss_mid_order_withdraws() {
+    let mut g = order_rig(2);
+    g.tick(false); // hop_active falling edge
+    assert!(g.has_hop("session_lost"));
+    assert!(!g.core.hopping());
+}
+
+/// A move edge that fires while a hop is in flight is held and acted on
+/// exactly once, after the hop resolves (mabur pairs this with the
+/// calibration hold; the hop hold is the part ported).
+#[test]
+fn move_edge_held_through_relocation() {
+    let mut g = Rig::new(2, true, 40);
+    g.session_opened_on(64, 64);
+    g.link_up();
+    assert_eq!(g.core.op(), 64);
+    g.until(200, true, "relocate 64 -> 40 placed");
+    assert!(g.has_hop("relocate"));
+    // A repeat DISC_ACK refreshes agreed to a non-member 60, then the edge.
+    let mut rep = g.ack(60);
+    rep.chip_caps = rc::CAP_FRAME_WIRE;
+    rep.seq = 2;
+    g.vrx.on_rc_frame(&rc::pack_disc_ack(&rep), g.ms());
+    assert_eq!(g.vrx.agreed_channel(), 60);
+    assert_eq!(g.vrx.link_state(), VrxState::Session);
+    // Video still on 64 (last_video_ch starts on the start channel, which
+    // is the target here): the confirm waits.
+    g.core.note_video(64);
+    g.vrx.test_set_move_edge();
+    g.tick(true);
+    assert!(g.core.hopping());
+    let line = "drone acked 60, not in our set; ignored";
+    assert!(!g.has_line(line)); // held while hopping
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, 40);
+    g.core.note_video(40);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.count_lines(line), 1);
+    assert_eq!(g.core.op(), 40);
+}
+
+#[test]
+fn relocate_lands_on_verify_pass() {
+    let mut g = Rig::new(2, true, 40);
+    g.session_opened_on(64, 64);
+    g.link_up();
+    g.until(200, true, "relocate 64 -> 40 placed");
+    assert!(g.has_line("relocate 64 -> 40 placed"));
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, 40);
+    g.core.note_video(40);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.core.op(), 40);
+    assert_ne!(g.core.snapshot(0).scan_state, "moving");
+}
+
+/// The auto boot hop: op's pair measured to min_rounds before the drone
+/// appears on 64, the link forms before maturity; at maturity the pick
+/// wants another pair: WantPick, relocate, confirm, verify_pass,
+/// "pick frozen on <pick> (relocated)".
+#[test]
+fn auto_want_pick_relocates_linked_drone_to_the_pick() {
+    let mut g = Rig::auto(2);
+    g.cards[1].s().cca_per_ms_on[60] = 5; // 64's pair is the busy one
+    g.cards[1].s().cca_per_ms_on[64] = 5;
+    let visits = |g: &Rig, ch: u8| g.rec().dwells.iter().filter(|d| d.1.ch == ch).count();
+    let mr = g.cfg.radio.scan.min_rounds as usize;
+    for _ in 0..3000 {
+        if visits(&g, 64) >= mr {
+            break;
+        }
+        g.tick(false);
+    }
+    assert!(visits(&g, 60) >= mr && visits(&g, 64) >= mr);
+    assert!(visits(&g, 144) < mr);
+    assert!(g.core.pick_open());
+    g.session_opened_on(64, 64);
+    g.link_up();
+    assert_eq!(g.core.op(), 64);
+    g.until(6000, true, "boot pick wants");
+    assert!(g.has_line(", link on 64: relocating"));
+    g.until(200, true, "relocate 64 -> ");
+    assert!(g.has_line(" placed"));
+    assert_eq!(g.core.snapshot(0).scan_state, "moving");
+    let target = g.core.hop_target();
+    assert!(target != 0 && target != 64);
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, target);
+    g.core.note_video(target);
+    g.tick(true);
+    assert!(g.has_hop("lead_confirm"));
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.core.op(), target);
+    assert!(g.has_line("(relocated)"));
+    let s = g.core.snapshot(0);
+    assert_eq!(s.scan_state, "frozen");
+    assert_eq!(s.scan_pick, Some(target));
+    assert_eq!(g.stored.lock().unwrap().last(), Some(&target));
+}
+
+/// The move edge sets link_edge_seen, which BootPick reads next tick as
+/// "one-card linked".
+#[test]
+fn one_card_link_edge_freezes_one_card_linked() {
+    let mut g = Rig::auto(1);
+    g.cards[0].s().cca_per_ms_on[40] = 5;
+    g.until(800, false, "one-card prelude ranking picks");
+    assert!(g.has_line("one-card prelude ranking picks"));
+    g.vrx.test_set_move_edge();
+    g.tick(true);
+    g.tick(true);
+    assert!(g.has_line("pick frozen on"));
+    assert!(g.has_line("(one-card linked)"));
+    let s = g.core.snapshot(0);
+    assert_eq!(s.scan_state, "frozen");
+    assert_eq!(s.scan_pick, Some(g.core.op()));
+}
+
+#[test]
+fn inflight_dwell_feeds_ranker_and_dwell_stats() {
+    let mut g = Rig::auto(2);
+    g.freeze_auto();
+    g.link_up();
+    for _ in 0..10 {
+        g.tick(true);
+    }
+    g.core.run_inflight_step();
+    g.tick(true); // drain
+    assert!(!g.core.dwell_busy());
+    assert_eq!(g.core.snapshot(0).dwell[1].unwrap().visits, 1);
+    assert_eq!(g.rec().dwells.last().unwrap().0, 1);
+    assert_eq!(g.ch(1), 40); // back on op
+}
+
+#[test]
+fn inflight_step_skips_when_not_in_session_or_one_card_or_pinned() {
+    let mut g = Rig::new(1, true, 40);
+    g.link_up();
+    for _ in 0..10 {
+        g.tick(true);
+    }
+    g.core.run_inflight_step();
+    g.tick(true);
+    assert!(g.core.snapshot(0).dwell[0].is_none()); // one card
+    let mut h = Rig::new(2, true, 40);
+    for _ in 0..10 {
+        h.tick(false);
+    }
+    h.core.run_inflight_step();
+    h.tick(false);
+    assert!(h.core.snapshot(0).dwell[1].is_none()); // no session
+    let mut p = Rig::new(2, true, 40);
+    p.link_up();
+    for _ in 0..10 {
+        p.tick(true);
+    }
+    let sweep = p.rec().dwells.len();
+    p.core.run_inflight_step();
+    p.tick(true);
+    assert_eq!(p.rec().dwells.len(), sweep); // pinned
+    assert!(p.core.snapshot(0).dwell[1].is_none());
+}
+
+#[test]
+fn tx_frozen_while_hopping() {
+    let mut g = order_rig(2);
+    let out = g.tick_tx(true, 0);
+    assert!(out.tx_frozen);
+    assert!(g.core.tx_frozen());
+}
+
+#[test]
+fn snapshot_channel_is_the_given_tx_card() {
+    let g = Rig::new(2, true, 40);
+    g.cards[1].s().ch = 112;
+    assert_eq!(g.core.snapshot(0).channel, 40);
+    assert_eq!(g.core.snapshot(1).channel, 112);
+}
+
+/// A record the core takes a tick late still reads own_air over the
+/// sampled span.
+#[test]
+fn sampled_record_consumed_next_tick_uses_sample_span() {
+    let mut g = Rig::new(1, true, 40);
+    g.link_up();
+    for _ in 0..2 * (g.cfg.hop.window_ms / 10) + 2 {
+        g.tick(true);
+    }
+    g.core.run_sampler_step(); // a record at T1
+    g.clk.advance(10);
+    g.tick_tx(true, 0); // consumed at T1 + 10
+    for _ in 0..13 {
+        g.tick(true); // T1 + 140
+    }
+    {
+        let mut s = g.cards[0].s();
+        s.fr.own_air_us += 70000; // 50 % of 140 ms
+        s.fr.own += 10;
+    }
+    g.core.run_sampler_step();
+    g.clk.advance(30);
+    g.cards[0].s().fr.own_air_us += 5000; // after the sample: must not count
+    g.tick_tx(true, 0);
+    let e = g.core.snapshot(0).energy[0].unwrap();
+    let pct = e.own_air_pct.unwrap();
+    assert!(pct > 49.0 && pct < 51.0, "{pct}");
+}
+
+/// Real threads, real clock: auto + linked with max_ms at its floor; the
+/// boot scout measures ~1 s, the pick freezes in place, the in-flight
+/// thread dwells on the non-TX card; shutdown() joins all of them.
+#[test]
+fn shutdown_joins_threads_and_is_idempotent() {
+    let mut cfg = bundle();
+    cfg.radio.channels = vec![40, 64];
+    cfg.radio.width = 40;
+    cfg.radio.scan.max_ms = 1000;
+    let clk = FakeClock::default();
+    let a = FakeCard::new(clk.clone(), 40);
+    let b = FakeCard::new(clk.clone(), 40);
+    a.s().width_mhz = 40;
+    let t0 = Instant::now();
+    let now_ms: MsClock = Arc::new(move || t0.elapsed().as_millis() as u64);
+    let now_us: UsClock = Arc::new(move || t0.elapsed().as_micros() as u64);
+    let mut vrx = VrxController::new(VrxCfg::from_config(&cfg, 40, 0));
+    let agg = Aggregator::new(&cfg.uep_layers(), 32, 2, 0);
+    let sink = Arc::new(Mutex::new(Rec::default()));
+    let mut core = ChannelCore::new(
+        ChannelCoreCfg {
+            radio: cfg.radio.clone(),
+            hop: cfg.hop.clone(),
+            key: cfg.link.key,
+            start_ch: 40,
+            ..Default::default()
+        },
+        vec![a.clone() as Arc<dyn LinkCard>, b.clone()],
+        Box::new(sink),
+        Box::new(|_| true),
+        now_ms.clone(),
+        now_us,
+        Arc::new(|ms| std::thread::sleep(Duration::from_millis(ms as u64))),
+    );
+    let mut dwelt = false;
+    for _ in 0..500 {
+        clk.set(now_ms());
+        let inp = ChannelTickIn {
+            now_ms: now_ms() as f64,
+            in_session: true,
+            tx_card: 0,
+            agg: Some(&agg),
+        };
+        core.tick(&inp, &mut vrx);
+        dwelt = core.snapshot(0).dwell[1].is_some();
+        if dwelt {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(dwelt);
+    let visits = core.snapshot(0).dwell[1].unwrap().visits;
+    let t = Instant::now();
+    core.shutdown();
+    core.shutdown();
+    assert!(t.elapsed() < Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(400));
+    let inp = ChannelTickIn {
+        now_ms: now_ms() as f64,
+        in_session: true,
+        tx_card: 0,
+        agg: Some(&agg),
+    };
+    assert!(!core.tick(&inp, &mut vrx).dwell_busy);
+    assert_eq!(core.snapshot(0).dwell[1].unwrap().visits, visits);
+}

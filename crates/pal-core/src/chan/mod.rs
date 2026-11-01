@@ -2,6 +2,7 @@
 //! module with each module's mabur tests. Plan and status:
 //! `docs/channel-core-port.md`.
 pub mod boot;
+pub mod core;
 #[cfg(test)]
 pub mod fake;
 pub mod gate;

@@ -157,6 +157,9 @@ impl VrxRendezvous {
     pub fn proposal(&self) -> u8 {
         self.proposal
     }
+    pub fn set_proposal(&mut self, ch: u8) {
+        self.proposal = ch;
+    }
     pub fn vtx_nonce(&self) -> Option<u32> {
         self.vtx_nonce
     }
@@ -201,6 +204,21 @@ impl VrxCfg {
 pub struct VrxOut {
     pub frame: Vec<u8>,
     pub is_disc: bool,
+}
+
+/// A DISC re-tagged for channel `ch` (the scout beacons the proposal on every
+/// candidate). Non-DISC bodies, ch 0 and an already-matching DISC pass through.
+pub fn disc_for_channel(disc: &[u8], ch: u8, key: &LinkKey) -> Vec<u8> {
+    if ch == 0 || rc::frame_type(disc) != Some(rc::T_DISC) {
+        return disc.to_vec();
+    }
+    match rc::parse_disc(disc) {
+        Some(mut d) if d.op_channel != ch => {
+            d.op_channel = ch;
+            rc::pack_disc(&d, key)
+        }
+        _ => disc.to_vec(),
+    }
 }
 
 fn op_from_rung(r: &Rung) -> OpPoint {
@@ -442,6 +460,10 @@ impl VrxController {
     pub fn key_mismatch(&self) -> bool {
         self.rz.state() == VrxState::KeyMismatch
     }
+    #[cfg(test)]
+    pub fn test_set_move_edge(&mut self) {
+        self.move_edge = true;
+    }
     pub fn take_move_edge(&mut self) -> bool {
         std::mem::take(&mut self.move_edge)
     }
@@ -453,6 +475,23 @@ impl VrxController {
     }
     pub fn set_keepalive_hold(&mut self, h: bool) {
         self.keepalive_hold = h;
+    }
+    /// In-flight hop: stamped into every RCF built from now on.
+    pub fn set_hop(&mut self, ch: u8, epoch: u8) {
+        self.hop_ch = ch;
+        self.hop_epoch = epoch;
+    }
+    pub fn hop_ch(&self) -> u8 {
+        self.hop_ch
+    }
+    pub fn hop_epoch(&self) -> u8 {
+        self.hop_epoch
+    }
+    pub fn blank_store(&mut self, until_ms: f64) {
+        self.ctrl.blank_store(until_ms);
+    }
+    pub fn set_proposal(&mut self, ch: u8) {
+        self.rz.set_proposal(ch);
     }
     pub fn session_ctx(&self) -> TagCtx {
         TagCtx {
