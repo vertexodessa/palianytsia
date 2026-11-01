@@ -7,6 +7,7 @@
 //! one thread, one clock (monotonic microseconds) for RX stamps and ticks.
 
 pub mod aggregator;
+pub mod chan;
 pub mod config;
 pub mod frame_stream;
 pub mod gap;
