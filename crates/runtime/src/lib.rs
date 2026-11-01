@@ -173,34 +173,63 @@ impl CoreIo for Sink {
 pub struct CoreLoop {
     pub core: Box<dyn GsCore>,
     pub sink: Sink,
+    ports: LoopPorts,
+    lat: bool,
+    // The loop's own schedule and marks; no caller sets or reads them.
+    last_params_us: u64,
+    last_lat_us: u64,
+    rx_full_seen: u64,
+    /// (frames, au drops) at the last report, for the stall warning.
+    stall_mark: (u64, u64),
+    last_stats_us: u64,
+    last_log_us: u64,
+    /// Calibration bookkeeping the core does not keep.
+    cal: CalUi,
+}
+
+/// The loop's channels to the UI.
+pub struct LoopPorts {
     pub stats_tx: SyncSender<String>,
     /// F18: the parameter table to the UI (2 Hz), commands and set results back.
     pub params_tx: SyncSender<String>,
     pub cmd_rx: Receiver<pal_osd::params::Cmd>,
     pub set_res_tx: SyncSender<(usize, Result<(), String>)>,
-    pub last_params_us: u64,
-    pub lat: bool,
-    pub last_lat_us: u64,
-    pub rx_full_seen: u64,
-    /// (frames, au drops) at the last report, for the stall warning.
-    pub stall_mark: (u64, u64),
-    pub last_stats_us: u64,
-    pub last_log_us: u64,
-    /// Calibration bookkeeping the core does not keep.
-    pub cal: CalUi,
 }
 
 /// What the loop adds around the core's calibration: the last start's
 /// refusal for the UI, the last state for the flight-log events, and
 /// whether the current core has been told where cal.log goes.
 #[derive(Default)]
-pub struct CalUi {
-    pub refusal: Option<String>,
-    pub last_state: String,
-    pub log_dir_set: bool,
+struct CalUi {
+    refusal: Option<String>,
+    last_state: String,
+    log_dir_set: bool,
 }
 
 impl CoreLoop {
+    /// `lat`: the --lat latency report on stderr.
+    pub fn new(core: Box<dyn GsCore>, sink: Sink, ports: LoopPorts, lat: bool) -> Self {
+        Self {
+            core,
+            sink,
+            ports,
+            lat,
+            last_params_us: 0,
+            last_lat_us: 0,
+            rx_full_seen: 0,
+            stall_mark: (0, 0),
+            last_stats_us: 0,
+            last_log_us: 0,
+            cal: CalUi::default(),
+        }
+    }
+
+    /// The core clock starts over (a replay's next pass): the stats line is
+    /// due at once again. Only that schedule rewinds, as before.
+    pub fn restart_stats_clock(&mut self) {
+        self.last_stats_us = 0;
+    }
+
     /// Swaps in a new core (a remake after a search, the channel core's
     /// attach, a replay pass); it is told where cal.log goes at its first tick.
     pub fn set_core(&mut self, core: Box<dyn GsCore>) {
@@ -290,7 +319,7 @@ impl CoreLoop {
             let e = sh.dec_errors.load(Ordering::Acquire);
             i.on_decoder_errors(e, sh.dec_err_au.load(Ordering::Relaxed), now);
         }
-        while let Ok(c) = self.cmd_rx.try_recv() {
+        while let Ok(c) = self.ports.cmd_rx.try_recv() {
             match c {
                 pal_osd::params::Cmd::Set(row, text) => {
                     let r = self.core.param_set(row, &text);
@@ -301,7 +330,7 @@ impl CoreLoop {
                         serde_json::json!({"row": row, "value": text,
                             "result": match &r { Ok(()) => "sent".to_string(), Err(e) => e.clone() }}),
                     );
-                    let _ = self.set_res_tx.try_send((row, r));
+                    let _ = self.ports.set_res_tx.try_send((row, r));
                 }
                 pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
                 pal_osd::params::Cmd::CalStart => self.cal_cmd(true),
@@ -317,7 +346,7 @@ impl CoreLoop {
         self.core.tick(now, &mut self.sink);
         if now >= self.last_params_us + 500_000 {
             self.last_params_us = now;
-            let _ = self.params_tx.try_send(self.core.params_json(now));
+            let _ = self.ports.params_tx.try_send(self.core.params_json(now));
         }
         if let Some(i) = self.sink.idr.as_mut() {
             let evs = i.step(now, &mut *self.core);
@@ -356,7 +385,7 @@ impl CoreLoop {
                     ui_line = format!("{},\"cal\":{c}}}", &ui_line[..ui_line.len() - 1]);
                 }
             }
-            let _ = self.stats_tx.try_send(ui_line);
+            let _ = self.ports.stats_tx.try_send(ui_line);
         }
         if now >= self.last_lat_us + 1_000_000 {
             self.last_lat_us = now;

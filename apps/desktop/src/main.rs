@@ -39,7 +39,7 @@ use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{GsCore, Mode};
 use pal_osd::{History, Snapshot};
 use pal_ref::{RefCore, RefOpts};
-use runtime::{lat_us, CoreLoop, LiveCfg, Shared, Sink};
+use runtime::{lat_us, CoreLoop, LiveCfg, LoopPorts, Shared, Sink};
 
 const RZ_NONCE: u32 = 0x5041_4c31;
 
@@ -255,7 +255,7 @@ fn run_replay(mut cl: CoreLoop, o: &Opts, path: PathBuf, repaint: egui::Context)
         }
         // A new pass is a new session: fresh core, as after a restart.
         cl.set_core(make_core(o, 0));
-        cl.last_stats_us = 0;
+        cl.restart_stats_clock();
     }
     if let Some(l) = cl.sink.log.as_mut() {
         let _ = l.flush();
@@ -720,22 +720,17 @@ fn main() {
                     .name("core".into())
                     .spawn(move || {
                         // Built here: pal-ref's core is not Send.
-                        let cl = CoreLoop {
-                            core: make_core(&o, channel),
+                        let cl = CoreLoop::new(
+                            make_core(&o, channel),
                             sink,
-                            stats_tx,
-                            params_tx,
-                            cmd_rx,
-                            set_res_tx,
-                            last_params_us: 0,
-                            lat: o.lat,
-                            last_lat_us: 0,
-                            rx_full_seen: 0,
-                            stall_mark: (0, 0),
-                            last_stats_us: 0,
-                            last_log_us: 0,
-                            cal: Default::default(),
-                        };
+                            LoopPorts {
+                                stats_tx,
+                                params_tx,
+                                cmd_rx,
+                                set_res_tx,
+                            },
+                            o.lat,
+                        );
                         let shared = cl.sink.shared.clone();
                         match o.replay.clone() {
                             Some(p) => run_replay(cl, &o, p, ctx),

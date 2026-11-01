@@ -128,22 +128,13 @@ impl Link {
         };
         // RustCore is built on the core thread (GsCore is not Send); a
         // config it refuses still shows up in last_error().
-        let mk_cl = move |core: Box<dyn pal_core::GsCore>| CoreLoop {
-            core,
-            sink,
+        let ports = runtime::LoopPorts {
             stats_tx,
             params_tx,
             cmd_rx,
             set_res_tx,
-            last_params_us: 0,
-            lat: false,
-            last_lat_us: 0,
-            rx_full_seen: 0,
-            stall_mark: (0, 0),
-            last_stats_us: 0,
-            last_log_us: 0,
-            cal: Default::default(),
         };
+        let mk_cl = move |core: Box<dyn pal_core::GsCore>| CoreLoop::new(core, sink, ports, false);
         let sh = shared.clone();
         let dec_t = std::thread::Builder::new()
             .name("pal-decode".into())
