@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Realtek (0x0bda): the RTL88xx cards devourer drives. -->
+<!-- The cards devourer-sys scans for (kScanPids); vendor 0x0bda alone also
+     matched a hub's RTL8153 Ethernet. -->
 <resources>
-    <usb-device vendor-id="3034" />
+    <usb-device vendor-id="3034" product-id="43034" />
+    <usb-device vendor-id="3034" product-id="34842" />
+    <usb-device vendor-id="3034" product-id="34834" />
 </resources>

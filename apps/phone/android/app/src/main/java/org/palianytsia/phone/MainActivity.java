@@ -37,6 +37,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     private static final String TAG = "palianytsia";
     private static final String ACTION_USB = "org.palianytsia.phone.USB_PERMISSION";
     private static final int REALTEK = 0x0bda;
+    /** devourer-sys kScanPids: 8812EU, 8812AU (881a), 8812AU. A hub's
+     *  RTL8153 Ethernet (0bda:8153) is Realtek too and must not match. */
+    private static final int[] CARD_PIDS = {0xa81a, 0x881a, 0x8812};
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SurfaceView video;
@@ -81,7 +84,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         } else {
             registerReceiver(permission, f);
         }
-        show("waiting for a Realtek card");
+        show("waiting for an RTL8812 card");
     }
 
     @Override
@@ -115,7 +118,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private UsbDevice findCard() {
         for (UsbDevice d : usb.getDeviceList().values()) {
-            if (d.getVendorId() == REALTEK) return d;
+            if (d.getVendorId() != REALTEK) continue;
+            for (int p : CARD_PIDS) {
+                if (d.getProductId() == p) return d;
+            }
         }
         return null;
     }
@@ -124,7 +130,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         if (handle != 0 || holder == null) return;
         UsbDevice d = findCard();
         if (d == null) {
-            show("no Realtek card");
+            show("no RTL8812 card");
             ui.postDelayed(this::tryStart, 3000);
             return;
         }
