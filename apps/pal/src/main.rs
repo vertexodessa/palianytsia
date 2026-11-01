@@ -8,7 +8,7 @@
 //!              [--log-dir DIR [--capture-mb N]] [--core ref|rust]
 //!   pal replay <bodies.bin> -c gs.toml [--mode gs|spotter] [--dump out.h265]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
-//!              [--drop-pct N --seed S] [--core ref|rust]
+//!              [--drop-pct N --seed S] [--core ref|rust] [--decode]
 //!   pal log    <fl-NNNN_...>   summarise one flight-log directory
 //!
 //! Gs mode transmits: the core's RC frames (DISC, RCF, NACK, refresh) go out
@@ -44,6 +44,7 @@ struct Opts {
     aus: Option<PathBuf>,
     sends: Option<PathBuf>,
     log_dir: Option<PathBuf>,
+    decode: bool,
     capture_mb: u64,
     mode: Option<Mode>,
     rust: bool,
@@ -76,6 +77,7 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--aus" => o.aus = Some(val().into()),
             "--sends" => o.sends = Some(val().into()),
             "--log-dir" => o.log_dir = Some(val().into()),
+            "--decode" => o.decode = true,
             "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
             "--mode" => {
                 o.mode = Some(match val().as_str() {
@@ -113,6 +115,8 @@ struct Sink {
     /// Every RC body handed to `send`, LP (u32 len | bytes), for `cmp`.
     sends_file: Option<BufWriter<std::fs::File>>,
     log: Option<Session>,
+    /// `--decode`: every AU through libavcodec (frames/errors in the summary).
+    dec: Option<decode::AvDecoder>,
     /// Core clock of the call in progress, for the AU log.
     now_us: u64,
     aus: u64,
@@ -144,6 +148,9 @@ impl Sink {
                 s
             }),
             now_us: 0,
+            dec: o.decode.then(|| {
+                decode::AvDecoder::open(0).unwrap_or_else(|e| die(&format!("decode: {e}")))
+            }),
             aus: 0,
             truncated: 0,
             bytes: 0,
@@ -186,6 +193,9 @@ impl CoreIo for Sink {
     fn on_au(&mut self, a: Au) {
         if let Some(l) = self.log.as_mut() {
             l.au(self.now_us, &a).unwrap();
+        }
+        if let Some(d) = self.dec.as_mut() {
+            decode::Decoder::decode(d, &a.data);
         }
         self.aus += 1;
         self.bytes += a.data.len() as u64;
@@ -461,6 +471,10 @@ fn replay(o: Opts) {
         "replay bodies={bodies} dropped={dropped} ticks={ticks} aus={} truncated={} au_bytes={} sends={}",
         sink.aus, sink.truncated, sink.bytes, sink.sends
     );
+    if let Some(d) = sink.dec.as_ref() {
+        let (f, e) = decode::Decoder::counters(d);
+        println!("decode frames={f} errors={e}");
+    }
     println!("stats {}", core.stats_json());
 }
 

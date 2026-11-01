@@ -1,0 +1,11 @@
+[package]
+name = "decode"
+description = "Video decode backends: libavcodec HEVC on Linux (low delay, slice threads)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "avcodec"
+
+[build-dependencies]
+cc = "1"

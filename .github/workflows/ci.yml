@@ -11,7 +11,7 @@ jobs:
         with:
           submodules: true
       - name: Host packages
-        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev pkg-config cmake
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libavcodec-dev libavutil-dev libswscale-dev pkg-config cmake
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

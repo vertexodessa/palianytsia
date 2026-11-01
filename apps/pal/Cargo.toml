@@ -12,3 +12,4 @@ pal-wire = { workspace = true }
 pal-ref.workspace = true
 devourer-sys.workspace = true
 flightlog.workspace = true
+decode.workspace = true
