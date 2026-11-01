@@ -1,12 +1,15 @@
-//! pal: the Linux CLI (spec 5.3). M1 scope: Spotter-mode live RX through
-//! devourer with a raw capture and an .h265 dump, and replay of a capture.
-//! The core is `pal-ref` (mabur's C++ WebGs) until the Rust core lands; the
-//! capture is what the two will be diffed on.
+//! pal: the Linux CLI (spec 5.3). Live RX/TX through devourer, replay of a
+//! capture, and the flight log. `--core ref` (default) runs mabur's C++
+//! WebGs through pal-ref, `--core rust` the Rust core; captures are what the
+//! two are diffed on.
 //!
 //!   pal live   -c gs.toml --ch 144 --width 40 [--mode gs|spotter] [--secs 30]
 //!              [--card N] [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
+//!              [--log-dir DIR [--capture-mb N]] [--core ref|rust]
 //!   pal replay <bodies.bin> -c gs.toml [--mode gs|spotter] [--dump out.h265]
-//!              [--aus out.aus]
+//!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
+//!              [--drop-pct N --seed S] [--core ref|rust]
+//!   pal log    <fl-NNNN_...>   summarise one flight-log directory
 //!
 //! Gs mode transmits: the core's RC frames (DISC, RCF, NACK, refresh) go out
 //! on the same card, and the drone follows this host.
@@ -14,6 +17,7 @@
 //! Both use a fixed frame-gap timeout and a pinned rendezvous nonce so a
 //! replay of a capture reproduces the live run's AUs exactly.
 use flightlog::capture::{self, Record};
+use flightlog::session::{self, Session};
 use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_ref::{RefCore, RefOpts};
@@ -39,6 +43,8 @@ struct Opts {
     dump: Option<PathBuf>,
     aus: Option<PathBuf>,
     sends: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
+    capture_mb: u64,
     mode: Option<Mode>,
     rust: bool,
     drop_pct: u32,
@@ -69,6 +75,8 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--dump" => o.dump = Some(val().into()),
             "--aus" => o.aus = Some(val().into()),
             "--sends" => o.sends = Some(val().into()),
+            "--log-dir" => o.log_dir = Some(val().into()),
+            "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
             "--mode" => {
                 o.mode = Some(match val().as_str() {
                     "gs" => Mode::Gs,
@@ -104,6 +112,9 @@ struct Sink {
     aus_file: Option<BufWriter<std::fs::File>>,
     /// Every RC body handed to `send`, LP (u32 len | bytes), for `cmp`.
     sends_file: Option<BufWriter<std::fs::File>>,
+    log: Option<Session>,
+    /// Core clock of the call in progress, for the AU log.
+    now_us: u64,
     aus: u64,
     truncated: u64,
     bytes: u64,
@@ -126,6 +137,13 @@ impl Sink {
             dump: mk(&o.dump),
             aus_file: mk(&o.aus),
             sends_file: mk(&o.sends),
+            log: o.log_dir.as_ref().map(|d| {
+                let s = Session::create(d, std::time::SystemTime::now(), o.capture_mb << 20)
+                    .unwrap_or_else(|e| die(&format!("{}: {e}", d.display())));
+                eprintln!("pal: flight log {}", s.dir().display());
+                s
+            }),
+            now_us: 0,
             aus: 0,
             truncated: 0,
             bytes: 0,
@@ -145,11 +163,30 @@ impl Sink {
         {
             w.flush().unwrap();
         }
+        if let Some(l) = self.log.as_mut() {
+            l.flush().unwrap();
+        }
+    }
+
+    /// Once a second of core clock: the stats line into the flight log.
+    fn log_stats(&mut self, now_us: u64, last: &mut u64, core: &dyn GsCore) {
+        if self.log.is_some() && now_us >= *last + 1_000_000 {
+            *last = now_us;
+            let line = core.stats_json();
+            self.log
+                .as_mut()
+                .map(|l| l.stats(now_us, &line))
+                .transpose()
+                .unwrap();
+        }
     }
 }
 
 impl CoreIo for Sink {
     fn on_au(&mut self, a: Au) {
+        if let Some(l) = self.log.as_mut() {
+            l.au(self.now_us, &a).unwrap();
+        }
         self.aus += 1;
         self.bytes += a.data.len() as u64;
         if !a.complete {
@@ -291,6 +328,7 @@ fn live(o: Opts) {
     }
 
     let end = Duration::from_secs(o.secs);
+    let mut last_stats = 0u64;
     let mut next_tick = mono_us(t0);
     let mut next_report = t0 + Duration::from_secs(1);
     let (mut bodies, mut last_aus, mut rssi_sum, mut rssi_n, mut mcs) =
@@ -311,6 +349,10 @@ fn live(o: Opts) {
                     mcs = b.mcs;
                 }
                 bodies += 1;
+                sink.now_us = b.mono_us;
+                if let Some(l) = sink.log.as_mut() {
+                    l.body(&b).unwrap();
+                }
                 core.on_rx(&b, &mut sink);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -321,7 +363,12 @@ fn live(o: Opts) {
             if let Some(c) = cap.as_mut() {
                 c.tick(now).unwrap();
             }
+            sink.now_us = now;
+            if let Some(l) = sink.log.as_mut() {
+                l.tick(now).unwrap();
+            }
             core.tick(now, &mut sink);
+            sink.log_stats(now, &mut last_stats, &*core);
             next_tick = now + TICK_US;
         }
         if Instant::now() >= next_report {
@@ -351,6 +398,7 @@ fn live(o: Opts) {
         if let Some(c) = cap.as_mut() {
             c.body(&b).unwrap();
         }
+        sink.now_us = b.mono_us;
         core.on_rx(&b, &mut sink);
     }
     if let Some(c) = cap.as_mut() {
@@ -378,6 +426,7 @@ fn replay(o: Opts) {
     let r = capture::Reader::new(BufReader::with_capacity(1 << 20, f))
         .unwrap_or_else(|e| die(&e.to_string()));
     let (mut bodies, mut ticks, mut dropped) = (0u64, 0u64, 0u64);
+    let mut last_stats = 0u64;
     // Synthetic loss: splitmix64 on a fixed seed, so both cores see the
     // same surviving bodies.
     let mut rng = o.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -396,11 +445,14 @@ fn replay(o: Opts) {
                     continue;
                 }
                 bodies += 1;
+                sink.now_us = b.mono_us;
                 core.on_rx(&b, &mut sink);
             }
             Record::Tick(t) => {
                 ticks += 1;
+                sink.now_us = t;
                 core.tick(t, &mut sink);
+                sink.log_stats(t, &mut last_stats, &*core);
             }
         }
     }
@@ -412,11 +464,57 @@ fn replay(o: Opts) {
     println!("stats {}", core.stats_json());
 }
 
+fn log_summary(o: Opts) {
+    let [dir] = <[PathBuf; 1]>::try_from(o.pos)
+        .unwrap_or_else(|_| die("log needs one fl-NNNN_... directory"));
+    let s = session::summarize(&dir).unwrap_or_else(|e| die(&format!("{}: {e}", dir.display())));
+    println!("{}", dir.display());
+    println!(
+        "  span {:.1} s, {} stats lines, capture {}",
+        s.span_s,
+        s.stats_lines,
+        if s.has_capture { "yes" } else { "no" }
+    );
+    let pct = |n: u64| {
+        if s.aus > 0 {
+            100.0 * n as f64 / s.aus as f64
+        } else {
+            0.0
+        }
+    };
+    println!(
+        "  AUs {} ({:.1} MB, {} IDR): truncated {} ({:.1} %, base {}), salvaged {}",
+        s.aus,
+        s.au_bytes as f64 / 1e6,
+        s.idr,
+        s.truncated,
+        pct(s.truncated),
+        s.truncated_base,
+        s.salvaged
+    );
+    for (t, to) in &s.session_edges {
+        println!("  session -> {to} at {:.3} s", *t as f64 / 1e6);
+    }
+    let ev: Vec<String> = s.events.iter().map(|(k, n)| format!("{k} {n}")).collect();
+    println!(
+        "  events: {}",
+        if ev.is_empty() {
+            "none".into()
+        } else {
+            ev.join(", ")
+        }
+    );
+    if let Some(v) = &s.last_stats {
+        println!("  last stats: {v}");
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("live") => live(parse(args)),
         Some("replay") => replay(parse(args)),
-        _ => die("usage: pal live|replay ... (see src/main.rs)"),
+        Some("log") => log_summary(parse(args)),
+        _ => die("usage: pal live|replay|log ... (see src/main.rs)"),
     }
 }

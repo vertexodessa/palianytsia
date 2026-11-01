@@ -1,6 +1,6 @@
 [package]
 name = "flightlog"
-description = "Session files: raw RxBody captures (bodies.bin), later stats/events/au logs"
+description = "Session files: raw RxBody captures (bodies.bin), session stats, events and AU logs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 pal-core.workspace = true
+serde_json.workspace = true
