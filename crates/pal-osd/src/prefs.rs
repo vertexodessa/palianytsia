@@ -33,7 +33,7 @@ impl Default for HudPrefs {
             messages: true,
             stats: false,
             scale: 1.0,
-            link_bw: 40,
+            link_bw: 20,
         }
     }
 }
@@ -67,8 +67,8 @@ impl HudPrefs {
                 .and_then(Value::as_f64)
                 .map_or(d.scale, |x| (x as f32).clamp(0.6, 2.0)),
             link_bw: match v.get("link_bw").and_then(Value::as_u64) {
-                Some(20) => 20,
-                _ => 40,
+                Some(40) => 40,
+                _ => 20,
             },
         }
     }
@@ -95,12 +95,12 @@ mod tests {
             nav: false,
             stats: true,
             scale: 1.4,
-            link_bw: 20,
+            link_bw: 40,
             ..Default::default()
         };
         assert_eq!(HudPrefs::from_json(&p.to_json()), p);
         assert_eq!(HudPrefs::from_json("garbage"), HudPrefs::default());
         let q = HudPrefs::from_json(r#"{"dot":false,"scale":9,"unknown":1}"#);
-        assert!(!q.dot && q.battery && q.scale == 2.0 && q.link_bw == 40);
+        assert!(!q.dot && q.battery && q.scale == 2.0 && q.link_bw == 20);
     }
 }
