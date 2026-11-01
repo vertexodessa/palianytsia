@@ -75,7 +75,10 @@ extern "C" dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap) try {
   if (!c->h) { set_err(err, err_cap, "no device"); dv_close(c.release()); return nullptr; }
 
   c->logger = std::make_shared<Logger>();
-  const int rc = devourer::claim_interface_then_reset(c->h, 0, c->logger, /*do_reset=*/true, c->lock);
+  // No reset on a wrapped fd: a reset re-enumerates the device and the fd
+  // UsbManager gave us goes stale (PixelPilot ChannelScan.cpp claims
+  // without one for the same reason).
+  const int rc = devourer::claim_interface_then_reset(c->h, 0, c->logger, /*do_reset=*/cfg->fd < 0, c->lock);
   if (rc != 0) {
     set_err(err, err_cap, "claim failed rc=" + std::to_string(rc));
     dv_close(c.release());
