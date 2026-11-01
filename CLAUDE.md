@@ -48,6 +48,9 @@ pairing key.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.
 
+## Finding code
+`zg query "<what it does>"` works here (index in `.zvec-grep/`, 87 files, submodules not indexed: use rg in `third_party/mabur`). Re-run `zg index` after large edits.
+
 ## Rules
 - Commit with `git -c user.email=ivlev.igor@gmail.com commit`; no AI attribution.
 - Do not push while the GitHub repo is being recreated (2026-11-01); ask first.
