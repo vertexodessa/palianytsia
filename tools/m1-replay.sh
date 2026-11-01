@@ -12,8 +12,9 @@ cargo build -q --release --manifest-path "$ROOT/Cargo.toml" -p pal
 PAL=$ROOT/target/release/pal
 CAPS=${PAL_CAPTURES:-$ROOT/captures}
 if [[ ! -f $CAPS/README.md ]]; then
-  echo "m1: no captures in $CAPS (they live outside git; set PAL_CAPTURES), skipped"
-  exit 0
+  # Not a pass: a fresh checkout has no captures, and exit 0 here read as green.
+  echo "m1: SKIPPED, no captures in $CAPS (they live outside git; set PAL_CAPTURES)" >&2
+  exit 77
 fi
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 fail=0

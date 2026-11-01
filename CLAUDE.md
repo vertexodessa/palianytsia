@@ -25,7 +25,7 @@ tools/m1-replay.sh     # ref == rust: AUs, sent RC bytes, final stats line, --id
 ```
 Every core change must keep ref==rust byte-identical. `captures/` is git-ignored
 (no binary recordings in the repo); `tools/m1-replay.sh` reads `PAL_CAPTURES`
-(default `captures/`) and skips when absent. `captures/README.md` lists each
+(default `captures/`) and exits 77 (skipped, not a pass) when absent. `captures/README.md` lists each
 capture with its expected AU sha256; a `<name>.key` beside a capture is its
 pairing key.
 

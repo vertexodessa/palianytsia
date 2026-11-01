@@ -473,8 +473,12 @@ fn replay(o: Opts) {
         .unwrap_or_else(|_| die("replay needs one <bodies.bin>"));
     let mut core = core(&o, 0);
     let mut sink = Sink::new(&o);
-    if o.idr == Some(true) && o.mode == Some(Mode::Gs) {
-        sink.idr = Some(IdrDriver::default());
+    if o.idr == Some(true) {
+        if o.mode == Some(Mode::Gs) {
+            sink.idr = Some(IdrDriver::default());
+        } else {
+            eprintln!("pal: --idr needs --mode gs (Spotter sends no RCF); ignored");
+        }
     }
     let f = std::fs::File::open(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
     let r = capture::Reader::new(BufReader::with_capacity(1 << 20, f))

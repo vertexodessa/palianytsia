@@ -183,7 +183,9 @@ impl RefreshRequester {
             return;
         }
         self.armed = false;
-        let heal = now_ms - self.armed_since_ms;
+        // Stamps come from two clocks (body RX time, tick time), so an IRAP
+        // body can carry a stamp older than the arming tick.
+        let heal = now_ms.saturating_sub(self.armed_since_ms);
         self.c.heals += 1;
         self.c.heal_ms_last = heal;
         self.events.push(Event {
@@ -206,7 +208,7 @@ impl RefreshRequester {
 #[derive(Debug, Default)]
 pub struct IdrDriver {
     pub r: RefreshRequester,
-    applied: u8,
+    applied: u64,
     dec_err_seen: u64,
     started: bool,
 }
@@ -237,9 +239,13 @@ impl IdrDriver {
     /// After each core tick: the retry clock, then the epoch into the core.
     pub fn step(&mut self, now_us: u64, core: &mut dyn crate::GsCore) -> Vec<Event> {
         self.r.poll(now_us / 1000);
-        if self.r.epoch() != self.applied {
-            self.applied = self.r.epoch();
-            core.set_idr_requests(u32::from(self.applied));
+        // The cumulative bump count, as WebGs takes it: `idr_req` in the
+        // stats stays monotonic and the RCF byte is its low 8 bits (= epoch).
+        let c = self.r.counters();
+        let total = c.requests + c.retries;
+        if total != self.applied {
+            self.applied = total;
+            core.set_idr_requests(total as u32);
         }
         self.r.take_events()
     }
@@ -305,6 +311,15 @@ mod tests {
     }
 
     #[test]
+    fn irap_stamped_before_arming_heals_in_zero_ms() {
+        let mut r = RefreshRequester::default();
+        r.request(Reason::Decoder, 1000);
+        r.note_au(0, true, false, 19, 0, 990);
+        assert!(!r.armed());
+        assert_eq!(r.counters().heal_ms_last, 0);
+    }
+
+    #[test]
     fn epoch_wraps() {
         let mut r = RefreshRequester::default();
         r.request(Reason::Decoder, 0);
@@ -312,6 +327,9 @@ mod tests {
             r.poll(i * RETRY_MS);
         }
         assert_eq!(r.epoch(), 0);
+        // IdrDriver hands the core the cumulative count, which keeps going.
+        let c = r.counters();
+        assert_eq!(c.requests + c.retries, 256);
     }
 
     #[test]
