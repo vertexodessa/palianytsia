@@ -384,6 +384,11 @@ Decided 2026-10-31:
 Still open:
 6. Phone UI: Kotlin shell with two surfaces (start here) or NativeActivity. Decide on the G2G A/B when the phone app is built.
 
+Known issues, deferred by Ihor (2026-11-01):
+7. **Grey picture on loss, CPU decode.** libavcodec's software HEVC decoder fills a missing reference with grey, so on a lossy link the desktop picture goes grey until the next intra refresh; vdpau and MediaCodec keep the last picture. Seen on `2026-10-31-bench-gs-ch40w40-idr.bin` with `--hwdec sw`, same with the system FFmpeg. Fix: hold the last clean frame while the decoder reports missing refs.
+8. **Desktop GPU decoders.** `--hwdec cuda` segfaults at exit (`cuCtxPopCurrent failed` in teardown); `--hwdec vaapi` stalls after 4 frames on NVIDIA's VA-API wrapper. Both reproduce with the system FFmpeg; `auto` picks vdpau first and is unaffected.
+9. **The APKs ship pal-ref.** The channel search (`channel = "auto"`) runs mabur's C++ ChannelCore through pal-ref, against decision 3. The Rust port of ChannelCore (ref == rust parity, like the rest of the core) retires it.
+
 ## 13 Latency measurement (needs the mabur fork)
 
 ### 13.1 What original mabur gives today
