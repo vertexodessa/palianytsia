@@ -64,7 +64,9 @@ pairing key.
   `release/v0.1` = `palianytsia/base` minus the bench `/sim` commit). `gs.toml` stays pinned for the parity gates.
 - Release desktop: `tools/ffmpeg-static.sh` once, then `PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release -p pal-desktop`
   (HEVC + swscale linked in, no hwaccel; the system-FFmpeg build did not start on QA's machine). v0.2 package:
-  `dist/palianytsia-v0.2/` (maburd from mabur `release/v0.2` = `release/v0.1` + DISC width agreement 7c3e2cf9).
+  `dist/palianytsia-v0.2/` (maburd from mabur `release/v0.2` = `release/v0.1` + DISC width agreement 7c3e2cf9);
+  v0.3 = same maburd, `tools/drone-install.sh` that also does a first install on a stock OpenIPC FPV image
+  (`--fresh` forces those steps, `--remove` undoes them; an update keeps the drone's mabur.toml), GPU decode in the desktop.
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
