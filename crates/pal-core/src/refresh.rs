@@ -202,9 +202,9 @@ impl RefreshRequester {
 /// The host side of the request path, shared by `pal live` and pal-desktop:
 /// AUs and decoder damage in, `GsCore::set_idr_requests` out. Both cores get
 /// identical calls, so the parity gate covers it (`pal replay --idr`).
-/// Deviation from maburgs: `skipped_before` is not reported through
-/// `GsCore` (webgs::Au has no such field), so whole-AU skips reach this
-/// only as decoder damage.
+/// `skipped_before` and `vcl_nal` come with the AU from both cores
+/// (webgs::Au carries them since the palianytsia mabur fork), as maburgs
+/// reads them off FrameStream.
 #[derive(Debug, Default)]
 pub struct IdrDriver {
     pub r: RefreshRequester,
@@ -221,7 +221,7 @@ pub struct IdrDriver {
 impl IdrDriver {
     pub fn on_au(&mut self, a: &crate::Au, now_us: u64) {
         self.aus += 1;
-        let vcl = first_vcl_nal(&a.data);
+        let vcl = a.vcl_nal;
         let irap = a.sid == 0 && a.complete && !a.salvaged && (16..=21).contains(&vcl);
         // The player's "start" (maburgs take_refresh): a decoder that joins
         // mid-stream has no reference until an IRAP, and the encoder runs
@@ -241,8 +241,14 @@ impl IdrDriver {
         }
         self.started = true;
         let was_armed = self.r.armed();
-        self.r
-            .note_au(a.sid, a.complete, a.salvaged, vcl, 0, now_us / 1000);
+        self.r.note_au(
+            a.sid,
+            a.complete,
+            a.salvaged,
+            vcl,
+            a.skipped_before,
+            now_us / 1000,
+        );
         if was_armed && !self.r.armed() {
             self.healed_at = self.aus;
         }
@@ -277,15 +283,6 @@ impl IdrDriver {
         }
         self.r.take_events()
     }
-}
-
-/// NAL type of the first slice (VCL, type < 32) in an Annex-B AU; 0xFF if
-/// it carries none. maburgs reads the same off FrameStream (`lat.vcl_nal`).
-pub fn first_vcl_nal(au: &[u8]) -> u8 {
-    hevc::nal::split_nals(au)
-        .iter()
-        .find(|v| v.ty < 32)
-        .map_or(0xFF, |v| v.ty)
 }
 
 #[cfg(test)]
@@ -368,7 +365,26 @@ mod tests {
             flags,
             complete,
             salvaged: false,
+            skipped_before: 0,
+            vcl_nal: nal,
         }
+    }
+
+    #[test]
+    fn driver_arms_lost_on_skipped_aus() {
+        let mut d = IdrDriver::default();
+        d.on_au(&au(0, true, 0, 19), 1_000); // clean IRAP start
+        assert!(!d.r.armed());
+        // Two whole AUs vanished before this complete P picture.
+        d.on_au(
+            &crate::Au {
+                skipped_before: 2,
+                ..au(0, true, 0, 1)
+            },
+            2_000,
+        );
+        assert!(d.r.armed());
+        assert_eq!(d.r.counters().by_reason[Reason::Lost as usize], 1);
     }
 
     #[test]
@@ -405,12 +421,5 @@ mod tests {
         d.on_decoder_errors(5, 3, 3_600);
         assert!(d.r.armed());
         assert_eq!(d.r.counters().by_reason[Reason::Decoder as usize], 1);
-    }
-
-    #[test]
-    fn vcl_nal_skips_parameter_sets() {
-        let au = [0, 0, 0, 1, 0x40, 1, 0xAA, 0, 0, 1, 0x26, 1, 0xBB];
-        assert_eq!(first_vcl_nal(&au), 19);
-        assert_eq!(first_vcl_nal(&[0, 0, 1, 0x40, 1]), 0xFF);
     }
 }

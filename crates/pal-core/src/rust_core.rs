@@ -81,6 +81,8 @@ impl FrameOut for AuOut<'_> {
     fn end(&mut self, complete: bool, lat: &AuLat) {
         self.cur.complete = complete;
         self.cur.salvaged = !complete && lat.slice.salvaged;
+        self.cur.skipped_before = lat.skipped_before;
+        self.cur.vcl_nal = lat.vcl_nal;
         if let Some(g) = self.gs.as_deref_mut() {
             let probe_follows =
                 self.cur.sid < 2 && self.lha.probe_commanded() != rc::NO_PROBE_PROFILE;

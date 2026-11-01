@@ -27,7 +27,8 @@ typedef struct pal_rx_body {
 } pal_rx_body;
 
 typedef void (*pal_au_cb)(void* user, uint8_t sid, uint8_t flags, uint8_t complete,
-                          uint8_t salvaged, uint32_t pts_us, const uint8_t* data, size_t len);
+                          uint8_t salvaged, uint32_t pts_us, uint32_t skipped_before,
+                          uint8_t vcl_nal, const uint8_t* data, size_t len);
 typedef void (*pal_send_cb)(void* user, const uint8_t* data, size_t len);
 
 typedef struct pal_ref pal_ref;

@@ -25,7 +25,8 @@ struct PalRxBody {
     body_len: usize,
 }
 
-type AuCb = extern "C" fn(*mut c_void, u8, u8, u8, u8, u32, *const u8, usize);
+// user, sid, flags, complete, salvaged, pts_us, skipped_before, vcl_nal, data, len
+type AuCb = extern "C" fn(*mut c_void, u8, u8, u8, u8, u32, u32, u8, *const u8, usize);
 type SendCb = extern "C" fn(*mut c_void, *const u8, usize);
 
 #[repr(C)]
@@ -95,6 +96,8 @@ extern "C" fn on_au_tramp(
     complete: u8,
     salvaged: u8,
     pts_us: u32,
+    skipped_before: u32,
+    vcl_nal: u8,
     data: *const u8,
     len: usize,
 ) {
@@ -114,6 +117,8 @@ extern "C" fn on_au_tramp(
             sid,
             flags,
             complete: complete != 0,
+            skipped_before,
+            vcl_nal,
             salvaged: salvaged != 0,
         });
     });

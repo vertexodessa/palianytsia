@@ -61,6 +61,11 @@ pub struct Au {
     pub complete: bool,
     /// Rebuilt from complete slices plus skip fills; never a sync point.
     pub salvaged: bool,
+    /// Whole AUs FrameStream skipped right before this one (webgs::Au,
+    /// AuLatMeta::skipped_before).
+    pub skipped_before: u32,
+    /// NAL type of the first slice; 0 when the AU carries none.
+    pub vcl_nal: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

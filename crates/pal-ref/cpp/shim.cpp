@@ -90,7 +90,7 @@ pal_ref* pal_ref_new(const char* config_path, int mode, int adaptive_gap, uint32
     webgs::Io io;
     io.on_au = [user, on_au](webgs::Au&& a) {
       on_au(user, a.sid, a.flags, a.complete ? 1 : 0, a.salvaged ? 1 : 0, a.pts_us,
-            a.data.data(), a.data.size());
+            a.skipped_before, a.vcl_nal, a.data.data(), a.data.size());
     };
     const webgs::Mode m = mode == 0 ? webgs::Mode::Gs : webgs::Mode::Spotter;
     if (m == webgs::Mode::Gs) {

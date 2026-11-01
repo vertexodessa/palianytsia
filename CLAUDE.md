@@ -14,7 +14,7 @@ status: `docs/spec.md`; read its M1/M2 status sections first).
 | `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
 | `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |
 | `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
-| `third_party/{mabur,devourer}` | pinned submodules (branch `palianytsia/base`); never edit here |
+| `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (branch `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
 
 ## Gates (run all before a commit)
 ```sh
