@@ -23,7 +23,7 @@ trace harness over the C++ `CalSession` built into pal-ref.
 | Level | Modules (C++) | Status |
 |---|---|---|
 | C0 | `cal_wire.h` (stamp), `cal_proto.h`, `cal_park.h`, `cal_mav.cpp` (dialect 60000-60005) into `pal-wire::cal` | done: 11 tests, the 6 messages byte-equal to mabur's encoder (golden bytes from cal_mav.cpp) |
-| C1 | `cal_plan`, `cal_analysis`, `cal_log` (kept readable by `maburcal report`) | |
+| C1 | `cal_plan`, `cal_analysis`, `cal_log` (kept readable by `maburcal report`) | done: `pal-core::cal::{plan, analysis, log}`, mabur's test_cal_plan/test_cal_analysis/test_cal_log cases ported (26 tests); a cal.log written by the Rust log renders in `maburcal report` unchanged |
 | C2 | seams: MavTunnel cal lane, cal-body routing in the aggregator, ChannelCore `cal_running` + `CalMoveEdgeHold` + the calibration channel pick (`cal_picker`, `cal_round_pick`), `cal_cmd_clear` | |
 | C3 | `CalSession` + the `CalControl` composition and refusals, wired into `RustCore` (radio silence gates every send); trace harness against the C++ session | |
 | C4 | UI: `GsCore::{cal_start, cal_status, cal_abort}`, runtime commands, a Calibrate button with a confirm step (video stops for about 40 s; needs distance), live progress, the result table, Abort; `cal.log` into the flight-log directory | |
