@@ -494,6 +494,7 @@ impl eframe::App for App {
                 let decode = (frames, self.shared.dec_errors.load(Ordering::Relaxed));
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(area.shrink(8.0)), |ui| {
                     pal_osd::chips(ui, &self.hist, self.fps, decode);
+                    pal_osd::key_banner(ui, &self.hist);
                 });
             });
         egui::Area::new(egui::Id::new("telem"))

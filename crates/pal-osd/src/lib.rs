@@ -26,6 +26,19 @@ pub struct Snapshot {
     pub salvaged: u64,
     pub sends: u64,
     pub resets: u64,
+    /// Fingerprint of our pairing key; "default" for `mabur-default-00`.
+    pub key_fp: String,
+    pub rtt_ms: Option<f64>,
+    /// "none" | "wait" | "ok" | ... (UplinkDelivery), with its window %.
+    pub uplink: String,
+    pub uplink_pct: Option<i64>,
+    /// Link health: loss before FEC, and what FEC left (post-FEC), 0..1.
+    pub pre_fec_loss: Option<f64>,
+    pub residual: Option<f64>,
+    pub drone_temp_c: Option<i64>,
+    /// NACK repairs: symbols filled so far, and the current rate.
+    pub nack_fill: u64,
+    pub nack_fill_pps: Option<f64>,
 }
 
 fn u(v: &Value, k: &str) -> u64 {
@@ -58,6 +71,26 @@ impl Snapshot {
             salvaged: u(&v, "salvaged"),
             sends: u(&v, "sends"),
             resets: u(&v, "resets"),
+            key_fp: v
+                .get("key_fp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            rtt_ms: v.get("rtt_ms").and_then(Value::as_f64),
+            uplink: v
+                .get("uplink")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+                .to_string(),
+            uplink_pct: v.get("uplink_pct").and_then(Value::as_i64),
+            pre_fec_loss: v.get("pre_fec_loss").and_then(Value::as_f64),
+            residual: v.get("residual").and_then(Value::as_f64),
+            drone_temp_c: v.get("drone_temp_c").and_then(Value::as_i64),
+            nack_fill: v.get("nack").map_or(0, |n| u(n, "fill")),
+            nack_fill_pps: v
+                .get("nack")
+                .and_then(|n| n.get("fill_pps"))
+                .and_then(Value::as_f64),
         })
     }
 }
@@ -76,6 +109,20 @@ pub fn drone_state_name(s: i64) -> &'static str {
 const OK: Color32 = Color32::from_rgb(90, 200, 120);
 const WARN: Color32 = Color32::from_rgb(230, 180, 60);
 const BAD: Color32 = Color32::from_rgb(230, 80, 70);
+
+trait Severity {
+    /// At least WARN (BAD stays BAD).
+    fn max_warn(self) -> Self;
+}
+impl Severity for Color32 {
+    fn max_warn(self) -> Self {
+        if self == BAD {
+            BAD
+        } else {
+            WARN
+        }
+    }
+}
 
 /// Per-second history for the 60 s monitor plots.
 #[derive(Default)]
@@ -130,6 +177,54 @@ fn chip(ui: &mut Ui, label: &str, text: &str, color: Color32) {
         });
 }
 
+/// What the pairing-key banner says, if anything (F5): a mismatch is an
+/// error (the drone ignores us), the default key a standing warning
+/// (anyone holding `mabur-default-00` can command the drone).
+pub fn key_warning(s: &Snapshot) -> Option<(String, bool)> {
+    if s.key_mismatch {
+        Some((
+            format!(
+                "KEY MISMATCH: the drone answers under another pairing key (ours {})",
+                s.key_fp
+            ),
+            true,
+        ))
+    } else if s.key_fp == "default" {
+        Some((
+            "DEFAULT LINK KEY: anyone with mabur-default-00 can command this drone".into(),
+            false,
+        ))
+    } else {
+        None
+    }
+}
+
+/// The key banner across the top of the video, when `key_warning` has one.
+pub fn key_banner(ui: &mut Ui, h: &History) {
+    let Some((text, bad)) = h.last().and_then(key_warning) else {
+        return;
+    };
+    let (fill, fg) = if bad {
+        (BAD, Color32::WHITE)
+    } else {
+        (
+            Color32::from_rgba_unmultiplied(230, 180, 60, 200),
+            Color32::BLACK,
+        )
+    };
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(4.0)
+        .inner_margin(Vec2::new(10.0, 5.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).strong().color(fg));
+        });
+}
+
+fn pct(v: f64) -> String {
+    format!("{:.1} %", 100.0 * v)
+}
+
 /// The top OSD row: link, signal, loss, uplink side.
 pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
     let Some(s) = h.last() else {
@@ -167,10 +262,17 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
         } else {
             0.0
         };
+        let mut loss = format!("trunc {pct:.1} %  salv {}", s.salvaged);
+        if let Some(p) = s.pre_fec_loss {
+            loss += &format!("  pre {}", self::pct(p));
+        }
+        if let Some(r) = s.residual {
+            loss += &format!("  post {}", self::pct(r));
+        }
         chip(
             ui,
             "loss",
-            &format!("trunc {pct:.1} %  salv {}", s.salvaged),
+            &loss,
             if pct < 2.0 {
                 OK
             } else if pct < 10.0 {
@@ -186,11 +288,37 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
             OK,
         );
         if let Some(d) = s.drone_state {
-            let c = if d == 2 { OK } else { WARN };
-            chip(ui, "drone", drone_state_name(d), c);
+            let mut c = if d == 2 { OK } else { WARN };
+            let mut t = drone_state_name(d).to_string();
+            if let Some(tc) = s.drone_temp_c {
+                t += &format!("  {tc} C");
+                if tc >= 85 {
+                    c = BAD;
+                } else if tc >= 75 {
+                    c = c.max_warn();
+                }
+            }
+            chip(ui, "drone", &t, c);
         }
         if s.mode == "gs" {
-            chip(ui, "tx", &format!("{} sends", s.sends), OK);
+            let mut up = match s.uplink_pct {
+                Some(p) => format!("{} {p} %", s.uplink),
+                None => s.uplink.clone(),
+            };
+            if let Some(r) = s.rtt_ms {
+                up += &format!("  rtt {r:.0} ms");
+            }
+            let c = match (s.uplink.as_str(), s.uplink_pct) {
+                ("ok", Some(p)) if p >= 80 => OK,
+                ("ok", _) | ("wait", _) | ("none", _) => WARN,
+                _ => BAD,
+            };
+            chip(ui, "uplink", &up, c);
+            let mut nack = format!("fill {}", s.nack_fill);
+            if let Some(r) = s.nack_fill_pps {
+                nack += &format!("  {r:.0}/s");
+            }
+            chip(ui, "nack", &nack, OK);
         }
     });
 }
@@ -267,5 +395,30 @@ mod tests {
         h.push(0.0, s.clone());
         h.push(1.0, Snapshot { trunc: 4, ..s });
         assert_eq!(h.rate(|s| s.trunc), vec![(1.0, 3.0)]);
+    }
+
+    #[test]
+    fn parses_new_fields_and_key_warnings() {
+        let s = Snapshot::parse(r#"{"mode":"gs","key_fp":"default","key_mismatch":false,"rtt_ms":6.1,"uplink":"ok","uplink_pct":92,"pre_fec_loss":0.085,"residual":0.0106,"drone_temp_c":46,"nack":{"fill":48,"fill_pps":0.0}}"#)
+            .expect("parse");
+        assert_eq!(
+            (s.uplink.as_str(), s.uplink_pct, s.drone_temp_c),
+            ("ok", Some(92), Some(46))
+        );
+        assert_eq!((s.nack_fill, s.rtt_ms), (48, Some(6.1)));
+        let (t, bad) = key_warning(&s).expect("default key warns");
+        assert!(t.starts_with("DEFAULT LINK KEY") && !bad);
+        let m = Snapshot {
+            key_mismatch: true,
+            key_fp: "1a2b".into(),
+            ..s.clone()
+        };
+        let (t, bad) = key_warning(&m).expect("mismatch");
+        assert!(t.contains("ours 1a2b") && bad);
+        let own = Snapshot {
+            key_fp: "1a2b".into(),
+            ..s
+        };
+        assert!(key_warning(&own).is_none());
     }
 }

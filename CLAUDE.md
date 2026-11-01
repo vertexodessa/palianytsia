@@ -42,6 +42,12 @@ pairing key.
 - No loss injector in original mabur; `radio.wall_margin_db` caps at 6 dB, so a
   real 20 % loss capture needs physical attenuation.
 
+## Helpers
+- `configs/bench-ch40.toml`: `gs.toml` pinned to ch 40 for the bench quad.
+- `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
+- `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
+- `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.
+
 ## Rules
 - Commit with `git -c user.email=ivlev.igor@gmail.com commit`; no AI attribution.
 - Do not push while the GitHub repo is being recreated (2026-11-01); ask first.
