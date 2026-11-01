@@ -1,6 +1,8 @@
 //! Touch controllers through OpenXR actions (spec 5.6 "Input"): the right
 //! controller's aim ray is a pointer on the OSD quad, the trigger clicks,
-//! B or Y opens the settings panel, A or X toggles link statistics.
+//! B or Y opens the settings panel, A or X toggles link statistics; the
+//! right thumbstick resizes the screen and the left one moves it nearer or
+//! farther.
 use openxr as xr;
 
 pub struct Input {
@@ -9,6 +11,8 @@ pub struct Input {
     click: xr::Action<bool>,
     menu: xr::Action<bool>,
     stats: xr::Action<bool>,
+    size: xr::Action<xr::Vector2f>,
+    dist: xr::Action<xr::Vector2f>,
     aim_space: xr::Space,
 }
 
@@ -21,6 +25,9 @@ pub struct Frame {
     pub click: Option<bool>,
     pub menu: bool,
     pub stats: bool,
+    /// Thumbstick Y, -1..1: right = screen size, left = distance.
+    pub size: f32,
+    pub dist: f32,
 }
 
 impl Input {
@@ -30,6 +37,8 @@ impl Input {
         let click = set.create_action::<bool>("click", "Click", &[])?;
         let menu = set.create_action::<bool>("menu", "Settings", &[])?;
         let stats = set.create_action::<bool>("stats", "Link statistics", &[])?;
+        let size = set.create_action::<xr::Vector2f>("size", "Screen size", &[])?;
+        let dist = set.create_action::<xr::Vector2f>("dist", "Screen distance", &[])?;
         let p = |s: &str| inst.string_to_path(s);
         inst.suggest_interaction_profile_bindings(
             p("/interaction_profiles/oculus/touch_controller")?,
@@ -40,6 +49,8 @@ impl Input {
                 xr::Binding::new(&menu, p("/user/hand/left/input/y/click")?),
                 xr::Binding::new(&stats, p("/user/hand/right/input/a/click")?),
                 xr::Binding::new(&stats, p("/user/hand/left/input/x/click")?),
+                xr::Binding::new(&size, p("/user/hand/right/input/thumbstick")?),
+                xr::Binding::new(&dist, p("/user/hand/left/input/thumbstick")?),
             ],
         )?;
         session.attach_action_sets(&[&set])?;
@@ -50,6 +61,8 @@ impl Input {
             click,
             menu,
             stats,
+            size,
+            dist,
             aim_space,
         })
     }
@@ -81,6 +94,21 @@ impl Input {
         f.click = edge(&self.click);
         f.menu = edge(&self.menu) == Some(true);
         f.stats = edge(&self.stats) == Some(true);
+        let stick = |a: &xr::Action<xr::Vector2f>| {
+            a.state(session, xr::Path::NULL)
+                .ok()
+                .filter(|s| s.is_active)
+                // A dead zone: a resting thumb must not creep the screen.
+                .map_or(0.0, |s| {
+                    if s.current_state.y.abs() < 0.2 {
+                        0.0
+                    } else {
+                        s.current_state.y
+                    }
+                })
+        };
+        f.size = stick(&self.size);
+        f.dist = stick(&self.dist);
         let active = self.aim.is_active(session, xr::Path::NULL).unwrap_or(false);
         if !active {
             return f;

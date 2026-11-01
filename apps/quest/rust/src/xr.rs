@@ -23,9 +23,63 @@ use crate::supervisor::Hub;
 /// Video swapchain size: the decoder scales into it.
 const VW: u32 = 1920;
 const VH: u32 = 1080;
-/// Goggle mode quad: 2.0 m wide at 1.5 m, about 67 degrees across.
-const DIST_M: f32 = 1.5;
-const WIDTH_M: f32 = 2.0;
+/// Goggle mode screen: where the video and OSD quads sit in VIEW space.
+/// Default 2.0 m wide at 1.5 m, about 67 degrees across; the thumbsticks
+/// change it and screen.json in the files dir keeps it.
+struct Screen {
+    dist_m: f32,
+    width_m: f32,
+    path: std::path::PathBuf,
+    /// Changed and not saved yet.
+    dirty: bool,
+}
+
+impl Screen {
+    fn load(path: std::path::PathBuf) -> Self {
+        let mut s = Self {
+            dist_m: 1.5,
+            width_m: 2.0,
+            path,
+            dirty: false,
+        };
+        if let Ok(t) = std::fs::read_to_string(&s.path) {
+            let num = |k: &str| {
+                t.split(&format!("\"{k}\":"))
+                    .nth(1)
+                    .and_then(|r| r.split([',', '}']).next())
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+            };
+            if let Some(d) = num("dist_m") {
+                s.dist_m = d.clamp(0.6, 5.0);
+            }
+            if let Some(w) = num("width_m") {
+                s.width_m = w.clamp(0.5, 6.0);
+            }
+        }
+        s
+    }
+
+    /// Stick Y per second: full deflection changes size or distance by
+    /// about 60 % a second, proportional so it feels the same near and far.
+    fn steer(&mut self, size: f32, dist: f32, dt: f32) {
+        if size == 0.0 && dist == 0.0 {
+            if self.dirty {
+                self.dirty = false;
+                let j = format!(
+                    "{{\"dist_m\":{:.3},\"width_m\":{:.3}}}",
+                    self.dist_m, self.width_m
+                );
+                if let Err(e) = std::fs::write(&self.path, j) {
+                    log::warn!("screen.json: {e}");
+                }
+            }
+            return;
+        }
+        self.width_m = (self.width_m * (1.0 + 0.6 * size * dt)).clamp(0.5, 6.0);
+        self.dist_m = (self.dist_m * (1.0 - 0.6 * dist * dt)).clamp(0.6, 5.0);
+        self.dirty = true;
+    }
+}
 
 struct Egl {
     egl: khronos_egl::Instance<khronos_egl::Static>,
@@ -150,6 +204,7 @@ fn video_swapchain(
 }
 
 fn quad(
+    scr: &Screen,
     space: sys::Space,
     sc: sys::Swapchain,
     w: u32,
@@ -184,12 +239,12 @@ fn quad(
             position: sys::Vector3f {
                 x: 0.0,
                 y: 0.0,
-                z: -DIST_M,
+                z: -scr.dist_m,
             },
         },
         size: sys::Extent2Df {
-            width: WIDTH_M,
-            height: WIDTH_M * 9.0 / 16.0,
+            width: scr.width_m,
+            height: scr.width_m * 9.0 / 16.0,
         },
     }
 }
@@ -320,6 +375,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             None
         }
     };
+    let mut scr = Screen::load(int_dir.join("screen.json"));
+    let mut t_frame = Instant::now();
     let mut video: Option<sys::Swapchain> = None;
     let mut osd: Option<Osd> = None;
     let fp = inst.fp();
@@ -417,11 +474,14 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 &session,
                 &space,
                 fs.predicted_display_time,
-                DIST_M,
-                WIDTH_M,
+                scr.dist_m,
+                scr.width_m,
                 crate::osd::points(),
             )
         });
+        let dt = t_frame.elapsed().as_secs_f32().min(0.1);
+        t_frame = Instant::now();
+        scr.steer(frame.size, frame.dist, dt);
         if let Some(o) = osd.as_mut() {
             o.tick(&hub, frame);
         }
@@ -443,6 +503,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         let mut quads = Vec::with_capacity(2);
         if let Some(sc) = video {
             quads.push(quad(
+                &scr,
                 space.as_raw(),
                 sc,
                 VW,
@@ -453,6 +514,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         }
         if let Some(o) = osd.as_ref().filter(|o| o.ready) {
             quads.push(quad(
+                &scr,
                 space.as_raw(),
                 o.sc.as_raw(),
                 crate::osd::W,
