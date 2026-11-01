@@ -57,6 +57,7 @@ extern "C" {
     fn pal_ref_frame_gap_timeout_ms(r: *const PalRefRaw) -> u32;
     fn pal_ref_mav_take(r: *mut PalRefRaw, out: *mut u8, cap: usize) -> usize;
     fn pal_ref_mav_push(r: *mut PalRefRaw, p: *const u8, n: usize);
+    fn pal_ref_set_idr_requests(r: *mut PalRefRaw, n: u32);
     fn pal_ref_stats_json(r: *const PalRefRaw, buf: *mut c_char, cap: usize) -> usize;
 
     fn pal_ffs_open(
@@ -231,6 +232,10 @@ impl GsCore for RefCore {
 
     fn mav_push_outbound(&mut self, bytes: &[u8]) {
         unsafe { pal_ref_mav_push(self.raw, bytes.as_ptr(), bytes.len()) };
+    }
+
+    fn set_idr_requests(&mut self, n: u32) {
+        unsafe { pal_ref_set_idr_requests(self.raw, n) };
     }
 
     fn stats_json(&self) -> String {

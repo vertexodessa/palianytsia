@@ -15,6 +15,7 @@ pub mod ladder;
 pub mod link_health;
 pub mod mav;
 pub mod nack;
+pub mod refresh;
 pub mod rust_core;
 pub mod slice_asm;
 pub mod uep;
@@ -88,4 +89,7 @@ pub trait GsCore {
     /// Bytes from a local MAVLink peer (a GCS), cut at any boundary; tunneled
     /// to the drone under the live session. Gs mode only.
     fn mav_push_outbound(&mut self, _bytes: &[u8]) {}
+    /// IDR requests so far (WebGs::set_idr_requests): the RCF's idr_epoch
+    /// byte becomes `n as u8`; the drone serves one IDR per change.
+    fn set_idr_requests(&mut self, _n: u32) {}
 }

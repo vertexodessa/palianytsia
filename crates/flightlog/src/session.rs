@@ -157,6 +157,25 @@ impl Session {
         writeln!(self.events, "{}", Value::Object(m))
     }
 
+    /// IDR request path: `idr_req` per epoch bump, `idr_heal` per clearing IRAP.
+    pub fn refresh_events(&mut self, evs: &[pal_core::refresh::Event]) -> io::Result<()> {
+        for e in evs {
+            let (ev, d) = if e.kind == 'H' {
+                (
+                    "idr_heal",
+                    json!({"reason": e.reason.as_str(), "epoch": e.epoch, "heal_ms": e.heal_ms, "retries": e.retries}),
+                )
+            } else {
+                (
+                    "idr_req",
+                    json!({"reason": e.reason.as_str(), "epoch": e.epoch, "retry": e.retries}),
+                )
+            };
+            self.event(e.t_ms * 1000, ev, d)?;
+        }
+        Ok(())
+    }
+
     pub fn au(&mut self, t_us: u64, a: &Au) -> io::Result<()> {
         writeln!(
             self.au,

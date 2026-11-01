@@ -18,6 +18,7 @@
 //! replay of a capture reproduces the live run's AUs exactly.
 use flightlog::capture::{self, Record};
 use flightlog::session::{self, Session};
+use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_ref::{RefCore, RefOpts};
@@ -51,6 +52,8 @@ struct Opts {
     rust: bool,
     drop_pct: u32,
     seed: u64,
+    /// Live: IDR requests on (`--no-idr` off). Replay: off (`--idr` on).
+    idr: Option<bool>,
     pos: Vec<PathBuf>,
 }
 
@@ -80,6 +83,8 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--mav" => o.mav = Some(val().into()),
             "--log-dir" => o.log_dir = Some(val().into()),
             "--decode" => o.decode = true,
+            "--idr" => o.idr = Some(true),
+            "--no-idr" => o.idr = Some(false),
             "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
             "--mode" => {
                 o.mode = Some(match val().as_str() {
@@ -130,6 +135,7 @@ struct Sink {
     card: Option<Arc<devourer_sys::Card>>,
     sends: u64,
     send_fail: u64,
+    idr: Option<IdrDriver>,
 }
 
 impl Sink {
@@ -164,6 +170,7 @@ impl Sink {
             card: None,
             sends: 0,
             send_fail: 0,
+            idr: None,
         }
     }
     fn finish(&mut self) {
@@ -180,6 +187,15 @@ impl Sink {
         }
         if let Some(l) = self.log.as_mut() {
             l.flush().unwrap();
+        }
+    }
+
+    /// After each core tick: IDR retries and the epoch into the core.
+    fn idr_step(&mut self, now_us: u64, core: &mut dyn GsCore) {
+        let Some(d) = self.idr.as_mut() else { return };
+        let evs = d.step(now_us, core);
+        if let Some(l) = self.log.as_mut() {
+            l.refresh_events(&evs).unwrap();
         }
     }
 
@@ -209,8 +225,14 @@ impl CoreIo for Sink {
         if let Some(l) = self.log.as_mut() {
             l.au(self.now_us, &a).unwrap();
         }
+        if let Some(i) = self.idr.as_mut() {
+            i.on_au(&a, self.now_us);
+        }
         if let Some(d) = self.dec.as_mut() {
             decode::Decoder::decode(d, &a.data);
+            if let Some(i) = self.idr.as_mut() {
+                i.on_decoder_errors(decode::Decoder::counters(d).1, self.now_us);
+            }
         }
         self.aus += 1;
         self.bytes += a.data.len() as u64;
@@ -350,6 +372,9 @@ fn live(o: Opts) {
     let card = Arc::new(card);
     if o.mode == Some(Mode::Gs) {
         sink.card = Some(card.clone());
+        if o.idr != Some(false) {
+            sink.idr = Some(IdrDriver::default());
+        }
     }
 
     let end = Duration::from_secs(o.secs);
@@ -393,6 +418,7 @@ fn live(o: Opts) {
                 l.tick(now).unwrap();
             }
             core.tick(now, &mut sink);
+            sink.idr_step(now, &mut *core);
             sink.log_stats(now, &mut last_stats, &*core);
             next_tick = now + TICK_US;
         }
@@ -447,6 +473,9 @@ fn replay(o: Opts) {
         .unwrap_or_else(|_| die("replay needs one <bodies.bin>"));
     let mut core = core(&o, 0);
     let mut sink = Sink::new(&o);
+    if o.idr == Some(true) && o.mode == Some(Mode::Gs) {
+        sink.idr = Some(IdrDriver::default());
+    }
     let f = std::fs::File::open(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
     let r = capture::Reader::new(BufReader::with_capacity(1 << 20, f))
         .unwrap_or_else(|e| die(&e.to_string()));
@@ -477,6 +506,7 @@ fn replay(o: Opts) {
                 ticks += 1;
                 sink.now_us = t;
                 core.tick(t, &mut sink);
+                sink.idr_step(t, &mut *core);
                 sink.log_stats(t, &mut last_stats, &*core);
             }
         }

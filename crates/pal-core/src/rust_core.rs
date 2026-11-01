@@ -191,6 +191,7 @@ pub struct RustCore {
     spotter_op: OpPoint,
     telem_rx_us: u64,
     channel: u8,
+    idr_req: u32,
 }
 
 macro_rules! au_out {
@@ -289,6 +290,7 @@ impl RustCore {
             },
             telem_rx_us: 0,
             channel: ch,
+            idr_req: 0,
         })
     }
 
@@ -614,6 +616,13 @@ impl GsCore for RustCore {
         self.last_health = lh.health;
     }
 
+    fn set_idr_requests(&mut self, n: u32) {
+        self.idr_req = n;
+        if let Some(g) = self.gs.as_mut() {
+            g.vrx.set_idr_epoch(n as u8);
+        }
+    }
+
     fn mav_push_outbound(&mut self, bytes: &[u8]) {
         if let Some(g) = self.gs.as_mut() {
             g.mav.push_outbound(bytes);
@@ -704,7 +713,7 @@ impl GsCore for RustCore {
         j.set("salvaged", self.c.aus_salvaged);
         j.set("sends", g.map_or(0, |g| g.sends));
         j.set("rcf_sent", g.map_or(0, |g| g.rcf_sent));
-        j.set("idr_req", 0u64);
+        j.set("idr_req", self.idr_req);
         j.set("osd_snaps", 0u64);
         j.set("osd_screens", 0u64);
         j.set(

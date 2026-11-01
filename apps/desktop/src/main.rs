@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use decode::Decoder;
 use flightlog::capture::{self, Record};
 use flightlog::session::Session;
+use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_osd::{History, Snapshot};
@@ -144,10 +145,15 @@ struct Sink {
     log: Option<Session>,
     now_us: u64,
     shared: Arc<Shared>,
+    /// GS mode only: AU damage and decoder errors into IDR requests.
+    idr: Option<IdrDriver>,
 }
 
 impl CoreIo for Sink {
     fn on_au(&mut self, a: Au) {
+        if let Some(i) = self.idr.as_mut() {
+            i.on_au(&a, self.now_us);
+        }
         if let Some(l) = self.log.as_mut() {
             let _ = l.au(self.now_us, &a);
         }
@@ -195,7 +201,16 @@ impl CoreLoop {
         if let Some(l) = self.sink.log.as_mut() {
             let _ = l.tick(now);
         }
+        if let Some(i) = self.sink.idr.as_mut() {
+            i.on_decoder_errors(self.sink.shared.dec_errors.load(Ordering::Relaxed), now);
+        }
         self.core.tick(now, &mut self.sink);
+        if let Some(i) = self.sink.idr.as_mut() {
+            let evs = i.step(now, &mut *self.core);
+            if let Some(l) = self.sink.log.as_mut() {
+                let _ = l.refresh_events(&evs);
+            }
+        }
         // 10 Hz to the UI, 1 Hz to the flight log.
         if now >= self.last_stats_us + 100_000 {
             self.last_stats_us = now;
@@ -517,6 +532,7 @@ fn main() {
         log,
         now_us: 0,
         shared: shared.clone(),
+        idr: (o.mode == Some(Mode::Gs)).then(IdrDriver::default),
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -52,6 +52,8 @@ uint32_t pal_ref_frame_gap_timeout_ms(const pal_ref* r);
 size_t pal_ref_mav_take(pal_ref* r, uint8_t* out, size_t cap);
 // Local MAVLink peer bytes toward the drone (any boundary).
 void pal_ref_mav_push(pal_ref* r, const uint8_t* p, size_t n);
+// WebGs::set_idr_requests: the RCF idr_epoch byte becomes (uint8_t)n.
+void pal_ref_set_idr_requests(pal_ref* r, uint32_t n);
 // Writes the stats JSON line; returns its full length (excluding NUL). The
 // output is truncated (and NUL-terminated) when cap is too small.
 size_t pal_ref_stats_json(const pal_ref* r, char* buf, size_t cap);

@@ -161,6 +161,8 @@ void pal_ref_mav_push(pal_ref* r, const uint8_t* p, size_t n) {
   r->gs->mav_push_outbound(p, n);
 }
 
+void pal_ref_set_idr_requests(pal_ref* r, uint32_t n) { r->gs->set_idr_requests(n); }
+
 uint32_t pal_ref_frame_gap_timeout_ms(const pal_ref* r) {
   return static_cast<uint32_t>(r->cfg.video.frame_gap_timeout_ms);
 }

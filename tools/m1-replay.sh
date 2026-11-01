@@ -10,13 +10,18 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cargo build -q --release --manifest-path "$ROOT/Cargo.toml" -p pal
 PAL=$ROOT/target/release/pal
+CAPS=${PAL_CAPTURES:-$ROOT/captures}
+if [[ ! -f $CAPS/README.md ]]; then
+  echo "m1: no captures in $CAPS (they live outside git; set PAL_CAPTURES), skipped"
+  exit 0
+fi
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 fail=0
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 while IFS='|' read -r _ file _ mode _ _ expect _; do
   file=$(echo "$file" | xargs); mode=$(echo "$mode" | xargs); expect=$(echo "$expect" | xargs)
   [[ $file == *.bin ]] || continue
-  cap=$ROOT/captures/$file
+  cap=$CAPS/$file
   # A capture recorded under another pairing key carries it beside itself.
   CFG=$ROOT/configs/gs.toml
   if [[ -f ${cap%.bin}.key ]]; then
@@ -41,5 +46,16 @@ while IFS='|' read -r _ file _ mode _ _ expect _; do
       else echo "FAIL ref!=rust $m drop=$d $file"; fail=1; fi
     done
   done
-done < "$ROOT/captures/README.md"
+  # IDR request path (pal's IdrDriver into set_idr_requests) under loss.
+  for d in 10 35; do
+    ref_out=$("$PAL" replay "$cap" -c "$CFG" --mode gs --idr --drop-pct $d --seed 7 \
+      --aus "$TMP/r.aus" --sends "$TMP/r.sends")
+    out=$("$PAL" replay "$cap" -c "$CFG" --mode gs --core rust --idr --drop-pct $d --seed 7 \
+      --aus "$TMP/u.aus" --sends "$TMP/u.sends")
+    if cmp -s "$TMP/r.aus" "$TMP/u.aus" && cmp -s "$TMP/r.sends" "$TMP/u.sends" \
+      && [[ $(grep '^stats ' <<<"$ref_out") == $(grep '^stats ' <<<"$out") ]]; then
+      echo "ok   ref==rust gs --idr drop=$d $file ($(grep -o '"idr_req":[0-9]*' <<<"$out"))"
+    else echo "FAIL ref!=rust gs --idr drop=$d $file"; fail=1; fi
+  done
+done < "$CAPS/README.md"
 exit $fail
