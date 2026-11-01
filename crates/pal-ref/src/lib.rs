@@ -5,6 +5,7 @@
 //! Also exposes mabur's `FrameFileSource` (maburd `--dry-run --out` frame
 //! files) as the M0 replay input, until live captures exist.
 
+pub mod chan_trace;
 #[cfg(feature = "live")]
 pub mod live;
 

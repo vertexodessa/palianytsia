@@ -18,6 +18,10 @@ pal-wire = { workspace = true, optional = true }
 # (runtime::Attach): pal-desktop and the Android apps.
 live = ["dep:runtime", "dep:devourer-sys", "dep:pal-wire"]
 
+[dev-dependencies]
+pal-core = { workspace = true, features = ["fake"] }
+pal-wire.workspace = true
+
 [build-dependencies]
 cmake = "0.1"
 cc = "1"

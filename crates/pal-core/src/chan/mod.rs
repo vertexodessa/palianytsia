@@ -3,7 +3,7 @@
 //! `docs/channel-core-port.md`.
 pub mod boot;
 pub mod core;
-#[cfg(test)]
+#[cfg(any(test, feature = "fake"))]
 pub mod fake;
 pub mod gate;
 pub mod hop;

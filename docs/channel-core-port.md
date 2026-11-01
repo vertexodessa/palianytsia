@@ -30,7 +30,12 @@ is refused at start, never silently ignored.
    the Rust port; every `LinkCard` call and every `ChannelSink` event is
    written to a trace, and the two traces must be equal. Scenarios: the
    mabur `test_channel_core.cpp` rigs plus the live captures' channel
-   timelines.
+   timelines. As built: `cpp/chan_trace.cpp` hosts the C++ core over
+   `LinkCard`s that call back into Rust, so both cores run on the same
+   `chan::fake::FakeCard` type (feature `fake`). After every step the sink
+   records, card calls, tick outputs and vrx frames are compared; doubles
+   print with their bits, so equal means bit-equal. The live-capture
+   timelines are not scripted yet.
 3. Live: desktop `--core rust` with an auto config against the quad, then
    the APKs switch to the Rust core and pal-ref leaves the Android build.
 
@@ -41,6 +46,6 @@ is refused at start, never silently ignored.
 | 0 | scout_pick (87), channel_ranker (144), s1_loss (141), width_resync (35), scout_radio (80), nhm_busy, nhm_window, snr_units, channel_plan (259), hop_verdict (320) | done: `chan::{scout_pick,ranker,radio,plan,verdict}`, s1_loss was already in `link_health.rs`; 87 tests |
 | 1 | pair_pick (171), hop_ranker (171), hop_blank (80), hop_controller (537) | done: `chan::{pair,hop_ranker,hop}` (hop_blank lives in `hop`); 76 tests |
 | 2 | hop_burst_gate (117), boot_pick (241), channel_scout (598), window_sampler (262), inflight_scout (246) | done: `chan::{gate,boot,scout,sampler,inflight}`; calibration parts and relay survey not ported; 79 tests |
-| 3 | channel_core (1448), the WebGs wiring in `rust_core.rs`, the trace harness | |
+| 3 | channel_core (1448), the WebGs wiring in `rust_core.rs`, the trace harness | core done: `chan::core`, 36 tests (cal and relay cases dropped; the cal move-edge case kept as the hop hold); trace harness done: `crates/pal-ref/tests/chan_trace.rs` (12 scenarios + 200 random scripts, every record bit-equal); WebGs wiring open |
 | 4 | live test, APKs on the Rust core, pal-ref out of the Android build | |
 | 5 | review pass over the ported code: simplify, improve structure, hunt bugs (Ihor, 2026-11-01); findings that are also mabur bugs go to the fork | |

@@ -11,3 +11,8 @@ pal-wire.workspace = true
 pal-fec.workspace = true
 hevc.workspace = true
 toml = "0.8"
+
+[features]
+# chan::fake (the scripted test card) for other crates' tests: pal-ref's
+# ChannelCore trace harness.
+fake = []

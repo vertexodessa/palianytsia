@@ -56,6 +56,7 @@ fn main() {
         .std("c++20")
         .file("cpp/shim.cpp")
         .file("cpp/pal_card.cpp")
+        .file("cpp/chan_trace.cpp")
         .include("cpp")
         .include(mabur.join("web/src"))
         .include(mabur.join("gs/src"))

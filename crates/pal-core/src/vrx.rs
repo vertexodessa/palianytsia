@@ -460,7 +460,7 @@ impl VrxController {
     pub fn key_mismatch(&self) -> bool {
         self.rz.state() == VrxState::KeyMismatch
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fake"))]
     pub fn test_set_move_edge(&mut self) {
         self.move_edge = true;
     }
