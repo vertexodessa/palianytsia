@@ -210,30 +210,58 @@ pub struct IdrDriver {
     pub r: RefreshRequester,
     applied: u64,
     dec_err_seen: u64,
+    /// AUs seen so far; AU number n is the n-th `on_au` call (1-based).
+    aus: u64,
+    /// Number of the AU whose IRAP last cleared a request.
+    healed_at: u64,
     started: bool,
+    in_discont: bool,
 }
 
 impl IdrDriver {
     pub fn on_au(&mut self, a: &crate::Au, now_us: u64) {
+        self.aus += 1;
         let vcl = first_vcl_nal(&a.data);
+        let irap = a.sid == 0 && a.complete && !a.salvaged && (16..=21).contains(&vcl);
         // The player's "start" (maburgs take_refresh): a decoder that joins
         // mid-stream has no reference until an IRAP, and the encoder runs
-        // with no GOP, so ask unless the first AU is that IRAP.
-        if !self.started {
-            self.started = true;
-            let irap = a.sid == 0 && a.complete && !a.salvaged && (16..=21).contains(&vcl);
-            if !irap {
-                self.r.request(Reason::Start, now_us / 1000);
-            }
+        // with no GOP, so ask unless the first AU is that IRAP. The first AU
+        // of a DISCONT run (producer restart: new pts/frame_id base, maybe a
+        // new resolution) is the same join, as "resync".
+        let discont = a.flags & pal_wire::frame_wire::FLAG_DISCONT != 0;
+        let new_run = discont && !self.in_discont;
+        self.in_discont = discont;
+        if !irap && (!self.started || new_run) {
+            let r = if self.started {
+                Reason::Resync
+            } else {
+                Reason::Start
+            };
+            self.r.request(r, now_us / 1000);
         }
+        self.started = true;
+        let was_armed = self.r.armed();
         self.r
             .note_au(a.sid, a.complete, a.salvaged, vcl, 0, now_us / 1000);
+        if was_armed && !self.r.armed() {
+            self.healed_at = self.aus;
+        }
     }
-    /// The decoder's cumulative error count; any rise is one damage report.
-    pub fn on_decoder_errors(&mut self, total: u64, now_us: u64) {
+    /// AUs seen so far: the number to tag decoder work with.
+    pub fn aus(&self) -> u64 {
+        self.aus
+    }
+    /// The decoder's cumulative error count, and the number (`aus()` at
+    /// submit time) of the newest AU it had decoded when the count was
+    /// read. Any rise is one damage report, unless that AU went in before
+    /// the last clearing IRAP: a decoder behind a queue reports the old
+    /// chain's errors after the heal, and those need no new IDR.
+    pub fn on_decoder_errors(&mut self, total: u64, au: u64, now_us: u64) {
         if total > self.dec_err_seen {
             self.dec_err_seen = total;
-            self.r.request(Reason::Decoder, now_us / 1000);
+            if au >= self.healed_at {
+                self.r.request(Reason::Decoder, now_us / 1000);
+            }
         }
     }
     /// After each core tick: the retry clock, then the epoch into the core.
@@ -330,6 +358,53 @@ mod tests {
         // IdrDriver hands the core the cumulative count, which keeps going.
         let c = r.counters();
         assert_eq!(c.requests + c.retries, 256);
+    }
+
+    fn au(sid: u8, complete: bool, flags: u8, nal: u8) -> crate::Au {
+        crate::Au {
+            data: vec![0, 0, 0, 1, nal << 1, 1, 0xAA],
+            pts_us: 0,
+            sid,
+            flags,
+            complete,
+            salvaged: false,
+        }
+    }
+
+    #[test]
+    fn driver_start_resync_on_discont_run() {
+        let mut d = IdrDriver::default();
+        d.on_au(&au(0, true, 0, 1), 1_000);
+        assert!(d.r.armed());
+        d.on_au(&au(0, true, 0, 19), 2_000);
+        assert!(!d.r.armed());
+        // A producer restart that opens on a P picture: resync.
+        d.on_au(&au(0, true, 2, 1), 3_000);
+        assert!(d.r.armed());
+        assert_eq!(d.r.counters().by_reason[Reason::Resync as usize], 1);
+        // The rest of the run does not re-arm; one opening on an IRAP asks nothing.
+        d.on_au(&au(0, true, 2, 19), 4_000);
+        d.on_au(&au(0, true, 2, 1), 5_000);
+        d.on_au(&au(0, true, 0, 1), 6_000);
+        d.on_au(&au(0, true, 2, 19), 7_000);
+        assert!(!d.r.armed());
+        assert_eq!(d.r.counters().requests, 2);
+    }
+
+    #[test]
+    fn driver_ignores_decoder_errors_from_before_the_heal() {
+        let mut d = IdrDriver::default();
+        d.on_au(&au(0, false, 0, 1), 1_000); // start + hole
+        d.on_au(&au(0, true, 0, 1), 2_000);
+        d.on_au(&au(0, true, 0, 19), 3_000); // AU 3 heals
+        assert!(!d.r.armed());
+        // The queued decoder reports errors from AU 2 after the heal.
+        d.on_decoder_errors(4, 2, 3_500);
+        assert!(!d.r.armed());
+        // Damage on the IRAP itself or later is real.
+        d.on_decoder_errors(5, 3, 3_600);
+        assert!(d.r.armed());
+        assert_eq!(d.r.counters().by_reason[Reason::Decoder as usize], 1);
     }
 
     #[test]

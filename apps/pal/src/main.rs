@@ -231,7 +231,9 @@ impl CoreIo for Sink {
         if let Some(d) = self.dec.as_mut() {
             decode::Decoder::decode(d, &a.data);
             if let Some(i) = self.idr.as_mut() {
-                i.on_decoder_errors(decode::Decoder::counters(d).1, self.now_us);
+                // Synchronous decode: the errors are this AU's.
+                let n = i.aus();
+                i.on_decoder_errors(decode::Decoder::counters(d).1, n, self.now_us);
             }
         }
         self.aus += 1;

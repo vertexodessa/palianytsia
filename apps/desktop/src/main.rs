@@ -8,6 +8,7 @@
 //!   pal-desktop -c gs.toml --live --ch 144 --width 40 [--mode gs] [--card N]
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
+//!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
 //!
 //! `--snapshot` saves one rendered window after N seconds and quits: the
 //! headless check that video and OSD actually draw.
@@ -45,6 +46,9 @@ struct Opts {
     snapshot: Option<PathBuf>,
     secs: f64,
     mav_udp: Option<String>,
+    /// Live: IDR requests on (`--no-idr` off). Replay: off (`--idr` on),
+    /// as `pal replay`, so one capture gives the same stats in both apps.
+    idr: Option<bool>,
 }
 
 fn die(msg: &str) -> ! {
@@ -86,6 +90,8 @@ fn parse() -> Opts {
             "--snapshot" => o.snapshot = Some(val().into()),
             "--secs" => o.secs = val().parse().unwrap_or_else(|_| die("--secs")),
             "--mav-udp" => o.mav_udp = Some(val()),
+            "--idr" => o.idr = Some(true),
+            "--no-idr" => o.idr = Some(false),
             s => die(&format!("unknown argument {s}")),
         }
     }
@@ -126,7 +132,13 @@ struct Shared {
     au_dropped: AtomicU64,
     frames: AtomicU64,
     dec_errors: AtomicU64,
+    /// Sink AU number of the AU decoded when `dec_errors` last rose.
+    dec_err_au: AtomicU64,
     ended: AtomicBool,
+    /// The window closed: the core loop returns, so the flight log flushes.
+    quit: AtomicBool,
+    /// The core loop has returned and dropped its Session.
+    core_done: AtomicBool,
 }
 
 struct Frame {
@@ -137,7 +149,8 @@ struct Frame {
 }
 
 struct Sink {
-    au_tx: SyncSender<Vec<u8>>,
+    /// AUs to the decoder, tagged with their number (`IdrDriver::aus`).
+    au_tx: SyncSender<(u64, Vec<u8>)>,
     mav_tx: SyncSender<Vec<u8>>,
     /// GCS bridge: inbound packets go to `peer`, whatever it sends comes back.
     udp: Option<(std::net::UdpSocket, std::net::SocketAddr)>,
@@ -151,13 +164,14 @@ struct Sink {
 
 impl CoreIo for Sink {
     fn on_au(&mut self, a: Au) {
-        if let Some(i) = self.idr.as_mut() {
+        let n = self.idr.as_mut().map_or(0, |i| {
             i.on_au(&a, self.now_us);
-        }
+            i.aus()
+        });
         if let Some(l) = self.log.as_mut() {
             let _ = l.au(self.now_us, &a);
         }
-        if let Err(TrySendError::Full(_)) = self.au_tx.try_send(a.data) {
+        if let Err(TrySendError::Full(_)) = self.au_tx.try_send((n, a.data)) {
             self.shared.au_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -202,7 +216,11 @@ impl CoreLoop {
             let _ = l.tick(now);
         }
         if let Some(i) = self.sink.idr.as_mut() {
-            i.on_decoder_errors(self.sink.shared.dec_errors.load(Ordering::Relaxed), now);
+            // Errors first (Acquire pairs with the decoder's Release): the AU
+            // number read after it is the same rise's or a newer one.
+            let sh = &self.sink.shared;
+            let e = sh.dec_errors.load(Ordering::Acquire);
+            i.on_decoder_errors(e, sh.dec_err_au.load(Ordering::Relaxed), now);
         }
         self.core.tick(now, &mut self.sink);
         if let Some(i) = self.sink.idr.as_mut() {
@@ -248,15 +266,19 @@ fn run_replay(mut cl: CoreLoop, o: &Opts, path: PathBuf, repaint: egui::Context)
             };
             let base = *t0.get_or_insert(t);
             let due = Duration::from_micros(t.saturating_sub(base));
-            if let Some(w) = due.checked_sub(wall0.elapsed()) {
-                std::thread::sleep(w);
+            // In slices, so a closed window is noticed inside a long gap.
+            while let Some(w) = due.checked_sub(wall0.elapsed()) {
+                if cl.sink.shared.quit.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(w.min(Duration::from_millis(50)));
             }
             match rec {
                 Record::Body(b) => cl.rx(&b),
                 Record::Tick(t) => cl.tick(t),
             }
         }
-        if !o.looping {
+        if !o.looping || cl.sink.shared.quit.load(Ordering::Relaxed) {
             break;
         }
         // A new pass is a new session: fresh core, as after a restart.
@@ -322,11 +344,14 @@ fn run_live(mut cl: CoreLoop, o: Opts) {
             cl.tick(now);
             next_tick = now + TICK_US;
         }
+        if cl.sink.shared.quit.load(Ordering::Relaxed) {
+            return;
+        }
     }
 }
 
 fn run_decode(
-    au_rx: Receiver<Vec<u8>>,
+    au_rx: Receiver<(u64, Vec<u8>)>,
     out: Arc<Mutex<Option<Frame>>>,
     shared: Arc<Shared>,
     repaint: egui::Context,
@@ -334,13 +359,19 @@ fn run_decode(
     let mut dec = decode::AvDecoder::open(0).unwrap_or_else(|e| die(&format!("decode: {e}")));
     let mut buf = Vec::new();
     let mut seq = 0u64;
-    while let Ok(au) = au_rx.recv() {
-        if dec.decode(&au) == 0 {
+    let mut errs = 0;
+    while let Ok((n, au)) = au_rx.recv() {
+        let got = dec.decode(&au);
+        let (f, e) = dec.counters();
+        if e > errs {
+            errs = e;
+            shared.dec_err_au.store(n, Ordering::Relaxed);
+            shared.dec_errors.store(e, Ordering::Release);
+        }
+        if got == 0 {
             continue;
         }
-        let (f, e) = dec.counters();
         shared.frames.store(f, Ordering::Relaxed);
-        shared.dec_errors.store(e, Ordering::Relaxed);
         if let Some((w, h)) = dec.rgba(&mut buf) {
             seq += 1;
             let mut slot = out.lock().unwrap_or_else(|p| p.into_inner());
@@ -499,7 +530,7 @@ fn main() {
     // Every dropped AU breaks the reference chain until the next intra
     // refresh (a 2-slot queue dropped 6 AUs at replay start and the
     // decoder logged missing POCs), so the queue absorbs decoder warm-up.
-    let (au_tx, au_rx) = mpsc::sync_channel::<Vec<u8>>(8);
+    let (au_tx, au_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(8);
     let (stats_tx, stats_rx) = mpsc::sync_channel::<String>(64);
     let (mav_tx, mav_rx) = mpsc::sync_channel::<Vec<u8>>(256);
     let udp = o.mav_udp.as_ref().map(|a| {
@@ -532,7 +563,7 @@ fn main() {
         log,
         now_us: 0,
         shared: shared.clone(),
-        idr: (o.mode == Some(Mode::Gs)).then(IdrDriver::default),
+        idr: (o.mode == Some(Mode::Gs) && o.idr.unwrap_or(o.live)).then(IdrDriver::default),
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -541,6 +572,7 @@ fn main() {
         ..Default::default()
     };
     let snapshot = o.snapshot.clone().map(|p| (p, o.secs));
+    let shared_main = shared.clone();
     let res = eframe::run_native(
         "Palianytsia",
         native,
@@ -567,10 +599,13 @@ fn main() {
                             last_stats_us: 0,
                             last_log_us: 0,
                         };
+                        let shared = cl.sink.shared.clone();
                         match o.replay.clone() {
                             Some(p) => run_replay(cl, &o, p, ctx),
                             None => run_live(cl, o),
                         }
+                        // `cl` (and its Session) is dropped by now.
+                        shared.core_done.store(true, Ordering::Release);
                     })
                     .expect("core thread");
             }
@@ -592,6 +627,13 @@ fn main() {
             }))
         }),
     );
+    // The process exit would skip the core thread's drops: the flight log's
+    // buffered tail was lost on every window close (and on --snapshot).
+    shared_main.quit.store(true, Ordering::Relaxed);
+    let until = Instant::now() + Duration::from_secs(2);
+    while !shared_main.core_done.load(Ordering::Acquire) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     if let Err(e) = res {
         die(&format!("eframe: {e}"));
     }
