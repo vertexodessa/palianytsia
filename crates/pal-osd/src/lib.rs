@@ -1,6 +1,7 @@
 //! OSD widgets (spec section 6) drawn from the core's `stats_json` line, so
 //! every app and both cores share one OSD. Reads only the snapshot it is
 //! handed: no locks toward the RX or core path.
+pub mod cal;
 pub mod hud;
 pub mod panel;
 pub mod params;
@@ -45,6 +46,8 @@ pub struct Snapshot {
     pub nack_fill_pps: Option<f64>,
     /// Rust core only (`GsCore::ladder_json`, merged in by the app).
     pub ladder: Option<Ladder>,
+    /// The TX-power calibration block (UI stats line only).
+    pub cal: Option<cal::CalView>,
 }
 
 /// What the next rung promote waits on (`GsCore::ladder_json`).
@@ -196,6 +199,7 @@ impl Snapshot {
                 .and_then(|n| n.get("fill_pps"))
                 .and_then(Value::as_f64),
             ladder: v.get("ladder").and_then(Ladder::parse),
+            cal: v.get("cal").and_then(cal::CalView::parse),
         })
     }
 }
@@ -403,8 +407,12 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
         return;
     };
     ui.horizontal_wrapped(|ui| {
+        let cal = s.cal.as_ref().and_then(cal::CalView::hud_line);
         let (link, c) = if s.key_mismatch {
             ("KEY MISMATCH".to_string(), BAD)
+        } else if let Some(line) = cal {
+            // A run owns the air: no video until it ends, by design.
+            (line, WARN)
         } else if s.mode == "spotter" {
             (format!("spotter MCS{} {}M", s.mcs, s.bw), OK)
         } else if s.session {

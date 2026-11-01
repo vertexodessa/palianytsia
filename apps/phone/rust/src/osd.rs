@@ -226,6 +226,7 @@ pub fn run(o: OsdIn) {
                         "{}\n\nadb pull /sdcard/Android/data/org.palianytsia.phone/files/logs",
                         o.log_info
                     ),
+                    cal: hist.last().and_then(|s| s.cal.as_ref()),
                 },
             );
             egui::CentralPanel::default()

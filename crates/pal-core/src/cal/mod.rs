@@ -9,9 +9,11 @@ use session::{sweep_token, CalSnapshot};
 
 /// The UI's view of a run (maburgs' sideport link.cal plus the result
 /// table `maburcal` prints): one JSON object.
-pub fn status_json(s: &CalSnapshot, sweeps: &[pal_wire::cal::SweepSpec]) -> String {
+/// `capable`: linked to a drone that advertises CAP_CALIBRATE.
+pub fn status_json(s: &CalSnapshot, sweeps: &[pal_wire::cal::SweepSpec], capable: bool) -> String {
     let mut j = J::obj();
     j.set("state", s.state.name());
+    j.set("capable", capable);
     j.set("running", s.state.running());
     j.set(
         "sweep_k",

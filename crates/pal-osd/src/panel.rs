@@ -47,6 +47,8 @@ pub struct Panel {
     pub tab: Tab,
     /// Phone: steppers and presets instead of text fields.
     pub touch: bool,
+    /// Calibrate pressed, waiting for the confirm.
+    pub cal_confirm: bool,
 }
 
 /// What the panel needs from the app, and the facts it shows read-only.
@@ -58,6 +60,8 @@ pub struct PanelIn<'a> {
     pub link_info: String,
     /// Where flight logs go, or why there are none.
     pub log_info: String,
+    /// The calibration block from the latest stats line.
+    pub cal: Option<&'a crate::cal::CalView>,
 }
 
 #[derive(Default)]
@@ -363,6 +367,12 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                             }
                             Tab::Osd => out.prefs_changed = osd_ui(ui, i.prefs),
                             Tab::Drone => {
+                                if let Some(c) =
+                                    crate::cal::ui(ui, i.cal, &mut p.cal_confirm, touch)
+                                {
+                                    out.cmd = Some(c);
+                                }
+                                ui.separator();
                                 if let Some(t) = i.table {
                                     ui.horizontal(|ui| {
                                         let alive = match t.alive {

@@ -250,7 +250,7 @@ fn run_replay(mut cl: CoreLoop, o: &Opts, path: PathBuf, repaint: egui::Context)
             break;
         }
         // A new pass is a new session: fresh core, as after a restart.
-        cl.core = make_core(o, 0);
+        cl.set_core(make_core(o, 0));
         cl.last_stats_us = 0;
     }
     if let Some(l) = cl.sink.log.as_mut() {
@@ -463,6 +463,7 @@ impl eframe::App for App {
                 prefs: &mut self.prefs,
                 link_info: format!("{}, key {key}", self.shared.radio_label(self.radio.1)),
                 log_info: self.log_info.clone(),
+                cal: self.hist.last().and_then(|s| s.cal.as_ref()),
             },
         );
         if let Some(c) = out.cmd {
@@ -729,6 +730,7 @@ fn main() {
                             stall_mark: (0, 0),
                             last_stats_us: 0,
                             last_log_us: 0,
+                            cal: Default::default(),
                         };
                         let shared = cl.sink.shared.clone();
                         match o.replay.clone() {
@@ -796,6 +798,7 @@ fn main() {
                         Default::default()
                     },
                     touch: false,
+                    cal_confirm: false,
                 },
                 prefs: pal_osd::prefs::HudPrefs::load(&prefs_path),
                 prefs_path: prefs_path.clone(),

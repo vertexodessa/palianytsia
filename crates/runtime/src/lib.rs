@@ -186,9 +186,74 @@ pub struct CoreLoop {
     pub stall_mark: (u64, u64),
     pub last_stats_us: u64,
     pub last_log_us: u64,
+    /// Calibration bookkeeping the core does not keep.
+    pub cal: CalUi,
+}
+
+/// What the loop adds around the core's calibration: the last start's
+/// refusal for the UI, the last state for the flight-log events, and
+/// whether the current core has been told where cal.log goes.
+#[derive(Default)]
+pub struct CalUi {
+    pub refusal: Option<String>,
+    pub last_state: String,
+    pub log_dir_set: bool,
 }
 
 impl CoreLoop {
+    /// Swaps in a new core (a remake after a search, the channel core's
+    /// attach, a replay pass); it is told where cal.log goes at its first tick.
+    pub fn set_core(&mut self, core: Box<dyn GsCore>) {
+        self.core = core;
+        self.cal.log_dir_set = false;
+        self.cal.last_state.clear();
+    }
+
+    fn cal_cmd(&mut self, start: bool) {
+        let r = if start {
+            self.core.cal_start(&[])
+        } else {
+            self.core.cal_abort();
+            Ok(())
+        };
+        eprintln!(
+            "pal: calibration {}: {r:?}",
+            if start { "start" } else { "abort" }
+        );
+        self.sink.shared.event(
+            if start { "cal_start" } else { "cal_abort" },
+            serde_json::json!({"result": match &r { Ok(()) => "ok".to_string(), Err(e) => e.clone() }}),
+        );
+        self.cal.refusal = r.err();
+    }
+
+    /// The core's calibration JSON with the refusal spliced in; a state
+    /// change goes to the flight log (with the result table on the way out).
+    fn cal_line(&mut self) -> Option<String> {
+        let j = self.core.cal_json()?;
+        let v: serde_json::Value = serde_json::from_str(&j).ok()?;
+        let st = v
+            .get("state")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        if st != self.cal.last_state {
+            if !self.cal.last_state.is_empty() || st != "idle" {
+                eprintln!("pal: calibration {} -> {st}", self.cal.last_state);
+                self.sink.shared.event("cal", v.clone());
+            }
+            self.cal.last_state = st;
+        }
+        match &self.cal.refusal {
+            Some(r) if j.ends_with('}') => Some(format!(
+                "{},\"refusal\":{}}}",
+                &j[..j.len() - 1],
+                serde_json::Value::from(r.as_str())
+            )),
+            _ => Some(j),
+        }
+    }
+
     pub fn rx(&mut self, b: &RxBody) {
         self.sink.now_us = b.mono_us;
         if let Some(l) = self.sink.log.as_mut() {
@@ -239,6 +304,14 @@ impl CoreLoop {
                     let _ = self.set_res_tx.try_send((row, r));
                 }
                 pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
+                pal_osd::params::Cmd::CalStart => self.cal_cmd(true),
+                pal_osd::params::Cmd::CalAbort => self.cal_cmd(false),
+            }
+        }
+        if !self.cal.log_dir_set {
+            self.cal.log_dir_set = true;
+            if let Some(l) = self.sink.log.as_ref() {
+                self.core.set_cal_log_dir(l.dir());
             }
         }
         self.core.tick(now, &mut self.sink);
@@ -272,12 +345,17 @@ impl CoreLoop {
                 .and_then(|v| v.parse().ok());
             // The ladder view goes to the UI only: the flight log keeps the
             // webgs stats line both cores agree on.
-            let ui_line = match self.core.ladder_json() {
+            let mut ui_line = match self.core.ladder_json() {
                 Some(l) if line.ends_with('}') => {
                     format!("{},\"ladder\":{l}}}", &line[..line.len() - 1])
                 }
                 _ => line,
             };
+            if let Some(c) = self.cal_line() {
+                if ui_line.ends_with('}') {
+                    ui_line = format!("{},\"cal\":{c}}}", &ui_line[..ui_line.len() - 1]);
+                }
+            }
             let _ = self.stats_tx.try_send(ui_line);
         }
         if now >= self.last_lat_us + 1_000_000 {
@@ -532,7 +610,7 @@ pub fn run_live(
     let mut tap_now: Option<Arc<dyn RxTap>> = None;
     if let Some(a) = attach {
         let at = a(&card)?;
-        cl.core = at.core;
+        cl.set_core(at.core);
         clock = at.clock;
         tap_now = Some(at.tap.clone());
         let _ = tap.set((at.tap, at.clock));
@@ -575,7 +653,8 @@ fn live_loop(
         };
         if ch != *core_ch {
             let remake = o.remake.as_mut().expect("remake");
-            cl.core = remake(ch)?;
+            let core = remake(ch)?;
+            cl.set_core(core);
             *core_ch = ch;
         }
         Ok(true)

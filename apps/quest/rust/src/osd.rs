@@ -281,6 +281,7 @@ impl Osd {
                     prefs,
                     link_info: link_info.clone(),
                     log_info: log_info.clone(),
+                    cal: hist.last().and_then(|s| s.cal.as_ref()),
                 },
             );
             let prefs = &*prefs;

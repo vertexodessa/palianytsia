@@ -1011,7 +1011,9 @@ impl GsCore for RustCore {
 
     fn cal_json(&self) -> Option<String> {
         let g = self.gs.as_ref()?;
-        Some(cal_status_json(&g.cal.snapshot(), g.cal.sweeps()))
+        let capable =
+            g.vrx.link_state() == VrxState::Session && g.vrx.peer_caps() & rc::CAP_CALIBRATE != 0;
+        Some(cal_status_json(&g.cal.snapshot(), g.cal.sweeps(), capable))
     }
 
     fn set_cal_log_dir(&mut self, dir: &std::path::Path) {

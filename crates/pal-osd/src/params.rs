@@ -71,6 +71,9 @@ impl Table {
 pub enum Cmd {
     Set(usize, String),
     Refresh,
+    /// TX-power calibration with the default sweeps (pal_core::cal).
+    CalStart,
+    CalAbort,
 }
 
 /// Per-row edit buffers (empty: the current value shows as a hint) and the

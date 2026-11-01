@@ -140,6 +140,7 @@ impl Link {
             stall_mark: (0, 0),
             last_stats_us: 0,
             last_log_us: 0,
+            cal: Default::default(),
         };
         let sh = shared.clone();
         let dec_t = std::thread::Builder::new()
