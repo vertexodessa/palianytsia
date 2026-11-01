@@ -11,14 +11,32 @@ android {
         // on API 32 (spikes/quest-xr-probe).
         minSdk 32
         targetSdk 32
-        versionCode 1
-        versionName "0.0.1"
+        versionCode 2
+        versionName "0.1.0"
         ndk { abiFilters "arm64-v8a" }
+    }
+    // Release signing from a properties file outside the repo (storeFile,
+    // storePassword, keyAlias, keyPassword): $PAL_SIGNING, else
+    // ~/.config/palianytsia/release-signing.properties. Without it the
+    // release APK comes out unsigned, never debug-signed.
+    def signing = file(System.getenv("PAL_SIGNING") ?:
+            "${System.getProperty('user.home')}/.config/palianytsia/release-signing.properties")
+    signingConfigs {
+        release {
+            if (signing.exists()) {
+                def p = new Properties()
+                signing.withInputStream { p.load(it) }
+                storeFile file(p.storeFile)
+                storePassword p.storePassword
+                keyAlias p.keyAlias
+                keyPassword p.keyPassword
+            }
+        }
     }
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            if (signing.exists()) signingConfig signingConfigs.release
         }
     }
     // libpalquest is built by cargo (tools/quest-apk.sh), not here.

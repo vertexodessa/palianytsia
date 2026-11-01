@@ -56,7 +56,12 @@ pairing key.
   ticked while sweeping. Events `search`, `drone_found`, `drone_lost`. Pinned configs never sweep;
   pal-desktop sweeps only with `--core rust` and no `--ch`; with `--core ref`, an auto config and no
   `--ch` it runs mabur's own ChannelCore on the card (`runtime::LiveCfg::attach`: prelude ranking,
-  boot pick, relocation, in-flight hops, transmitting through the card; its clock is `pal_ref::now_us`). `gs.toml` stays pinned for the parity gates.
+  boot pick, relocation, in-flight hops, transmitting through the card; its clock is `pal_ref::now_us`).
+  The phone/Quest APKs do the same for an auto config (`pal_ref::live`, pal-ref cross-built for aarch64).
+- Release APKs: `PAL_RELEASE=1 tools/{phone,quest}-apk.sh`, signed from
+  `~/.config/palianytsia/release-signing.properties` (key `~/.android/palianytsia-release.jks`, never in the
+  repo; without it the APK is unsigned). v0.1 package: `dist/palianytsia-v0.1/` (drone maburd from mabur
+  `release/v0.1` = `palianytsia/base` minus the bench `/sim` commit). `gs.toml` stays pinned for the parity gates.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.

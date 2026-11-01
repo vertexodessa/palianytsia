@@ -3,8 +3,9 @@
 # libc++_shared and Khronos' libopenxr_loader next to it, the GS config as
 # the gs.toml asset, then Gradle. The loader comes from the Maven Central
 # AAR (prefab only, so Gradle would not package it), cached in target/.
-#   tools/quest-apk.sh [config.toml]   (default configs/bench-ch40.toml)
-# Out: apps/quest/android/app/build/outputs/apk/debug/app-debug.apk
+#   tools/quest-apk.sh [config.toml]   (default configs/gs-auto.toml)
+#   PAL_RELEASE=1: release APK signed with the release key (app/build.gradle)
+# Out (debug): apps/quest/android/app/build/outputs/apk/debug/app-debug.apk
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CFG=${1:-$ROOT/configs/gs-auto.toml}
@@ -29,5 +30,10 @@ unzip -o -j -q "$AAR" prefab/modules/openxr_loader/libs/android.arm64-v8a/libope
   -d "$A/jniLibs/arm64-v8a/"
 cd "$ROOT/apps/quest/android"
 [[ -f local.properties ]] || echo "sdk.dir=$HOME/Android/Sdk" > local.properties
-./gradlew -q assembleDebug
-ls -la app/build/outputs/apk/debug/app-debug.apk
+if [[ ${PAL_RELEASE:-0} == 1 ]]; then
+  ./gradlew -q assembleRelease
+  ls -la app/build/outputs/apk/release/app-release.apk
+else
+  ./gradlew -q assembleDebug
+  ls -la app/build/outputs/apk/debug/app-debug.apk
+fi
