@@ -1,6 +1,7 @@
 //! OSD widgets (spec section 6) drawn from the core's `stats_json` line, so
 //! every app and both cores share one OSD. Reads only the snapshot it is
 //! handed: no locks toward the RX or core path.
+pub mod params;
 pub mod telem;
 
 use std::collections::VecDeque;

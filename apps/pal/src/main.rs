@@ -9,6 +9,7 @@
 //!   pal replay <bodies.bin> -c gs.toml [--mode gs|spotter] [--dump out.h265]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
+//!              [--param-set T_S,ROW,TEXT ...]   F18 sets; prints `param` results and `params`
 //!   pal log    <fl-NNNN_...>   summarise one flight-log directory
 //!
 //! Gs mode transmits: the core's RC frames (DISC, RCF, NACK, refresh) go out
@@ -49,6 +50,8 @@ struct Opts {
     decode: bool,
     /// libavcodec hwaccel for `--decode` ("vdpau", "vaapi", "cuda"); "" = software.
     hwdec: String,
+    /// Replay: parameter sets `T_S,ROW,TEXT` (seconds after the first tick).
+    param_sets: Vec<(f64, usize, String)>,
     capture_mb: u64,
     mode: Option<Mode>,
     rust: bool,
@@ -86,6 +89,18 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--log-dir" => o.log_dir = Some(val().into()),
             "--decode" => o.decode = true,
             "--hwdec" => o.hwdec = val(),
+            "--param-set" => {
+                let v = val();
+                let mut it = v.splitn(3, ',');
+                let (Some(t), Some(r), Some(x)) = (it.next(), it.next(), it.next()) else {
+                    die("--param-set T_S,ROW,TEXT")
+                };
+                o.param_sets.push((
+                    t.parse().unwrap_or_else(|_| die("--param-set T_S")),
+                    r.parse().unwrap_or_else(|_| die("--param-set ROW")),
+                    x.to_string(),
+                ));
+            }
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
             "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
@@ -491,6 +506,11 @@ fn replay(o: Opts) {
         .unwrap_or_else(|e| die(&e.to_string()));
     let (mut bodies, mut ticks, mut dropped) = (0u64, 0u64, 0u64);
     let mut last_stats = 0u64;
+    let mut t_first: Option<u64> = None;
+    let mut sets = o.param_sets.clone();
+    sets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut sets = sets.into_iter().peekable();
+    let mut last_t = 0u64;
     // Synthetic loss: splitmix64 on a fixed seed, so both cores see the
     // same surviving bodies.
     let mut rng = o.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -515,6 +535,14 @@ fn replay(o: Opts) {
             Record::Tick(t) => {
                 ticks += 1;
                 sink.now_us = t;
+                last_t = t;
+                let t0 = *t_first.get_or_insert(t);
+                while let Some((ts, row, text)) =
+                    sets.next_if(|(ts, _, _)| t >= t0 + (*ts * 1e6) as u64)
+                {
+                    let r = core.param_set(row, &text);
+                    println!("param t={ts} row={row} text={text} -> {r:?}");
+                }
                 core.tick(t, &mut sink);
                 sink.idr_step(t, &mut *core);
                 sink.log_stats(t, &mut last_stats, &*core);
@@ -531,6 +559,9 @@ fn replay(o: Opts) {
         println!("decode frames={f} errors={e} hw_frames={}", d.hw_frames());
     }
     println!("stats {}", core.stats_json());
+    if o.mode == Some(Mode::Gs) {
+        println!("params {}", core.params_json(last_t));
+    }
 }
 
 fn log_summary(o: Opts) {

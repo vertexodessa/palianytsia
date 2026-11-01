@@ -5,7 +5,9 @@
 #  3. ref and Rust must agree byte for byte, AUs and (GS) transmitted RC
 #     bodies, in both modes on every capture at 0/10/20/35 % synthetic body
 #     loss (same seed, same surviving bodies), and so must the final stats
-#     line (webgs::stats_json key for key, nlohmann's number spelling).
+#     line (webgs::stats_json key for key, nlohmann's number spelling) and,
+#     in GS, the parameter table (webgs::params_json);
+#  4. the F18 set path: the same --param-set script into both cores.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cargo build -q --release --manifest-path "$ROOT/Cargo.toml" -p pal
@@ -42,7 +44,7 @@ while IFS='|' read -r _ file _ mode _ _ expect _; do
       out=$("$PAL" replay "$cap" -c "$CFG" --mode $m --core rust --drop-pct $d --seed 7 \
         --aus "$TMP/u.aus" --sends "$TMP/u.sends")
       if cmp -s "$TMP/r.aus" "$TMP/u.aus" && cmp -s "$TMP/r.sends" "$TMP/u.sends" \
-        && [[ $(grep '^stats ' <<<"$ref_out") == $(grep '^stats ' <<<"$out") ]]; then
+        && [[ $(grep -E '^(stats|params) ' <<<"$ref_out") == "$(grep -E '^(stats|params) ' <<<"$out")" ]]; then
         echo "ok   ref==rust $m drop=$d $file ($(grep -o 'aus=[0-9]* truncated=[0-9]*.*sends=[0-9]*' <<<"$out" | sed 's/ au_bytes=[0-9]*//'))"
       else echo "FAIL ref!=rust $m drop=$d $file"; fail=1; fi
     done
@@ -54,9 +56,20 @@ while IFS='|' read -r _ file _ mode _ _ expect _; do
     out=$("$PAL" replay "$cap" -c "$CFG" --mode gs --core rust --idr --drop-pct $d --seed 7 \
       --aus "$TMP/u.aus" --sends "$TMP/u.sends")
     if cmp -s "$TMP/r.aus" "$TMP/u.aus" && cmp -s "$TMP/r.sends" "$TMP/u.sends" \
-      && [[ $(grep '^stats ' <<<"$ref_out") == $(grep '^stats ' <<<"$out") ]]; then
+      && [[ $(grep '^stats ' <<<"$ref_out") == "$(grep '^stats ' <<<"$out")" ]]; then
       echo "ok   ref==rust gs --idr drop=$d $file ($(grep -o '"idr_req":[0-9]*' <<<"$out"))"
     else echo "FAIL ref!=rust gs --idr drop=$d $file"; fail=1; fi
   done
+  # F18: a set, a refused set while it is pending, a bad value, a refresh-
+  # free late set; sends, refusals and the final table must agree.
+  PS=(--param-set 5,4,9000 --param-set 6,99,1 --param-set 20,1,maybe --param-set 32,0,2.5)
+  ref_out=$("$PAL" replay "$cap" -c "$CFG" --mode gs --drop-pct 10 --seed 7 "${PS[@]}" \
+    --sends "$TMP/r.sends")
+  out=$("$PAL" replay "$cap" -c "$CFG" --mode gs --core rust --drop-pct 10 --seed 7 "${PS[@]}" \
+    --sends "$TMP/u.sends")
+  if cmp -s "$TMP/r.sends" "$TMP/u.sends" \
+    && [[ $(grep -E '^(param|params|stats) ' <<<"$ref_out") == "$(grep -E '^(param|params|stats) ' <<<"$out")" ]]; then
+    echo "ok   ref==rust gs --param-set $file ($(grep -o '"list":"[a-z]*"' <<<"$out"))"
+  else echo "FAIL ref!=rust gs --param-set $file"; fail=1; fi
 done < "$CAPS/README.md"
 exit $fail

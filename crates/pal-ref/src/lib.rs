@@ -58,6 +58,16 @@ extern "C" {
     fn pal_ref_mav_take(r: *mut PalRefRaw, out: *mut u8, cap: usize) -> usize;
     fn pal_ref_mav_push(r: *mut PalRefRaw, p: *const u8, n: usize);
     fn pal_ref_set_idr_requests(r: *mut PalRefRaw, n: u32);
+    fn pal_ref_params_json(r: *const PalRefRaw, now_us: u64, buf: *mut c_char, cap: usize)
+        -> usize;
+    fn pal_ref_param_set(
+        r: *mut PalRefRaw,
+        row: usize,
+        text: *const c_char,
+        why: *mut c_char,
+        cap: usize,
+    ) -> c_int;
+    fn pal_ref_param_refresh(r: *mut PalRefRaw);
     fn pal_ref_stats_json(r: *const PalRefRaw, buf: *mut c_char, cap: usize) -> usize;
 
     fn pal_ffs_open(
@@ -236,6 +246,33 @@ impl GsCore for RefCore {
 
     fn set_idr_requests(&mut self, n: u32) {
         unsafe { pal_ref_set_idr_requests(self.raw, n) };
+    }
+
+    fn params_json(&self, now_us: u64) -> String {
+        let n = unsafe { pal_ref_params_json(self.raw, now_us, std::ptr::null_mut(), 0) };
+        let mut buf = vec![0 as c_char; n + 1];
+        unsafe { pal_ref_params_json(self.raw, now_us, buf.as_mut_ptr(), buf.len()) };
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn param_set(&mut self, row: usize, text: &str) -> Result<(), String> {
+        let text = CString::new(text).map_err(|_| "bad value".to_string())?;
+        let mut why = [0 as c_char; 256];
+        let ok =
+            unsafe { pal_ref_param_set(self.raw, row, text.as_ptr(), why.as_mut_ptr(), why.len()) };
+        if ok == 1 {
+            Ok(())
+        } else {
+            Err(unsafe { CStr::from_ptr(why.as_ptr()) }
+                .to_string_lossy()
+                .into_owned())
+        }
+    }
+
+    fn param_refresh(&mut self) {
+        unsafe { pal_ref_param_refresh(self.raw) };
     }
 
     fn stats_json(&self) -> String {

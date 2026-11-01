@@ -623,6 +623,29 @@ impl GsCore for RustCore {
         }
     }
 
+    fn params_json(&self, now_us: u64) -> String {
+        params_json(self.gs.as_ref().map(|g| &g.params), now_us / 1000)
+    }
+
+    fn param_set(&mut self, row: usize, text: &str) -> Result<(), String> {
+        let now_ms = self.now_us / 1000;
+        let Some(g) = self.gs.as_mut() else {
+            return Err("not linked".into());
+        };
+        let r = g.params.set(row, text, now_ms);
+        // WebGs's client pushes onto the tunnel as it sends.
+        g.drain_params();
+        r
+    }
+
+    fn param_refresh(&mut self) {
+        let now_ms = self.now_us / 1000;
+        if let Some(g) = self.gs.as_mut() {
+            g.params.refresh(now_ms);
+            g.drain_params();
+        }
+    }
+
     fn mav_push_outbound(&mut self, bytes: &[u8]) {
         if let Some(g) = self.gs.as_mut() {
             g.mav.push_outbound(bytes);
@@ -746,4 +769,86 @@ impl GsCore for RustCore {
         );
         j.dump()
     }
+}
+
+/// `webgs::params_json`: the table with the client's state, or (Spotter,
+/// no client) the static table with every value unknown.
+fn params_json(pc: Option<&ParamClient>, now_ms: u64) -> String {
+    use crate::mav::{Apply, ListState, PType, RowState, TABLE};
+    fn ty(t: PType) -> &'static str {
+        match t {
+            PType::Bool => "bool",
+            PType::Int32 => "int",
+            PType::Real32 => "real",
+            PType::Str => "str",
+        }
+    }
+    fn apply(a: Apply) -> &'static str {
+        match a {
+            Apply::Knob => "knob",
+            Apply::Reprogram => "reprogram",
+            Apply::Rebuild => "rebuild",
+        }
+    }
+    let mut j = J::obj();
+    let mut rows = J::arr();
+    let st = pc.map(ParamClient::state);
+    for (i, row) in TABLE.iter().enumerate() {
+        let mut r = J::obj();
+        r.set("id", row.id);
+        r.set("section", row.section);
+        r.set("key", row.key);
+        r.set("type", ty(row.ty));
+        r.set("apply", apply(row.apply));
+        r.set("help", row.help);
+        match st {
+            None => {
+                r.set("value", J::Null);
+                r.set("state", "idle");
+                r.set("status", "");
+                r.set("age_ms", J::Null);
+            }
+            Some(st) => {
+                let rs = &st.rows[i];
+                r.set("value", rs.value.as_ref().map(crate::mav::format_text));
+                r.set("state", rs.st.as_str());
+                r.set("status", rs.status.as_str());
+                let terminal = matches!(
+                    rs.st,
+                    RowState::Accepted
+                        | RowState::Failed
+                        | RowState::Unsupported
+                        | RowState::Timeout
+                );
+                r.set(
+                    "age_ms",
+                    terminal.then(|| now_ms.wrapping_sub(rs.result_ms) as i64),
+                );
+            }
+        }
+        rows.push(r);
+    }
+    match (pc, st) {
+        (Some(pc), Some(st)) => {
+            j.set("linked", st.linked);
+            j.set("alive", (st.alive_ms != 0).then(|| pc.alive(now_ms)));
+            j.set(
+                "list",
+                match st.list {
+                    ListState::None => "none",
+                    ListState::Pending => "pending",
+                    ListState::Complete => "complete",
+                    ListState::Partial => "partial",
+                },
+            );
+            j.set("mismatch", st.table_mismatch);
+            j.set("pending", st.pending_row.map_or(-1, |r| r as i64));
+        }
+        _ => {
+            j.set("linked", false);
+            j.set("mode", "spotter");
+        }
+    }
+    j.set("rows", rows);
+    j.dump()
 }

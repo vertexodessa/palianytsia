@@ -10,6 +10,7 @@
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
 //!           [--hwdec vdpau|vaapi|cuda]  hardware decode, software if it fails to open
+//!           [--params]              open the drone settings window (P toggles; GS only)
 //!
 //! `--snapshot` saves one rendered window after N seconds and quits: the
 //! headless check that video and OSD actually draw.
@@ -52,6 +53,8 @@ struct Opts {
     idr: Option<bool>,
     /// libavcodec hwaccel ("vdpau", "vaapi", "cuda"); "" = software.
     hwdec: String,
+    /// Open the settings window at start (P toggles it).
+    params: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -96,6 +99,7 @@ fn parse() -> Opts {
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
             "--hwdec" => o.hwdec = val(),
+            "--params" => o.params = true,
             s => die(&format!("unknown argument {s}")),
         }
     }
@@ -196,6 +200,11 @@ struct CoreLoop {
     core: Box<dyn GsCore>,
     sink: Sink,
     stats_tx: SyncSender<String>,
+    /// F18: the parameter table to the UI (2 Hz), commands and set results back.
+    params_tx: SyncSender<String>,
+    cmd_rx: Receiver<pal_osd::params::Cmd>,
+    set_res_tx: SyncSender<(usize, Result<(), String>)>,
+    last_params_us: u64,
     last_stats_us: u64,
     last_log_us: u64,
 }
@@ -226,7 +235,21 @@ impl CoreLoop {
             let e = sh.dec_errors.load(Ordering::Acquire);
             i.on_decoder_errors(e, sh.dec_err_au.load(Ordering::Relaxed), now);
         }
+        while let Ok(c) = self.cmd_rx.try_recv() {
+            match c {
+                pal_osd::params::Cmd::Set(row, text) => {
+                    let r = self.core.param_set(row, &text);
+                    eprintln!("pal-desktop: param set {row} {text:?}: {r:?}");
+                    let _ = self.set_res_tx.try_send((row, r));
+                }
+                pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
+            }
+        }
         self.core.tick(now, &mut self.sink);
+        if now >= self.last_params_us + 500_000 {
+            self.last_params_us = now;
+            let _ = self.params_tx.try_send(self.core.params_json(now));
+        }
         if let Some(i) = self.sink.idr.as_mut() {
             let evs = i.step(now, &mut *self.core);
             if let Some(l) = self.sink.log.as_mut() {
@@ -403,6 +426,12 @@ struct App {
     frame: Arc<Mutex<Option<Frame>>>,
     shared: Arc<Shared>,
     stats_rx: Receiver<String>,
+    params_rx: Receiver<String>,
+    cmd_tx: mpsc::Sender<pal_osd::params::Cmd>,
+    set_res_rx: Receiver<(usize, Result<(), String>)>,
+    params: Option<pal_osd::params::Table>,
+    edits: pal_osd::params::Edits,
+    show_params: bool,
     hist: History,
     tex: Option<egui::TextureHandle>,
     shown_seq: u64,
@@ -458,8 +487,36 @@ impl eframe::App for App {
             self.fps = (frames - self.fps_mark.1) as f64 / self.fps_mark.0.elapsed().as_secs_f64();
             self.fps_mark = (Instant::now(), frames);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+        // Hotkeys only while no text field has focus (typing a value must
+        // not toggle panels).
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::M)) {
             self.show_monitor = !self.show_monitor;
+        }
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::P)) {
+            self.show_params = !self.show_params;
+        }
+        while let Ok(l) = self.params_rx.try_recv() {
+            if let Some(t) = pal_osd::params::Table::parse(&l) {
+                self.params = Some(t);
+            }
+        }
+        while let Ok(r) = self.set_res_rx.try_recv() {
+            self.edits.last = Some(r);
+        }
+        if self.show_params {
+            if let Some(t) = &self.params {
+                let mut open = true;
+                egui::Window::new("drone settings (P)")
+                    .open(&mut open)
+                    .default_pos([24.0, 120.0])
+                    .show(ctx, |ui| {
+                        if let Some(c) = pal_osd::params::widget(ui, t, &mut self.edits) {
+                            let _ = self.cmd_tx.send(c);
+                        }
+                    });
+                self.show_params = open;
+            }
         }
         if self.show_monitor {
             egui::SidePanel::right("monitor")
@@ -539,6 +596,9 @@ fn main() {
     // decoder logged missing POCs), so the queue absorbs decoder warm-up.
     let (au_tx, au_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(8);
     let (stats_tx, stats_rx) = mpsc::sync_channel::<String>(64);
+    let (params_tx, params_rx) = mpsc::sync_channel::<String>(4);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<pal_osd::params::Cmd>();
+    let (set_res_tx, set_res_rx) = mpsc::sync_channel(8);
     let (mav_tx, mav_rx) = mpsc::sync_channel::<Vec<u8>>(256);
     let udp = o.mav_udp.as_ref().map(|a| {
         let peer: std::net::SocketAddr = a.parse().unwrap_or_else(|_| die("--mav-udp HOST:PORT"));
@@ -604,6 +664,10 @@ fn main() {
                             core: make_core(&o, channel),
                             sink,
                             stats_tx,
+                            params_tx,
+                            cmd_rx,
+                            set_res_tx,
+                            last_params_us: 0,
                             last_stats_us: 0,
                             last_log_us: 0,
                         };
@@ -623,6 +687,12 @@ fn main() {
                 frame,
                 shared,
                 stats_rx,
+                params_rx,
+                cmd_tx,
+                set_res_rx,
+                params: None,
+                edits: Default::default(),
+                show_params: o.params,
                 hist: History::default(),
                 tex: None,
                 shown_seq: 0,

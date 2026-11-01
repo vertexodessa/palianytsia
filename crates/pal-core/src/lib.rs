@@ -92,4 +92,16 @@ pub trait GsCore {
     /// IDR requests so far (WebGs::set_idr_requests): the RCF's idr_epoch
     /// byte becomes `n as u8`; the drone serves one IDR per change.
     fn set_idr_requests(&mut self, _n: u32) {}
+    /// The drone parameter table (F18), `webgs::params_json` at `now_us` on
+    /// the core clock: one JSON object, rows in table order.
+    fn params_json(&self, _now_us: u64) -> String {
+        String::new()
+    }
+    /// Set one row from its text form (WebGs::param_set); `Err(why)` on a
+    /// refusal ("not linked", "apply in progress", "bad value for int", ...).
+    fn param_set(&mut self, _row: usize, _text: &str) -> Result<(), String> {
+        Err("not linked".into())
+    }
+    /// Re-list the drone's parameters (WebGs::param_refresh).
+    fn param_refresh(&mut self) {}
 }

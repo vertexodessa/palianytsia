@@ -54,6 +54,11 @@ size_t pal_ref_mav_take(pal_ref* r, uint8_t* out, size_t cap);
 void pal_ref_mav_push(pal_ref* r, const uint8_t* p, size_t n);
 // WebGs::set_idr_requests: the RCF idr_epoch byte becomes (uint8_t)n.
 void pal_ref_set_idr_requests(pal_ref* r, uint32_t n);
+// webgs::params_json(gs, now_us / 1000); same buffer contract as stats_json.
+size_t pal_ref_params_json(const pal_ref* r, uint64_t now_us, char* buf, size_t cap);
+// WebGs::param_set: 1 on success, 0 with the reason in why.
+int pal_ref_param_set(pal_ref* r, size_t row, const char* text, char* why, size_t cap);
+void pal_ref_param_refresh(pal_ref* r);
 // Writes the stats JSON line; returns its full length (excluding NUL). The
 // output is truncated (and NUL-terminated) when cap is too small.
 size_t pal_ref_stats_json(const pal_ref* r, char* buf, size_t cap);

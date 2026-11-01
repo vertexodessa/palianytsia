@@ -14,6 +14,7 @@ pub enum J {
     U(u64),
     F(f64),
     S(String),
+    A(Vec<J>),
     O(BTreeMap<&'static str, J>),
 }
 
@@ -25,6 +26,15 @@ impl J {
     pub fn set(&mut self, k: &'static str, v: impl Into<J>) {
         if let J::O(m) = self {
             m.insert(k, v.into());
+        }
+    }
+    pub fn arr() -> Self {
+        J::A(Vec::new())
+    }
+    /// Append to an array; a no-op on anything else.
+    pub fn push(&mut self, v: impl Into<J>) {
+        if let J::A(a) = self {
+            a.push(v.into());
         }
     }
     pub fn dump(&self) -> String {
@@ -44,6 +54,16 @@ impl J {
             }
             J::F(v) => write_double(out, *v),
             J::S(s) => write_str(out, s),
+            J::A(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write(out);
+                }
+                out.push(']');
+            }
             J::O(m) => {
                 out.push('{');
                 for (i, (k, v)) in m.iter().enumerate() {

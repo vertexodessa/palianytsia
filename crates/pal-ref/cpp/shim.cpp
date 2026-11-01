@@ -163,6 +163,35 @@ void pal_ref_mav_push(pal_ref* r, const uint8_t* p, size_t n) {
 
 void pal_ref_set_idr_requests(pal_ref* r, uint32_t n) { r->gs->set_idr_requests(n); }
 
+size_t pal_ref_params_json(const pal_ref* r, uint64_t now_us, char* buf, size_t cap) {
+  std::string s;
+  try {
+    s = webgs::params_json(*r->gs, now_us / 1000);
+  } catch (...) {
+    s = "{}";
+  }
+  if (buf && cap) {
+    const size_t n = s.size() < cap - 1 ? s.size() : cap - 1;
+    std::memcpy(buf, s.data(), n);
+    buf[n] = '\0';
+  }
+  return s.size();
+}
+
+int pal_ref_param_set(pal_ref* r, size_t row, const char* text, char* why, size_t cap) {
+  std::string w;
+  bool ok = false;
+  try {
+    ok = r->gs->param_set(row, text, &w);
+  } catch (...) {
+    w = "exception";
+  }
+  if (why && cap) std::snprintf(why, cap, "%s", w.c_str());
+  return ok ? 1 : 0;
+}
+
+void pal_ref_param_refresh(pal_ref* r) { r->gs->param_refresh(); }
+
 uint32_t pal_ref_frame_gap_timeout_ms(const pal_ref* r) {
   return static_cast<uint32_t>(r->cfg.video.frame_gap_timeout_ms);
 }
