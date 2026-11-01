@@ -14,6 +14,8 @@
 //!           [--hwdec auto|vdpau|vaapi|cuda|sw]  decoder (default auto: first hwaccel
 //!                                   that opens, else software)
 //!           [--params]              open the drone settings window (P toggles; GS only)
+//!   keys: S link statistics over the video, M monitor plots, P drone settings
+//!         (the flight HUD: battery, timer, alt/speed/home, centre dot, is always on)
 //!           [--cpu-rgba]            RGBA via swscale instead of the YUV shader
 //!           [--lat]                 per-second latency breakdown on stderr (printed
 //!                                   anyway while a stage is over its threshold)
@@ -342,6 +344,9 @@ struct App {
     fps: f64,
     fps_mark: (Instant, u64),
     show_monitor: bool,
+    /// Link statistics over the video (S); off by default, the flight HUD
+    /// is what stays on.
+    show_stats: bool,
     snapshot: Option<(PathBuf, f64)>,
     snapshot_sent: bool,
 }
@@ -399,6 +404,9 @@ impl eframe::App for App {
         let typing = ctx.memory(|m| m.focused().is_some());
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::M)) {
             self.show_monitor = !self.show_monitor;
+        }
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::S)) {
+            self.show_stats = !self.show_stats;
         }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::P)) {
             self.show_params = !self.show_params;
@@ -479,15 +487,36 @@ impl eframe::App for App {
                         egui::Color32::WHITE,
                     );
                 }
-                let decode = (frames, self.shared.dec_errors.load(Ordering::Relaxed));
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(area.shrink(8.0)), |ui| {
-                    pal_osd::chips(ui, &self.hist, self.fps, decode);
-                    pal_osd::key_banner(ui, &self.hist);
+                // The HUD sits on the picture, not the window: same fit as
+                // the video above.
+                let src = yuv_size.or_else(|| {
+                    self.tex.as_ref().map(|t| {
+                        let [w, h] = t.size().map(|v| v as f32);
+                        (w, h)
+                    })
                 });
+                let vr = src.map_or(area, |(w, h)| {
+                    let scale = (area.width() / w).min(area.height() / h);
+                    egui::Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale))
+                });
+                pal_osd::hud::hud(ui, vr, &self.telem, &self.hist, now);
+                let mismatch = self.hist.last().is_some_and(|s| s.key_mismatch);
+                if self.show_stats || mismatch {
+                    let decode = (frames, self.shared.dec_errors.load(Ordering::Relaxed));
+                    let top = vr.shrink(8.0).translate(egui::vec2(0.0, 40.0));
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
+                        if self.show_stats {
+                            pal_osd::chips(ui, &self.hist, self.fps, decode);
+                        }
+                        pal_osd::key_banner(ui, &self.hist);
+                    });
+                }
             });
-        egui::Area::new(egui::Id::new("telem"))
-            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
-            .show(ctx, |ui| pal_osd::telem::widget(ui, &self.telem, now));
+        if self.show_stats {
+            egui::Area::new(egui::Id::new("telem"))
+                .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -120.0))
+                .show(ctx, |ui| pal_osd::telem::widget(ui, &self.telem, now));
+        }
         if let Some((path, secs)) = self.snapshot.clone() {
             if !self.snapshot_sent && now >= secs {
                 self.snapshot_sent = true;
@@ -647,7 +676,8 @@ fn main() {
                 t0: Instant::now(),
                 fps: 0.0,
                 fps_mark: (Instant::now(), 0),
-                show_monitor: true,
+                show_monitor: false,
+                show_stats: false,
                 snapshot,
                 snapshot_sent: false,
             }))

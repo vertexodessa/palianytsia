@@ -7,6 +7,7 @@
 //!   long start(int fd, Surface video, Surface osd, float density, String configToml)
 //!                             0 = failed, see lastError()
 //!   String stats(long h)      newest stats JSON ("" before the first)
+//!   void toggleStats(long h)  link statistics over the flight HUD (tap)
 //!   String lastError()
 //!   void stop(long h)
 #[cfg(target_os = "android")]

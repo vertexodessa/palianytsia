@@ -3,7 +3,7 @@
 //! chips as pal-desktop and the Quest can reuse this for its OSD layer.
 //! One thread owns the EGL context; it redraws when a stats line arrives
 //! (10 Hz) and clears to transparent around the widgets.
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +22,10 @@ pub struct OsdIn {
     /// The newest stats line, also read by the Java side.
     pub last: Arc<Mutex<String>>,
     pub shared: Arc<Shared>,
+    /// The drone's MAVLink packets (CoreIo::on_mav) for the flight HUD.
+    pub mav_rx: Receiver<Vec<u8>>,
+    /// Link statistics over the HUD; a tap on the screen toggles it.
+    pub show_stats: Arc<AtomicBool>,
 }
 
 struct Gl {
@@ -96,6 +100,7 @@ pub fn run(o: OsdIn) {
     };
     let ctx = egui::Context::default();
     let mut hist = History::default();
+    let mut telem = pal_osd::telem::Telemetry::default();
     let t0 = Instant::now();
     let (mut fps, mut last_frames, mut fps_t) = (0.0, 0u64, Instant::now());
     loop {
@@ -111,6 +116,10 @@ pub fn run(o: OsdIn) {
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
+        }
+        let now = t0.elapsed().as_secs_f64();
+        while let Ok(p) = o.mav_rx.try_recv() {
+            telem.on_packet(&p, now);
         }
         let frames = o.shared.frames.load(Ordering::Relaxed);
         let dt = fps_t.elapsed().as_secs_f64();
@@ -132,10 +141,23 @@ pub fn run(o: OsdIn) {
         let dec = (frames, o.shared.dec_errors.load(Ordering::Relaxed));
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(8)))
+                .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
-                    pal_osd::chips(ui, &hist, fps, dec);
-                    pal_osd::key_banner(ui, &hist);
+                    // The video SurfaceView fills the same rect, and
+                    // MediaCodec scales the picture to it.
+                    let r = ui.max_rect();
+                    pal_osd::hud::hud(ui, r, &telem, &hist, now);
+                    let stats = o.show_stats.load(Ordering::Relaxed);
+                    let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
+                    if stats || mismatch {
+                        let top = r.shrink(8.0).translate(egui::vec2(0.0, 36.0));
+                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
+                            if stats {
+                                pal_osd::chips(ui, &hist, fps, dec);
+                            }
+                            pal_osd::key_banner(ui, &hist);
+                        });
+                    }
                 });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);

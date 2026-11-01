@@ -17,6 +17,9 @@ final class Native {
     /** Newest core stats line (JSON), "" before the first. */
     static native String stats(long handle);
 
+    /** Link statistics over the flight HUD on/off. */
+    static native void toggleStats(long handle);
+
     static native String lastError();
 
     static native void stop(long handle);

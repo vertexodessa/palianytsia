@@ -27,6 +27,9 @@ struct Shared {
     frames: AtomicU64,
     stale: AtomicU64,
     errors: AtomicU64,
+    /// AUs dropped because no input buffer freed up within 20 ms (a
+    /// decoder that stopped consuming).
+    no_input: AtomicU64,
     /// (pts, queued at) of AUs in flight, oldest first.
     queued: Mutex<VecDeque<(u64, Instant)>>,
 }
@@ -65,6 +68,7 @@ impl MediaCodecDecoder {
             frames: AtomicU64::new(0),
             stale: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            no_input: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
         });
         let s2 = sh.clone();
@@ -78,6 +82,11 @@ impl MediaCodecDecoder {
             pts: 0,
             _win: win,
         })
+    }
+
+    /// AUs dropped for want of an input buffer since open.
+    pub fn no_input(&self) -> u64 {
+        self.sh.no_input.load(Ordering::Relaxed)
     }
 
     /// Frames dropped by the stale cap since open.
@@ -153,7 +162,11 @@ impl Decoder for MediaCodecDecoder {
                     sh.errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
+                sh.no_input.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                log::warn!("mediacodec: dequeue_input {e:?}");
                 sh.errors.fetch_add(1, Ordering::Relaxed);
             }
         }

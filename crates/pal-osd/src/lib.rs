@@ -1,6 +1,7 @@
 //! OSD widgets (spec section 6) drawn from the core's `stats_json` line, so
 //! every app and both cores share one OSD. Reads only the snapshot it is
 //! handed: no locks toward the RX or core path.
+pub mod hud;
 pub mod params;
 pub mod telem;
 
@@ -375,7 +376,7 @@ fn pct(v: f64) -> String {
 const UP_WIDTH: usize = 46;
 
 /// How long the signal chip keeps the last rssi/SNR through null windows.
-const SIGNAL_HOLD_S: f64 = 1.5;
+pub(crate) const SIGNAL_HOLD_S: f64 = 1.5;
 
 /// The top OSD row: link, signal, loss, uplink side.
 pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {

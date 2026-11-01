@@ -32,11 +32,11 @@ struct Phone {
     core: Option<JoinHandle<()>>,
     dec: Option<JoinHandle<()>>,
     osd: Option<JoinHandle<()>>,
+    show_stats: Arc<std::sync::atomic::AtomicBool>,
     // Kept alive for the core loop's F18 channels.
     _params_rx: Receiver<String>,
     _cmd_tx: mpsc::Sender<pal_osd::params::Cmd>,
     _set_res_rx: Receiver<(usize, Result<(), String>)>,
-    _mav_rx: Receiver<Vec<u8>>,
 }
 
 fn start(
@@ -92,7 +92,10 @@ fn start(
     };
 
     let last = Arc::new(Mutex::new(String::new()));
+    let show_stats = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let osd_in = crate::osd::OsdIn {
+        mav_rx,
+        show_stats: show_stats.clone(),
         win: osd_win,
         density,
         stats_rx,
@@ -141,10 +144,10 @@ fn start(
         core: Some(core_t),
         dec: Some(dec_t),
         osd: Some(osd_t),
+        show_stats,
         _params_rx: params_rx,
         _cmd_tx: cmd_tx,
         _set_res_rx: set_res_rx,
-        _mav_rx: mav_rx,
     })
 }
 
@@ -152,14 +155,40 @@ fn start(
 /// way the desktop's decode thread reports them.
 fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>, sh: &Shared) {
     let mut errs = 0;
-    while let Ok((n, _t, au)) = au_rx.recv() {
-        dec.decode(&au);
-        let (f, e) = dec.counters();
+    // Once a second: a line when AUs came in but no frame came out, so a
+    // stall on the glass leaves its cause in logcat.
+    let (mut t, mut aus, mut f0, mut s0, mut n0) = (Instant::now(), 0u64, 0u64, 0u64, 0u64);
+    loop {
+        let got = match au_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(x) => Some(x),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if let Some((n, _t, au)) = got {
+            aus += 1;
+            dec.decode(&au);
+            let (_, e) = dec.counters();
+            if e > errs {
+                errs = e;
+                sh.dec_err_au.store(n, Ordering::Relaxed);
+                sh.dec_errors.store(e, Ordering::Release);
+            }
+        }
+        let (f, _) = dec.counters();
         sh.frames.store(f, Ordering::Relaxed);
-        if e > errs {
-            errs = e;
-            sh.dec_err_au.store(n, Ordering::Relaxed);
-            sh.dec_errors.store(e, Ordering::Release);
+        if t.elapsed() >= Duration::from_secs(1) {
+            let (st, ni) = (dec.stale(), dec.no_input());
+            if aus > 0 && f == f0 {
+                log::warn!(
+                    "video stalled: {aus} AUs in, 0 frames out; stale {} no_input {} errors {errs} au_drops {}",
+                    st - s0,
+                    ni - n0,
+                    sh.au_dropped.load(Ordering::Relaxed)
+                );
+            } else if aus == 0 && sh.frames.load(Ordering::Relaxed) > 0 {
+                log::warn!("video stalled: no AUs from the core for 1 s");
+            }
+            (t, aus, f0, s0, n0) = (Instant::now(), 0, f, st, ni);
         }
     }
     log::info!("decode loop ended ({} stale frames dropped)", dec.stale());
@@ -235,6 +264,20 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_stats(
     let p = unsafe { &*(h as *mut Phone) };
     let s = p.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
     jstr(&mut env, &s)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_palianytsia_phone_Native_toggleStats(
+    _env: JNIEnv,
+    _c: JClass,
+    h: jlong,
+) {
+    if h == 0 {
+        return;
+    }
+    // SAFETY: as in stats().
+    let p = unsafe { &*(h as *mut Phone) };
+    p.show_stats.fetch_xor(true, Ordering::Relaxed);
 }
 
 #[no_mangle]

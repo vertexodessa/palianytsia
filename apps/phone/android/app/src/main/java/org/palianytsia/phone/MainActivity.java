@@ -85,6 +85,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         osd.setTextSize(13);
         osd.setPadding(24, 16, 24, 16);
         root.addView(osd, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
+        // A tap shows or hides the link statistics over the flight HUD.
+        root.setOnClickListener(v -> {
+            if (handle != 0) Native.toggleStats(handle);
+        });
         setContentView(root);
         IntentFilter f = new IntentFilter(ACTION_USB);
         if (Build.VERSION.SDK_INT >= 33) {

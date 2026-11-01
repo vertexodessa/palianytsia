@@ -58,6 +58,12 @@ pub struct Telemetry {
     pub lat_lon: Option<(f64, f64)>,
     pub home: Option<(f64, f64)>,
     pub texts: VecDeque<(f64, u8, String)>,
+    /// Cell count, guessed once from the first pack voltage (4.35 V max
+    /// per cell covers LiHV).
+    pub cells: Option<u8>,
+    /// Flight timer: armed time before the current arm, and when it began.
+    pub flown_s: f64,
+    pub armed_at: Option<f64>,
 }
 
 /// Great-circle distance in metres.
@@ -107,12 +113,23 @@ impl Telemetry {
                 // Home is where the drone arms with a fix.
                 if armed && !self.armed {
                     self.home = self.lat_lon;
+                    self.armed_at = Some(now_s);
+                }
+                if !armed {
+                    if let Some(t) = self.armed_at.take() {
+                        self.flown_s += now_s - t;
+                    }
                 }
                 self.armed = armed;
             }
             MSG_SYS_STATUS => {
                 let mv = u16_at(pl, 14);
                 self.batt_v = (mv != u16::MAX).then(|| f32::from(mv) / 1000.0);
+                if let (None, Some(v)) = (self.cells, self.batt_v) {
+                    if v > 2.0 {
+                        self.cells = Some((v / 4.35).ceil() as u8);
+                    }
+                }
                 let ca = i16_at(pl, 16);
                 self.batt_a = (ca >= 0).then(|| f32::from(ca) / 100.0);
                 let pct = pl[30] as i8;
@@ -150,6 +167,16 @@ impl Telemetry {
             }
             _ => {}
         }
+    }
+
+    /// Armed time so far, the current arm included.
+    pub fn flight_s(&self, now_s: f64) -> f64 {
+        self.flown_s + self.armed_at.map_or(0.0, |t| now_s - t)
+    }
+
+    /// Pack voltage per cell.
+    pub fn cell_v(&self) -> Option<f32> {
+        Some(self.batt_v? / f32::from(self.cells?.max(1)))
     }
 
     pub fn home_distance_m(&self) -> Option<f64> {
