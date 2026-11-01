@@ -20,6 +20,7 @@ pub mod nack;
 pub mod refresh;
 pub mod rust_core;
 pub mod slice_asm;
+pub mod tx_selector;
 pub mod uep;
 pub mod uplink;
 pub mod vrx;

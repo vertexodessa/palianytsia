@@ -31,6 +31,7 @@ use crate::ladder::LinkHealth;
 use crate::link_health::{LinkHealthAssembler, LinkHealthInputs, OpPoint};
 use crate::mav::{MavTunnel, ParamClient};
 use crate::nack::{NackInputs, NackTailView, NackTracker};
+use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelectorCfg};
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
 use crate::vrx::{
     random_nonce, RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState,
@@ -184,6 +185,8 @@ struct Gs {
     peer_width: u8,
     /// MAVLink packet seq of the cal packets.
     cal_mav_seq: u8,
+    /// The uplink TX card among `cards` (card 0 without a roster).
+    sel: TxSelector,
 }
 
 impl Gs {
@@ -195,6 +198,34 @@ impl Gs {
             return false;
         }
         self.send_now(f, now_us, io)
+    }
+
+    /// The card this RCF step transmits on (maburgs main.cpp at vrx.step).
+    /// A card the scout owns is off searching or measuring and never a
+    /// candidate; while a dwell or a hop is in flight the last pick holds
+    /// (`tx_selection_frozen`). Without a card roster: card 0.
+    fn pick_tx(&mut self, agg: &Aggregator, now_ms: u64) -> usize {
+        let Some(c) = self.chan.as_ref() else {
+            return self.sel.selected();
+        };
+        if !c.tx_frozen() {
+            let snaps: Vec<CardSnapshot> = self
+                .cards
+                .iter()
+                .enumerate()
+                .map(|(i, card)| {
+                    let t = &agg.cards()[i];
+                    CardSnapshot {
+                        alive: !c.scout_owns_card(i) && card.alive(),
+                        rssi_ema: t.rf.rssi_ema,
+                        last_frame_us: t.last_frame_us,
+                    }
+                })
+                .collect();
+            self.sel.update(&snaps, now_ms * 1000);
+        }
+        c.note_tx_card(self.sel.selected());
+        self.sel.selected()
     }
 
     /// Past the calibration gate: the cal lane's own frames, which the
@@ -232,6 +263,7 @@ impl Gs {
         for frame in frames {
             let mut sf = SlotFrame {
                 frame,
+                card: self.sel.selected() as i32,
                 ..SlotFrame::default()
             };
             if !self.slot.offer(&mut sf, now_us / 1000, false) {
@@ -388,6 +420,13 @@ impl RustCore {
                 ladder: cfg.link.ladder_cfg.ladder.clone(),
                 peer_width: 0,
                 cal_mav_seq: 0,
+                sel: TxSelector::new(
+                    TxSelectorCfg {
+                        pinned: effective_tx_card(cfg.radio.tx_card, n_cards),
+                        ..TxSelectorCfg::default()
+                    },
+                    n_cards,
+                ),
             }
         });
         let stored_ch = Arc::new(AtomicU8::new(0));
@@ -600,6 +639,7 @@ impl RustCore {
             let sf = SlotFrame {
                 frame: rc::pack_nack(&nk, &g.key, &ctx),
                 offered_ms: now_ms,
+                card: g.sel.selected() as i32,
                 ..SlotFrame::default()
             };
             if g.send(&sf, *now_us, io) {
@@ -766,17 +806,17 @@ impl GsCore for RustCore {
         }
         if let Some(g) = self.gs.as_mut() {
             if let Some(c) = g.chan.as_mut() {
-                // maburgs main.cpp's per-tick block; one TX card, card 0
-                // (no TxSelector).
+                // maburgs main.cpp's per-tick block, on the TX selector's
+                // card as it stood after the last RCF step.
+                let tx = g.sel.selected();
                 let cin = ChannelTickIn {
                     now_ms: now_ms as f64,
                     in_session: g.vrx.link_state() == VrxState::Session,
                     cal_running: g.cal.running(),
-                    tx_card: 0,
+                    tx_card: tx,
                     agg: Some(&self.agg),
                 };
                 c.tick(&cin, &mut g.vrx);
-                c.note_tx_card(0);
             }
         }
         if let Some(g) = self.gs.as_ref() {
@@ -844,6 +884,7 @@ impl GsCore for RustCore {
                 let sf = SlotFrame {
                     frame,
                     offered_ms: now_ms,
+                    card: g.sel.selected() as i32,
                     ..SlotFrame::default()
                 };
                 g.send_now(&sf, now_us, io);
@@ -873,12 +914,13 @@ impl GsCore for RustCore {
                 if !out.is_disc {
                     self.lha.on_step_sent(&self.agg);
                 }
+                let tx = g.pick_tx(&self.agg, now_ms);
                 // A DISC follows the scout (the core's disc targets); an RCF
-                // goes to card 0. rcf_seq() IS this frame's seq; DISCs are
-                // not matchable RTT sends.
+                // goes to the TX selector's card. rcf_seq() IS this frame's
+                // seq; DISCs are not matchable RTT sends.
                 let targets = match (&g.chan, out.is_disc) {
-                    (Some(c), true) => c.disc_targets(0),
-                    _ => vec![0],
+                    (Some(c), true) => c.disc_targets(tx),
+                    _ => vec![tx],
                 };
                 for t in targets {
                     let frame = match (&g.chan, out.is_disc) {
@@ -1110,6 +1152,10 @@ impl GsCore for RustCore {
                 o
             });
             j.set("cards", J::A(cards.collect()));
+            if let Some(g) = g {
+                j.set("tx_card", g.sel.selected() as u64);
+                j.set("tx_switches", g.sel.switches());
+            }
         }
         let rtt = g.map(|g| &g.rtt);
         j.set("rtt_ms", rtt.filter(|r| r.has_rtt()).map(|r| r.rtt_ms()));
@@ -1378,10 +1424,64 @@ mod tests {
         core.on_rx(&body, &mut io);
         assert_eq!(core.agg.bad_card_msgs(), 0);
         assert!(core.stats_json().contains("\"cards\":[{"));
+        assert!(core.stats_json().contains("\"tx_card\":0"));
         let mut one = RustCore::with_cards(&cfg, opts(64), env(&a, &clk)).unwrap();
         one.on_rx(&body, &mut io);
         assert_eq!(one.agg.bad_card_msgs(), 1);
         assert!(!one.stats_json().contains("\"cards\""));
+    }
+
+    /// The TX selector moves the RCFs to the card that hears the drone
+    /// 10 dB better once the margin has held 2 s (maburgs TxSelector).
+    #[test]
+    fn rcfs_follow_the_stronger_card() {
+        let mut cfg = bundle();
+        cfg.radio.pin = Some(64);
+        let clk = FakeClock::default();
+        clk.set(1000);
+        let a = FakeCard::new(clk.clone(), 64);
+        let b = FakeCard::new(clk.clone(), 64);
+        let mut two = env(&a, &clk);
+        two.cards.push(b.clone() as Arc<dyn LinkCard>);
+        let mut core = RustCore::with_cards(&cfg, opts(64), two).unwrap();
+        let mut io = Io::default();
+        core.tick(clk.ms() * 1000, &mut io);
+        core.inject_disc_ack_for_replay(clk.ms() * 1000);
+        let body = |card: u8, rssi: u8, us: u64| RxBody {
+            card_id: card,
+            mono_us: us,
+            rssi: [rssi, rssi],
+            // RF folds only from frames with a PHY status.
+            phy_valid: true,
+            crc_ok: true,
+            rx_channel: 64,
+            body: vec![0u8; 64],
+            ..RxBody::default()
+        };
+        let rcfs = |c: &FakeCard| {
+            c.s()
+                .sent
+                .iter()
+                .filter(|f| rc::frame_type(f) == Some(rc::T_RCF))
+                .count()
+        };
+        let mut b_at_1s = 0;
+        for i in 0..3000 {
+            clk.advance(2);
+            let us = clk.ms() * 1000;
+            core.on_rx(&body(0, 50, us), &mut io);
+            core.on_rx(&body(1, 60, us), &mut io);
+            core.tick(us, &mut io);
+            if i == 500 {
+                b_at_1s = rcfs(&b);
+            }
+        }
+        let g = core.gs.as_ref().unwrap();
+        assert!(rcfs(&a) > 0, "card 0 carried the start");
+        assert_eq!(b_at_1s, 0, "switched before the 2 s hold");
+        assert!(rcfs(&b) > 0, "never moved to the stronger card");
+        assert_eq!(g.sel.selected(), 1);
+        assert_eq!(g.sel.switches(), 1);
     }
 
     /// Auto: the search runs on the card and the stats line reports it.

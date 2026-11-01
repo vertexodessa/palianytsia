@@ -43,6 +43,8 @@ pub struct Snapshot {
     /// Per-card receive (two or more cards only): smoothed RSSI and the
     /// video bodies the card has delivered.
     pub cards: Vec<CardRx>,
+    /// The card the uplink transmits on (two or more cards only).
+    pub tx_card: Option<u64>,
     pub drone_temp_c: Option<i64>,
     /// NACK repairs: symbols filled so far, and the current rate.
     pub nack_fill: u64,
@@ -59,10 +61,10 @@ pub struct CardRx {
     pub video: u64,
 }
 
-/// "c0 -45 dBm 52 %  c1 -50 dBm 48 %": each card's RSSI and its share of
-/// the video bodies received so far (both cards hear most of them, so the
-/// shares say which one hears more, not who carries the link).
-pub fn cards_line(cards: &[CardRx]) -> String {
+/// "c0 TX -45 dBm 52 %  c1 -50 dBm 48 %": each card's RSSI and its share
+/// of the video bodies received so far (both cards hear most of them, so
+/// the shares say which one hears more), and which one transmits.
+pub fn cards_line(cards: &[CardRx], tx: Option<u64>) -> String {
     let total: u64 = cards.iter().map(|c| c.video).sum();
     cards
         .iter()
@@ -70,7 +72,8 @@ pub fn cards_line(cards: &[CardRx]) -> String {
         .map(|(i, c)| {
             let r = c.rssi.map_or("  -".into(), |r| format!("{r:>3}"));
             let share = (100 * c.video).checked_div(total).unwrap_or(0);
-            format!("c{i} {r} dBm {share:>2} %")
+            let t = if tx == Some(i as u64) { " TX" } else { "" };
+            format!("c{i}{t} {r} dBm {share:>2} %")
         })
         .collect::<Vec<_>>()
         .join("  ")
@@ -230,6 +233,7 @@ impl Snapshot {
                         .collect()
                 })
                 .unwrap_or_default(),
+            tx_card: v.get("tx_card").and_then(Value::as_u64),
             drone_temp_c: v.get("drone_temp_c").and_then(Value::as_i64),
             nack_fill: v.get("nack").map_or(0, |n| u(n, "fill")),
             nack_fill_pps: v
@@ -475,7 +479,7 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
             },
         );
         if s.cards.len() > 1 {
-            chip(ui, "cards", &cards_line(&s.cards), OK);
+            chip(ui, "cards", &cards_line(&s.cards, s.tx_card), OK);
         }
         let total = s.aus + s.trunc;
         let pct = if total > 0 {
@@ -645,7 +649,14 @@ mod tests {
     fn parses_new_fields_and_key_warnings() {
         let two = Snapshot::parse(r#"{"cards":[{"frames":10,"video":30,"crc_fail":0,"rssi":-45},{"frames":9,"video":10,"crc_fail":1,"rssi":null}]}"#)
             .unwrap();
-        assert_eq!(cards_line(&two.cards), "c0 -45 dBm 75 %  c1   - dBm 25 %");
+        assert_eq!(
+            cards_line(&two.cards, None),
+            "c0 -45 dBm 75 %  c1   - dBm 25 %"
+        );
+        assert_eq!(
+            cards_line(&two.cards, Some(1)),
+            "c0 -45 dBm 75 %  c1 TX   - dBm 25 %"
+        );
         let s = Snapshot::parse(r#"{"mode":"gs","key_fp":"default","key_mismatch":false,"rtt_ms":6.1,"uplink":"ok","uplink_pct":92,"pre_fec_loss":0.085,"residual":0.0106,"drone_temp_c":46,"nack":{"fill":48,"fill_pps":0.0}}"#)
             .expect("parse");
         assert_eq!(
