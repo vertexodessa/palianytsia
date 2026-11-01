@@ -1784,6 +1784,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openxr"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a2d6934d2508f94fd4cbda6c2a326f111f60ce59fd9136df6d478564397dd40"
+dependencies = [
+ "libc",
+ "libloading",
+ "ndk-context",
+ "openxr-sys",
+]
+
+[[package]]
+name = "openxr-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f10e7e38c47f2175fc39363713b656db899fa0b4a14341029702cbdfa6f44d05"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1821,6 +1842,21 @@ dependencies = [
  "pal-core",
  "pal-ref",
  "pal-wire",
+ "serde_json",
+]
+
+[[package]]
+name = "pal-android"
+version = "0.0.1"
+dependencies = [
+ "decode",
+ "devourer-sys",
+ "flightlog",
+ "log",
+ "ndk",
+ "pal-core",
+ "pal-osd",
+ "runtime",
  "serde_json",
 ]
 
@@ -1872,8 +1908,6 @@ name = "pal-phone"
 version = "0.0.1"
 dependencies = [
  "android_logger",
- "decode",
- "devourer-sys",
  "egui",
  "egui_glow",
  "glow",
@@ -1881,7 +1915,27 @@ dependencies = [
  "khronos-egl",
  "log",
  "ndk",
- "pal-core",
+ "pal-android",
+ "pal-osd",
+ "runtime",
+]
+
+[[package]]
+name = "pal-quest"
+version = "0.0.1"
+dependencies = [
+ "android-activity",
+ "android_logger",
+ "egui",
+ "egui_glow",
+ "glow",
+ "jni 0.21.1",
+ "khronos-egl",
+ "log",
+ "ndk",
+ "ndk-context",
+ "openxr",
+ "pal-android",
  "pal-osd",
  "runtime",
 ]
@@ -2154,6 +2208,7 @@ dependencies = [
  "pal-core",
  "pal-osd",
  "pal-wire",
+ "serde_json",
 ]
 
 [[package]]

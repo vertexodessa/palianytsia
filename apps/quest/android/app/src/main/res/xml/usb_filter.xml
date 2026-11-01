@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- RTL88xx Wi-Fi only. Ids carry 0x: without it the platform parses them as
+         decimal, drops the field, and the filter matches every USB device. -->
+    <usb-device vendor-id="0x0bda" product-id="0x8812" /> <!-- RTL8812AU -->
+    <usb-device vendor-id="0x0bda" product-id="0x881a" /> <!-- RTL8812AU-VS -->
+    <usb-device vendor-id="0x0bda" product-id="0x881b" /> <!-- RTL8812AU-VL -->
+    <usb-device vendor-id="0x2357" product-id="0x0101" /> <!-- Archer T4U -->
+    <usb-device vendor-id="0x2357" product-id="0x0103" /> <!-- Archer T4UH -->
+    <usb-device vendor-id="0x2357" product-id="0x010d" /> <!-- Archer T4U V2 -->
+    <usb-device vendor-id="0x2357" product-id="0x010e" /> <!-- Archer T4UH V2 -->
+    <usb-device vendor-id="0x0b05" product-id="0x17d2" /> <!-- Asus AC56 -->
+    <usb-device vendor-id="0x2604" product-id="0x0012" /> <!-- Tenda U12 -->
+    <usb-device vendor-id="0x0409" product-id="0x0408" /> <!-- NEC AtermWL900U -->
+    <usb-device vendor-id="0x0586" product-id="0x3426" /> <!-- ZyXel 6605 -->
+    <usb-device vendor-id="0x0bda" product-id="0xa81a" /> <!-- RTL8812EU -->
+    <usb-device vendor-id="0x0bda" product-id="0xa82a" /> <!-- RTL8822EU -->
+    <usb-device vendor-id="0x0bda" product-id="0xe822" /> <!-- RTL8822EU multi-function -->
+</resources>

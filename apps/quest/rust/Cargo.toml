@@ -1,0 +1,27 @@
+[package]
+name = "pal-quest"
+description = "Quest 3 GS (spec 5.6): NativeActivity + OpenXR, MediaCodec into a surface swapchain quad, egui OSD quad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "palquest"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+pal-android = { path = "../../../crates/pal-android" }
+pal-osd.workspace = true
+runtime.workspace = true
+openxr = { version = "0.19", features = ["loaded"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+ndk-context = "0.1"
+ndk = { version = "0.9", features = ["media", "api-level-29"] }
+jni = "0.21"
+khronos-egl = { version = "6", features = ["static", "no-pkg-config"] }
+android_logger = "0.14"
+log = "0.4"
+egui = { workspace = true }
+egui_glow = "0.31"
+glow = "0.16"

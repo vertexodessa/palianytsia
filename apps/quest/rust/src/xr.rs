@@ -1,0 +1,506 @@
+//! The OpenXR side, grown from spikes/quest-xr-probe (whose findings it
+//! keeps: the ndk_context Activity swap, the zero fields of the surface
+//! swapchain, the vertical flip). Two quad layers in VIEW space (goggle
+//! mode, head-locked like real FPV goggles): the video, decoded by
+//! MediaCodec straight into an XR_KHR_android_surface_swapchain, and the
+//! OSD above it. The frame loop never waits for video.
+use std::ffi::CString;
+use std::io::Read;
+use std::ptr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use android_activity::{AndroidApp, MainEvent, PollEvent};
+use glow::HasContext;
+use openxr as xr;
+use openxr::sys;
+
+use crate::input::Input;
+use crate::osd::Osd;
+use crate::supervisor::Hub;
+
+/// Video swapchain size: the decoder scales into it.
+const VW: u32 = 1920;
+const VH: u32 = 1080;
+/// Goggle mode quad: 2.0 m wide at 1.5 m, about 67 degrees across.
+const DIST_M: f32 = 1.5;
+const WIDTH_M: f32 = 2.0;
+
+struct Egl {
+    egl: khronos_egl::Instance<khronos_egl::Static>,
+    display: khronos_egl::Display,
+    config: khronos_egl::Config,
+    context: khronos_egl::Context,
+}
+
+/// The GLES context the session binds to; the OSD draws with it. A tiny
+/// pbuffer keeps it current (all real targets are swapchain FBOs).
+fn make_egl() -> Result<Egl, String> {
+    use khronos_egl as egl;
+    let e = egl::Instance::new(egl::Static);
+    let d = unsafe { e.get_display(egl::DEFAULT_DISPLAY) }.ok_or("no EGL display")?;
+    e.initialize(d).map_err(|x| format!("eglInitialize: {x}"))?;
+    let attrs = [
+        egl::RENDERABLE_TYPE,
+        0x0040, // EGL_OPENGL_ES3_BIT
+        egl::SURFACE_TYPE,
+        egl::PBUFFER_BIT,
+        egl::RED_SIZE,
+        8,
+        egl::GREEN_SIZE,
+        8,
+        egl::BLUE_SIZE,
+        8,
+        egl::ALPHA_SIZE,
+        8,
+        egl::NONE,
+    ];
+    let cfg = e
+        .choose_first_config(d, &attrs)
+        .map_err(|x| format!("eglChooseConfig: {x}"))?
+        .ok_or("no EGL config")?;
+    let ctx = e
+        .create_context(d, cfg, None, &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE])
+        .map_err(|x| format!("eglCreateContext: {x}"))?;
+    let pb = e
+        .create_pbuffer_surface(d, cfg, &[egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE])
+        .map_err(|x| format!("pbuffer: {x}"))?;
+    e.make_current(d, Some(pb), Some(pb), Some(ctx))
+        .map_err(|x| format!("eglMakeCurrent: {x}"))?;
+    Ok(Egl {
+        egl: e,
+        display: d,
+        config: cfg,
+        context: ctx,
+    })
+}
+
+fn asset(app: &AndroidApp, name: &str) -> Result<String, String> {
+    let c = CString::new(name).map_err(|e| e.to_string())?;
+    let mut a = app
+        .asset_manager()
+        .open(&c)
+        .ok_or_else(|| format!("asset {name} missing"))?;
+    let mut s = String::new();
+    a.read_to_string(&mut s)
+        .map_err(|e| format!("asset {name}: {e}"))?;
+    Ok(s)
+}
+
+/// The display rate a video fps divides evenly (spec 5.6 "Frame rate"),
+/// or None while the fps is unknown.
+fn rate_for(fps: f64, offered: &[f32]) -> Option<f32> {
+    let want = if fps > 100.0 {
+        120.0
+    } else if fps > 75.0 {
+        90.0
+    } else if fps > 45.0 {
+        120.0
+    } else if fps > 20.0 {
+        90.0
+    } else {
+        return None;
+    };
+    offered.iter().copied().find(|r| (r - want).abs() < 1.0)
+}
+
+/// Surface swapchain plus its Android Surface as a NativeWindow.
+fn video_swapchain(
+    inst: &xr::Instance,
+    session: &xr::Session<xr::OpenGlEs>,
+    vm: &jni::JavaVM,
+) -> Result<(sys::Swapchain, ndk::native_window::NativeWindow), String> {
+    let create = inst
+        .exts()
+        .khr_android_surface_swapchain
+        .as_ref()
+        .ok_or("no XR_KHR_android_surface_swapchain")?
+        .create_swapchain_android_surface;
+    // The Meta runtime accepts only usage 0 and zero counts here; any 1
+    // is ERROR_VALIDATION_FAILURE with no log (spike, 2026-10-31).
+    let ci = sys::SwapchainCreateInfo {
+        ty: sys::SwapchainCreateInfo::TYPE,
+        next: ptr::null(),
+        create_flags: sys::SwapchainCreateFlags::EMPTY,
+        usage_flags: sys::SwapchainUsageFlags::EMPTY,
+        format: 0,
+        sample_count: 0,
+        width: VW,
+        height: VH,
+        face_count: 0,
+        array_size: 0,
+        mip_count: 0,
+    };
+    let mut sc = sys::Swapchain::NULL;
+    let mut surface: sys::platform::jobject = ptr::null_mut();
+    // SAFETY: a valid session handle and out-pointers.
+    let r = unsafe { create(session.as_raw(), &ci, &mut sc, &mut surface) };
+    if r != sys::Result::SUCCESS || surface.is_null() {
+        return Err(format!("xrCreateSwapchainAndroidSurfaceKHR: {r:?}"));
+    }
+    let env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    // SAFETY: `surface` is the runtime's live android.view.Surface.
+    let win = unsafe {
+        ndk::native_window::NativeWindow::from_surface(env.get_raw().cast(), surface.cast())
+    }
+    .ok_or("ANativeWindow_fromSurface returned null")?;
+    log::info!("video swapchain {}x{}", win.width(), win.height());
+    Ok((sc, win))
+}
+
+fn quad(
+    space: sys::Space,
+    sc: sys::Swapchain,
+    w: u32,
+    h: u32,
+    flags: sys::CompositionLayerFlags,
+    next: *const std::ffi::c_void,
+) -> sys::CompositionLayerQuad {
+    sys::CompositionLayerQuad {
+        ty: sys::CompositionLayerQuad::TYPE,
+        next,
+        layer_flags: flags,
+        space,
+        eye_visibility: sys::EyeVisibility::BOTH,
+        sub_image: sys::SwapchainSubImage {
+            swapchain: sc,
+            image_rect: sys::Rect2Di {
+                offset: sys::Offset2Di { x: 0, y: 0 },
+                extent: sys::Extent2Di {
+                    width: w as i32,
+                    height: h as i32,
+                },
+            },
+            image_array_index: 0,
+        },
+        pose: sys::Posef {
+            orientation: sys::Quaternionf {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            },
+            position: sys::Vector3f {
+                x: 0.0,
+                y: 0.0,
+                z: -DIST_M,
+            },
+        },
+        size: sys::Extent2Df {
+            width: WIDTH_M,
+            height: WIDTH_M * 9.0 / 16.0,
+        },
+    }
+}
+
+/// Consumes NativeActivity's input queue. Unread, the input dispatcher
+/// times out on it and the system shows "isn't responding" over the
+/// video (seen 2026-11-01). Controllers come through OpenXR actions, not
+/// this queue.
+fn drain_input(app: &AndroidApp) {
+    if let Ok(mut it) = app.input_events_iter() {
+        while it.next(|_| android_activity::InputStatus::Unhandled) {}
+    }
+}
+
+pub fn run(app: &AndroidApp) -> Result<(), String> {
+    let toml = asset(app, "gs.toml")?;
+    let ext_dir = app.external_data_path().ok_or("no external files dir")?;
+    let int_dir = app.internal_data_path().ok_or("no files dir")?;
+    let hub = Arc::new(Hub::default());
+    let act = app.activity_as_ptr() as usize;
+    let sup = {
+        let hub = hub.clone();
+        let log_dir = ext_dir.join("logs");
+        std::thread::Builder::new()
+            .name("pal-supervisor".into())
+            .spawn(move || crate::supervisor::run(hub, act, toml, log_dir))
+            .map_err(|e| e.to_string())?
+    };
+
+    let entry = unsafe { xr::Entry::load() }.map_err(|e| format!("load loader: {e}"))?;
+    entry
+        .initialize_android_loader()
+        .map_err(|e| format!("xrInitializeLoaderKHR: {e}"))?;
+    let exts = entry
+        .enumerate_extensions()
+        .map_err(|e| format!("extensions: {e}"))?;
+    if !exts.khr_android_surface_swapchain {
+        return Err("runtime lacks XR_KHR_android_surface_swapchain".into());
+    }
+    // android-activity 0.6 puts the Application into ndk_context and
+    // openxr hands that over as applicationActivity; the Meta runtime then
+    // holds the session in IDLE for good. Give it the Activity.
+    let vm_ptr = ndk_context::android_context().vm();
+    unsafe {
+        ndk_context::release_android_context();
+        ndk_context::initialize_android_context(vm_ptr, app.activity_as_ptr());
+    }
+    // SAFETY: the process's JavaVM.
+    let vm = unsafe { jni::JavaVM::from_raw(vm_ptr.cast()) }.map_err(|e| e.to_string())?;
+    let mut want = xr::ExtensionSet::default();
+    want.khr_android_create_instance = true;
+    want.khr_android_surface_swapchain = true;
+    want.khr_opengl_es_enable = true;
+    want.fb_display_refresh_rate = exts.fb_display_refresh_rate;
+    want.fb_composition_layer_image_layout = exts.fb_composition_layer_image_layout;
+    let inst = entry
+        .create_instance(
+            &xr::ApplicationInfo {
+                application_name: "palianytsia",
+                application_version: 1,
+                engine_name: "palianytsia",
+                engine_version: 1,
+                api_version: xr::Version::new(1, 0, 0),
+            },
+            &want,
+            &[],
+        )
+        .map_err(|e| format!("create_instance: {e}"))?;
+    let sys_id = inst
+        .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)
+        .map_err(|e| format!("system: {e}"))?;
+    inst.graphics_requirements::<xr::OpenGlEs>(sys_id)
+        .map_err(|e| format!("gles requirements: {e}"))?;
+    // xrCreateSession checks the activity is resumed, focused and has a
+    // window; created earlier, the session never leaves IDLE.
+    let (mut resumed, mut window, mut focused) = (false, false, false);
+    while !(resumed && window && focused) {
+        let mut destroy = false;
+        drain_input(app);
+        app.poll_events(Some(Duration::from_millis(100)), |e| {
+            if let PollEvent::Main(m) = &e {
+                match m {
+                    MainEvent::Resume { .. } => resumed = true,
+                    MainEvent::InitWindow { .. } => window = true,
+                    MainEvent::Pause => resumed = false,
+                    MainEvent::TerminateWindow { .. } => window = false,
+                    MainEvent::GainedFocus => focused = true,
+                    MainEvent::LostFocus => focused = false,
+                    MainEvent::Destroy => destroy = true,
+                    _ => {}
+                }
+            }
+        });
+        if destroy {
+            hub.quit.store(true, Ordering::Relaxed);
+            let _ = sup.join();
+            return Ok(());
+        }
+    }
+    let egl = make_egl()?;
+    let (session, _waiter, _stream) = unsafe {
+        inst.create_session::<xr::OpenGlEs>(
+            sys_id,
+            &xr::opengles::SessionCreateInfo::Android {
+                display: egl.display.as_ptr() as _,
+                config: egl.config.as_ptr() as _,
+                context: egl.context.as_ptr() as _,
+            },
+        )
+    }
+    .map_err(|e| format!("create_session: {e}"))?;
+    // SAFETY: the context made current in make_egl().
+    let gl = Arc::new(unsafe {
+        glow::Context::from_loader_function(|n| {
+            egl.egl
+                .get_proc_address(n)
+                .map_or(ptr::null(), |f| f as *const _)
+        })
+    });
+    let space = session
+        .create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)
+        .map_err(|e| format!("space: {e}"))?;
+
+    let input = match Input::new(&inst, &session) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            log::error!("controllers: {e}");
+            None
+        }
+    };
+    let mut video: Option<sys::Swapchain> = None;
+    let mut osd: Option<Osd> = None;
+    let fp = inst.fp();
+    let mut ev = xr::EventDataBuffer::new();
+    let (mut running, mut quit) = (false, false);
+    let (mut frames, mut t_log) = (0u64, Instant::now());
+    let mut rate = (0.0f32, Instant::now(), 0u64);
+    while !quit {
+        drain_input(app);
+        app.poll_events(Some(Duration::ZERO), |e| {
+            if let PollEvent::Main(MainEvent::Destroy) = &e {
+                quit = true;
+            }
+        });
+        while let Some(e) = inst.poll_event(&mut ev).map_err(|e| e.to_string())? {
+            if let xr::Event::SessionStateChanged(s) = e {
+                log::info!("xr state {:?}", s.state());
+                match s.state() {
+                    xr::SessionState::READY => {
+                        session
+                            .begin(xr::ViewConfigurationType::PRIMARY_STEREO)
+                            .map_err(|e| e.to_string())?;
+                        running = true;
+                        // After READY: created earlier, the shell transition
+                        // stalled in the spike.
+                        if video.is_none() {
+                            let (sc, win) = video_swapchain(&inst, &session, &vm)?;
+                            *hub.win.lock().unwrap_or_else(|p| p.into_inner()) = Some(win);
+                            video = Some(sc);
+                        }
+                        if osd.is_none() {
+                            match Osd::new(&session, gl.clone(), int_dir.join("hud.json")) {
+                                Ok(o) => osd = Some(o),
+                                Err(e) => log::error!("{e}"),
+                            }
+                        }
+                    }
+                    xr::SessionState::STOPPING => {
+                        session.end().map_err(|e| e.to_string())?;
+                        running = false;
+                    }
+                    xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => quit = true,
+                    _ => {}
+                }
+            }
+        }
+        if !running {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        // Match the display to the video every 2 s from the decoded fps.
+        if exts.fb_display_refresh_rate && rate.1.elapsed() >= Duration::from_secs(2) {
+            let sh = hub.shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let f = sh.map_or(0, |s| s.frames.load(Ordering::Relaxed));
+            let fps = f.saturating_sub(rate.2) as f64 / rate.1.elapsed().as_secs_f64();
+            let offered = session
+                .enumerate_display_refresh_rates()
+                .unwrap_or_default();
+            if let Some(r) = rate_for(fps, &offered) {
+                if (r - rate.0).abs() > 0.5 {
+                    match session.request_display_refresh_rate(r) {
+                        Ok(()) => log::info!("display {r} Hz for video {fps:.0} fps"),
+                        Err(e) => log::warn!("display {r} Hz refused: {e}"),
+                    }
+                    rate.0 = r;
+                }
+            }
+            rate.1 = Instant::now();
+            rate.2 = f;
+        }
+
+        let mut fs = sys::FrameState {
+            ty: sys::FrameState::TYPE,
+            next: ptr::null_mut(),
+            predicted_display_time: sys::Time::from_nanos(0),
+            predicted_display_period: sys::Duration::from_nanos(0),
+            should_render: sys::FALSE,
+        };
+        let wi = sys::FrameWaitInfo {
+            ty: sys::FrameWaitInfo::TYPE,
+            next: ptr::null(),
+        };
+        let bi = sys::FrameBeginInfo {
+            ty: sys::FrameBeginInfo::TYPE,
+            next: ptr::null(),
+        };
+        // SAFETY: a running session; the info structs live across the calls.
+        unsafe {
+            (fp.wait_frame)(session.as_raw(), &wi, &mut fs);
+        }
+        // Input at the predicted display time, so the ray matches the
+        // frame it is drawn into.
+        let frame = input.as_ref().map_or_else(Default::default, |i| {
+            i.poll(
+                &session,
+                &space,
+                fs.predicted_display_time,
+                DIST_M,
+                WIDTH_M,
+                crate::osd::points(),
+            )
+        });
+        if let Some(o) = osd.as_mut() {
+            o.tick(&hub, frame);
+        }
+        // SAFETY: as above.
+        unsafe {
+            (fp.begin_frame)(session.as_raw(), &bi);
+        }
+        // A decoder Surface stores rows top-down; OpenXR samples bottom-up.
+        let flip = sys::CompositionLayerImageLayoutFB {
+            ty: sys::CompositionLayerImageLayoutFB::TYPE,
+            next: ptr::null_mut(),
+            flags: sys::CompositionLayerImageLayoutFlagsFB::VERTICAL_FLIP,
+        };
+        let flip_ptr = if exts.fb_composition_layer_image_layout {
+            &flip as *const _ as *const std::ffi::c_void
+        } else {
+            ptr::null()
+        };
+        let mut quads = Vec::with_capacity(2);
+        if let Some(sc) = video {
+            quads.push(quad(
+                space.as_raw(),
+                sc,
+                VW,
+                VH,
+                sys::CompositionLayerFlags::EMPTY,
+                flip_ptr,
+            ));
+        }
+        if let Some(o) = osd.as_ref().filter(|o| o.ready) {
+            quads.push(quad(
+                space.as_raw(),
+                o.sc.as_raw(),
+                crate::osd::W,
+                crate::osd::H,
+                sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA,
+                ptr::null(),
+            ));
+        }
+        let layers: Vec<*const sys::CompositionLayerBaseHeader> = quads
+            .iter()
+            .map(|q| q as *const _ as *const sys::CompositionLayerBaseHeader)
+            .collect();
+        let render = fs.should_render != sys::FALSE;
+        let ei = sys::FrameEndInfo {
+            ty: sys::FrameEndInfo::TYPE,
+            next: ptr::null(),
+            display_time: fs.predicted_display_time,
+            environment_blend_mode: sys::EnvironmentBlendMode::OPAQUE,
+            layer_count: if render { layers.len() as u32 } else { 0 },
+            layers: layers.as_ptr(),
+        };
+        // SAFETY: the layers and their chained structs outlive the call.
+        let r = unsafe { (fp.end_frame)(session.as_raw(), &ei) };
+        if r != sys::Result::SUCCESS {
+            log::warn!("xr end_frame {r:?}");
+        }
+        frames += 1;
+        if t_log.elapsed() >= Duration::from_secs(10) {
+            log::info!(
+                "xr {:.1} frames/s, period {} us",
+                frames as f64 / t_log.elapsed().as_secs_f64(),
+                fs.predicted_display_period.as_nanos() / 1000
+            );
+            frames = 0;
+            t_log = Instant::now();
+        }
+    }
+    hub.quit.store(true, Ordering::Relaxed);
+    drop(osd);
+    // The supervisor stops the link (bounded 3 s) before it returns.
+    let t0 = Instant::now();
+    while !sup.is_finished() && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if sup.is_finished() {
+        let _ = sup.join();
+    }
+    // SAFETY: nothing draws any more.
+    unsafe { gl.finish() };
+    Ok(())
+}

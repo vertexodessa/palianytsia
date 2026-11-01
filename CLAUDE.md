@@ -15,6 +15,8 @@ status: `docs/spec.md`; read its M1/M2 status sections first).
 | `crates/runtime` | shared by the apps: devourer RX thread, core loop (`CoreLoop`: GsCore + IdrDriver + log + stats/params), `run_live` |
 | `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |
 | `apps/phone` | phone app (M3): `rust/` = `pal-phone` cdylib (JNI start/stats/lastError/stop over `runtime`, MediaCodec into the Surface), `android/` = Java shell (USB permission, SurfaceView, text OSD). `tools/phone-apk.sh [cfg]` builds the APK |
+| `crates/pal-android` | Android link shared by phone and Quest: `Link::start(fd, window, config)` runs core + MediaCodec threads and the flight log, `Ports` for the UI, bounded `stop()` |
+| `apps/quest` | Quest 3 app (M3): `rust/` = `pal-quest` NativeActivity (OpenXR: video via surface swapchain quad, egui OSD quad, controller ray + panel, USB supervisor with 3 s retry), `android/` = manifest only. `tools/quest-apk.sh [cfg]` builds the APK (OpenXR loader pulled from Maven Central) |
 | `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
 | `third_party/libusb` | upstream libusb v1.0.27, Android only (`tools/android-libusb.sh`; `tools/android-build.sh build -p <crate>` cross-builds for aarch64) |
 | `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (branch `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
