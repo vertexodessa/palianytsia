@@ -8,6 +8,7 @@ extern crate alloc;
 pub mod crc16;
 pub mod dot11;
 pub mod frame_wire;
+pub mod mavlink;
 pub mod probe;
 pub mod profile;
 pub mod rc;

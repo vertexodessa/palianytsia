@@ -46,6 +46,17 @@ run_case() {  # name, then the shared replay flags
   fi
 }
 
+# GS: the Rust core's transmitted RC bodies (RCF, DISC, NACK, MAV) must
+# match pal-ref's byte for byte; webgs replay has no sends dump.
+sends_case() {  # name, then the shared replay flags
+  local name=$1; shift
+  "$PAL" "$TMP/frames.bin" "$TMP/r.aus" -c "$TMP/gs.toml" "$@" --sends "$TMP/r.sends" 2>/dev/null
+  "$PAL" "$TMP/frames.bin" "$TMP/u.aus" -c "$TMP/gs.toml" "$@" --core rust --sends "$TMP/u.sends" 2>/dev/null
+  if cmp -s "$TMP/r.sends" "$TMP/u.sends" && cmp -s "$TMP/r.aus" "$TMP/u.aus"; then
+    echo "ok   $name: $(stat -c %s "$TMP/r.sends") send bytes"
+  else echo "FAIL $name: ref and rust sends or AUs differ"; fail=1; fi
+}
+
 for spec in "0 1" "5 7" "15 3"; do
   set -- $spec
   run_case "spotter fixed-gap drop=$1 seed=$2" --mode spotter --fixed-gap --drop-pct "$1" --seed "$2"
@@ -53,6 +64,10 @@ for spec in "0 1" "5 7" "15 3"; do
   run_case "rust spotter fixed drop=$1 seed=$2" --mode spotter --fixed-gap --drop-pct "$1" --seed "$2" --core rust
   run_case "rust spotter adapt drop=$1 seed=$2" --mode spotter --drop-pct "$1" --seed "$2" --core rust
   run_case "gs fake-ack       drop=$1 seed=$2" --mode gs --fake-ack --drop-pct "$1" --seed "$2"
+  run_case "rust gs fake-ack  drop=$1 seed=$2" --mode gs --fake-ack --drop-pct "$1" --seed "$2" --core rust
+  run_case "rust gs fixed-ack drop=$1 seed=$2" --mode gs --fake-ack --fixed-gap --drop-pct "$1" --seed "$2" --core rust
+  sends_case "gs sends ref==rust drop=$1 seed=$2" --mode gs --fake-ack --drop-pct "$1" --seed "$2"
+  sends_case "gs sends no-ack    drop=$1 seed=$2" --mode gs --drop-pct "$1" --seed "$2"
 done
 
 # Row-sliced 1080p frames (mabur's slices4 fixture): truncated AUs go

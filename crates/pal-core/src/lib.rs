@@ -10,9 +10,15 @@ pub mod aggregator;
 pub mod config;
 pub mod frame_stream;
 pub mod gap;
+pub mod ladder;
+pub mod link_health;
+pub mod mav;
+pub mod nack;
 pub mod rust_core;
 pub mod slice_asm;
 pub mod uep;
+pub mod uplink;
+pub mod vrx;
 
 /// One received 802.11 body with its RX metadata. Mirrors
 /// `mabur::node::RxBody` field for field.

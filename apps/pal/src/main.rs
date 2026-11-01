@@ -38,6 +38,7 @@ struct Opts {
     capture: Option<PathBuf>,
     dump: Option<PathBuf>,
     aus: Option<PathBuf>,
+    sends: Option<PathBuf>,
     mode: Option<Mode>,
     rust: bool,
     drop_pct: u32,
@@ -67,6 +68,7 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--capture" => o.capture = Some(val().into()),
             "--dump" => o.dump = Some(val().into()),
             "--aus" => o.aus = Some(val().into()),
+            "--sends" => o.sends = Some(val().into()),
             "--mode" => {
                 o.mode = Some(match val().as_str() {
                     "gs" => Mode::Gs,
@@ -100,6 +102,8 @@ fn die(msg: &str) -> ! {
 struct Sink {
     dump: Option<BufWriter<std::fs::File>>,
     aus_file: Option<BufWriter<std::fs::File>>,
+    /// Every RC body handed to `send`, LP (u32 len | bytes), for `cmp`.
+    sends_file: Option<BufWriter<std::fs::File>>,
     aus: u64,
     truncated: u64,
     bytes: u64,
@@ -121,6 +125,7 @@ impl Sink {
         Sink {
             dump: mk(&o.dump),
             aus_file: mk(&o.aus),
+            sends_file: mk(&o.sends),
             aus: 0,
             truncated: 0,
             bytes: 0,
@@ -130,9 +135,13 @@ impl Sink {
         }
     }
     fn finish(&mut self) {
-        for w in [self.dump.as_mut(), self.aus_file.as_mut()]
-            .into_iter()
-            .flatten()
+        for w in [
+            self.dump.as_mut(),
+            self.aus_file.as_mut(),
+            self.sends_file.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
         {
             w.flush().unwrap();
         }
@@ -159,6 +168,10 @@ impl CoreIo for Sink {
     }
     fn send(&mut self, rc_body: &[u8]) {
         self.sends += 1;
+        if let Some(w) = self.sends_file.as_mut() {
+            w.write_all(&(rc_body.len() as u32).to_le_bytes()).unwrap();
+            w.write_all(rc_body).unwrap();
+        }
         if let Some(c) = &self.card {
             if !c.send_control(rc_body) {
                 self.send_fail += 1;
@@ -181,6 +194,8 @@ fn core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
                 RustOpts {
                     mode,
                     adaptive_gap: false,
+                    rz_nonce: RZ_NONCE,
+                    channel,
                 },
             )
             .unwrap_or_else(|e| die(&e)),
@@ -391,8 +406,8 @@ fn replay(o: Opts) {
     }
     sink.finish();
     println!(
-        "replay bodies={bodies} dropped={dropped} ticks={ticks} aus={} truncated={} au_bytes={}",
-        sink.aus, sink.truncated, sink.bytes
+        "replay bodies={bodies} dropped={dropped} ticks={ticks} aus={} truncated={} au_bytes={} sends={}",
+        sink.aus, sink.truncated, sink.bytes, sink.sends
     );
     println!("stats {}", core.stats_json());
 }
