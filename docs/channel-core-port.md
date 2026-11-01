@@ -39,7 +39,7 @@ is refused at start, never silently ignored.
 | Level | Modules (lines of C++) | Status |
 |---|---|---|
 | 0 | scout_pick (87), channel_ranker (144), s1_loss (141), width_resync (35), scout_radio (80), nhm_busy, nhm_window, snr_units, channel_plan (259), hop_verdict (320) | done: `chan::{scout_pick,ranker,radio,plan,verdict}`, s1_loss was already in `link_health.rs`; 87 tests |
-| 1 | pair_pick (171), hop_ranker (171), hop_blank (80), hop_controller (537) | |
+| 1 | pair_pick (171), hop_ranker (171), hop_blank (80), hop_controller (537) | done: `chan::{pair,hop_ranker,hop}` (hop_blank lives in `hop`); 76 tests |
 | 2 | hop_burst_gate (117), boot_pick (241), channel_scout (598), window_sampler (262), inflight_scout (246) | |
 | 3 | channel_core (1448), the WebGs wiring in `rust_core.rs`, the trace harness | |
 | 4 | live test, APKs on the Rust core, pal-ref out of the Android build | |
