@@ -439,17 +439,23 @@ pub trait RxTap: Send + Sync {
 
 pub struct Attached {
     pub core: Box<dyn GsCore>,
-    pub tap: Arc<dyn RxTap>,
+    /// One per card the core drives, in card order; a card without a tap
+    /// (past the end) has its frames dropped.
+    pub taps: Vec<Arc<dyn RxTap>>,
     /// The core's own clock; RX stamps and ticks use it.
     pub clock: fn() -> u64,
 }
 
-/// Builds such a core once the card is open and receiving.
-pub type Attach = Box<dyn FnOnce(&Arc<devourer_sys::Card>) -> Result<Attached, String>>;
+/// Builds such a core once the cards are open and receiving (card 0 is
+/// `LiveCfg::select`, then `LiveCfg::extra` in order).
+pub type Attach = Box<dyn FnOnce(&[Arc<devourer_sys::Card>]) -> Result<Attached, String>>;
 
 /// Where the card comes from and how to tune it.
 pub struct LiveCfg {
     pub select: devourer_sys::Select,
+    /// More cards for an attached core (mabur's multi-card GS: every card
+    /// receives, the channel core scouts on one). Ignored without `attach`.
+    pub extra: Vec<devourer_sys::Select>,
     pub ch: u8,
     pub width: u8,
     /// GS mode: the card also transmits the core's RC frames.
@@ -466,7 +472,7 @@ pub struct LiveCfg {
     pub attach: Option<Attach>,
 }
 
-type TapClock = (Arc<dyn RxTap>, fn() -> u64);
+type TapClock = (Vec<Arc<dyn RxTap>>, fn() -> u64);
 
 fn mono_default() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -537,21 +543,19 @@ fn search(
     Ok(found)
 }
 
-/// Opens the card and runs the core loop on this thread until
-/// `shared.quit`; `on_open` gets the chip name once the card is up.
+/// Opens the card(s) and runs the core loop on this thread until
+/// `shared.quit`; `on_open` gets the chip names once the cards are up.
 pub fn run_live(
     mut cl: CoreLoop,
     mut o: LiveCfg,
     on_open: impl FnOnce(&str),
 ) -> Result<(), String> {
-    let mut card = devourer_sys::Card::open(&devourer_sys::Config {
-        select: o.select.clone(),
-        channel: o.ch,
-        width_mhz: o.width,
-    })
-    .map_err(|e| format!("card: {e}"))?;
-    on_open(&card.chip().unwrap_or("?".into()));
     let attach = o.attach.take();
+    let attached = attach.is_some();
+    let mut selects = vec![o.select.clone()];
+    if attached {
+        selects.extend(o.extra.iter().cloned());
+    }
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
     // The channel RX frames are stamped with; 0 while the card retunes.
     let cur = Arc::new(AtomicU8::new(o.ch));
@@ -559,75 +563,107 @@ pub fn run_live(
     let hits = Arc::new(AtomicU32::new(0));
     // Set once an attached core exists; frames before it are dropped.
     let tap: Arc<std::sync::OnceLock<TapClock>> = Arc::default();
-    let attached = attach.is_some();
     let shared_rx = cl.sink.shared.clone();
-    let (cur_rx, hits_rx, tap_rx) = (cur.clone(), hits.clone(), tap.clone());
-    card.start_rx(move |f| {
-        let v = dot11::parse(f.frame, f.crc_err, f.data_rate);
-        let (ch, now) = if attached {
-            let Some((t, clock)) = tap_rx.get() else {
-                return;
-            };
-            match t.on_rx(f, &v) {
-                Some(ch) => (ch, clock()),
-                None => return,
+    let mut cards = Vec::with_capacity(selects.len());
+    let mut chips = Vec::with_capacity(selects.len());
+    for (i, sel) in selects.into_iter().enumerate() {
+        let mut card = match devourer_sys::Card::open(&devourer_sys::Config {
+            select: sel,
+            channel: o.ch,
+            width_mhz: o.width,
+        }) {
+            Ok(c) => c,
+            Err(e) if i == 0 => return Err(format!("card: {e}")),
+            // A second card that will not come up costs diversity, not
+            // the link: fly on the ones that did.
+            Err(e) => {
+                eprintln!("pal: card {i} skipped: {e}");
+                shared_rx.event(
+                    "card_skipped",
+                    serde_json::json!({"card": i, "err": e.to_string()}),
+                );
+                continue;
             }
-        } else {
-            let ch = cur_rx.load(Ordering::Relaxed);
-            if ch == 0 {
-                return;
-            }
-            (ch, mono_default())
         };
-        if let dot11::Verdict::Body(p) = v {
-            if !f.crc_err && f.frame[0] & 0xFC == 0x88 {
-                hits_rx.fetch_add(1, Ordering::Relaxed);
+        chips.push(card.chip().unwrap_or("?".into()));
+        let (cur_rx, hits_rx, tap_rx) = (cur.clone(), hits.clone(), tap.clone());
+        let (tx, shared_rx) = (tx.clone(), shared_rx.clone());
+        // Contiguous ids over the cards that opened: the core's roster.
+        let card_id = cards.len() as u8;
+        card.start_rx(move |f| {
+            let v = dot11::parse(f.frame, f.crc_err, f.data_rate);
+            let (ch, now) = if attached {
+                let Some((taps, clock)) = tap_rx.get() else {
+                    return;
+                };
+                let Some(t) = taps.get(usize::from(card_id)) else {
+                    return;
+                };
+                match t.on_rx(f, &v) {
+                    Some(ch) => (ch, clock()),
+                    None => return,
+                }
+            } else {
+                let ch = cur_rx.load(Ordering::Relaxed);
+                if ch == 0 {
+                    return;
+                }
+                (ch, mono_default())
+            };
+            if let dot11::Verdict::Body(p) = v {
+                if !f.crc_err && f.frame[0] & 0xFC == 0x88 {
+                    hits_rx.fetch_add(1, Ordering::Relaxed);
+                }
+                shared_rx.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
+                let r = tx.try_send(RxBody {
+                    card_id,
+                    mono_us: now,
+                    rssi: f.rssi,
+                    snr: f.snr,
+                    evm: f.evm,
+                    phy_valid: f.physt,
+                    crc_ok: !f.crc_err,
+                    mac_seq: p.mac_seq,
+                    tsfl: f.tsfl,
+                    mcs: p.mcs,
+                    rx_channel: ch,
+                    body: f.frame[p.body_off..].to_vec(),
+                });
+                if r.is_err() {
+                    shared_rx.lat.rx_full.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            shared_rx.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
-            let r = tx.try_send(RxBody {
-                card_id: 0,
-                mono_us: now,
-                rssi: f.rssi,
-                snr: f.snr,
-                evm: f.evm,
-                phy_valid: f.physt,
-                crc_ok: !f.crc_err,
-                mac_seq: p.mac_seq,
-                tsfl: f.tsfl,
-                mcs: p.mcs,
-                rx_channel: ch,
-                body: f.frame[p.body_off..].to_vec(),
-            });
-            if r.is_err() {
-                shared_rx.lat.rx_full.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    })?;
-    let card = Arc::new(card);
+        })?;
+        cards.push(Arc::new(card));
+    }
+    drop(tx);
+    on_open(&chips.join(" + "));
     let shared = cl.sink.shared.clone();
     shared.channel.store(o.ch, Ordering::Relaxed);
     let mut clock: fn() -> u64 = mono_default;
     let mut tap_now: Option<Arc<dyn RxTap>> = None;
     if let Some(a) = attach {
-        let at = a(&card)?;
+        let at = a(&cards)?;
         cl.set_core(at.core);
         clock = at.clock;
-        tap_now = Some(at.tap.clone());
-        let _ = tap.set((at.tap, at.clock));
+        // The link card's channel is the one the UI shows.
+        tap_now = at.taps.first().cloned();
+        let _ = tap.set((at.taps, at.clock));
     }
     let r = live_loop(
         &mut cl,
         &mut o,
-        &card,
+        &cards[0],
         &cur,
         &hits,
         &rx,
         clock,
         tap_now.as_deref(),
     );
-    // The attached core's threads use the card: they stop before it closes.
+    // The attached core's threads use the cards: they stop before those close.
     drop(cl);
     drop(tap_now);
+    drop(cards);
     r
 }
 

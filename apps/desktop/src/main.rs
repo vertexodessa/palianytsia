@@ -5,7 +5,7 @@
 //! and the newest stats line.
 //!
 //!   pal-desktop -c gs.toml --replay bodies.bin [--mode gs|spotter] [--loop]
-//!   pal-desktop [-c gs.toml] [--live] [--ch N --width 20|40] [--bw 20|40] [--mode gs|spotter] [--card N]
+//!   pal-desktop [-c gs.toml] [--live] [--ch N --width 20|40] [--bw 20|40] [--mode gs|spotter] [--card N] [--card2 N]
 //!     --bw: video link width (every ladder rung); default the saved pref (Link tab)
 //!     live is the default; config from -c, $PAL_CONFIG, or configs/gs-auto.toml (finds the drone);
 //!     channel/width from its radio section, mode gs
@@ -59,6 +59,9 @@ struct Opts {
     /// Video link width (every ladder rung's bw); 0 = the saved pref.
     link_bw: u8,
     card: i32,
+    /// A second card (scan index) for the channel core: receives too, and
+    /// the core scouts on it. Only with an attached core (auto config).
+    card2: Option<i32>,
     mode: Option<Mode>,
     rust: bool,
     looping: bool,
@@ -112,6 +115,7 @@ fn parse() -> Opts {
             "--ch" => o.ch = val().parse().unwrap_or_else(|_| die("--ch")),
             "--width" => o.width = val().parse().unwrap_or_else(|_| die("--width")),
             "--card" => o.card = val().parse().unwrap_or_else(|_| die("--card")),
+            "--card2" => o.card2 = Some(val().parse().unwrap_or_else(|_| die("--card2"))),
             "--mode" => {
                 o.mode = Some(match val().as_str() {
                     "gs" => Mode::Gs,
@@ -739,6 +743,11 @@ fn main() {
                                 let o2 = o.clone();
                                 let cfg = LiveCfg {
                                     select: devourer_sys::Select::Scan { index: o.card },
+                                    extra: o
+                                        .card2
+                                        .map(|index| devourer_sys::Select::Scan { index })
+                                        .into_iter()
+                                        .collect(),
                                     ch: o.ch,
                                     width: o.width,
                                     gs: o.mode == Some(Mode::Gs),

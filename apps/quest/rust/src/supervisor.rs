@@ -1,7 +1,8 @@
-//! Keeps one `pal_android::Link` running on whatever card is attached:
-//! waits for the decoder window and the card, starts the link, watches it,
-//! and starts over 3 s after the card leaves or the core gives up (spec
-//! 5.5 USB robustness). XR session state never reaches here: with the
+//! Keeps one `pal_android::Link` running on whatever cards are attached
+//! (up to `MAX_CARDS`; mabur's multi-card GS: all receive, the channel core
+//! scouts on one): waits for the decoder window and the cards, starts the
+//! link, watches it, and starts over 3 s after a card leaves or the core
+//! gives up (spec 5.5 USB robustness), at once when a card is added. XR session state never reaches here: with the
 //! headset lifted the link and the flight log carry on.
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +12,7 @@ use std::time::Duration;
 use pal_android::{clear_err, last_error, Link, LinkCfg, Ports};
 use runtime::Shared;
 
-use crate::usb::{Find, Usb};
+use crate::usb::{Open, Usb};
 
 /// What the OSD needs from a freshly started link.
 pub struct LinkUi {
@@ -52,6 +53,19 @@ impl Hub {
 }
 
 const RETRY: Duration = Duration::from_secs(3);
+/// Two cards is what the Quest's port powers (a hub with two 8812s).
+const MAX_CARDS: usize = 2;
+/// With one card ready and another still waiting for its permission
+/// dialog, start without it after this long.
+const PERM_WAIT: Duration = Duration::from_secs(20);
+
+fn ids(opens: &[Open]) -> String {
+    opens
+        .iter()
+        .map(|o| o.id.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
 
 pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: PathBuf) {
     let ctx = ndk_context::android_context();
@@ -71,6 +85,8 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
         Err(e) => return log::error!("supervisor: UsbManager: {e}"),
     };
     let mut asked = Vec::new();
+    // Since when a card has been waiting for its permission dialog.
+    let mut perm_since: Option<std::time::Instant> = None;
     let nap = |d: Duration| {
         let t0 = std::time::Instant::now();
         while t0.elapsed() < d && !hub.quit.load(Ordering::Relaxed) {
@@ -83,38 +99,87 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
             nap(Duration::from_millis(200));
             continue;
         };
-        let found = env.with_local_frame(32, |env| usb.find(env, &mut asked));
-        let open = match found {
+        // Which cards are there and which may be opened.
+        let scan = env.with_local_frame(32, |env| {
+            let mut devs = usb.cards(env)?;
+            devs.truncate(MAX_CARDS);
+            let mut ready = Vec::new();
+            let mut waiting = Vec::new();
+            for d in devs {
+                if usb.permitted(env, &d.name, &mut asked)? {
+                    ready.push(d);
+                } else {
+                    waiting.push(d);
+                }
+            }
+            Ok::<_, jni::errors::Error>((ready, waiting))
+        });
+        let (ready, waiting) = match scan {
             Err(e) => {
                 let _ = env.exception_clear();
                 hub.set_status(format!("USB scan failed: {e}"));
                 nap(RETRY);
                 continue;
             }
-            Ok(Find::None) => {
-                hub.set_status("no RTL8812 card");
-                nap(RETRY);
-                continue;
-            }
-            Ok(Find::Waiting(id)) => {
-                hub.set_status(format!("card {id}: waiting for USB permission"));
+            Ok(x) => x,
+        };
+        if ready.is_empty() && waiting.is_empty() {
+            perm_since = None;
+            hub.set_status("no RTL8812 card");
+            nap(RETRY);
+            continue;
+        }
+        if !waiting.is_empty() {
+            let t0 = *perm_since.get_or_insert_with(std::time::Instant::now);
+            let w = waiting.iter().map(|d| d.id.as_str()).collect::<Vec<_>>();
+            if ready.is_empty() || t0.elapsed() < PERM_WAIT {
+                hub.set_status(format!(
+                    "card {}: waiting for USB permission ({} ready)",
+                    w.join(", "),
+                    ready.len()
+                ));
                 nap(Duration::from_secs(1));
                 continue;
             }
-            Ok(Find::Ready(o)) => o,
-        };
+            log::warn!("starting without {}: no USB permission", w.join(", "));
+        } else {
+            perm_since = None;
+        }
+        let mut opens = Vec::new();
+        for d in &ready {
+            match env.with_local_frame(32, |env| usb.open(env, d)) {
+                Ok(Ok(o)) => opens.push(o),
+                Ok(Err(e)) => log::warn!("usb: {e}"),
+                Err(e) => {
+                    let _ = env.exception_clear();
+                    log::warn!("usb: open {}: {e}", d.id);
+                }
+            }
+        }
+        if opens.is_empty() {
+            hub.set_status("card would not open; retrying");
+            nap(RETRY);
+            continue;
+        }
         clear_err();
-        hub.set_status(format!("card {} up, starting", open.id));
+        hub.set_status(format!("card {} up, starting", ids(&opens)));
         let cfg = LinkCfg {
-            fd: open.fd,
+            fds: opens.iter().map(|o| o.fd).collect(),
             toml: toml.clone(),
             log_dir: log_dir.clone(),
             link_bw: pal_osd::prefs::HudPrefs::load(&prefs).link_bw,
         };
+        log::info!(
+            "supervisor: starting on {} card(s): {}",
+            opens.len(),
+            ids(&opens)
+        );
         let (link, ports) = match Link::start(cfg, win) {
             Ok(x) => x,
             Err(e) => {
-                Usb::close(&mut env, open);
+                for o in opens {
+                    Usb::close(&mut env, o);
+                }
                 hub.set_status(format!("start failed: {e}; retrying"));
                 nap(RETRY);
                 continue;
@@ -139,9 +204,27 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
             if !link.running() {
                 break format!("link stopped: {}", last_error());
             }
-            match env.with_local_frame(32, |env| usb.present(env, &open.name)) {
-                Ok(false) => break "card detached".to_string(),
-                Ok(true) => {}
+            let check = env.with_local_frame(32, |env| {
+                for o in &opens {
+                    if !usb.present(env, &o.name)? {
+                        return Ok(Some(format!("card {} detached", o.id)));
+                    }
+                }
+                if opens.len() < MAX_CARDS {
+                    for d in usb.cards(env)? {
+                        if opens.iter().any(|o| o.name == d.name) {
+                            continue;
+                        }
+                        if usb.permitted(env, &d.name, &mut asked)? {
+                            return Ok(Some(format!("card {} added", d.id)));
+                        }
+                    }
+                }
+                Ok::<_, jni::errors::Error>(None)
+            });
+            match check {
+                Ok(Some(why)) => break why,
+                Ok(None) => {}
                 Err(_) => {
                     let _ = env.exception_clear();
                 }
@@ -150,10 +233,12 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
         log::warn!("supervisor: {why}");
         *hub.shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
         link.stop();
-        Usb::close(&mut env, open);
-        if why == "link width changed" {
-            // The card stays attached: reopen right away.
-            hub.set_status("link width changed, restarting");
+        for o in opens {
+            Usb::close(&mut env, o);
+        }
+        if why == "link width changed" || why.ends_with(" added") {
+            // The cards stay attached: reopen right away.
+            hub.set_status(format!("{why}, restarting"));
             nap(Duration::from_millis(300));
         } else {
             hub.set_status(format!("{why}; retrying"));

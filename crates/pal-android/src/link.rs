@@ -34,8 +34,10 @@ pub fn clear_err() {
 }
 
 pub struct LinkCfg {
-    /// usbfs fd from UsbDeviceConnection.getFileDescriptor().
-    pub fd: i32,
+    /// usbfs fds from UsbDeviceConnection.getFileDescriptor(), one per
+    /// card; the first is the link card, the rest receive (and scout) with
+    /// it under the channel core.
+    pub fds: Vec<i32>,
     pub toml: String,
     /// Flight log root; one `fl-NNNN_*` directory per start.
     pub log_dir: PathBuf,
@@ -147,7 +149,11 @@ impl Link {
             .name("pal-decode".into())
             .spawn(move || decode_loop(dec, au_rx, &sh))
             .map_err(|e| e.to_string())?;
-        let fd = c.fd;
+        let fd = *c.fds.first().ok_or("no card fd")?;
+        let extra: Vec<devourer_sys::Select> = c.fds[1..]
+            .iter()
+            .map(|&f| devourer_sys::Select::Fd(f))
+            .collect();
         let core_t = std::thread::Builder::new()
             .name("pal-core".into())
             .spawn(move || {
@@ -183,6 +189,7 @@ impl Link {
                 });
                 let lc = LiveCfg {
                     select: devourer_sys::Select::Fd(fd),
+                    extra,
                     ch,
                     width,
                     gs: true,

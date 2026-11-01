@@ -29,7 +29,7 @@ fn start(
     let link_bw = pal_osd::prefs::HudPrefs::load(&prefs_path).link_bw;
     let (link, ports) = Link::start(
         LinkCfg {
-            fd,
+            fds: vec![fd],
             toml,
             log_dir,
             link_bw,

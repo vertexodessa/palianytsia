@@ -37,6 +37,8 @@ pub struct DevCard {
     // Weak: the card's RX handler holds this (the tap), so a strong ref
     // would keep the card open forever.
     card: Weak<devourer_sys::Card>,
+    /// The card's index in the core's roster (log lines only).
+    idx: usize,
     caps: CardCaps,
     ready: AtomicBool,
     rx_frames: AtomicU64,
@@ -56,7 +58,7 @@ pub struct DevCard {
 impl DevCard {
     /// RadioFrontend::start_ after InitWrite: the caps and which energy
     /// counters this chip has.
-    pub fn new(card: &Arc<devourer_sys::Card>, ch: u8, width: u8) -> Self {
+    pub fn new(card: &Arc<devourer_sys::Card>, idx: usize, ch: u8, width: u8) -> Self {
         let (ac, e) = {
             let c = card.ctl();
             (c.caps(), c.rx_energy(true))
@@ -87,6 +89,7 @@ impl DevCard {
         };
         Self {
             card: Arc::downgrade(card),
+            idx,
             caps,
             ready: AtomicBool::new(true),
             rx_frames: AtomicU64::new(0),
@@ -234,11 +237,14 @@ impl LinkCard for DevCard {
             self.rx_channel.store(ch, Ordering::Release);
             match r {
                 Ok(()) => {
-                    eprintln!("pal radio: card 0 width {was} -> {w} MHz on ch {ch}");
+                    eprintln!(
+                        "pal radio: card {} width {was} -> {w} MHz on ch {ch}",
+                        self.idx
+                    );
                     true
                 }
                 Err(e) => {
-                    eprintln!("pal radio: {e}");
+                    eprintln!("pal radio: card {}: {e}", self.idx);
                     false
                 }
             }
@@ -259,13 +265,19 @@ impl LinkCard for DevCard {
     }
 }
 
-/// Builds the Rust GS with its channel core on the card once it is open at
-/// `opts.channel` / `width` (pal-ref's `live::channel_core` for the Rust
-/// core). The core's threads run on real time: `mono_default`, the clock
-/// the RX stamps and ticks use.
+/// Builds the Rust GS with its channel core on the cards once they are open
+/// at `opts.channel` / `width` (pal-ref's `live::channel_core` for the Rust
+/// core). Card 0 is the link card; with two or more the channel core
+/// scouts on another and every card's bodies feed the aggregator. The
+/// core's threads run on real time: `mono_default`, the clock the RX
+/// stamps and ticks use.
 pub fn rust_channel_core(cfg: Config, opts: RustOpts, width: u8) -> Attach {
-    Box::new(move |card| {
-        let dc = Arc::new(DevCard::new(card, opts.channel, width));
+    Box::new(move |cards| {
+        let dcs: Vec<Arc<DevCard>> = cards
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Arc::new(DevCard::new(c, i, opts.channel, width)))
+            .collect();
         let now_us: UsClock = Arc::new(mono_default);
         let now_ms: MsClock = Arc::new(|| mono_default() / 1000);
         let sleep: Sleeper = Arc::new(|ms| {
@@ -274,7 +286,7 @@ pub fn rust_channel_core(cfg: Config, opts: RustOpts, width: u8) -> Attach {
             }
         });
         let env = ChanEnv {
-            cards: vec![dc.clone() as Arc<dyn LinkCard>],
+            cards: dcs.iter().map(|d| d.clone() as Arc<dyn LinkCard>).collect(),
             now_ms,
             now_us,
             sleep,
@@ -283,7 +295,7 @@ pub fn rust_channel_core(cfg: Config, opts: RustOpts, width: u8) -> Attach {
         let core = RustCore::with_cards(&cfg, opts, env)?;
         Ok(Attached {
             core: Box::new(core),
-            tap: dc,
+            taps: dcs.into_iter().map(|d| d as Arc<dyn RxTap>).collect(),
             clock: mono_default,
         })
     })

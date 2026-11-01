@@ -16,7 +16,7 @@ status: `docs/spec.md`; read its M1/M2 status sections first).
 | `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |
 | `apps/phone` | phone app (M3): `rust/` = `pal-phone` cdylib (JNI start/stats/lastError/stop over `runtime`, MediaCodec into the Surface), `android/` = Java shell (USB permission, SurfaceView, text OSD). `tools/phone-apk.sh [cfg]` builds the APK |
 | `crates/pal-android` | Android link shared by phone and Quest: `Link::start(fd, window, config)` runs core + MediaCodec threads and the flight log, `Ports` for the UI, bounded `stop()` |
-| `apps/quest` | Quest 3 app (M3): `rust/` = `pal-quest` NativeActivity (OpenXR: video via surface swapchain quad, egui OSD quad, controller ray + panel, USB supervisor with 3 s retry), `android/` = manifest only. `tools/quest-apk.sh [cfg]` builds the APK (OpenXR loader pulled from Maven Central) |
+| `apps/quest` | Quest 3 app (M3): `rust/` = `pal-quest` NativeActivity (OpenXR: video via surface swapchain quad, egui OSD quad, controller ray + panel, USB supervisor with 3 s retry; up to 2 cards: card 0 = link/TX, all receive, the channel core scouts on the other; a card added or detached restarts the link), `android/` = manifest only. `tools/quest-apk.sh [cfg]` builds the APK (OpenXR loader pulled from Maven Central) |
 | `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
 | `third_party/libusb` | upstream libusb v1.0.27, Android only (`tools/android-libusb.sh`; `tools/android-build.sh build -p <crate>` cross-builds for aarch64) |
 | `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (branch `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
@@ -53,7 +53,7 @@ pairing key.
 - `configs/gs-auto.toml` (the APK default): `gs.toml` with `channel = "auto"`. A GS on an auto
   config (pal-desktop with no `--ch`, the phone/Quest APKs) runs the channel core on the card through
   `runtime::LiveCfg::attach`: prelude ranking, boot pick, relocation, in-flight hops, transmitting
-  through the card. `--core rust` (and the APKs) use the Rust port (`RustCore::with_cards` +
+  through the card. `--card2 N` (desktop) / a second adapter (Quest) adds a receive+scout card (`LiveCfg::extra`, stats `cards`, OSD chip `cards`). `--core rust` (and the APKs) use the Rust port (`RustCore::with_cards` +
   `runtime::dev_card::rust_channel_core`, clock `runtime` mono); `--core ref` uses mabur's C++ one
   (`pal_ref::live`, clock `pal_ref::now_us`). pal-ref is no longer in the Android build. A Rust
   spotter on an auto config still uses the old `runtime::run_live` sweep (400 ms per channel, 3

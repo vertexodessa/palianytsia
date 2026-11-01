@@ -1,5 +1,5 @@
-//! UsbManager from Rust (the Quest app has no Java): find an RTL88xx card,
-//! ask for permission once, open it and hand out the usbfs fd for
+//! UsbManager from Rust (the Quest app has no Java): find the RTL88xx cards,
+//! ask for permission once per card, open them and hand out the usbfs fds for
 //! `libusb_wrap_sys_device`. Runs on the supervisor thread, attached to
 //! the VM for good.
 use jni::objects::{GlobalRef, JObject, JString, JValue};
@@ -28,11 +28,12 @@ pub struct Open {
     conn: GlobalRef,
 }
 
-pub enum Find {
-    None,
-    /// Found, but no permission yet (a request went out, or did before).
-    Waiting(String),
-    Ready(Open),
+/// An attached card as UsbManager lists it.
+pub struct Dev {
+    /// usbfs path (`/dev/bus/usb/...`): the key of getDeviceList.
+    pub name: String,
+    /// vid:pid, for the status line.
+    pub id: String,
 }
 
 fn jstring(env: &mut JNIEnv, o: JObject) -> jni::errors::Result<String> {
@@ -60,67 +61,10 @@ impl<'a> Usb<'a> {
         Ok(Self { act, mgr })
     }
 
-    /// The first attached card, opened when permission is there. `asked`
-    /// holds device names a request already went out for (one dialog each).
-    pub fn find(&self, env: &mut JNIEnv, asked: &mut Vec<String>) -> jni::errors::Result<Find> {
-        let Some((dev, name, id)) = self.card(env)? else {
-            return Ok(Find::None);
-        };
-        let has = env
-            .call_method(
-                &self.mgr,
-                "hasPermission",
-                "(Landroid/hardware/usb/UsbDevice;)Z",
-                &[(&dev).into()],
-            )?
-            .z()?;
-        if !has {
-            if !asked.contains(&name) {
-                self.request(env, &dev)?;
-                asked.push(name.clone());
-            }
-            return Ok(Find::Waiting(id));
-        }
-        let conn = env
-            .call_method(
-                &self.mgr,
-                "openDevice",
-                "(Landroid/hardware/usb/UsbDevice;)Landroid/hardware/usb/UsbDeviceConnection;",
-                &[(&dev).into()],
-            )?
-            .l()?;
-        if conn.is_null() {
-            return Ok(Find::Waiting(format!("{id}: openDevice returned null")));
-        }
-        let fd = env
-            .call_method(&conn, "getFileDescriptor", "()I", &[])?
-            .i()?;
-        Ok(Find::Ready(Open {
-            name,
-            id,
-            fd,
-            conn: env.new_global_ref(conn)?,
-        }))
-    }
-
-    /// Whether the device with this name is still on the bus.
-    pub fn present(&self, env: &mut JNIEnv, name: &str) -> jni::errors::Result<bool> {
-        Ok(self.card(env)?.is_some_and(|(_, n, _)| n == name))
-    }
-
-    pub fn close(env: &mut JNIEnv, o: Open) {
-        if env.call_method(&o.conn, "close", "()V", &[]).is_err() {
-            let _ = env.exception_clear();
-        }
-    }
-
-    fn card<'b>(
-        &self,
-        env: &mut JNIEnv<'b>,
-    ) -> jni::errors::Result<Option<(JObject<'b>, String, String)>> {
-        let map = env
-            .call_method(&self.mgr, "getDeviceList", "()Ljava/util/HashMap;", &[])?
-            .l()?;
+    /// Every attached card, sorted by device name so card 0 stays the same
+    /// card from one start to the next.
+    pub fn cards(&self, env: &mut JNIEnv) -> jni::errors::Result<Vec<Dev>> {
+        let map = self.devices(env)?;
         let vals = env
             .call_method(&map, "values", "()Ljava/util/Collection;", &[])?
             .l()?;
@@ -128,6 +72,7 @@ impl<'a> Usb<'a> {
             env.call_method(&vals, "toArray", "()[Ljava/lang/Object;", &[])?
                 .l()?,
         );
+        let mut out = Vec::new();
         for i in 0..env.get_array_length(&arr)? {
             let d = env.get_object_array_element(&arr, i)?;
             let vid = env.call_method(&d, "getVendorId", "()I", &[])?.i()?;
@@ -138,10 +83,100 @@ impl<'a> Usb<'a> {
             let n = env
                 .call_method(&d, "getDeviceName", "()Ljava/lang/String;", &[])?
                 .l()?;
-            let name = jstring(env, n)?;
-            return Ok(Some((d, name, format!("{vid:04x}:{pid:04x}"))));
+            out.push(Dev {
+                name: jstring(env, n)?,
+                id: format!("{vid:04x}:{pid:04x}"),
+            });
         }
-        Ok(None)
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// Whether the app may open this card; asks once per device name
+    /// (`asked`) when it may not. False also when the card is gone.
+    pub fn permitted(
+        &self,
+        env: &mut JNIEnv,
+        name: &str,
+        asked: &mut Vec<String>,
+    ) -> jni::errors::Result<bool> {
+        let Some(dev) = self.device(env, name)? else {
+            return Ok(false);
+        };
+        let has = env
+            .call_method(
+                &self.mgr,
+                "hasPermission",
+                "(Landroid/hardware/usb/UsbDevice;)Z",
+                &[(&dev).into()],
+            )?
+            .z()?;
+        if !has && !asked.iter().any(|a| a == name) {
+            self.request(env, &dev)?;
+            asked.push(name.to_string());
+        }
+        Ok(has)
+    }
+
+    /// Opens a permitted card; Err(reason) when it is gone or will not open.
+    pub fn open(&self, env: &mut JNIEnv, d: &Dev) -> jni::errors::Result<Result<Open, String>> {
+        let Some(dev) = self.device(env, &d.name)? else {
+            return Ok(Err(format!("{}: gone", d.id)));
+        };
+        let conn = env
+            .call_method(
+                &self.mgr,
+                "openDevice",
+                "(Landroid/hardware/usb/UsbDevice;)Landroid/hardware/usb/UsbDeviceConnection;",
+                &[(&dev).into()],
+            )?
+            .l()?;
+        if conn.is_null() {
+            return Ok(Err(format!("{}: openDevice returned null", d.id)));
+        }
+        let fd = env
+            .call_method(&conn, "getFileDescriptor", "()I", &[])?
+            .i()?;
+        Ok(Ok(Open {
+            name: d.name.clone(),
+            id: d.id.clone(),
+            fd,
+            conn: env.new_global_ref(conn)?,
+        }))
+    }
+
+    /// Whether the device with this name is still on the bus.
+    pub fn present(&self, env: &mut JNIEnv, name: &str) -> jni::errors::Result<bool> {
+        Ok(self.device(env, name)?.is_some())
+    }
+
+    pub fn close(env: &mut JNIEnv, o: Open) {
+        if env.call_method(&o.conn, "close", "()V", &[]).is_err() {
+            let _ = env.exception_clear();
+        }
+    }
+
+    fn devices<'b>(&self, env: &mut JNIEnv<'b>) -> jni::errors::Result<JObject<'b>> {
+        env.call_method(&self.mgr, "getDeviceList", "()Ljava/util/HashMap;", &[])?
+            .l()
+    }
+
+    fn device<'b>(
+        &self,
+        env: &mut JNIEnv<'b>,
+        name: &str,
+    ) -> jni::errors::Result<Option<JObject<'b>>> {
+        let map = self.devices(env)?;
+        let key = env.new_string(name)?;
+        let d = env
+            .call_method(
+                &map,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[(&key).into()],
+            )?
+            .l()?;
+        Ok((!d.is_null()).then_some(d))
     }
 
     fn request(&self, env: &mut JNIEnv, dev: &JObject) -> jni::errors::Result<()> {

@@ -40,6 +40,9 @@ pub struct Snapshot {
     /// Link health: loss before FEC, and what FEC left (post-FEC), 0..1.
     pub pre_fec_loss: Option<f64>,
     pub residual: Option<f64>,
+    /// Per-card receive (two or more cards only): smoothed RSSI and the
+    /// video bodies the card has delivered.
+    pub cards: Vec<CardRx>,
     pub drone_temp_c: Option<i64>,
     /// NACK repairs: symbols filled so far, and the current rate.
     pub nack_fill: u64,
@@ -48,6 +51,29 @@ pub struct Snapshot {
     pub ladder: Option<Ladder>,
     /// The TX-power calibration block (UI stats line only).
     pub cal: Option<cal::CalView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CardRx {
+    pub rssi: Option<i64>,
+    pub video: u64,
+}
+
+/// "c0 -45 dBm 52 %  c1 -50 dBm 48 %": each card's RSSI and its share of
+/// the video bodies received so far (both cards hear most of them, so the
+/// shares say which one hears more, not who carries the link).
+pub fn cards_line(cards: &[CardRx]) -> String {
+    let total: u64 = cards.iter().map(|c| c.video).sum();
+    cards
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let r = c.rssi.map_or("  -".into(), |r| format!("{r:>3}"));
+            let share = (100 * c.video).checked_div(total).unwrap_or(0);
+            format!("c{i} {r} dBm {share:>2} %")
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// What the next rung promote waits on (`GsCore::ladder_json`).
@@ -192,6 +218,18 @@ impl Snapshot {
             uplink_pct: v.get("uplink_pct").and_then(Value::as_i64),
             pre_fec_loss: v.get("pre_fec_loss").and_then(Value::as_f64),
             residual: v.get("residual").and_then(Value::as_f64),
+            cards: v
+                .get("cards")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|c| CardRx {
+                            rssi: c.get("rssi").and_then(Value::as_i64),
+                            video: u(c, "video"),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             drone_temp_c: v.get("drone_temp_c").and_then(Value::as_i64),
             nack_fill: v.get("nack").map_or(0, |n| u(n, "fill")),
             nack_fill_pps: v
@@ -436,6 +474,9 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
                 WARN
             },
         );
+        if s.cards.len() > 1 {
+            chip(ui, "cards", &cards_line(&s.cards), OK);
+        }
         let total = s.aus + s.trunc;
         let pct = if total > 0 {
             100.0 * s.trunc as f64 / total as f64
@@ -602,6 +643,9 @@ mod tests {
 
     #[test]
     fn parses_new_fields_and_key_warnings() {
+        let two = Snapshot::parse(r#"{"cards":[{"frames":10,"video":30,"crc_fail":0,"rssi":-45},{"frames":9,"video":10,"crc_fail":1,"rssi":null}]}"#)
+            .unwrap();
+        assert_eq!(cards_line(&two.cards), "c0 -45 dBm 75 %  c1   - dBm 25 %");
         let s = Snapshot::parse(r#"{"mode":"gs","key_fp":"default","key_mismatch":false,"rtt_ms":6.1,"uplink":"ok","uplink_pct":92,"pre_fec_loss":0.085,"residual":0.0106,"drone_temp_c":46,"nack":{"fill":48,"fill_pps":0.0}}"#)
             .expect("parse");
         assert_eq!(

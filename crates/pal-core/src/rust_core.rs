@@ -332,6 +332,9 @@ impl RustCore {
 
     fn build(cfg: &Config, opts: RustOpts, env: Option<ChanEnv>) -> Result<Self, String> {
         let layers = cfg.uep_layers();
+        // maburgs sizes both by its card roster; with none (replay, the
+        // parity gates) it is WebGs's one card.
+        let n_cards = env.as_ref().map_or(1, |e| e.cards.len().max(1));
         let ch = if opts.channel != 0 {
             opts.channel
         } else {
@@ -419,7 +422,12 @@ impl RustCore {
             mode: opts.mode,
             opts,
             now_us: 0,
-            agg: Aggregator::new(&layers, cfg.fec.seq_horizon, 1, cfg.link.arrival_guard_syms),
+            agg: Aggregator::new(
+                &layers,
+                cfg.fec.seq_horizon,
+                n_cards,
+                cfg.link.arrival_guard_syms,
+            ),
             fs: FrameStream::new(FrameStreamCfg {
                 gap_timeout_ms: cfg.video.frame_gap_timeout_ms,
                 lookahead: cfg.video.frame_lookahead,
@@ -442,7 +450,7 @@ impl RustCore {
             gs,
             // Probe bodies ride the enh layer's geometry; blocks_per_body
             // is 4 on decode (config.cpp).
-            lha: LinkHealthAssembler::new(1, 4, sw::HEADER_LEN + layers[1].symbol_size),
+            lha: LinkHealthAssembler::new(n_cards, 4, sw::HEADER_LEN + layers[1].symbol_size),
             last_health: LinkHealth::empty(),
             spotter_op: OpPoint {
                 bw: i32::from(cfg.radio.width),
@@ -1086,6 +1094,23 @@ impl GsCore for RustCore {
         let pre = self.lha.pre_all;
         j.set("pre_fec_loss", pre.valid.then_some(pre.loss));
         j.set("residual", self.lha.residual);
+        // Per-card receive counters, only with two or more cards: a one-card
+        // line stays byte-equal to WebGs's (the m1 parity gate).
+        if self.agg.cards().len() > 1 {
+            let cards = self.agg.cards().iter().map(|c| {
+                let mut o = J::obj();
+                o.set("frames", c.frames);
+                o.set("video", c.video_bodies);
+                o.set("crc_fail", c.crc_fail);
+                // dBm, as LinkHealth reads the same EMA (raw RSSI - 110).
+                o.set(
+                    "rssi",
+                    c.rf.has_ema.then(|| (c.rf.rssi_ema - 110.0).round() as i64),
+                );
+                o
+            });
+            j.set("cards", J::A(cards.collect()));
+        }
         let rtt = g.map(|g| &g.rtt);
         j.set("rtt_ms", rtt.filter(|r| r.has_rtt()).map(|r| r.rtt_ms()));
         j.set(
@@ -1326,6 +1351,37 @@ mod tests {
         let j = core.stats_json();
         assert!(j.contains("\"hop\":{"), "{j}");
         assert!(j.contains("\"channel\":64"), "{j}");
+    }
+
+    /// A second card's bodies reach the aggregator (maburgs sizes it by the
+    /// roster); with one card they are refused as a foreign card's.
+    #[test]
+    fn with_two_cards_both_feed_the_aggregator() {
+        let mut cfg = bundle();
+        cfg.radio.pin = Some(64);
+        let clk = FakeClock::default();
+        clk.set(1000);
+        let a = FakeCard::new(clk.clone(), 64);
+        let b = FakeCard::new(clk.clone(), 64);
+        let mut two = env(&a, &clk);
+        two.cards.push(b.clone() as Arc<dyn LinkCard>);
+        let mut io = Io::default();
+        let body = RxBody {
+            card_id: 1,
+            mono_us: clk.ms() * 1000,
+            crc_ok: true,
+            rx_channel: 64,
+            body: vec![0u8; 64],
+            ..RxBody::default()
+        };
+        let mut core = RustCore::with_cards(&cfg, opts(64), two).unwrap();
+        core.on_rx(&body, &mut io);
+        assert_eq!(core.agg.bad_card_msgs(), 0);
+        assert!(core.stats_json().contains("\"cards\":[{"));
+        let mut one = RustCore::with_cards(&cfg, opts(64), env(&a, &clk)).unwrap();
+        one.on_rx(&body, &mut io);
+        assert_eq!(one.agg.bad_card_msgs(), 1);
+        assert!(!one.stats_json().contains("\"cards\""));
     }
 
     /// Auto: the search runs on the card and the stats line reports it.

@@ -36,7 +36,9 @@ impl runtime::RxTap for RefTap {
 
 /// Builds the C++ core on the card once it is open at `ch` / `width`.
 pub fn channel_core(config: PathBuf, ch: u8, width: u8) -> runtime::Attach {
-    Box::new(move |card| {
+    Box::new(move |cards| {
+        // mabur's WebGs drives one card; any further ones stay untapped.
+        let card = cards.first().ok_or("no card")?;
         // Weak: the card's RX handler holds the tap, so a strong ref would
         // keep the card open forever.
         let tx = Arc::downgrade(card);
@@ -48,7 +50,7 @@ pub fn channel_core(config: PathBuf, ch: u8, width: u8) -> runtime::Attach {
         let core = RefCore::new_with_card(&config, rc.clone())?;
         Ok(runtime::Attached {
             core: Box::new(core),
-            tap: Arc::new(RefTap(rc)),
+            taps: vec![Arc::new(RefTap(rc))],
             clock: crate::now_us,
         })
     })
