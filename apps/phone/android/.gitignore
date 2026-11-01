@@ -1,0 +1,7 @@
+.gradle/
+build/
+app/build/
+local.properties
+# Filled by tools/phone-apk.sh from cargo output and configs/.
+app/src/main/jniLibs/
+app/src/main/assets/

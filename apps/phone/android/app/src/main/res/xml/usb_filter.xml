@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Realtek (0x0bda): the RTL88xx cards devourer drives. -->
+<resources>
+    <usb-device vendor-id="3034" />
+</resources>
