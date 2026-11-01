@@ -124,7 +124,7 @@ impl Ladder {
         }
         let clean = format!(
             "clean {:.1}/{:.1} s",
-            u.clean_ms as f64 / 1000.0,
+            u.clean_ms.min(u.clean_need_ms) as f64 / 1000.0,
             u.clean_need_ms as f64 / 1000.0
         );
         let probe = match u.probe.as_str() {
@@ -348,6 +348,10 @@ fn pct(v: f64) -> String {
     format!("{:.1} %", 100.0 * v)
 }
 
+/// Chars of the "up" chip: its longest text, "clean 1.5/1.5 s  probe r1
+/// lossy u 0.26 > 0.05".
+const UP_WIDTH: usize = 46;
+
 /// How long the signal chip keeps the last rssi/SNR through null windows.
 const SIGNAL_HOLD_S: f64 = 1.5;
 
@@ -383,17 +387,6 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
                 WARN
             },
         );
-        if let (true, Some(l)) = (s.session, s.ladder.as_ref()) {
-            let (txt, blocked) = l.summary();
-            let mut hover = format!("rung {}/{}", l.rung, l.top);
-            if let Some((r, f, t, age)) = &l.last {
-                hover += &format!(
-                    "\nlast change: {r} {f} -> {t}, {:.1} s ago",
-                    *age as f64 / 1000.0
-                );
-            }
-            chip_hover(ui, "up", &txt, if blocked { WARN } else { OK }, &hover);
-        }
         let total = s.aus + s.trunc;
         let pct = if total > 0 {
             100.0 * s.trunc as f64 / total as f64
@@ -457,6 +450,25 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
                 nack += &format!("  {r:.0}/s");
             }
             chip(ui, "nack", &nack, OK);
+        }
+        if let (true, Some(l)) = (s.session, s.ladder.as_ref()) {
+            let (txt, blocked) = l.summary();
+            let mut hover = format!("rung {}/{}", l.rung, l.top);
+            if let Some((r, f, t, age)) = &l.last {
+                hover += &format!(
+                    "\nlast change: {r} {f} -> {t}, {:.1} s ago",
+                    *age as f64 / 1000.0
+                );
+            }
+            // Last in the row and padded: its text length changes every
+            // window, and a chip before others would make them all jump.
+            chip_hover(
+                ui,
+                "up",
+                &format!("{txt:<UP_WIDTH$}"),
+                if blocked { WARN } else { OK },
+                &hover,
+            );
         }
     });
 }
@@ -583,10 +595,11 @@ mod tests {
         let l = row(&format!(r#"{{{base},"probe":"clean","streak":48}}"#));
         assert_eq!(
             l.summary(),
-            ("clean 2.0/1.5 s  probe r1 48/90".into(), true)
+            ("clean 1.5/1.5 s  probe r1 48/90".into(), true)
         );
         let l = row(&format!(r#"{{{base},"probe":"lossy","streak":0}}"#));
         assert!(l.summary().0.contains("lossy") && l.summary().1);
+        assert!(l.summary().0.len() <= UP_WIDTH);
         let l = row(&format!(r#"{{{base},"probe":"clean","streak":95}}"#));
         assert!(!l.summary().1);
         let l = row(
