@@ -1,0 +1,47 @@
+# CLAUDE.md
+
+Palianytsia: a Rust ground station for the mabur FPV link (spec and milestone
+status: `docs/spec.md`; read its M1/M2 status sections first).
+
+## Layout
+| Path | Role |
+|---|---|
+| `crates/pal-wire` | wire formats: dot11, SBI, RC (RCF/DISC/Telem/NACK/MAV), MAVLink 2 framer |
+| `crates/pal-fec` | GF(256), sliding-window RLC decoder |
+| `crates/pal-core` | the Rust GS core (`rust_core.rs`, WebGs wiring), `GsCore` trait, ladder, LHA, NACK, MAV tunnel, refresh (IDR) |
+| `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle |
+| `crates/devourer-sys` | devourer through a C shim (USB cards) |
+| `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
+| `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |
+| `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
+| `third_party/{mabur,devourer}` | pinned submodules (branch `palianytsia/base`); never edit here |
+
+## Gates (run all before a commit)
+```sh
+cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+tools/m0-parity.sh     # pal-ref == mabur's webgs replay on maburd dry-run files
+tools/m1-replay.sh     # ref == rust: AUs, sent RC bytes, final stats line, --idr path
+```
+Every core change must keep ref==rust byte-identical. `captures/` is git-ignored
+(no binary recordings in the repo); `tools/m1-replay.sh` reads `PAL_CAPTURES`
+(default `captures/`) and skips when absent. `captures/README.md` lists each
+capture with its expected AU sha256; a `<name>.key` beside a capture is its
+pairing key.
+
+## Live rig (as of 2026-11-01)
+- Host card: RTL8812AU 0bda:881a on USB 5-2. If sends fail with
+  `error -4` and dmesg shows `USB disconnect` ~2 s after open, the card dropped
+  off the bus; `authorized` toggling does not fix it, a physical replug did.
+- Drone `ld` (192.168.1.10): RTL8822E quad, maburd RC 18, default key, parked on
+  ch 40 / 40 MHz. `configs/gs.toml` pins ch 144, so live runs use a copy with
+  `channel = 40` and `pal live --ch 40 --width 40 --mode gs`.
+- maburd respawns 2 s after it exits (S96mabur loop); `kill $(pidof maburd)`
+  is a drone restart. Ihor allowed drone actions; device commands still carry a
+  `# predict:` claim.
+- No loss injector in original mabur; `radio.wall_margin_db` caps at 6 dB, so a
+  real 20 % loss capture needs physical attenuation.
+
+## Rules
+- Commit with `git -c user.email=ivlev.igor@gmail.com commit`; no AI attribution.
+- Do not push while the GitHub repo is being recreated (2026-11-01); ask first.
