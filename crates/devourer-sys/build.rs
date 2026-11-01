@@ -50,5 +50,11 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=pthread");
     println!("cargo:rerun-if-changed=cpp");
+    // Without these a fork commit in the submodule kept the old static lib:
+    // a 2026-11-01 live run still printed the per-frame warning the fork
+    // had already rate-limited.
+    for p in ["src", "CMakeLists.txt"] {
+        println!("cargo:rerun-if-changed={}", devourer.join(p).display());
+    }
     println!("cargo:rerun-if-changed=build.rs");
 }

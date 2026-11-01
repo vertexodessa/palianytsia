@@ -58,9 +58,16 @@ fn main() {
 
     println!("cargo:rerun-if-changed=cpp");
     println!("cargo:rerun-if-changed=build.rs");
-    // A submodule move changes the gitlink, which changes this file's view.
-    println!(
-        "cargo:rerun-if-changed={}",
-        mabur.join("common/include/mabur/rc_proto.h").display()
-    );
+    // Directories, not one header: cargo rescans them by mtime, so a fork
+    // commit to web_gs.cpp (or to devourer, which mabur links) rebuilds the
+    // oracle instead of linking the stale archive.
+    for d in [
+        mabur.join("web/src"),
+        mabur.join("gs/src"),
+        mabur.join("gs/player/src"),
+        mabur.join("common"),
+        devourer.join("src"),
+    ] {
+        println!("cargo:rerun-if-changed={}", d.display());
+    }
 }
