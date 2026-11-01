@@ -287,6 +287,28 @@ fn chip_hover(ui: &mut Ui, label: &str, text: &str, color: Color32, hover: &str)
 }
 
 fn chip_frame(ui: &mut Ui, label: &str, text: &str, color: Color32) -> egui::Response {
+    // horizontal_wrapped cannot see a Frame's width before it is drawn, so
+    // on a narrow screen (the phone, ~890 points) the last chips ran off
+    // the edge. Measure the two labels and break the row ourselves.
+    let style = ui.style().clone();
+    let w = |t: egui::RichText| {
+        egui::WidgetText::from(t)
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Body,
+            )
+            .size()
+            .x
+    };
+    let need = w(egui::RichText::new(label).small())
+        + w(egui::RichText::new(text).monospace())
+        + style.spacing.item_spacing.x
+        + 2.0 * 6.0;
+    if need > ui.available_size_before_wrap().x && ui.cursor().min.x > ui.max_rect().min.x + 1.0 {
+        ui.end_row();
+    }
     egui::Frame::NONE
         .fill(Color32::from_black_alpha(160))
         .corner_radius(4.0)

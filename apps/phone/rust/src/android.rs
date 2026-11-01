@@ -27,10 +27,11 @@ fn set_err(e: impl Into<String>) {
 
 struct Phone {
     shared: Arc<Shared>,
-    stats_rx: Receiver<String>,
-    last_stats: String,
+    /// Newest stats line, written by the OSD thread.
+    last: Arc<Mutex<String>>,
     core: Option<JoinHandle<()>>,
     dec: Option<JoinHandle<()>>,
+    osd: Option<JoinHandle<()>>,
     // Kept alive for the core loop's F18 channels.
     _params_rx: Receiver<String>,
     _cmd_tx: mpsc::Sender<pal_osd::params::Cmd>,
@@ -38,7 +39,13 @@ struct Phone {
     _mav_rx: Receiver<Vec<u8>>,
 }
 
-fn start(fd: i32, win: ndk::native_window::NativeWindow, toml: &str) -> Result<Phone, String> {
+fn start(
+    fd: i32,
+    win: ndk::native_window::NativeWindow,
+    osd_win: ndk::native_window::NativeWindow,
+    density: f32,
+    toml: &str,
+) -> Result<Phone, String> {
     let cfg = pal_core::config::parse_config_str(toml).map_err(|e| e.to_string())?;
     let ch = cfg
         .radio
@@ -84,6 +91,18 @@ fn start(fd: i32, win: ndk::native_window::NativeWindow, toml: &str) -> Result<P
         last_log_us: 0,
     };
 
+    let last = Arc::new(Mutex::new(String::new()));
+    let osd_in = crate::osd::OsdIn {
+        win: osd_win,
+        density,
+        stats_rx,
+        last: last.clone(),
+        shared: shared.clone(),
+    };
+    let osd_t = std::thread::Builder::new()
+        .name("pal-osd".into())
+        .spawn(move || crate::osd::run(osd_in))
+        .map_err(|e| e.to_string())?;
     let sh = shared.clone();
     let dec_t = std::thread::Builder::new()
         .name("pal-decode".into())
@@ -118,10 +137,10 @@ fn start(fd: i32, win: ndk::native_window::NativeWindow, toml: &str) -> Result<P
         .map_err(|e| e.to_string())?;
     Ok(Phone {
         shared,
-        stats_rx,
-        last_stats: String::new(),
+        last,
         core: Some(core_t),
         dec: Some(dec_t),
+        osd: Some(osd_t),
         _params_rx: params_rx,
         _cmd_tx: cmd_tx,
         _set_res_rx: set_res_rx,
@@ -158,6 +177,8 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
     _c: JClass,
     fd: jint,
     surface: JObject,
+    osd: JObject,
+    density: jni::sys::jfloat,
     toml: JString,
 ) -> jlong {
     android_logger::init_once(
@@ -183,7 +204,15 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
         set_err("ANativeWindow_fromSurface returned null");
         return 0;
     };
-    match start(fd, win, &toml) {
+    // SAFETY: as above, the transparent OSD SurfaceView's Surface.
+    let osd_win = unsafe {
+        ndk::native_window::NativeWindow::from_surface(env.get_raw().cast(), osd.as_raw().cast())
+    };
+    let Some(osd_win) = osd_win else {
+        set_err("OSD ANativeWindow_fromSurface returned null");
+        return 0;
+    };
+    match start(fd, win, osd_win, density, &toml) {
         Ok(p) => Box::into_raw(Box::new(p)) as jlong,
         Err(e) => {
             set_err(e);
@@ -203,11 +232,8 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_stats(
     }
     // SAFETY: h came from start() and stop() has not run (the Activity
     // calls both on the UI thread).
-    let p = unsafe { &mut *(h as *mut Phone) };
-    while let Ok(s) = p.stats_rx.try_recv() {
-        p.last_stats = s;
-    }
-    let s = p.last_stats.clone();
+    let p = unsafe { &*(h as *mut Phone) };
+    let s = p.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
     jstr(&mut env, &s)
 }
 
@@ -239,6 +265,17 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_stop(_env: JNIEnv, _c: 
             let _ = c.join();
         } else {
             log::warn!("core thread did not stop in 3 s; leaving it");
+        }
+    }
+    // The OSD thread draws into a Surface the Activity is about to destroy:
+    // it checks quit every 250 ms at most.
+    if let Some(o) = p.osd.take() {
+        let t1 = Instant::now();
+        while !o.is_finished() && t1.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if o.is_finished() {
+            let _ = o.join();
         }
     }
     if let Some(d) = p.dec.take() {

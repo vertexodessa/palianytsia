@@ -11,7 +11,8 @@ final class Native {
     private Native() {}
 
     /** Returns a handle, or 0 with the reason in {@link #lastError()}. */
-    static native long start(int usbFd, Surface video, String configToml);
+    static native long start(int usbFd, Surface video, Surface osd, float density,
+            String configToml);
 
     /** Newest core stats line (JSON), "" before the first. */
     static native String stats(long handle);

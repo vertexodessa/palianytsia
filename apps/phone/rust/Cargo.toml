@@ -22,3 +22,7 @@ jni = "0.21"
 ndk = { version = "0.9", features = ["media", "api-level-29"] }
 android_logger = "0.14"
 log = "0.4"
+egui = { workspace = true }
+egui_glow = "0.31"
+glow = "0.16"
+khronos-egl = { version = "6", features = ["static", "no-pkg-config"] }

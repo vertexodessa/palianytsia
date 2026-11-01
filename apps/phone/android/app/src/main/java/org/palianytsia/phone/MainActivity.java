@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.graphics.Color;
+import android.graphics.PixelFormat;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbManager;
@@ -21,8 +22,6 @@ import android.view.SurfaceView;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
-
-import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -43,10 +42,14 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SurfaceView video;
+    /** Transparent, above the video: Rust draws the pal-osd widgets here. */
+    private SurfaceView osdView;
+    /** Status text before the link is up and on errors. */
     private TextView osd;
     private UsbManager usb;
     private UsbDeviceConnection conn;
     private SurfaceHolder holder;
+    private SurfaceHolder osdHolder;
     private long handle;
 
     private final BroadcastReceiver permission = new BroadcastReceiver() {
@@ -71,6 +74,11 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         video = new SurfaceView(this);
         video.getHolder().addCallback(this);
         root.addView(video, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        osdView = new SurfaceView(this);
+        osdView.setZOrderMediaOverlay(true);
+        osdView.getHolder().setFormat(PixelFormat.TRANSLUCENT);
+        osdView.getHolder().addCallback(this);
+        root.addView(osdView, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         osd = new TextView(this);
         osd.setTextColor(Color.WHITE);
         osd.setShadowLayer(3, 1, 1, Color.BLACK);
@@ -102,7 +110,11 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     @Override
     public void surfaceCreated(SurfaceHolder h) {
-        holder = h;
+        if (h == osdView.getHolder()) {
+            osdHolder = h;
+        } else {
+            holder = h;
+        }
         tryStart();
     }
 
@@ -111,9 +123,13 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
     @Override
     public void surfaceDestroyed(SurfaceHolder h) {
-        // MediaCodec renders into this Surface: stop before it goes away.
+        // MediaCodec and the OSD render into these Surfaces: stop first.
         stopLink();
-        holder = null;
+        if (h == osdView.getHolder()) {
+            osdHolder = null;
+        } else {
+            holder = null;
+        }
     }
 
     private UsbDevice findCard() {
@@ -127,7 +143,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     }
 
     private void tryStart() {
-        if (handle != 0 || holder == null) return;
+        if (handle != 0 || holder == null || osdHolder == null) return;
         UsbDevice d = findCard();
         if (d == null) {
             show("no RTL8812 card");
@@ -157,7 +173,9 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         }
         String name = String.format("%04x:%04x", d.getVendorId(), d.getProductId());
         Log.i(TAG, "starting on " + name + " fd " + conn.getFileDescriptor());
-        handle = Native.start(conn.getFileDescriptor(), holder.getSurface(), cfg);
+        float density = getResources().getDisplayMetrics().density;
+        handle = Native.start(conn.getFileDescriptor(), holder.getSurface(),
+                osdHolder.getSurface(), density, cfg);
         if (handle == 0) {
             show("start failed: " + Native.lastError());
             conn.close();
@@ -172,38 +190,12 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
         @Override
         public void run() {
             if (handle == 0) return;
+            // The Rust OSD shows the link; this text is only for errors.
             String err = Native.lastError();
-            String s = Native.stats(handle);
-            osd.setText(err.isEmpty() ? summary(s) : "error: " + err + "\n" + summary(s));
+            osd.setText(err.isEmpty() ? "" : "error: " + err);
             ui.postDelayed(this, 500);
         }
     };
-
-    private static String summary(String json) {
-        if (json.isEmpty()) return "no stats yet";
-        try {
-            JSONObject j = new JSONObject(json);
-            String link = j.optBoolean("session")
-                    ? "rung " + j.optInt("rung") + " MCS" + j.optInt("mcs") + " " + j.optInt("bw") + "M"
-                    : "beaconing";
-            return link
-                    + "   rssi " + fmt(j, "rssi_dbm", "%.0f") + " dBm  SNR " + fmt(j, "snr_db", "%.0f")
-                    + "   pre " + pct(j, "pre_fec_loss") + "  post " + pct(j, "residual")
-                    + "   AUs " + j.optLong("aus") + "  trunc " + j.optLong("trunc")
-                    + "   idr " + j.optLong("idr_req")
-                    + (j.optBoolean("drone_lp") ? "   low power" : "");
-        } catch (Exception e) {
-            return json;
-        }
-    }
-
-    private static String fmt(JSONObject j, String k, String f) {
-        return j.isNull(k) ? "-" : String.format(f, j.optDouble(k));
-    }
-
-    private static String pct(JSONObject j, String k) {
-        return j.isNull(k) ? "-" : String.format("%.1f%%", 100 * j.optDouble(k));
-    }
 
     private void stopLink() {
         ui.removeCallbacks(tick);
