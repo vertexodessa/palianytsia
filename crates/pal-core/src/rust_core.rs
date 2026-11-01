@@ -625,6 +625,36 @@ impl GsCore for RustCore {
         }
     }
 
+    fn ladder_json(&self) -> Option<String> {
+        let g = self.gs.as_ref()?;
+        let c = g.vrx.ctl();
+        let now = (self.now_us / 1000) as f64;
+        let mut j = J::obj();
+        j.set("rung", c.rung());
+        j.set("top", c.ladder().len() as i32 - 1);
+        if let Some(u) = c.up_status(now) {
+            j.set("u", u.u);
+            j.set("up_util", u.up_util);
+            j.set("clean_ms", u.clean_ms.round() as i64);
+            j.set("clean_need_ms", u.clean_need_ms.round() as i64);
+            j.set("probe", u.probe.state.as_str());
+            j.set("probe_rung", u.probe.rung);
+            j.set("probe_u", u.probe.u);
+            j.set("probe_max_util", u.probe_max_util);
+            j.set("streak", u.probe.streak_bodies);
+            j.set("streak_need", u.probe_need);
+            j.set("penalty_ms", u.next_penalty_ms);
+        }
+        let e = c.last_event();
+        if e.t_ms > 0.0 {
+            j.set("last_reason", e.reason.as_str());
+            j.set("last_from", e.from);
+            j.set("last_to", e.to);
+            j.set("last_age_ms", (now - e.t_ms).max(0.0).round() as i64);
+        }
+        Some(j.dump())
+    }
+
     fn params_json(&self, now_us: u64) -> String {
         params_json(self.gs.as_ref().map(|g| &g.params), now_us / 1000)
     }

@@ -102,6 +102,21 @@ pub struct ProbeGate {
     pub streak_bodies: u64,
 }
 
+/// `LadderController::up_status`.
+#[derive(Clone, Copy, Debug)]
+pub struct UpStatus {
+    pub u: f64,
+    pub up_util: f64,
+    /// How long s1 utilization has stayed under up_util (0 = not now).
+    pub clean_ms: f64,
+    pub clean_need_ms: f64,
+    pub probe: ProbeGate,
+    pub probe_max_util: f64,
+    pub probe_need: u64,
+    /// Remaining block on the next rung after a failed promote.
+    pub next_penalty_ms: i32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CtlEvent {
     pub t_ms: f64,
@@ -443,6 +458,33 @@ impl LadderController {
     }
     pub fn budget_enh_for(&self, r: i32) -> f64 {
         Self::budget(self.cfg.ladder[r as usize].overhead_enh)
+    }
+    /// What the next promote waits on, for a UI: the s1 clean run, the
+    /// probe streak and a penalty on the next rung. `None` on the top rung.
+    pub fn up_status(&self, now: f64) -> Option<UpStatus> {
+        let next = self.idx as usize + 1;
+        if next >= self.cfg.ladder.len() {
+            return None;
+        }
+        let pen_ms = self
+            .penalized(now)
+            .into_iter()
+            .find(|(r, _)| *r as usize == next)
+            .map_or(0, |(_, ms)| ms);
+        Some(UpStatus {
+            u: self.u,
+            up_util: self.cfg.up_util,
+            clean_ms: if self.clean_start_ms < 0.0 {
+                0.0
+            } else {
+                now - self.clean_start_ms
+            },
+            clean_need_ms: f64::from(self.cfg.clean_ms),
+            probe: self.probe_gate(),
+            probe_max_util: self.probe_util_threshold(),
+            probe_need: self.cfg.probe.clean_bodies as u64,
+            next_penalty_ms: pen_ms,
+        })
     }
     fn probe_util_threshold(&self) -> f64 {
         if self.cfg.probe.max_util < 0.0 {

@@ -109,4 +109,11 @@ pub trait GsCore {
     }
     /// Re-list the drone's parameters (WebGs::param_refresh).
     fn param_refresh(&mut self) {}
+    /// Why the ladder is not stepping up, as one JSON object (rung, s1
+    /// clean run, probe streak, penalty, last change). UI only: WebGs has no
+    /// such view, so the oracle returns None and the m1 parity lines never
+    /// carry it.
+    fn ladder_json(&self) -> Option<String> {
+        None
+    }
 }

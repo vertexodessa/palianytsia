@@ -367,7 +367,15 @@ impl CoreLoop {
                 .nth(1)
                 .and_then(|r| r.split([',', '}']).next())
                 .and_then(|v| v.parse().ok());
-            let _ = self.stats_tx.try_send(line);
+            // The ladder view goes to the UI only: the flight log keeps the
+            // webgs stats line both cores agree on.
+            let ui_line = match self.core.ladder_json() {
+                Some(l) if line.ends_with('}') => {
+                    format!("{},\"ladder\":{l}}}", &line[..line.len() - 1])
+                }
+                _ => line,
+            };
+            let _ = self.stats_tx.try_send(ui_line);
         }
         if now >= self.last_lat_us + 1_000_000 {
             self.last_lat_us = now;

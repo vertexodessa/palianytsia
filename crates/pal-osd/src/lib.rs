@@ -40,6 +40,106 @@ pub struct Snapshot {
     /// NACK repairs: symbols filled so far, and the current rate.
     pub nack_fill: u64,
     pub nack_fill_pps: Option<f64>,
+    /// Rust core only (`GsCore::ladder_json`, merged in by the app).
+    pub ladder: Option<Ladder>,
+}
+
+/// What the next rung promote waits on (`GsCore::ladder_json`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ladder {
+    pub rung: i64,
+    pub top: i64,
+    /// None on the top rung.
+    pub up: Option<LadderUp>,
+    /// Last rung change: reason, from, to, age.
+    pub last: Option<(String, i64, i64, i64)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LadderUp {
+    pub u: f64,
+    pub up_util: f64,
+    pub clean_ms: i64,
+    pub clean_need_ms: i64,
+    pub probe: String,
+    pub probe_rung: i64,
+    pub probe_u: f64,
+    pub probe_max_util: f64,
+    pub streak: u64,
+    pub streak_need: u64,
+    pub penalty_ms: i64,
+}
+
+impl Ladder {
+    fn parse(v: &Value) -> Option<Self> {
+        let i = |k: &str| v.get(k).and_then(Value::as_i64);
+        let f = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let up = v.get("probe").and_then(Value::as_str).map(|p| LadderUp {
+            u: f("u"),
+            up_util: f("up_util"),
+            clean_ms: i("clean_ms").unwrap_or(0),
+            clean_need_ms: i("clean_need_ms").unwrap_or(0),
+            probe: p.to_string(),
+            probe_rung: i("probe_rung").unwrap_or(-1),
+            probe_u: f("probe_u"),
+            probe_max_util: f("probe_max_util"),
+            streak: u(v, "streak"),
+            streak_need: u(v, "streak_need"),
+            penalty_ms: i("penalty_ms").unwrap_or(0),
+        });
+        let last = v.get("last_reason").and_then(Value::as_str).map(|r| {
+            (
+                r.to_string(),
+                i("last_from").unwrap_or(-1),
+                i("last_to").unwrap_or(-1),
+                i("last_age_ms").unwrap_or(0),
+            )
+        });
+        Some(Self {
+            rung: i("rung")?,
+            top: i("top").unwrap_or(0),
+            up,
+            last,
+        })
+    }
+
+    /// The chip text and whether the promote is blocked right now, in the
+    /// order the controller checks: penalty, s1 loss, s1 clean run, probe.
+    pub fn summary(&self) -> (String, bool) {
+        let Some(u) = &self.up else {
+            return ("top rung".into(), false);
+        };
+        if u.penalty_ms > 0 {
+            return (
+                format!(
+                    "r{} blocked {:.1} s",
+                    self.rung + 1,
+                    u.penalty_ms as f64 / 1000.0
+                ),
+                true,
+            );
+        }
+        if u.u >= u.up_util {
+            return (format!("loss u {:.2} > {:.2}", u.u, u.up_util), true);
+        }
+        let clean = format!(
+            "clean {:.1}/{:.1} s",
+            u.clean_ms as f64 / 1000.0,
+            u.clean_need_ms as f64 / 1000.0
+        );
+        let probe = match u.probe.as_str() {
+            "off" => "probe off".to_string(),
+            "clean" => format!("probe r{} {}/{}", u.probe_rung, u.streak, u.streak_need),
+            "lossy" => format!(
+                "probe r{} lossy u {:.2} > {:.2}",
+                u.probe_rung, u.probe_u, u.probe_max_util
+            ),
+            other => format!("probe r{} {other}", u.probe_rung),
+        };
+        let blocked = u.clean_ms < u.clean_need_ms
+            || (u.probe != "off" && (u.probe != "clean" || u.streak < u.streak_need));
+        (format!("{clean}  {probe}"), blocked)
+    }
 }
 
 fn u(v: &Value, k: &str) -> u64 {
@@ -92,6 +192,7 @@ impl Snapshot {
                 .get("nack")
                 .and_then(|n| n.get("fill_pps"))
                 .and_then(Value::as_f64),
+            ladder: v.get("ladder").and_then(Ladder::parse),
         })
     }
 }
@@ -178,6 +279,14 @@ impl History {
 }
 
 fn chip(ui: &mut Ui, label: &str, text: &str, color: Color32) {
+    chip_frame(ui, label, text, color);
+}
+
+fn chip_hover(ui: &mut Ui, label: &str, text: &str, color: Color32, hover: &str) {
+    chip_frame(ui, label, text, color).on_hover_text(hover);
+}
+
+fn chip_frame(ui: &mut Ui, label: &str, text: &str, color: Color32) -> egui::Response {
     egui::Frame::NONE
         .fill(Color32::from_black_alpha(160))
         .corner_radius(4.0)
@@ -187,7 +296,8 @@ fn chip(ui: &mut Ui, label: &str, text: &str, color: Color32) {
                 ui.label(egui::RichText::new(label).small().color(Color32::GRAY));
                 ui.label(egui::RichText::new(text).monospace().color(color));
             });
-        });
+        })
+        .response
 }
 
 /// What the pairing-key banner says, if anything (F5): a mismatch is an
@@ -273,6 +383,17 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, decode: (u64, u64)) {
                 WARN
             },
         );
+        if let (true, Some(l)) = (s.session, s.ladder.as_ref()) {
+            let (txt, blocked) = l.summary();
+            let mut hover = format!("rung {}/{}", l.rung, l.top);
+            if let Some((r, f, t, age)) = &l.last {
+                hover += &format!(
+                    "\nlast change: {r} {f} -> {t}, {:.1} s ago",
+                    *age as f64 / 1000.0
+                );
+            }
+            chip_hover(ui, "up", &txt, if blocked { WARN } else { OK }, &hover);
+        }
         let total = s.aus + s.trunc;
         let pct = if total > 0 {
             100.0 * s.trunc as f64 / total as f64
@@ -449,5 +570,29 @@ mod tests {
         assert_eq!(h.signal(SIGNAL_HOLD_S), Some((-40.0, 30.0)));
         h.push(1.6, row(""));
         assert_eq!(h.signal(SIGNAL_HOLD_S), None);
+    }
+
+    #[test]
+    fn ladder_summary_names_the_blocking_stage() {
+        let row = |l: &str| {
+            Snapshot::parse(&format!(r#"{{"mode":"gs","ladder":{l}}}"#))
+                .and_then(|s| s.ladder)
+                .expect("ladder")
+        };
+        let base = r#""rung":0,"top":4,"u":0.0,"up_util":0.15,"clean_ms":2000,"clean_need_ms":1500,"probe_rung":1,"probe_u":0.0,"probe_max_util":0.05,"streak_need":90,"penalty_ms":0"#;
+        let l = row(&format!(r#"{{{base},"probe":"clean","streak":48}}"#));
+        assert_eq!(
+            l.summary(),
+            ("clean 2.0/1.5 s  probe r1 48/90".into(), true)
+        );
+        let l = row(&format!(r#"{{{base},"probe":"lossy","streak":0}}"#));
+        assert!(l.summary().0.contains("lossy") && l.summary().1);
+        let l = row(&format!(r#"{{{base},"probe":"clean","streak":95}}"#));
+        assert!(!l.summary().1);
+        let l = row(
+            r#"{"rung":4,"top":4,"last_reason":"promote_probed","last_from":3,"last_to":4,"last_age_ms":900}"#,
+        );
+        assert_eq!(l.summary(), ("top rung".into(), false));
+        assert_eq!(l.last.as_ref().map(|x| x.2), Some(4));
     }
 }
