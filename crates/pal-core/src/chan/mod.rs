@@ -7,6 +7,7 @@ pub mod fake;
 pub mod gate;
 pub mod hop;
 pub mod hop_ranker;
+pub mod inflight;
 pub mod pair;
 pub mod plan;
 pub mod radio;

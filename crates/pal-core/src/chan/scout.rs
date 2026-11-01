@@ -80,6 +80,10 @@ pub const FLAG_NHM_MISSING: u32 = 1 << 4;
 pub struct ScoutDwell {
     pub seq: u64,
     pub ch: u8,
+    /// What the card was tuned at: 20, or 40 with `offset` (the in-flight
+    /// dwell keeps the card's tuning).
+    pub width_mhz: u8,
+    pub offset: u8,
     pub round: u64,
     pub t_start_ms: i64,
     pub t_end_ms: i64,
@@ -462,6 +466,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         let mut d = ScoutDwell {
             seq: rs.seq,
             ch,
+            width_mhz: 20,
             round,
             t_start_ms: (self.now)(),
             settle_ms: self.cfg.settle_ms,
