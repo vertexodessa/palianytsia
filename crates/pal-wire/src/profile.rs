@@ -53,3 +53,33 @@ pub fn decode(b: u8) -> Profile {
         bw_mhz: code_to_bw((b >> 4) & 0x3),
     }
 }
+
+const HT20_LGI: [f64; 8] = [6.5, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0];
+const HT40_LGI: [f64; 8] = [13.5, 27.0, 40.5, 54.0, 81.0, 108.0, 121.5, 135.0];
+const VHT20_LGI: [f64; 9] = [6.5, 13.0, 19.5, 26.0, 39.0, 52.0, 58.5, 65.0, 78.0];
+const VHT40_LGI: [f64; 9] = [13.5, 27.0, 40.5, 54.0, 81.0, 108.0, 121.5, 135.0, 162.0];
+const VHT80_LGI: [f64; 9] = [29.3, 58.5, 87.8, 117.0, 175.5, 234.0, 263.3, 292.5, 351.0];
+
+/// On-air PHY rate in Mbps, long GI (`phy_rate_mbps` of a `ladder_from`
+/// spec, which never sets SGI).
+pub fn phy_rate_mbps(mode: PhyMode, mcs: u8, bw_mhz: u8) -> f64 {
+    match mode {
+        PhyMode::Ht => {
+            let t = if bw_mhz == 40 { &HT40_LGI } else { &HT20_LGI };
+            t[usize::from(mcs.min(7))]
+        }
+        PhyMode::Vht => {
+            let t = match bw_mhz {
+                40 => &VHT40_LGI,
+                80 => &VHT80_LGI,
+                _ => &VHT20_LGI,
+            };
+            t[usize::from(mcs.min(8))]
+        }
+    }
+}
+
+/// `ladder_from`'s MCS for both layers: clamped to 7 (HT) / 8 (VHT).
+pub fn layer_mcs(mode: PhyMode, mcs: u8) -> u8 {
+    mcs.min(if mode == PhyMode::Vht { 8 } else { 7 })
+}

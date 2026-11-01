@@ -36,6 +36,11 @@ pub struct LayerStats {
     pub subblocks_salvaged: u64,
     pub dec: DecoderStats,
     pub rows_in_flight: usize,
+    /// ArrivalTracker: arrival-time pre-FEC accounting.
+    pub arr_expected: u64,
+    pub arr_arrived: u64,
+    pub arr_expected_stale: u64,
+    pub arr_arrived_stale: u64,
 }
 
 struct Layer {
@@ -215,6 +220,10 @@ impl UepDecoder {
             subblocks_salvaged: l.subblocks_salvaged,
             dec: *l.sw.stats(),
             rows_in_flight: l.sw.rows_in_flight(),
+            arr_expected: l.sw.arrival().expected,
+            arr_arrived: l.sw.arrival().arrived,
+            arr_expected_stale: l.sw.arrival().expected_stale,
+            arr_arrived_stale: l.sw.arrival().arrived_stale,
         }
     }
     pub fn bodies_misrouted(&self) -> u64 {

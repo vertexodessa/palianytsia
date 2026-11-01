@@ -28,16 +28,16 @@ pub fn siphash24(key: &[u8; 16], msg: &[u8]) -> u64 {
         0x6c79_6765_6e65_7261 ^ k0,
         0x7465_6462_7974_6573 ^ k1,
     ];
-    let mut chunks = msg.chunks_exact(8);
-    for c in &mut chunks {
-        let m = u64::from_le_bytes(c.try_into().unwrap());
+    let (chunks, rest) = msg.as_chunks::<8>();
+    for c in chunks {
+        let m = u64::from_le_bytes(*c);
         v[3] ^= m;
         round(&mut v);
         round(&mut v);
         v[0] ^= m;
     }
     let mut b = (msg.len() as u64) << 56;
-    for (i, &x) in chunks.remainder().iter().enumerate() {
+    for (i, &x) in rest.iter().enumerate() {
         b |= u64::from(x) << (8 * i);
     }
     v[3] ^= b;

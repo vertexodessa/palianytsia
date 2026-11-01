@@ -140,8 +140,7 @@ pub fn parse_st_rps(
     num_delta_pocs: &[u32],
 ) -> Option<(u32, u32)> {
     let inter = idx != 0 && r.flag();
-    let out;
-    if inter {
+    let out = if inter {
         let delta_idx_m1 = if idx == num_sets { r.ue() } else { 0 };
         if delta_idx_m1 + 1 > idx || (idx - (delta_idx_m1 + 1)) as usize >= num_delta_pocs.len() {
             return None;
@@ -163,7 +162,7 @@ pub fn parse_st_rps(
                 used += 1;
             }
         }
-        out = (n, used);
+        (n, used)
     } else {
         let neg = r.ue();
         let pos = r.ue();
@@ -175,8 +174,8 @@ pub fn parse_st_rps(
             r.ue();
             used += r.u(1);
         }
-        out = (neg + pos, used);
-    }
+        (neg + pos, used)
+    };
     (!r.bad()).then_some(out)
 }
 
