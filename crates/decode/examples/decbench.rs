@@ -4,7 +4,9 @@
 //!
 //!   cargo run --release -p decode --example decbench -- in.aus [hwaccel] [threads]
 //!   DECBENCH_NO_RGBA=1: decode only (no download, no colour conversion).
-use decode::{AvDecoder, Decoder};
+//!   DECBENCH_PLANES=1: packed YUV planes instead of RGBA (pal-desktop's
+//!   GPU-conversion path: download and copy, no swscale).
+use decode::{AvDecoder, Decoder, Planes};
 use std::time::Instant;
 
 fn main() {
@@ -25,10 +27,16 @@ fn main() {
         .unwrap_or_else(|e| panic!("open {hw}: {e}"));
     let mut rgba = Vec::new();
     let convert = std::env::var_os("DECBENCH_NO_RGBA").is_none();
+    let planes = std::env::var_os("DECBENCH_PLANES").is_some();
+    let mut p = Planes::default();
     let t0 = Instant::now();
     for au in &aus {
         if d.decode(au) > 0 && convert {
-            d.rgba(&mut rgba);
+            if planes {
+                assert!(d.planes(&mut p), "no planes");
+            } else {
+                d.rgba(&mut rgba);
+            }
         }
     }
     let wall = t0.elapsed().as_secs_f64() * 1e3;

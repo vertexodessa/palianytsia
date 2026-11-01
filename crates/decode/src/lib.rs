@@ -17,11 +17,47 @@ extern "C" {
         cap: usize,
     ) -> *mut RawDec;
     fn pal_dec_hw_frames(d: *const RawDec) -> c_int;
+    fn pal_dec_planes(
+        d: *mut RawDec,
+        w: *mut c_int,
+        h: *mut c_int,
+        fmt: *mut c_int,
+        cs: *mut c_int,
+        full: *mut c_int,
+        data: *mut [*const u8; 3],
+        linesize: *mut [c_int; 3],
+    ) -> c_int;
     fn pal_dec_free(d: *mut RawDec);
     fn pal_dec_send(d: *mut RawDec, au: *const u8, n: usize) -> c_int;
     fn pal_dec_size(d: *const RawDec, w: *mut c_int, h: *mut c_int) -> c_int;
     fn pal_dec_rgba(d: *mut RawDec, out: *mut u8, cap: usize) -> c_int;
     fn pal_dec_counters(d: *const RawDec, frames: *mut c_int, errors: *mut c_int);
+}
+
+/// One frame as tightly packed YUV planes, for a GPU colour conversion.
+#[derive(Default, Clone)]
+pub struct Planes {
+    pub w: usize,
+    pub h: usize,
+    /// NV12 (`u` holds interleaved UV, `v` empty) or I420.
+    pub nv12: bool,
+    /// BT.709 matrix (else BT.601), full range (else limited).
+    pub bt709: bool,
+    pub full_range: bool,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+fn copy_plane(dst: &mut Vec<u8>, src: *const u8, stride: c_int, row_bytes: usize, rows: usize) {
+    dst.resize(row_bytes * rows, 0);
+    for r in 0..rows {
+        // SAFETY: libavcodec's plane holds `rows` rows of `stride` bytes.
+        let line = unsafe {
+            std::slice::from_raw_parts(src.offset(r as isize * stride as isize), row_bytes)
+        };
+        dst[r * row_bytes..(r + 1) * row_bytes].copy_from_slice(line);
+    }
 }
 
 pub trait Decoder: Send {
@@ -58,6 +94,37 @@ impl AvDecoder {
             return Err(msg.to_string_lossy().into_owned());
         }
         Ok(Self { raw })
+    }
+    /// The newest frame's planes, tightly packed into `out` (buffers reused);
+    /// false when there is no frame or it is neither I420 nor NV12.
+    pub fn planes(&mut self, out: &mut Planes) -> bool {
+        let (mut w, mut h, mut fmt, mut cs, mut full) = (0, 0, 0, 0, 0);
+        let mut data = [std::ptr::null(); 3];
+        let mut ls = [0; 3];
+        let r = unsafe {
+            pal_dec_planes(
+                self.raw, &mut w, &mut h, &mut fmt, &mut cs, &mut full, &mut data, &mut ls,
+            )
+        };
+        if r != 0 || w <= 0 || h <= 0 {
+            return false;
+        }
+        let (w, h) = (w as usize, h as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        out.w = w;
+        out.h = h;
+        out.nv12 = fmt == 1;
+        out.bt709 = cs != 0;
+        out.full_range = full != 0;
+        copy_plane(&mut out.y, data[0], ls[0], w, h);
+        if out.nv12 {
+            copy_plane(&mut out.u, data[1], ls[1], cw * 2, ch);
+            out.v.clear();
+        } else {
+            copy_plane(&mut out.u, data[1], ls[1], cw, ch);
+            copy_plane(&mut out.v, data[2], ls[2], cw, ch);
+        }
+        true
     }
     /// Frames that came out as hardware surfaces.
     pub fn hw_frames(&self) -> u64 {

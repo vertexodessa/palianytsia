@@ -192,3 +192,35 @@ void pal_dec_counters(const pal_dec* d, int* frames, int* errors) {
 }
 
 int pal_dec_hw_frames(const pal_dec* d) { return d->hw_frames; }
+
+// The newest frame's planes for a GPU colour conversion, no swscale: a hw
+// frame is transferred down (NV12 for 8-bit 4:2:0), a software one is used
+// as is. fmt: 0 I420 (3 planes), 1 NV12 (Y + interleaved UV). cs: 1 when
+// the stream signals BT.709, else BT.601. full: 1 for full (JPEG) range.
+// The pointers stay valid until the next send. Returns 0, or -1 when there
+// is no frame or its format is neither (the caller falls back to rgba()).
+int pal_dec_planes(pal_dec* d, int* w, int* h, int* fmt, int* cs, int* full,
+                   const uint8_t* data[3], int linesize[3]) {
+  if (!d->have) return -1;
+  const AVFrame* f = d->frame;
+  if (f->format == d->hw_fmt) {
+    av_frame_unref(d->sw);
+    if (av_hwframe_transfer_data(d->sw, f, 0) < 0) return -1;
+    av_frame_copy_props(d->sw, f);
+    f = d->sw;
+  }
+  switch (f->format) {
+    case AV_PIX_FMT_YUV420P: *fmt = 0; *full = f->color_range == AVCOL_RANGE_JPEG; break;
+    case AV_PIX_FMT_YUVJ420P: *fmt = 0; *full = 1; break;
+    case AV_PIX_FMT_NV12: *fmt = 1; *full = f->color_range == AVCOL_RANGE_JPEG; break;
+    default: return -1;
+  }
+  *cs = f->colorspace == AVCOL_SPC_BT709;
+  *w = f->width;
+  *h = f->height;
+  for (int i = 0; i < 3; i++) {
+    data[i] = f->data[i];
+    linesize[i] = f->linesize[i];
+  }
+  return 0;
+}

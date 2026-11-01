@@ -14,11 +14,14 @@
 //!           [--hwdec auto|vdpau|vaapi|cuda|sw]  decoder (default auto: first hwaccel
 //!                                   that opens, else software)
 //!           [--params]              open the drone settings window (P toggles; GS only)
+//!           [--cpu-rgba]            RGBA via swscale instead of the YUV shader
 //!           [--lat]                 per-second latency breakdown on stderr (printed
 //!                                   anyway while a stage is over its threshold)
 //!
 //! `--snapshot` saves one rendered window after N seconds and quits: the
 //! headless check that video and OSD actually draw.
+mod gl_video;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -63,6 +66,8 @@ struct Opts {
     /// Per-second latency breakdown on stderr (RX queue, capture->AU,
     /// decode, display).
     lat: bool,
+    /// Convert to RGBA on the CPU (swscale) instead of in a shader.
+    cpu_rgba: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -108,6 +113,7 @@ fn parse() -> Opts {
             "--hwdec" => o.hwdec = val(),
             "--params" => o.params = true,
             "--lat" => o.lat = true,
+            "--cpu-rgba" => o.cpu_rgba = true,
             s => die(&format!("unknown argument {s}")),
         }
     }
@@ -547,6 +553,7 @@ fn run_decode(
     shared: Arc<Shared>,
     repaint: egui::Context,
     hwdec: String,
+    yuv: Option<Arc<Mutex<Option<gl_video::YuvFrame>>>>,
 ) {
     let mut dec = decode::AvDecoder::open_or_sw(0, if hwdec == "sw" { "" } else { &hwdec })
         .unwrap_or_else(|e| die(&format!("decode: {e}")));
@@ -557,6 +564,8 @@ fn run_decode(
     // never shown, so it skips the GPU download and RGBA conversion (the
     // bulk of the per-frame cost at 90 fps).
     let mut next: Option<(u64, u64, Vec<u8>)> = None;
+    // The plane buffers of the frame the UI no longer holds, for reuse.
+    let mut spare: Option<decode::Planes> = None;
     while let Some((n, t_enq, au)) = next.take().or_else(|| au_rx.recv().ok()) {
         let t_dec0 = lat_us();
         let got = dec.decode(&au);
@@ -587,6 +596,24 @@ fn run_decode(
             shared.lat.skipped_rgba.fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        // Shader path: packed planes, no colour conversion here.
+        if let Some(slot) = yuv.as_ref() {
+            let mut p = spare.take().unwrap_or_default();
+            if dec.planes(&mut p) {
+                seq += 1;
+                let mut s = slot.lock().unwrap_or_else(|p| p.into_inner());
+                let old = s.replace(gl_video::YuvFrame {
+                    p,
+                    seq,
+                    t_dec: t_dec1,
+                });
+                drop(s);
+                spare = old.map(|f| f.p);
+                repaint.request_repaint();
+                continue;
+            }
+            spare = Some(p);
+        }
         if let Some((w, h)) = dec.rgba(&mut buf) {
             seq += 1;
             let mut slot = out.lock().unwrap_or_else(|p| p.into_inner());
@@ -611,6 +638,9 @@ struct App {
     mav_rx: Receiver<Vec<u8>>,
     telem: pal_osd::telem::Telemetry,
     frame: Arc<Mutex<Option<Frame>>>,
+    /// Shader path (None with --cpu-rgba): the newest frame's YUV planes.
+    yuv: Option<Arc<Mutex<Option<gl_video::YuvFrame>>>>,
+    gl_video: gl_video::GlVideo,
     shared: Arc<Shared>,
     stats_rx: Receiver<String>,
     params_rx: Receiver<String>,
@@ -731,7 +761,25 @@ impl eframe::App for App {
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 let area = ui.max_rect();
-                if let Some(t) = &self.tex {
+                let yuv_size = self.yuv.as_ref().and_then(|y| {
+                    let g = y.lock().unwrap_or_else(|p| p.into_inner());
+                    g.as_ref().map(|f| (f.p.w as f32, f.p.h as f32))
+                });
+                if let (Some((w, h)), Some(y)) = (yuv_size, self.yuv.as_ref()) {
+                    let scale = (area.width() / w).min(area.height() / h);
+                    let r = egui::Rect::from_center_size(
+                        area.center(),
+                        egui::vec2(w * scale, h * scale),
+                    );
+                    let sh = self.shared.clone();
+                    ui.painter()
+                        .add(self.gl_video.callback(r, y.clone(), move |t_dec| {
+                            let l = &sh.lat;
+                            l.show_max
+                                .fetch_max(lat_us().saturating_sub(t_dec), Ordering::Relaxed);
+                            l.shown.fetch_add(1, Ordering::Relaxed);
+                        }));
+                } else if let Some(t) = &self.tex {
                     let [w, h] = t.size().map(|v| v as f32);
                     let scale = (area.width() / w).min(area.height() / h);
                     let r = egui::Rect::from_center_size(
@@ -805,6 +853,8 @@ fn main() {
     });
     let shared = Arc::new(Shared::default());
     let frame = Arc::new(Mutex::new(None));
+    let yuv: Option<Arc<Mutex<Option<gl_video::YuvFrame>>>> =
+        (!o.cpu_rgba).then(|| Arc::new(Mutex::new(None)));
     let log = o.log_dir.as_ref().map(|d| {
         let cap = if o.live { 512 << 20 } else { 0 };
         let s = Session::create(d, std::time::SystemTime::now(), cap)
@@ -840,9 +890,10 @@ fn main() {
             {
                 let (frame, shared, ctx) = (frame.clone(), shared.clone(), ctx.clone());
                 let hwdec = o.hwdec.clone();
+                let yuv = yuv.clone();
                 std::thread::Builder::new()
                     .name("decode".into())
-                    .spawn(move || run_decode(au_rx, frame, shared, ctx, hwdec))
+                    .spawn(move || run_decode(au_rx, frame, shared, ctx, hwdec, yuv))
                     .expect("decode thread");
             }
             {
@@ -881,6 +932,8 @@ fn main() {
                 mav_rx,
                 telem: Default::default(),
                 frame,
+                yuv,
+                gl_video: gl_video::GlVideo::default(),
                 shared,
                 stats_rx,
                 params_rx,
