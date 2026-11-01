@@ -5,7 +5,7 @@
 //!
 //!   pal live   -c gs.toml --ch 144 --width 40 [--mode gs|spotter] [--secs 30]
 //!              [--card N] [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
-//!              [--log-dir DIR [--capture-mb N]] [--core ref|rust]
+//!              [--log-dir DIR [--capture-mb N]] [--core ref|rust] [--param-set T_S,ROW,TEXT ...]
 //!   pal replay <bodies.bin> -c gs.toml [--mode gs|spotter] [--dump out.h265]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
@@ -402,6 +402,10 @@ fn live(o: Opts) {
     let mut last_stats = 0u64;
     let mut next_tick = mono_us(t0);
     let mut next_report = t0 + Duration::from_secs(1);
+    let mut sets = o.param_sets.clone();
+    sets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut sets = sets.into_iter().peekable();
+    let mut last_params = String::new();
     let (mut bodies, mut last_aus, mut rssi_sum, mut rssi_n, mut mcs) =
         (0u64, 0u64, 0f64, 0u64, 255u8);
     while t0.elapsed() < end {
@@ -438,7 +442,20 @@ fn live(o: Opts) {
             if let Some(l) = sink.log.as_mut() {
                 l.tick(now).unwrap();
             }
+            let el = t0.elapsed().as_secs_f64();
+            while let Some((ts, row, text)) = sets.next_if(|(ts, _, _)| el >= *ts) {
+                let r = core.param_set(row, &text);
+                println!("param t={ts} row={row} text={text} -> {r:?}");
+            }
             core.tick(now, &mut sink);
+            if !o.param_sets.is_empty() {
+                // Live: print each change of a row's state as it happens.
+                let p = core.params_json(now);
+                if p != last_params {
+                    print_param_changes(&last_params, &p, el);
+                    last_params = p;
+                }
+            }
             sink.idr_step(now, &mut *core);
             sink.log_stats(now, &mut last_stats, &*core);
             next_tick = now + TICK_US;
@@ -561,6 +578,32 @@ fn replay(o: Opts) {
     println!("stats {}", core.stats_json());
     if o.mode == Some(Mode::Gs) {
         println!("params {}", core.params_json(last_t));
+    }
+}
+
+/// Rows whose value, state or status changed between two params tables.
+fn print_param_changes(old: &str, new: &str, t_s: f64) {
+    let rows = |s: &str| -> Vec<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .and_then(|v| v.get("rows").and_then(|r| r.as_array().cloned()))
+            .unwrap_or_default()
+    };
+    let (a, b) = (rows(old), rows(new));
+    for (i, r) in b.iter().enumerate() {
+        let pick = |r: &serde_json::Value| {
+            (
+                r.get("value").cloned(),
+                r.get("state").cloned(),
+                r.get("status").cloned(),
+            )
+        };
+        if a.get(i).map(pick) != Some(pick(r)) {
+            println!(
+                "param t={t_s:.1} {} value={} state={} status={}",
+                r["id"], r["value"], r["state"], r["status"]
+            );
+        }
     }
 }
 

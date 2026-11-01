@@ -1761,6 +1761,7 @@ dependencies = [
  "pal-core",
  "pal-ref",
  "pal-wire",
+ "serde_json",
 ]
 
 [[package]]
