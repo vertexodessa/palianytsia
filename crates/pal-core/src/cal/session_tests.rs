@@ -20,7 +20,8 @@ use super::session::*;
 const FLAGS: u8 = FLAG_LDPC | FLAG_STBC;
 const POWER_AIR: usize = 26 + PAYLOAD_LEN + 4;
 const ROWS: i32 = SWEEP_HI - SWEEP_LO + 1;
-const WALLS: [i32; 8] = [20, 10, 5, 0, -5, -10, -20, NO_WALL];
+// MCS0 at the rail, as on every real card: a row 0 that dips fails the run.
+const WALLS: [i32; 8] = [63, 10, 5, 0, -5, -10, -20, NO_WALL];
 const LEAVE: i32 = WALL_LEAVE as i32;
 
 fn sp(kind: Kind, bw: u8) -> SweepSpec {
@@ -404,11 +405,11 @@ fn power_sweep_yields_an_apply_with_leave_for_undetermined() {
         assert_eq!(i32::from(*w), *want);
     }
     assert_eq!(a.walls[7], WALL_LEAVE);
-    assert_eq!(a.legacy, 20);
+    assert_eq!(a.legacy, 63);
     let snap = s.snapshot();
     assert!(snap.width[0].have_walls);
     assert_ne!(snap.width[0].walls[7].flags & FLAG_UNDETERMINED, 0);
-    assert_eq!(snap.width[0].walls[0].wall, 20);
+    assert_eq!(snap.width[0].walls[0].wall, 63);
     assert!(s.due_mav(100).is_none());
     assert!(apply(s.due_mav(240)).is_some());
 }
@@ -422,7 +423,7 @@ fn expected_per_cell_comes_from_the_done() {
     feed_power(&mut s, 20, &WALLS, 20, FLAGS, 10);
     s.on_mav(&power_done(15, 0, 10), 30);
     let a = apply(s.due_mav(40)).unwrap();
-    assert_eq!((a.walls[0], a.walls[6]), (20, -20));
+    assert_eq!((a.walls[0], a.walls[6]), (63, -20));
 }
 
 #[test]
@@ -462,9 +463,15 @@ fn applied_ok_opens_verify_and_tallies_by_rate() {
     assert_eq!(s.snapshot().stamp_mismatch, 1);
     let close = verify_close(100, 7);
     assert!(s.radio_silent(close - 1));
-    s.due_mav(close);
+    let retry = apply(s.due_mav(close)).unwrap();
     assert!(!s.radio_silent(close));
-    assert_eq!(s.state(), State::Done);
+    // Rate 1 heard at 50 % goes down 1 dB; rate 2, silent, is left alone.
+    assert_eq!(s.state(), State::Apply);
+    assert_eq!(retry.seq, VERIFY_RETRY_SEQ0 + 1);
+    assert_eq!(
+        (retry.walls[0], retry.walls[1], retry.walls[2]),
+        (a.walls[0], a.walls[1] - 4, a.walls[2])
+    );
     let w = &s.snapshot().width[0];
     assert!(w.applied);
     assert_eq!(
@@ -829,7 +836,7 @@ fn a_repeated_done_after_analyze_is_ignored() {
     s.on_mav(&power_done(37, 0, 20), next + 10);
     assert_eq!(s.state(), State::AwaitAck);
     assert!(s.snapshot().width[0].have_walls);
-    assert_eq!(s.snapshot().width[0].walls[0].wall, 20);
+    assert_eq!(s.snapshot().width[0].walls[0].wall, 63);
 }
 
 #[test]
@@ -935,15 +942,15 @@ fn legacy_comes_from_the_20_table_when_both_are_swept() {
     let mut s = session();
     start(&mut s, 20, &[sp(Kind::Power, 40), sp(Kind::Power, 20)], 0);
     let a20 = run_power(&mut s, 20, 0, 20, &WALLS, 0);
-    assert_eq!(a20.legacy, 20);
+    assert_eq!(a20.legacy, 63);
     applied(&mut s, 20, 0, 20, true, "", 100);
     let t = verify_close(100, 7);
-    let w40 = [15, 10, 5, 0, -5, -10, -20, -30];
+    let w40 = [63, 10, 5, 0, -5, -10, -20, -30];
     let a40 = run_power(&mut s, 20, 1, 40, &w40, t);
-    assert!(a40.bw == 40 && a40.walls[0] == 15 && a40.legacy == WALL_LEAVE);
+    assert!(a40.bw == 40 && a40.walls[0] == 63 && a40.legacy == WALL_LEAVE);
     let mut u = session();
     start(&mut u, 21, &[sp(Kind::Power, 40)], 0);
-    assert_eq!(run_power(&mut u, 21, 0, 40, &w40, 0).legacy, 15);
+    assert_eq!(run_power(&mut u, 21, 0, 40, &w40, 0).legacy, 63);
 }
 
 #[test]
@@ -1086,16 +1093,20 @@ fn verify_parks_match_the_drone_rule() {
     s.set_peer(true, true, TagCtx::default());
     start(&mut s, 29, &[sp(Kind::Power, 20)], 0);
     let mut walls = [NO_WALL; 8];
-    walls[0] = SWEEP_LO;
-    walls[1] = 30;
+    walls[0] = SWEEP_HI;
+    walls[1] = SWEEP_LO;
+    walls[2] = 30;
     let a = run_power(&mut s, 29, 0, 20, &walls, 0);
-    assert_eq!(i32::from(a.walls[0]), SWEEP_LO);
+    assert_eq!(i32::from(a.walls[1]), SWEEP_LO);
     applied(&mut s, 29, 0, 20, true, "", 100);
     assert_eq!(s.state(), State::Verify);
     let drone = park_rel_for(&a.walls, cfg.margin_db);
     let w = &s.snapshot().width[0];
     assert_eq!(w.park, drone);
-    assert_eq!((w.park[0], w.park[1], w.park[2]), (REL_MIN, 30 - 28, LEAVE));
+    assert_eq!(
+        (w.park[0], w.park[1], w.park[2], w.park[3]),
+        (SWEEP_HI - 28, REL_MIN, 30 - 28, LEAVE)
+    );
     let close =
         100 + u64::from(verify_duration_ms(verify_cells(&drone).len())) + cfg.phase_slack_ms;
     assert!(s.radio_silent(close - 1));
@@ -1447,4 +1458,99 @@ fn the_r_line_names_the_pick() {
             .expect("R line");
         assert!(r.contains(" 36 ") && r.contains(word), "{r}");
     }
+}
+
+/// Verify frames for `rate` parked at `park`: `got` of VERIFY_FRAMES heard.
+fn feed_verify(s: &mut CalSession, rate: u8, park: i32, got: u32, now: u64) {
+    for k in 0..got {
+        let f = stamp(Kind::Verify, rate, park, 20, FLAGS, k);
+        frame(s, 0, f, true, POWER_AIR, now);
+    }
+}
+
+#[test]
+fn an_mcs0_row_that_dips_fails_the_run_and_applies_nothing() {
+    // 2026-11-02, ch 40 at 95 % loss: every row, MCS0 included, delivered
+    // only near the floor; applied, it left the quad at minimum power.
+    let mut s = session();
+    start(
+        &mut s,
+        40,
+        &[sp(Kind::Power, 20), sp(Kind::Capacity, 20)],
+        0,
+    );
+    let cmd = sweep(s.due_mav(0)).unwrap();
+    ack(&mut s, 40, cmd.seq, 10);
+    feed_power(&mut s, 20, &[-37; 8], 20, FLAGS, u32::from(POWER_FRAMES));
+    s.on_mav(&power_done(40, cmd.seq, u32::from(POWER_FRAMES)), 30);
+    let m = s.due_mav(40);
+    assert!(apply(m.clone()).is_none(), "nothing may be applied");
+    assert_eq!(s.state(), State::Failed);
+    assert!(s.snapshot().fail_reason.contains("MCS0 lost frames"));
+    // The drone hears the abort and restores its operating power.
+    assert_eq!(abort_nonce(&m), Some(40));
+}
+
+#[test]
+fn a_lossy_rate_steps_down_until_its_verify_passes() {
+    let mut s = session();
+    start(&mut s, 41, &[sp(Kind::Power, 20)], 0);
+    let a = run_power(&mut s, 41, 0, 20, &WALLS, 0);
+    applied(&mut s, 41, 0, 20, true, "", 100);
+    let parks = park_rel_for(&a.walls, 1.0);
+    for r in 0..7u8 {
+        // MCS3 at 18/20 is on its wall's slope; the rest are clean.
+        let got = if r == 3 { 18 } else { 20 };
+        feed_verify(&mut s, r, parks[usize::from(r)], got, 200);
+    }
+    let t1 = verify_close(100, 7);
+    let r1 = apply(s.due_mav(t1)).unwrap();
+    assert_eq!(r1.seq, VERIFY_RETRY_SEQ0 + 1);
+    assert_eq!(r1.walls[3], a.walls[3] - 4);
+    assert_eq!(r1.walls[4], a.walls[4]);
+    assert!(!r1.has_eff);
+    // The power sweep's Applied, answered late from the drone's cache, is
+    // not the re-apply's.
+    applied(&mut s, 41, 0, 20, true, "", t1 + 10);
+    assert_eq!(s.state(), State::Apply);
+    applied(&mut s, 41, r1.seq, 20, true, "", t1 + 20);
+    assert_eq!(s.state(), State::Verify);
+    let parks2 = park_rel_for(&r1.walls, 1.0);
+    for r in 0..7u8 {
+        feed_verify(&mut s, r, parks2[usize::from(r)], 20, t1 + 100);
+    }
+    s.due_mav(verify_close(t1 + 20, 7));
+    assert_eq!(s.state(), State::Done);
+    assert_eq!(s.snapshot().width[0].verify_pct[3], 100);
+}
+
+#[test]
+fn the_step_down_stops_after_four_db() {
+    let mut s = session();
+    start(&mut s, 42, &[sp(Kind::Power, 20)], 0);
+    let a = run_power(&mut s, 42, 0, 20, &WALLS, 0);
+    let mut seq = 0u8;
+    let mut walls = a.walls;
+    let mut t = 100u64;
+    for k in 0..=u32::from(VERIFY_RETRY_MAX) {
+        applied(&mut s, 42, seq, 20, true, "", t);
+        assert_eq!(s.state(), State::Verify);
+        let parks = park_rel_for(&walls, 1.0);
+        for r in 0..7u8 {
+            let got = if r == 3 { 10 } else { 20 };
+            feed_verify(&mut s, r, parks[usize::from(r)], got, t + 50);
+        }
+        let close = verify_close(t, 7);
+        let m = s.due_mav(close);
+        if k == u32::from(VERIFY_RETRY_MAX) {
+            assert!(apply(m).is_none());
+            break;
+        }
+        let r = apply(m).unwrap();
+        seq = r.seq;
+        walls = r.walls;
+        t = close + 10;
+    }
+    assert_eq!(s.state(), State::Done);
+    assert_eq!(walls[3], a.walls[3] - 4 * VERIFY_RETRY_MAX as i8);
 }

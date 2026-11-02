@@ -23,13 +23,13 @@ use pal_wire::rc::TagCtx;
 
 use super::analysis::{
     analyze_capacity, analyze_rate, CalCell, CalThresholds, CapCell, CapResult, RateWall,
-    FLAG_LOST, FLAG_TX_BOUND, NO_WALL,
+    FLAG_LOST, FLAG_NO_DIP, FLAG_TX_BOUND, NO_WALL,
 };
 use super::log::CalLog;
 use super::picker::{CalPicker, Mode};
 use super::plan::{
     make_capacity_sweep, make_power_sweep, sweep_duration_ms, verify_cells, verify_duration_ms,
-    VERIFY_FRAMES,
+    SWEEP_LO, VERIFY_FRAMES,
 };
 
 /// How often an unanswered SweepCmd or ApplyCmd goes again: the uplink
@@ -39,6 +39,15 @@ const RESEND_MS: u64 = 200;
 /// Copies of the closing Abort: the uplink is lossy and the drone ignores
 /// a nonce it already closed.
 pub const ABORT_COPIES: u32 = 3;
+/// A parked rate passes verify at 19 of 20 frames: one lost frame is
+/// noise, two are the slope of its wall.
+pub const VERIFY_PASS_PCT: i32 = 95;
+/// 1 dB (the chip's index step is 0.25 dB).
+pub const VERIFY_RETRY_STEP: i32 = 4;
+/// At most 4 dB below the analysed wall.
+pub const VERIFY_RETRY_MAX: u8 = 4;
+/// Re-apply seqs: 0xF1.. never meets a sweep seq (the sweep index).
+pub const VERIFY_RETRY_SEQ0: u8 = 0xF0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CalSessionCfg {
@@ -276,6 +285,8 @@ pub struct CalSession {
 
     apply: ApplyCmd,
     apply_wrote_walls: bool,
+    /// Re-applies of this power sweep's walls after a failed verify.
+    verify_retries: u8,
     width: [WidthResult; 2],
 }
 
@@ -327,6 +338,7 @@ impl CalSession {
             verify_seen: [false; 8],
             apply: ApplyCmd::default(),
             apply_wrote_walls: false,
+            verify_retries: 0,
             width: Default::default(),
         }
     }
@@ -513,7 +525,7 @@ impl CalSession {
                 // one width and the drone answers repeats from its cache.
                 if self.state != State::Apply
                     || ap.nonce != self.nonce
-                    || ap.seq != self.cmd.seq
+                    || ap.seq != self.apply.seq
                     || ap.bw != self.cmd.bw
                 {
                     return;
@@ -899,6 +911,9 @@ impl CalSession {
         } else {
             self.analyze_capacity_sweep()
         };
+        if self.state == State::Failed {
+            return;
+        }
         if apply {
             self.phase_start_ms = now_ms;
             self.sent_once = false;
@@ -963,7 +978,23 @@ impl CalSession {
                 any = true;
             }
         }
+        // MCS0 never meets a transmitter wall inside the sweep (it holds to
+        // the +63 rail on every card measured so far). A row 0 that lost
+        // frames below the rail measured the channel, not the drone's PA:
+        // on 2026-11-02 a run on a channel at 95 % loss wrote walls of
+        // -37..-41 for every MCS and left the quad at minimum power. Such a
+        // run applies nothing, its capacity sweep included.
+        if walls[0].wall != NO_WALL && walls[0].flags & FLAG_NO_DIP == 0 {
+            self.apply_wrote_walls = false;
+            self.fail(format!(
+                "MCS0 lost frames at power {} (floor {}): the channel was busy or the \
+                 pair too close; nothing applied, the drone keeps its walls",
+                walls[0].wall, walls[0].floor_idx
+            ));
+            return false;
+        }
         apply.has_walls = any;
+        self.verify_retries = 0;
         // legacy_wall_rel is one number for every width; the 20 MHz table
         // owns it whenever this run measures one.
         apply.legacy = if self.cmd.bw == 20 || !self.has_power20() {
@@ -1086,7 +1117,56 @@ impl CalSession {
             };
             self.log.verify(rate, at, pct);
         }
+        if self.retry_lossy_walls(now_ms) {
+            return;
+        }
         self.next_sweep(now_ms);
+    }
+
+    /// A rate that loses frames at its own parked power is parked on the
+    /// slope of its wall, not below it: on 2026-11-02 MCS3 verified at 90 %
+    /// at park 28 (wall 32 from the better card; the other card lost a
+    /// third of the frames there), the ladder's MCS3 probe stayed lossy and
+    /// the link never left rung 2. Such rates go down 1 dB and are verified
+    /// again, up to VERIFY_RETRY_MAX times; what is applied is what passed.
+    /// True: a re-apply is in flight.
+    fn retry_lossy_walls(&mut self, now_ms: u64) -> bool {
+        if self.verify_retries >= VERIFY_RETRY_MAX {
+            return false;
+        }
+        let pct = self.width_result().verify_pct;
+        let mut next = self.apply;
+        let mut lowered = false;
+        for (wall, &p) in next.walls.iter_mut().zip(&pct) {
+            let w = i32::from(*wall);
+            // Heard but lossy only: a rate silent at verify (link gone, verify
+            // never started) is not on a slope 1 dB can fix.
+            if w == i32::from(WALL_LEAVE) || p <= 0 || p >= VERIFY_PASS_PCT {
+                continue;
+            }
+            let down = w - VERIFY_RETRY_STEP;
+            if down < SWEEP_LO {
+                continue;
+            }
+            *wall = down as i8;
+            lowered = true;
+        }
+        if !lowered {
+            return false;
+        }
+        self.verify_retries += 1;
+        if self.apply.legacy != WALL_LEAVE {
+            next.legacy = next.walls[0];
+        }
+        // A fresh seq: the drone answers a repeated (nonce, seq) from its
+        // cache and never re-applies it. Sweep seqs are the sweep index.
+        next.seq = VERIFY_RETRY_SEQ0 + self.verify_retries;
+        next.has_eff = false;
+        self.apply = next;
+        self.phase_start_ms = now_ms;
+        self.sent_once = false;
+        self.state = State::Apply;
+        true
     }
 
     fn next_sweep(&mut self, now_ms: u64) {
