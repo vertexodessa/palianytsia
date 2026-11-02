@@ -60,25 +60,77 @@ pub struct Snapshot {
     pub chscan: Option<channels::ScanView>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CardRx {
     pub rssi: Option<i64>,
     pub video: u64,
+    /// Every frame the card delivered, CRC failures included.
+    pub frames: u64,
+    pub crc_fail: u64,
 }
 
-/// "c0 TX -45 dBm 52 %  c1 -50 dBm 48 %": each card's RSSI and its share
-/// of the video bodies received so far (both cards hear most of them, so
-/// the shares say which one hears more), and which one transmits.
-pub fn cards_line(cards: &[CardRx], tx: Option<u64>) -> String {
-    let total: u64 = cards.iter().map(|c| c.video).sum();
-    cards
+/// One card over the last `History::CARD_WINDOW_S`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardRate {
+    pub rssi: Option<i64>,
+    pub fps: f64,
+    /// None while the card delivered nothing in the window.
+    pub crc_pct: Option<f64>,
+    pub deaf: bool,
+}
+
+/// The best card must deliver this many frames/s before another one can be
+/// called deaf: below it (search, a dark drone) every card is quiet.
+const DEAF_MIN_BEST_FPS: f64 = 50.0;
+/// A card on the link channel hears the same air as its neighbour; under a
+/// tenth of the best card's frames it is not receiving (2026-11-02 Quest:
+/// card 0 at 0.1 frames/s against card 1 at 230 with no USB error).
+const DEAF_SHARE: f64 = 0.1;
+
+/// Per-card rates from two snapshots `dt` seconds apart; empty when the
+/// card count changed between them.
+pub fn card_rates(old: &[CardRx], new: &[CardRx], dt: f64) -> Vec<CardRate> {
+    if old.len() != new.len() || dt <= 0.0 {
+        return Vec::new();
+    }
+    let raw: Vec<(f64, u64, u64)> = old
+        .iter()
+        .zip(new)
+        .map(|(a, b)| {
+            let f = b.frames.saturating_sub(a.frames);
+            (f as f64 / dt, f, b.crc_fail.saturating_sub(a.crc_fail))
+        })
+        .collect();
+    let best = raw.iter().map(|r| r.0).fold(0.0, f64::max);
+    raw.iter()
+        .zip(new)
+        .map(|(&(fps, f, crc), c)| CardRate {
+            rssi: c.rssi,
+            fps,
+            crc_pct: (f > 0).then(|| 100.0 * crc.min(f) as f64 / f as f64),
+            deaf: best >= DEAF_MIN_BEST_FPS && fps < DEAF_SHARE * best,
+        })
+        .collect()
+}
+
+/// "c0 DEAF   0/s  c1 TX -45 dBm 230/s crc 6 %": each card's frames/s
+/// and CRC failures over the last seconds, its RSSI, and which one
+/// transmits. A deaf card's RSSI is left out: it is the last one heard.
+pub fn cards_line(rates: &[CardRate], tx: Option<u64>) -> String {
+    rates
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let r = c.rssi.map_or("  -".into(), |r| format!("{r:>3}"));
-            let share = (100 * c.video).checked_div(total).unwrap_or(0);
             let t = if tx == Some(i as u64) { " TX" } else { "" };
-            format!("c{i}{t} {r} dBm {share:>2} %")
+            let fps = c.fps.round() as i64;
+            if c.deaf {
+                return format!("c{i}{t} DEAF {fps:>3}/s");
+            }
+            let r = c.rssi.map_or("  -".into(), |r| format!("{r:>3}"));
+            let crc = c
+                .crc_pct
+                .map_or(String::new(), |p| format!(" crc {:>2.0} %", p));
+            format!("c{i}{t} {r} dBm {fps:>3}/s{crc}")
         })
         .collect::<Vec<_>>()
         .join("  ")
@@ -234,6 +286,8 @@ impl Snapshot {
                         .map(|c| CardRx {
                             rssi: c.get("rssi").and_then(Value::as_i64),
                             video: u(c, "video"),
+                            frames: u(c, "frames"),
+                            crc_fail: u(c, "crc_fail"),
                         })
                         .collect()
                 })
@@ -289,6 +343,10 @@ pub struct History {
 
 impl History {
     pub const SPAN_S: f64 = 60.0;
+    /// The cards chip's window: long enough that a 5 ms scout dwell or one
+    /// late stats line does not move it, short enough to show a card that
+    /// just stopped.
+    pub const CARD_WINDOW_S: f64 = 3.0;
     pub fn push(&mut self, t_s: f64, s: Snapshot) {
         self.rows.push_back((t_s, s));
         while self
@@ -317,6 +375,24 @@ impl History {
     /// row. A stats window with no drone frame in it reports both as null,
     /// so taking only the last row made the chip blink "no signal" on a
     /// healthy link.
+    /// Per-card rates over the last `CARD_WINDOW_S` (empty with fewer
+    /// than two cards or one snapshot).
+    pub fn card_rates(&self) -> Vec<CardRate> {
+        let Some((t1, new)) = self.rows.back() else {
+            return Vec::new();
+        };
+        if new.cards.len() < 2 {
+            return Vec::new();
+        }
+        let Some((t0, old)) = self
+            .rows
+            .iter()
+            .find(|(t, _)| t1 - t <= Self::CARD_WINDOW_S)
+        else {
+            return Vec::new();
+        };
+        card_rates(&old.cards, &new.cards, t1 - t0)
+    }
     pub fn signal(&self, hold_s: f64) -> Option<(f64, f64)> {
         let t_last = self.rows.back()?.0;
         self.rows
@@ -484,8 +560,15 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
                 WARN
             },
         );
-        if s.cards.len() > 1 {
-            chip(ui, "cards", &cards_line(&s.cards, s.tx_card), OK);
+        let rates = h.card_rates();
+        if !rates.is_empty() {
+            let deaf = rates.iter().any(|c| c.deaf);
+            chip(
+                ui,
+                "cards",
+                &cards_line(&rates, s.tx_card),
+                if deaf { BAD } else { OK },
+            );
         }
         let total = s.aus + s.trunc;
         let pct = if total > 0 {
@@ -655,14 +738,7 @@ mod tests {
     fn parses_new_fields_and_key_warnings() {
         let two = Snapshot::parse(r#"{"cards":[{"frames":10,"video":30,"crc_fail":0,"rssi":-45},{"frames":9,"video":10,"crc_fail":1,"rssi":null}]}"#)
             .unwrap();
-        assert_eq!(
-            cards_line(&two.cards, None),
-            "c0 -45 dBm 75 %  c1   - dBm 25 %"
-        );
-        assert_eq!(
-            cards_line(&two.cards, Some(1)),
-            "c0 -45 dBm 75 %  c1 TX   - dBm 25 %"
-        );
+        assert_eq!((two.cards[0].frames, two.cards[1].crc_fail), (10, 1));
         let s = Snapshot::parse(r#"{"mode":"gs","key_fp":"default","key_mismatch":false,"rtt_ms":6.1,"uplink":"ok","uplink_pct":92,"pre_fec_loss":0.085,"residual":0.0106,"drone_temp_c":46,"nack":{"fill":48,"fill_pps":0.0}}"#)
             .expect("parse");
         assert_eq!(
@@ -721,5 +797,75 @@ mod tests {
         );
         assert_eq!(l.summary(), ("top rung".into(), false));
         assert_eq!(l.last.as_ref().map(|x| x.2), Some(4));
+    }
+
+    fn card(rssi: Option<i64>, frames: u64, crc_fail: u64) -> CardRx {
+        CardRx {
+            rssi,
+            frames,
+            crc_fail,
+            ..CardRx::default()
+        }
+    }
+
+    #[test]
+    fn a_card_that_stopped_hearing_reads_deaf() {
+        // The 2026-11-02 Quest session: card 0 at ~0.1 frames/s, card 1 at
+        // ~230 with 7 % CRC failures.
+        let old = [card(None, 97, 0), card(Some(-50), 19_086, 1_000)];
+        let new = [card(None, 97, 0), card(Some(-48), 19_776, 1_048)];
+        let r = card_rates(&old, &new, 3.0);
+        assert!(r[0].deaf && !r[1].deaf);
+        assert_eq!(r[0].crc_pct, None);
+        assert_eq!(r[1].fps, 230.0);
+        assert_eq!(
+            cards_line(&r, Some(1)),
+            "c0 DEAF   0/s  c1 TX -48 dBm 230/s crc  7 %"
+        );
+    }
+
+    #[test]
+    fn quiet_air_or_a_changed_card_set_names_no_card_deaf() {
+        // No drone: both cards hear only the neighbours.
+        let r = card_rates(
+            &[card(None, 0, 0); 2],
+            &[card(None, 30, 3), card(None, 0, 0)],
+            1.0,
+        );
+        assert!(r.iter().all(|c| !c.deaf));
+        // A second card was just added.
+        assert!(card_rates(&[card(None, 0, 0)], &[card(None, 9, 0); 2], 1.0).is_empty());
+        // Both cards on the link, one weaker: not deaf.
+        let r = card_rates(
+            &[card(None, 0, 0); 2],
+            &[card(Some(-40), 230, 9), card(Some(-60), 60, 20)],
+            1.0,
+        );
+        assert!(r.iter().all(|c| !c.deaf));
+        assert_eq!(
+            cards_line(&r, None),
+            "c0 -40 dBm 230/s crc  4 %  c1 -60 dBm  60/s crc 33 %"
+        );
+    }
+
+    #[test]
+    fn history_rates_span_the_card_window() {
+        let snap = |f0, f1| Snapshot {
+            cards: vec![card(Some(-40), f0, 0), card(Some(-41), f1, 0)],
+            ..Snapshot::default()
+        };
+        let mut h = History::default();
+        assert!(h.card_rates().is_empty());
+        h.push(0.0, snap(0, 0));
+        h.push(1.0, snap(100, 100));
+        h.push(2.0, snap(300, 300));
+        h.push(4.0, snap(700, 300));
+        // Window 3 s: from t=1 to t=4.
+        let r = h.card_rates();
+        assert_eq!((r[0].fps, r[1].fps), (200.0, 200.0 / 3.0));
+        assert!(!r[1].deaf);
+        h.push(6.0, snap(1100, 300));
+        let r = h.card_rates();
+        assert!(r[1].deaf, "card 1 heard nothing for 4 s: {r:?}");
     }
 }
