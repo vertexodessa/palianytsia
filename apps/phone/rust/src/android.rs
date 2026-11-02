@@ -26,14 +26,12 @@ fn start(
     prefs_path: std::path::PathBuf,
     log_dir: std::path::PathBuf,
 ) -> Result<Phone, String> {
-    let hp = pal_osd::prefs::HudPrefs::load(&prefs_path);
     let (link, ports) = Link::start(
         LinkCfg {
             fds: vec![fd],
             toml,
             log_dir,
-            link_bw: hp.link_bw,
-            link_channel: hp.link_channel,
+            pick: pal_android::link_pick(&prefs_path),
         },
         win,
     )?;

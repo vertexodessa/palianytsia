@@ -168,8 +168,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
             fds: opens.iter().map(|o| o.fd).collect(),
             toml: toml.clone(),
             log_dir: log_dir.clone(),
-            link_bw: pal_osd::prefs::HudPrefs::load(&prefs).link_bw,
-            link_channel: pal_osd::prefs::HudPrefs::load(&prefs).link_channel,
+            pick: pal_android::link_pick(&prefs),
         };
         log::info!(
             "supervisor: starting on {} card(s): {}",

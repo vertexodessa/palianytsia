@@ -33,6 +33,16 @@ pub fn clear_err() {
     LAST_ERR.lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
+/// The start-time choices in the saved prefs: the one place that knows
+/// which HudPrefs fields a link applies when it starts.
+pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
+    let p = pal_osd::prefs::HudPrefs::load(prefs);
+    pal_core::config::LinkPick {
+        bw: p.link_bw,
+        channel: p.link_channel,
+    }
+}
+
 pub struct LinkCfg {
     /// usbfs fds from UsbDeviceConnection.getFileDescriptor(), one per
     /// card; the first is the link card, the rest receive (and scout) with
@@ -41,10 +51,8 @@ pub struct LinkCfg {
     pub toml: String,
     /// Flight log root; one `fl-NNNN_*` directory per start.
     pub log_dir: PathBuf,
-    /// Video link width (HudPrefs::link_bw): every ladder rung at this bw.
-    pub link_bw: u8,
-    /// A fixed channel (HudPrefs::link_channel), or 0 = the config's own.
-    pub link_channel: u8,
+    /// The operator's start-time choices (`link_pick`).
+    pub pick: pal_core::config::LinkPick,
 }
 
 /// What the UI side reads and sends while the link runs.
@@ -78,17 +86,10 @@ impl Link {
         win: ndk::native_window::NativeWindow,
     ) -> Result<(Link, Ports), String> {
         let mut c = c;
-        match pal_core::config::with_link_bw(&c.toml, c.link_bw) {
-            Ok(t) => c.toml = t,
-            // A 40 MHz pick on a 20 MHz radio config: fly the config as is.
-            Err(e) => log::warn!("link width {} MHz not applied: {e}", c.link_bw),
-        }
-        if c.link_channel != 0 {
-            match pal_core::config::with_channel(&c.toml, c.link_channel) {
-                Ok(t) => c.toml = t,
-                // A channel saved under another config: fly the config as is.
-                Err(e) => log::warn!("channel {} not applied: {e}", c.link_channel),
-            }
+        let (toml, skipped) = pal_core::config::with_link_pick(&c.toml, c.pick);
+        c.toml = toml;
+        for s in skipped {
+            log::warn!("{s}");
         }
         let cfg = pal_core::config::parse_config_str(&c.toml).map_err(|e| e.to_string())?;
         let ch = cfg

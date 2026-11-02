@@ -776,6 +776,35 @@ pub fn load_config(path: &Path, overlay: Option<&Path>) -> R<Config> {
     parse_config(&j)
 }
 
+/// The operator's start-time link choices (the apps' HudPrefs): applied to
+/// the config text once, when a link starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkPick {
+    /// Video width, 20 or 40 MHz (`with_link_bw`).
+    pub bw: u8,
+    /// A fixed channel, 0 = the config's own (`with_channel`).
+    pub channel: u8,
+}
+
+/// `text` with `pick` applied, and one line per choice that could not be
+/// (a 40 MHz pick on a 20 MHz radio, a channel saved under another config):
+/// that choice is skipped and the config flies as it is there.
+pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
+    let mut out = text.to_string();
+    let mut skipped = Vec::new();
+    match with_link_bw(&out, pick.bw) {
+        Ok(t) => out = t,
+        Err(e) => skipped.push(format!("link width {} MHz not applied: {e}", pick.bw)),
+    }
+    if pick.channel != 0 {
+        match with_channel(&out, pick.channel) {
+            Ok(t) => out = t,
+            Err(e) => skipped.push(format!("channel {} not applied: {e}", pick.channel)),
+        }
+    }
+    (out, skipped)
+}
+
 /// `text` with the GS card (`radio.width`), every `[[link.ladder]]` rung and
 /// `link.static_bw` at `bw` MHz: the drone airs each rung at the width the
 /// RCF names, and a 20 MHz link wants a 20 MHz receiver too (tuned 40 it
@@ -1457,6 +1486,33 @@ mod tests {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(p)
+    }
+
+    #[test]
+    fn link_pick_applies_each_choice_or_skips_it() {
+        let auto = std::fs::read_to_string(repo("configs/gs-auto.toml")).unwrap();
+        let pick = |bw, channel| LinkPick { bw, channel };
+        let (t, skipped) = with_link_pick(&auto, pick(20, 144));
+        assert!(skipped.is_empty());
+        assert_eq!(
+            t,
+            with_channel(&with_link_bw(&auto, 20).unwrap(), 144).unwrap()
+        );
+        let (t, skipped) = with_link_pick(&auto, pick(20, 0));
+        assert!(skipped.is_empty());
+        assert_eq!(
+            t,
+            with_link_bw(&auto, 20).unwrap(),
+            "0 leaves the channel alone"
+        );
+        let (t, skipped) = with_link_pick(&auto, pick(20, 36));
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].starts_with("channel 36 not applied"));
+        assert_eq!(
+            t,
+            with_link_bw(&auto, 20).unwrap(),
+            "the width still applies"
+        );
     }
 
     #[test]
