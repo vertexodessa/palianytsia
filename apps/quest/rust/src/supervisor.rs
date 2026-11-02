@@ -18,9 +18,7 @@ use crate::usb::{Open, Usb};
 pub struct LinkUi {
     pub ports: Ports,
     pub shared: Arc<Shared>,
-    pub width: u8,
-    pub channels: Vec<u8>,
-    pub log_info: String,
+    pub info: pal_android::LinkInfo,
 }
 
 /// Shared between the supervisor, the XR loop and the OSD.
@@ -190,9 +188,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
         *hub.ui.lock().unwrap_or_else(|p| p.into_inner()) = Some(LinkUi {
             ports,
             shared: link.shared.clone(),
-            width: link.width,
-            channels: link.channels.clone(),
-            log_info: link.log_info.clone(),
+            info: link.info.clone(),
         });
         hub.set_status("");
         let why = loop {

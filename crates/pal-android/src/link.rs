@@ -67,15 +67,21 @@ pub struct Ports {
     pub mav_rx: Receiver<Vec<u8>>,
 }
 
-pub struct Link {
-    pub shared: Arc<Shared>,
-    /// Channel width; the channel itself is `shared.radio_label(width)`,
+/// What a started link tells the UI about itself; fixed for the link's life.
+#[derive(Clone, Debug)]
+pub struct LinkInfo {
+    /// Channel width; the channel itself is `Shared::radio_label(width)`,
     /// which follows the drone search.
     pub width: u8,
     /// The config's channel set, for the panel's channel picker.
     pub channels: Vec<u8>,
     /// Where the flight log goes, or why there is none.
     pub log_info: String,
+}
+
+pub struct Link {
+    pub shared: Arc<Shared>,
+    pub info: LinkInfo,
     core: Option<JoinHandle<()>>,
     dec: Option<JoinHandle<()>>,
 }
@@ -198,9 +204,11 @@ impl Link {
         Ok((
             Link {
                 shared,
-                width,
-                channels,
-                log_info,
+                info: LinkInfo {
+                    width,
+                    channels,
+                    log_info,
+                },
                 core: Some(core_t),
                 dec: Some(dec_t),
             },

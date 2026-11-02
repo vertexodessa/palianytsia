@@ -125,8 +125,8 @@ impl Osd {
         if let Some(l) = hub.ui.lock().unwrap_or_else(|p| p.into_inner()).take() {
             log::info!(
                 "osd: link {}, {}",
-                l.shared.radio_label(l.width),
-                l.log_info
+                l.shared.radio_label(l.info.width),
+                l.info.log_info
             );
             // A new link is a new session: fresh history.
             self.hist = History::default();
@@ -216,7 +216,7 @@ impl Osd {
             let mut status = hub.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
             if let Some(l) = self.link.as_ref() {
                 if status.is_empty() && l.shared.searching.load(Ordering::Relaxed) {
-                    status = l.shared.radio_label(l.width);
+                    status = l.shared.radio_label(l.info.width);
                 }
             }
             if let Err(e) = self.draw(hub, now, &status, events) {
@@ -252,7 +252,7 @@ impl Osd {
             |l| {
                 format!(
                     "{}, key {}",
-                    l.shared.radio_label(l.width),
+                    l.shared.radio_label(l.info.width),
                     hist.last().map_or("?", |s| s.key_fp.as_str())
                 )
             },
@@ -260,10 +260,10 @@ impl Osd {
         let log_info = self.link.as_ref().map_or_else(String::new, |l| {
             format!(
                 "{}\n\nadb pull /sdcard/Android/data/org.palianytsia.quest/files/logs",
-                l.log_info
+                l.info.log_info
             )
         });
-        let channels: &[u8] = self.link.as_ref().map_or(&[], |l| &l.channels);
+        let channels: &[u8] = self.link.as_ref().map_or(&[], |l| &l.info.channels);
         let cursor = self.pointer.filter(|_| panel.open);
         let mut pout = pal_osd::panel::PanelOut::default();
         let dec = self.link.as_ref().map_or((0, 0), |l| {

@@ -33,11 +33,8 @@ pub struct OsdIn {
     pub params_rx: Receiver<String>,
     pub cmd_tx: Sender<Cmd>,
     pub set_res_rx: Receiver<(usize, Result<(), String>)>,
-    /// "ch 40 / 40 MHz", for the Link tab.
-    pub width: u8,
-    pub channels: Vec<u8>,
-    /// Where this session's flight log goes, for the Logs tab.
-    pub log_info: String,
+    /// Width, channel set and flight log place, for the Link and Logs tabs.
+    pub info: pal_android::LinkInfo,
     /// HUD prefs file in the app's files dir.
     pub prefs_path: std::path::PathBuf,
 }
@@ -220,15 +217,15 @@ pub fn run(o: OsdIn) {
                     prefs: &mut prefs,
                     link_info: format!(
                         "{}, key {}",
-                        o.shared.radio_label(o.width),
+                        o.shared.radio_label(o.info.width),
                         hist.last().map_or("?", |s| s.key_fp.as_str())
                     ),
                     log_info: format!(
                         "{}\n\nadb pull /sdcard/Android/data/org.palianytsia.phone/files/logs",
-                        o.log_info
+                        o.info.log_info
                     ),
                     cal: hist.last().and_then(|s| s.cal.as_ref()),
-                    channels: &o.channels,
+                    channels: &o.info.channels,
                 },
             );
             egui::CentralPanel::default()
@@ -253,7 +250,7 @@ pub fn run(o: OsdIn) {
                         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
                             if searching {
                                 ui.label(
-                                    egui::RichText::new(o.shared.radio_label(o.width))
+                                    egui::RichText::new(o.shared.radio_label(o.info.width))
                                         .size(20.0)
                                         .color(egui::Color32::YELLOW),
                                 );
