@@ -1064,6 +1064,13 @@ impl GsCore for RustCore {
         Ok(())
     }
 
+    fn set_channels(&mut self, chosen: &[u8]) -> Result<(), String> {
+        match self.gs.as_mut().and_then(|g| g.chan.as_mut()) {
+            Some(c) => c.set_usable(chosen),
+            None => Err("no channel core (a spotter or a card-less replay)".into()),
+        }
+    }
+
     fn cal_abort(&mut self) {
         if let Some(g) = self.gs.as_mut() {
             if g.cal.running() || g.cal.picking() {

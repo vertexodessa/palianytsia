@@ -73,6 +73,24 @@ impl HopRanker {
         }
     }
 
+    /// A new candidate set; the visits of members that stay are kept.
+    pub fn set_candidates(&mut self, set: Vec<u8>) {
+        let mut old: Vec<(u8, VecDeque<HopVisit>)> = self
+            .candidates
+            .drain(..)
+            .zip(self.visits.drain(..))
+            .collect();
+        self.visits = set
+            .iter()
+            .map(|c| {
+                old.iter()
+                    .position(|(o, _)| o == c)
+                    .map_or_else(VecDeque::new, |i| std::mem::take(&mut old[i].1))
+            })
+            .collect();
+        self.candidates = set;
+    }
+
     /// The boot scan's pick arrives with the first DiscAck; until then (0)
     /// ties fall through to config order.
     pub fn set_boot_pick(&mut self, ch: u8) {

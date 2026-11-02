@@ -53,6 +53,10 @@ use crate::link_health::S1LossWindow;
 use crate::vrx::{disc_for_channel, VrxController};
 
 /// hop.state on the sideport.
+/// steer_into_use: a move out of a non-usable member that did not land
+/// is ordered again after this long (the hop cap still applies).
+const STEER_RETRY_MS: f64 = 10_000.0;
+
 pub fn hop_state_name(s: HopState) -> &'static str {
     match s {
         HopState::Idle => "idle",
@@ -363,6 +367,8 @@ pub struct ChannelCore {
     scout_card_died_seen: bool,
     pending_relocate: Option<u8>,
     frozen_pick: Option<u8>,
+    /// The last steer_into_use order.
+    steer_ms: Option<f64>,
     last_bi: BootPickIn,
 
     hop_lead_latched: Option<usize>,
@@ -462,6 +468,7 @@ impl ChannelCore {
         if let Some(sci) = scout_card {
             let sc = ScoutCfg {
                 channels: cfg.radio.channels.clone(),
+                usable: cfg.radio.use_.clone(),
                 measure: !pinned,
                 dwell_ms: scan.dwell_ms,
                 settle_ms: scan.settle_ms,
@@ -492,7 +499,7 @@ impl ChannelCore {
                 InflightScoutCfg {
                     observe_ms: cfg.hop.dwell_observe_ms,
                     period_ms: cfg.hop.dwell_period_ms,
-                    candidates: cfg.radio.channels.clone(),
+                    candidates: cfg.radio.usable().to_vec(),
                     width_mhz: cfg.radio.width,
                     busy_dbm: scan.busy.busy_dbm,
                 },
@@ -542,7 +549,7 @@ impl ChannelCore {
             ranker: HopRanker::new(
                 cfg.hop.clone(),
                 scan.busy.clone(),
-                cfg.radio.channels.clone(),
+                cfg.radio.usable().to_vec(),
                 0,
             ),
             hopc: HopController::new(cfg.hop.clone()),
@@ -577,6 +584,7 @@ impl ChannelCore {
             scout_card_died_seen: false,
             pending_relocate: None,
             frozen_pick: pinned.then_some(cfg.start_ch),
+            steer_ms: None,
             last_bi: BootPickIn::default(),
             hop_lead_latched: None,
             recovered_prev_window: 0,
@@ -958,7 +966,7 @@ impl ChannelCore {
         };
         let all = s.ranking();
         let any = if self.cfg.radio.width == 40 {
-            any_pair_ranked(&all, &self.cfg.radio.channels, mr)
+            any_pair_ranked(&all, self.cfg.radio.usable(), mr)
         } else {
             all.iter().any(|e| e.visits >= mr as u32)
         };
@@ -1074,8 +1082,87 @@ impl ChannelCore {
         self.live.scout_working.store(w, Relaxed);
     }
 
+    /// The operator's channel choice on a live link (`radio.use`): the
+    /// members the link may sit on, one = that channel only, all = plain
+    /// auto. The search keeps the drone's whole set; a link outside the new
+    /// choice relocates into it by the boot pick's hop (steer_into_use).
+    pub fn set_usable(&mut self, chosen: &[u8]) -> Result<(), String> {
+        if self.pinned {
+            return Err("a pinned config keeps its channel".into());
+        }
+        if chosen.is_empty() {
+            return Err("choose at least one channel".into());
+        }
+        let set = &self.cfg.radio.channels;
+        if let Some(c) = chosen.iter().find(|c| !set.contains(c)) {
+            return Err(format!("{c} is not a member of radio.channels"));
+        }
+        let use_: Vec<u8> = if set.iter().all(|c| chosen.contains(c)) {
+            Vec::new()
+        } else {
+            chosen.to_vec()
+        };
+        self.cfg.radio.use_ = use_.clone();
+        let usable = self.cfg.radio.usable().to_vec();
+        if let Some(s) = &self.scout {
+            s.set_usable(use_);
+        }
+        if let Some(i) = self.live.inflight.lock().unwrap().as_mut() {
+            i.set_candidates(usable.clone());
+        }
+        self.ranker.set_candidates(usable.clone());
+        // A relocation wanted toward a member no longer chosen is dropped;
+        // the next tick steers toward the new choice at once.
+        let op = self.plan.op();
+        if !self.plan.hopping() && !usable.contains(&self.plan.want()) {
+            self.plan.set_want(self.now_ms_cur, op);
+        }
+        self.steer_ms = None;
+        self.log(format!(
+            "maburgs channel: operator channels {usable:?} (link on {op})"
+        ));
+        Ok(())
+    }
+
+    /// A link found on a member outside `radio.use` (the drone parked
+    /// there) moves to the best usable one once nothing else is moving it;
+    /// a move that did not land is tried again after STEER_RETRY_MS.
+    fn steer_into_use(&mut self, inp: &ChannelTickIn) {
+        let usable = self.cfg.radio.usable();
+        let op = self.plan.op();
+        if self.pinned
+            || !inp.in_session
+            || usable.contains(&op)
+            || self.plan.hopping()
+            || self.plan.want() != op
+            || self.boot_pick.open()
+            || self.boot_pick.relocating()
+            || self
+                .steer_ms
+                .is_some_and(|t| inp.now_ms - t < STEER_RETRY_MS)
+        {
+            return;
+        }
+        let ranked = self
+            .scout
+            .as_ref()
+            .map(|s| s.pick_ranking())
+            .unwrap_or_default();
+        let to = ranked
+            .into_iter()
+            .find(|c| usable.contains(c))
+            .unwrap_or(usable[0]);
+        self.steer_ms = Some(inp.now_ms);
+        self.plan.set_want(inp.now_ms, to);
+        self.boot_pick.rearm_relocation();
+        self.log(format!(
+            "maburgs channel: link on {op} is outside radio.use: relocating to {to}"
+        ));
+    }
+
     fn step_boot_pick(&mut self, inp: &ChannelTickIn) {
         let now_ms = inp.now_ms;
+        self.steer_into_use(inp);
         let mut bi = BootPickIn {
             now_ms,
             since_start_ms: self.now_ms_u_cur.wrapping_sub(self.gs_start_ms),
@@ -1706,7 +1793,7 @@ impl ChannelCore {
             &halves,
             if have_op { self.op_live } else { None },
             op,
-            &self.cfg.radio.channels,
+            self.cfg.radio.usable(),
             self.cfg.radio.width,
             scan.pick_margin as u32,
             scan.busy.blocked_pct,

@@ -127,6 +127,11 @@ pub trait GsCore {
     }
     /// Abandon the run; the drone restores its power table at once.
     fn cal_abort(&mut self) {}
+    /// The operator's channel choice on a live link (`radio.use`, see
+    /// `ChannelCore::set_usable`); `Err(why)` when this core cannot.
+    fn set_channels(&mut self, _chosen: &[u8]) -> Result<(), String> {
+        Err("channel choice needs the Rust channel core".into())
+    }
     /// The run's state and result table as one JSON object (`cal::status_json`).
     fn cal_json(&self) -> Option<String> {
         None

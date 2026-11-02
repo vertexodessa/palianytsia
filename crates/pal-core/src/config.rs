@@ -132,7 +132,12 @@ impl Default for HopCfg {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RadioCfg {
+    /// The drone's set: the GS searches all of it for the drone.
     pub channels: Vec<u8>,
+    /// `radio.use`: the members the GS may put the link on (measure, pick,
+    /// hop); empty = all of `channels`. Pal only: an operator who narrows
+    /// the set still has to find a drone parked outside it.
+    pub use_: Vec<u8>,
     /// None = "auto".
     pub pin: Option<u8>,
     pub width: u8,
@@ -143,10 +148,22 @@ pub struct RadioCfg {
     pub scan: ScanCfg,
 }
 
+impl RadioCfg {
+    /// The members the link may sit on: `radio.use`, else the whole set.
+    pub fn usable(&self) -> &[u8] {
+        if self.use_.is_empty() {
+            &self.channels
+        } else {
+            &self.use_
+        }
+    }
+}
+
 impl Default for RadioCfg {
     fn default() -> Self {
         Self {
             channels: vec![40, 64, 112, 144],
+            use_: Vec::new(),
             pin: None,
             width: 20,
             cards: Vec::new(),
@@ -521,32 +538,7 @@ impl Config {
     }
 }
 
-/// 0 = no standard HT40 pair; 1 = secondary above; 2 = below.
-pub fn ht40_offset(ch: u8) -> u8 {
-    if (36..=144).contains(&ch) && (ch - 36).is_multiple_of(4) {
-        return if ((ch - 36) / 4).is_multiple_of(2) {
-            1
-        } else {
-            2
-        };
-    }
-    if (149..=161).contains(&ch) && (ch - 149).is_multiple_of(4) {
-        return if ((ch - 149) / 4).is_multiple_of(2) {
-            1
-        } else {
-            2
-        };
-    }
-    0
-}
-
-pub fn ht40_pair_other(ch: u8) -> u8 {
-    match ht40_offset(ch) {
-        1 => ch + 4,
-        2 => ch - 4,
-        _ => 0,
-    }
-}
+pub use pal_wire::ht40::{ht40_offset, ht40_pair_other};
 
 const NHM_EDGES: [i32; 11] = [-104, -101, -98, -95, -92, -89, -86, -83, -80, -75, -70];
 
@@ -778,12 +770,13 @@ pub fn load_config(path: &Path, overlay: Option<&Path>) -> R<Config> {
 
 /// The operator's start-time link choices (the apps' HudPrefs): applied to
 /// the config text once, when a link starts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkPick {
     /// Video width, 20 or 40 MHz (`with_link_bw`).
     pub bw: u8,
-    /// A fixed channel, 0 = the config's own (`with_channel`).
-    pub channel: u8,
+    /// The members the link may sit on (`with_channels`): one = that
+    /// channel, fixed; several = auto among them; none = the config's own.
+    pub channels: Vec<u8>,
 }
 
 /// `text` with `pick` applied, and one line per choice that could not be
@@ -796,13 +789,68 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
         Ok(t) => out = t,
         Err(e) => skipped.push(format!("link width {} MHz not applied: {e}", pick.bw)),
     }
-    if pick.channel != 0 {
-        match with_channel(&out, pick.channel) {
+    // The choice was saved against a set and a width: what is no longer a
+    // member, or has no pair at 40 MHz, drops out; nothing left = all.
+    let fly: Vec<u8> = match parse_config_str(&out) {
+        Ok(c) => pick
+            .channels
+            .iter()
+            .copied()
+            .filter(|ch| c.radio.channels.contains(ch))
+            .filter(|&ch| c.radio.width != 40 || ht40_offset(ch) != 0)
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if fly.len() != pick.channels.len() {
+        skipped.push(format!(
+            "channels {:?}: flying {:?} (the rest are not in this set or width)",
+            pick.channels, fly
+        ));
+    }
+    if !fly.is_empty() {
+        match with_channels(&out, &fly) {
             Ok(t) => out = t,
-            Err(e) => skipped.push(format!("channel {} not applied: {e}", pick.channel)),
+            Err(e) => skipped.push(format!("channels {fly:?} not applied: {e}")),
         }
     }
     (out, skipped)
+}
+
+/// The operator's channel choice over the drone's set (`radio.channels`,
+/// which stays whole: the GS still searches all of it for the drone): auto
+/// with `radio.use` narrowed to `chosen`, plain auto for all of them. One
+/// member is still auto, so the choice can change on a live link
+/// (`ChannelCore::set_usable`); a pin could not.
+pub fn with_channels(text: &str, chosen: &[u8]) -> R<String> {
+    let set = parse_config_str(text)?.radio.channels;
+    if let Some(ch) = chosen.iter().find(|c| !set.contains(c)) {
+        return Err(ConfigError(format!(
+            "{ch} is not a member of radio.channels"
+        )));
+    }
+    if chosen.is_empty() {
+        return Err(ConfigError("choose at least one channel".into()));
+    }
+    let mut j = text
+        .parse::<Table>()
+        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    let radio = j
+        .entry("radio")
+        .or_insert_with(|| Value::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError("config: radio is not a table".into()))?;
+    radio.insert("channel".into(), Value::String("auto".into()));
+    if set.iter().all(|c| chosen.contains(c)) {
+        radio.remove("use");
+    } else {
+        radio.insert(
+            "use".into(),
+            Value::Array(chosen.iter().map(|&c| Value::Integer(c.into())).collect()),
+        );
+    }
+    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
+    parse_config_str(&out)?;
+    Ok(out)
 }
 
 /// `text` with the GS card (`radio.width`), every `[[link.ladder]]` rung and
@@ -895,7 +943,7 @@ fn parse_config(j: &Table) -> R<Config> {
             r,
             "radio",
             &[
-                "channel", "channels", "width", "cards", "tx_card", "scan", "relays",
+                "channel", "channels", "use", "width", "cards", "tx_card", "scan", "relays",
             ],
         )?;
         c.radio.width = get_int(r, "width", 20, 20, 40, "radio")? as u8;
@@ -951,6 +999,30 @@ fn parse_config(j: &Table) -> R<Config> {
                     "radio.channel",
                     "must be \"auto\" or a member of radio.channels",
                 )
+            }
+        }
+        if let Some(v) = r.get("use") {
+            let Value::Array(a) = v else {
+                return fail("radio.use", "not an array");
+            };
+            for x in a {
+                let Value::Integer(ch) = x else {
+                    return fail("radio.use", "not an integer");
+                };
+                let ch = u8::try_from(*ch).unwrap_or(0);
+                if !c.radio.channels.contains(&ch) {
+                    return fail(
+                        "radio.use",
+                        &format!("{ch} is not a member of radio.channels"),
+                    );
+                }
+                if c.radio.use_.contains(&ch) {
+                    return fail("radio.use", &format!("duplicate channel {ch}"));
+                }
+                c.radio.use_.push(ch);
+            }
+            if c.radio.use_.is_empty() {
+                return fail("radio.use", "must list at least one member");
             }
         }
         c.radio.tx_card = get_i32(r, "tx_card", -1, -1, 15, "radio")?;
@@ -1491,28 +1563,36 @@ mod tests {
     #[test]
     fn link_pick_applies_each_choice_or_skips_it() {
         let auto = std::fs::read_to_string(repo("configs/gs-auto.toml")).unwrap();
-        let pick = |bw, channel| LinkPick { bw, channel };
-        let (t, skipped) = with_link_pick(&auto, pick(20, 144));
+        let pick = |bw, chs: &[u8]| LinkPick {
+            bw,
+            channels: chs.to_vec(),
+        };
+        let (t, skipped) = with_link_pick(&auto, pick(20, &[144]));
         assert!(skipped.is_empty());
         assert_eq!(
             t,
-            with_channel(&with_link_bw(&auto, 20).unwrap(), 144).unwrap()
+            with_channels(&with_link_bw(&auto, 20).unwrap(), &[144]).unwrap()
         );
-        let (t, skipped) = with_link_pick(&auto, pick(20, 0));
+        let (t, skipped) = with_link_pick(&auto, pick(20, &[]));
         assert!(skipped.is_empty());
         assert_eq!(
             t,
             with_link_bw(&auto, 20).unwrap(),
-            "0 leaves the channel alone"
+            "none leaves the channel alone"
         );
-        let (t, skipped) = with_link_pick(&auto, pick(20, 36));
+        let (t, skipped) = with_link_pick(&auto, pick(20, &[64, 36]));
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].starts_with("channel 36 not applied"));
+        assert!(skipped[0].starts_with("channels [64, 36]: flying [64]"));
+        let c = parse_config_str(&t).unwrap();
         assert_eq!(
-            t,
-            with_link_bw(&auto, 20).unwrap(),
-            "the width still applies"
+            c.radio.use_,
+            vec![64],
+            "the members that are left still fly"
         );
+        assert_eq!(c.radio.width, 20, "the width still applies");
+        let (t, skipped) = with_link_pick(&auto, pick(20, &[36]));
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(t, with_link_bw(&auto, 20).unwrap(), "nothing left = all");
     }
 
     #[test]
@@ -1534,6 +1614,48 @@ mod tests {
         assert!(c.link.ladder_cfg.ladder.iter().all(|r| r.bw == 40));
         assert_eq!(c.radio.width, 40);
         assert!(with_link_bw(&text, 30).is_err());
+    }
+
+    #[test]
+    fn channels_pin_one_narrow_several_and_keep_the_search_set() {
+        let pinned = std::fs::read_to_string(repo("configs/gs.toml")).unwrap();
+        let orig = parse_config_str(&pinned).unwrap();
+        let c = |chs: &[u8]| parse_config_str(&with_channels(&pinned, chs).unwrap()).unwrap();
+        let one = c(&[64]);
+        assert_eq!((one.radio.pin, one.radio.use_.clone()), (None, vec![64]));
+        let two = c(&[112, 40]);
+        assert_eq!(two.radio.pin, None);
+        assert_eq!(two.radio.use_, vec![112, 40]);
+        assert_eq!(two.radio.usable(), &[112, 40]);
+        assert_eq!(
+            two.radio.channels, orig.radio.channels,
+            "the search set stays"
+        );
+        let all = c(&orig.radio.channels);
+        assert_eq!((all.radio.pin, all.radio.use_.clone()), (None, vec![]));
+        assert_eq!(all.radio.usable(), &orig.radio.channels[..]);
+        // Narrowed, then all again: the narrowing is gone.
+        let back = with_channels(
+            &with_channels(&pinned, &[64, 112]).unwrap(),
+            &orig.radio.channels,
+        );
+        assert!(parse_config_str(&back.unwrap())
+            .unwrap()
+            .radio
+            .use_
+            .is_empty());
+        assert!(with_channels(&pinned, &[36]).is_err(), "not a member");
+    }
+
+    #[test]
+    fn radio_use_must_name_members_once() {
+        let base = "[radio]\nchannels = [40, 64, 112, 144]\n";
+        let p = |u: &str| parse_config_str(&format!("{base}use = {u}\n"));
+        assert_eq!(p("[64, 144]").unwrap().radio.use_, vec![64, 144]);
+        assert!(p("[36]").is_err());
+        assert!(p("[64, 64]").is_err());
+        assert!(p("[]").is_err());
+        assert!(p("64").is_err());
     }
 
     #[test]

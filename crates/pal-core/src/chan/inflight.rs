@@ -167,6 +167,13 @@ impl InflightScout {
         (d, Some(v))
     }
 
+    /// The operator narrowed or widened `radio.use`: the dwells go to the
+    /// new set from its first member.
+    pub fn set_candidates(&mut self, set: Vec<u8>) {
+        self.cfg.candidates = set;
+        self.next_idx = 0;
+    }
+
     /// Round-robin over the dwell set in config order, skipping the channel
     /// the card is on; None when that is the only one.
     pub fn next_candidate(&mut self, skip: u8) -> Option<u8> {

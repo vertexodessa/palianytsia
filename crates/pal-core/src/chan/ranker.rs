@@ -139,7 +139,16 @@ impl ChannelRanker {
     }
 
     pub fn proposal_at(&self, current: u8, min_rounds: i32) -> u8 {
-        let k = self.ranked_at(min_rounds);
+        self.proposal_among(current, min_rounds, &[])
+    }
+
+    /// `proposal_at` over the members in `usable` (empty = all); `current`
+    /// may be outside it, and then any usable ranked member beats it.
+    pub fn proposal_among(&self, current: u8, min_rounds: i32, usable: &[u8]) -> u8 {
+        let mut k = self.ranked_at(min_rounds);
+        if !usable.is_empty() {
+            k.retain(|e| usable.contains(&e.ch));
+        }
         let Some(best) = k.first() else {
             return current;
         };
@@ -192,6 +201,21 @@ mod tests {
     }
     fn chs(v: &[RankEntry]) -> Vec<u8> {
         v.iter().map(|e| e.ch).collect()
+    }
+
+    #[test]
+    fn proposal_among_names_only_usable_members() {
+        let mut r = ChannelRanker::plain(&[36, 40, 44], 1);
+        r.add(&s(36, 0, 0, 0, 0));
+        r.add(&s(40, 50, 0, 0, 0));
+        r.add(&s(44, 90, 0, 0, 0));
+        assert_eq!(r.proposal_at(44, 1), 36);
+        assert_eq!(r.proposal_among(44, 1, &[]), 36);
+        assert_eq!(r.proposal_among(44, 1, &[40, 44]), 40);
+        // Current outside the usable set: the best usable, however busy.
+        assert_eq!(r.proposal_among(36, 1, &[44]), 44);
+        // Nothing usable ranked yet: stay.
+        assert_eq!(r.proposal_among(36, 2, &[44]), 36);
     }
 
     #[test]

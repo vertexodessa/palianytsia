@@ -27,6 +27,9 @@ use crate::config::ht40_pair_other;
 pub struct ScoutCfg {
     /// The set, config order (primaries at width 40).
     pub channels: Vec<u8>,
+    /// The members a pick may name (`radio.use`); empty = all of
+    /// `channels`. The search and the rounds still cover every member.
+    pub usable: Vec<u8>,
     /// Auto: observe + rank; false (pinned): search only.
     pub measure: bool,
     pub dwell_ms: i32,
@@ -52,6 +55,7 @@ impl Default for ScoutCfg {
     fn default() -> Self {
         Self {
             channels: Vec::new(),
+            usable: Vec::new(),
             measure: true,
             dwell_ms: 250,
             settle_ms: 30,
@@ -196,6 +200,9 @@ struct RunState {
 
 pub struct ChannelScout<R: ScoutRadio + ?Sized> {
     cfg: ScoutCfg,
+    /// `cfg.usable` as the operator last set it (`set_usable`). Taken
+    /// after `sh`, never held while taking it.
+    usable: Mutex<Vec<u8>>,
     radio: std::sync::Arc<R>,
     now: NowFn,
     sleep: SleepFn,
@@ -233,6 +240,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         let first = cfg.channels.first().copied().unwrap_or(0);
         let prelude = cfg.one_card && cfg.measure;
         Self {
+            usable: Mutex::new(cfg.usable.clone()),
             sh: Mutex::new(Shared {
                 ranker: ChannelRanker::new(&dc, cfg.min_rounds, cfg.pick_margin, cfg.blocked_pct),
                 dwells: Vec::new(),
@@ -405,6 +413,23 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             self.end_round_measuring();
         }
     }
+    /// The members a pick may name; the whole set unless narrowed.
+    fn usable(&self) -> Vec<u8> {
+        let u = self.usable.lock().unwrap();
+        if u.is_empty() {
+            self.cfg.channels.clone()
+        } else {
+            u.clone()
+        }
+    }
+
+    /// The operator's new `radio.use` (empty = all); the proposal follows
+    /// at once unless the pick is frozen.
+    pub fn set_usable(&self, usable: Vec<u8>) {
+        *self.usable.lock().unwrap() = usable;
+        self.publish();
+    }
+
     fn member(&self, ch: u8) -> bool {
         ch != 0 && self.cfg.channels.contains(&ch)
     }
@@ -679,13 +704,13 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             pair_proposal(
                 sh.ranker.all(),
                 op,
-                &self.cfg.channels,
+                &self.usable(),
                 mr,
                 self.cfg.pick_margin,
                 self.cfg.blocked_pct,
             )
         } else {
-            sh.ranker.proposal_at(op, mr)
+            sh.ranker.proposal_among(op, mr, &self.usable())
         };
         self.proposal.store(p, Release);
     }
@@ -742,14 +767,15 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         let sh = self.sh.lock().unwrap();
         let mr = self.eff_min_rounds();
         if self.cfg.link_width_mhz == 40 {
-            return pair_ranking(
-                sh.ranker.all(),
-                &self.cfg.channels,
-                mr,
-                self.cfg.blocked_pct,
-            );
+            return pair_ranking(sh.ranker.all(), &self.usable(), mr, self.cfg.blocked_pct);
         }
-        sh.ranker.ranked_at(mr).into_iter().map(|e| e.ch).collect()
+        let usable = self.usable();
+        sh.ranker
+            .ranked_at(mr)
+            .into_iter()
+            .map(|e| e.ch)
+            .filter(|c| usable.contains(c))
+            .collect()
     }
 }
 

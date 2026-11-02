@@ -77,8 +77,12 @@ struct Rig {
 
 impl Rig {
     fn new(n: usize, pinned: bool, start: u8) -> Self {
+        Self::with_use(n, pinned, start, &[])
+    }
+    fn with_use(n: usize, pinned: bool, start: u8, use_: &[u8]) -> Self {
         let mut cfg = bundle();
         cfg.radio.channels = vec![40, 64, 112, 144];
+        cfg.radio.use_ = use_.to_vec();
         cfg.radio.width = 40;
         if pinned {
             cfg.radio.pin = Some(if start != 0 { start } else { 40 });
@@ -601,6 +605,79 @@ fn pinned_relocation_is_not_failed_by_a_dirty_pin() {
     assert_eq!(s.hop.state, "idle");
     assert!(g.core.op() == 40 && g.ch(0) == 40 && g.ch(1) == 40);
     assert_eq!(s.hop.verdict, "interfered");
+}
+
+/// radio.use narrows where the link may sit, not where the drone is
+/// searched: a link found outside it (here op 40, frozen unmeasured) is
+/// moved to a usable member, and the reactive candidates are only those.
+#[test]
+fn a_link_outside_radio_use_is_moved_into_it() {
+    let mut g = Rig::with_use(2, false, 0, &[64, 112]);
+    g.cards[1].s().retune_ok = false; // the scout never completes a dwell
+    g.until(4000, false, "pick frozen on");
+    assert_eq!(g.core.op(), 40);
+    g.link_up();
+    g.until(200, true, "relocate 40 -> 64 placed");
+    assert!(g.has_line("link on 40 is outside radio.use: relocating to 64"));
+    assert!(g.has_line("relocate 40 -> 64 placed"));
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, 64);
+    g.core.note_video(64);
+    g.tick(true);
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.core.op(), 64);
+    g.tick(true);
+    assert_eq!(
+        g.count_lines("outside radio.use"),
+        1,
+        "steered once, not again once inside"
+    );
+}
+
+/// The operator's channel choice on a live link: one member moves the
+/// link there by the relocate hop (no relink), all of them leaves it be,
+/// a pinned config refuses.
+#[test]
+fn set_usable_moves_a_live_link_by_hop() {
+    let mut g = Rig::auto(2);
+    g.cards[1].s().retune_ok = false;
+    g.until(4000, false, "pick frozen on");
+    g.link_up();
+    g.tick(true);
+    assert_eq!(g.core.op(), 40);
+    assert!(g.core.set_usable(&[]).is_err());
+    assert!(g.core.set_usable(&[36]).is_err());
+    g.core.set_usable(&[112]).unwrap();
+    g.until(200, true, "relocate 40 -> 112 placed");
+    assert!(g.has_line("relocate 40 -> 112 placed"));
+    assert_eq!(g.pump_rcf().unwrap().hop_ch, 112);
+    g.core.note_video(112);
+    g.tick(true);
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.core.op(), 112);
+    g.core.set_usable(&[40, 64, 112, 144]).unwrap();
+    for _ in 0..300 {
+        g.tick(true);
+    }
+    assert_eq!(g.core.op(), 112, "all members: the link stays where it is");
+    assert_eq!(g.count_lines("channel: relocate "), 1);
+
+    let mut p = Rig::new(2, true, 40);
+    assert!(p.core.set_usable(&[64]).is_err());
+}
+
+#[test]
+fn without_radio_use_a_link_on_any_member_stays() {
+    let mut g = Rig::auto(2);
+    g.cards[1].s().retune_ok = false;
+    g.until(4000, false, "pick frozen on");
+    g.link_up();
+    for _ in 0..300 {
+        g.tick(true);
+    }
+    assert!(!g.has_line("outside radio.use"));
+    assert_eq!(g.core.op(), 40);
 }
 
 /// Auto, frozen, linked, interfered: an order to a ranked candidate.
