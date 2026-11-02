@@ -37,7 +37,6 @@ use flightlog::session::Session;
 use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::{GsCore, Mode};
-use pal_osd::{History, Snapshot};
 use pal_ref::{RefCore, RefOpts};
 use runtime::{lat_us, CoreLoop, Drive, LiveCfg, LoopPorts, Search, Shared, Sink};
 
@@ -390,7 +389,6 @@ fn run_decode(
 
 struct App {
     mav_rx: Receiver<Vec<u8>>,
-    telem: pal_osd::telem::Telemetry,
     frame: Arc<Mutex<Option<Frame>>>,
     /// Shader path (None with --cpu-rgba): the newest frame's YUV planes.
     yuv: Option<Arc<Mutex<Option<gl_video::YuvFrame>>>>,
@@ -400,21 +398,16 @@ struct App {
     params_rx: Receiver<String>,
     cmd_tx: mpsc::Sender<pal_osd::params::Cmd>,
     set_res_rx: Receiver<(usize, Result<(), String>)>,
-    params: Option<pal_osd::params::Table>,
-    edits: pal_osd::params::Edits,
-    /// Settings panel (gear button, P opens it on the Drone tab).
-    panel: pal_osd::panel::Panel,
-    prefs: pal_osd::prefs::HudPrefs,
-    prefs_path: PathBuf,
+    /// Stats history, telemetry, drone settings, prefs and the settings
+    /// panel (gear button, P opens it on the Drone tab).
+    console: pal_osd::console::Console,
     /// Channel and width the card runs on, for the Link tab.
     radio: (u8, u8),
     log_info: String,
-    hist: History,
     tex: Option<egui::TextureHandle>,
     shown_seq: u64,
     t0: Instant,
     fps: f64,
-    fps_mark: (Instant, u64),
     show_monitor: bool,
     snapshot: Option<(PathBuf, f64)>,
     snapshot_sent: bool,
@@ -433,14 +426,15 @@ fn write_ppm(path: &PathBuf, img: &egui::ColorImage) -> std::io::Result<()> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         let now = self.t0.elapsed().as_secs_f64();
-        while let Ok(p) = self.mav_rx.try_recv() {
-            self.telem.on_packet(&p, now);
-        }
-        while let Ok(line) = self.stats_rx.try_recv() {
-            if let Some(s) = Snapshot::parse(&line) {
-                self.hist.push(now, s);
-            }
-        }
+        self.console.drain_stats(now, &self.stats_rx);
+        self.console.drain(
+            now,
+            pal_osd::console::Feeds {
+                mav: &self.mav_rx,
+                params: &self.params_rx,
+                set_res: &self.set_res_rx,
+            },
+        );
         if let Some(fr) = self
             .frame
             .lock()
@@ -464,10 +458,7 @@ impl eframe::App for App {
             }
         }
         let frames = self.shared.frames.load(Ordering::Relaxed);
-        if self.fps_mark.0.elapsed() >= Duration::from_secs(1) {
-            self.fps = (frames - self.fps_mark.1) as f64 / self.fps_mark.0.elapsed().as_secs_f64();
-            self.fps_mark = (Instant::now(), frames);
-        }
+        self.fps = self.console.fps(frames);
         // Hotkeys only while no text field has focus (typing a value must
         // not toggle panels).
         let typing = ctx.memory(|m| m.focused().is_some());
@@ -475,50 +466,33 @@ impl eframe::App for App {
             self.show_monitor = !self.show_monitor;
         }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::S)) {
-            self.prefs.stats = !self.prefs.stats;
-            self.prefs.save(&self.prefs_path);
+            self.console.toggle_stats();
         }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::P)) {
-            self.panel.open = !self.panel.open;
-            self.panel.tab = pal_osd::panel::Tab::Drone;
+            self.console.panel.open = !self.console.panel.open;
+            self.console.panel.tab = pal_osd::panel::Tab::Drone;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.panel.open = false;
+            self.console.panel.open = false;
         }
-        while let Ok(l) = self.params_rx.try_recv() {
-            if let Some(t) = pal_osd::params::Table::parse(&l) {
-                self.params = Some(t);
-            }
-        }
-        while let Ok(r) = self.set_res_rx.try_recv() {
-            self.edits.last = Some(r);
-        }
-        pal_osd::panel::gear(ctx, &mut self.panel);
-        let key = self.hist.last().map_or("?".into(), |s| s.key_fp.clone());
-        let out = pal_osd::panel::show(
+        pal_osd::panel::gear(ctx, &mut self.console.panel);
+        let key = self
+            .console
+            .hist
+            .last()
+            .map_or("?".into(), |s| s.key_fp.clone());
+        let mut out = self.console.show_panel(
             ctx,
-            &mut self.panel,
-            pal_osd::panel::PanelIn {
-                table: self.params.as_ref(),
-                edits: &mut self.edits,
-                prefs: &mut self.prefs,
-                link_info: format!("{}, key {key}", self.shared.radio_label(self.radio.1)),
-                log_info: self.log_info.clone(),
-                cal: self.hist.last().and_then(|s| s.cal.as_ref()),
-                // The desktop picks its channel on the command line (--ch).
-                channels: &[],
-            },
+            format!("{}, key {key}", self.shared.radio_label(self.radio.1)),
+            self.log_info.clone(),
+            // The desktop picks its channel on the command line (--ch).
+            &[],
         );
-        if let Some(c) = out.cmd {
-            let _ = self.cmd_tx.send(c);
-        }
-        if out.prefs_changed {
-            self.prefs.save(&self.prefs_path);
-        }
+        self.console.settle(&mut out, Some(&self.cmd_tx));
         if out.relink {
             eprintln!(
                 "pal-desktop: video width {} MHz saved; restart pal-desktop to apply",
-                self.prefs.link_bw
+                self.console.prefs.link_bw
             );
         }
         if self.show_monitor {
@@ -526,7 +500,7 @@ impl eframe::App for App {
                 .default_width(320.0)
                 .show(ctx, |ui| {
                     ui.heading("monitor (M)");
-                    pal_osd::monitor(ui, &self.hist, now);
+                    pal_osd::monitor(ui, &self.console.hist, now);
                     ui.separator();
                     ui.label(format!(
                         "decoded {}  dec errors {}  AU drops {}",
@@ -587,32 +561,40 @@ impl eframe::App for App {
                     let scale = (area.width() / w).min(area.height() / h);
                     egui::Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale))
                 });
-                let hr = pal_osd::panel::hud_rect(ctx, &self.panel, vr);
+                let hr = pal_osd::panel::hud_rect(ctx, &self.console.panel, vr);
                 pal_osd::hud::hud(
                     ui,
                     hr,
                     vr.center(),
-                    &self.telem,
-                    &self.hist,
+                    &self.console.telem,
+                    &self.console.hist,
                     now,
-                    &self.prefs,
+                    &self.console.prefs,
                 );
-                let mismatch = self.hist.last().is_some_and(|s| s.key_mismatch);
-                if self.prefs.stats || mismatch {
+                let mismatch = self.console.hist.last().is_some_and(|s| s.key_mismatch);
+                if self.console.prefs.stats || mismatch {
                     let decode = (frames, self.shared.dec_errors.load(Ordering::Relaxed));
                     let top = vr.shrink(8.0).translate(egui::vec2(0.0, 40.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
-                        if self.prefs.stats {
-                            pal_osd::chips(ui, &self.hist, self.fps, self.shared.rx_kbps(), decode);
+                        if self.console.prefs.stats {
+                            pal_osd::chips(
+                                ui,
+                                &self.console.hist,
+                                self.fps,
+                                self.shared.rx_kbps(),
+                                decode,
+                            );
                         }
-                        pal_osd::key_banner(ui, &self.hist);
+                        pal_osd::key_banner(ui, &self.console.hist);
                     });
                 }
             });
-        if self.prefs.stats {
+        if self.console.prefs.stats {
             egui::Area::new(egui::Id::new("telem"))
                 .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -120.0))
-                .show(ctx, |ui| pal_osd::telem::widget(ui, &self.telem, now));
+                .show(ctx, |ui| {
+                    pal_osd::telem::widget(ui, &self.console.telem, now)
+                });
         }
         if let Some((path, secs)) = self.snapshot.clone() {
             if !self.snapshot_sent && now >= secs {
@@ -795,7 +777,6 @@ fn main() {
             }
             Ok(Box::new(App {
                 mav_rx,
-                telem: Default::default(),
                 frame,
                 yuv,
                 gl_video: gl_video::GlVideo::default(),
@@ -804,28 +785,25 @@ fn main() {
                 params_rx,
                 cmd_tx,
                 set_res_rx,
-                params: None,
-                edits: Default::default(),
-                panel: pal_osd::panel::Panel {
-                    open: o.params,
-                    tab: if o.params {
-                        pal_osd::panel::Tab::Drone
-                    } else {
-                        Default::default()
+                console: pal_osd::console::Console::new(
+                    prefs_path.clone(),
+                    pal_osd::panel::Panel {
+                        open: o.params,
+                        tab: if o.params {
+                            pal_osd::panel::Tab::Drone
+                        } else {
+                            Default::default()
+                        },
+                        touch: false,
+                        cal_confirm: Default::default(),
                     },
-                    touch: false,
-                    cal_confirm: Default::default(),
-                },
-                prefs: pal_osd::prefs::HudPrefs::load(&prefs_path),
-                prefs_path: prefs_path.clone(),
+                ),
                 radio: (o.ch, o.width),
                 log_info: log_info.clone(),
-                hist: History::default(),
                 tex: None,
                 shown_seq: 0,
                 t0: Instant::now(),
                 fps: 0.0,
-                fps_mark: (Instant::now(), 0),
                 show_monitor: false,
                 snapshot,
                 snapshot_sent: false,
