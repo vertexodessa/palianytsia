@@ -184,10 +184,10 @@ mod tests {
 
     #[test]
     fn parses_gs_and_spotter_tables() {
-        let t = Table::parse(r#"{"alive":true,"linked":true,"list":"complete","mismatch":false,"pending":-1,"rows":[{"age_ms":null,"apply":"rebuild","help":"h","id":"VENC_MODE","key":"fps","section":"venc","state":"accepted","status":"","type":"str","value":"90@1920x1080"}]}"#)
+        let t = Table::parse(r#"{"alive":true,"linked":true,"list":"complete","mismatch":false,"pending":-1,"rows":[{"age_ms":null,"apply":"rebuild","help":"h","id":"VENC_MODE","key":"fps","section":"venc","state":"accepted","status":"","type":"str","value":"90@1920x1080/binned"}]}"#)
             .expect("gs");
         assert!(t.linked && t.alive == Some(true) && t.pending.is_none() && !t.spotter);
-        assert_eq!(t.rows[0].value.as_deref(), Some("90@1920x1080"));
+        assert_eq!(t.rows[0].value.as_deref(), Some("90@1920x1080/binned"));
         let s = Table::parse(r#"{"linked":false,"mode":"spotter","rows":[{"age_ms":null,"apply":"knob","help":"","id":"X","key":"k","section":"s","state":"idle","status":"","type":"int","value":null}]}"#)
             .expect("spotter");
         assert!(s.spotter && s.alive.is_none() && s.rows[0].value.is_none());

@@ -98,20 +98,25 @@ fn step(id: &str) -> f64 {
 }
 
 /// Choices for string rows on touch. maburd picks the sensor mode from the
-/// driver's own list: the widest 2x2-binned mode that reaches the fps
-/// (1920x1080 up to 90; above it 1472x816 on OpenIPC's stock IMX415 driver,
-/// 1728x972 / 1728x816 on waybeam's). 1280x720 fits 1472x816 after a 1.5 %
-/// crop, but not waybeam's 2.12:1 120 fps mode, where the drone refuses it.
+/// driver's own list. Binned: the widest 2x2-binned mode that reaches the
+/// fps (1920x1080 up to 90; above it 1472x816 on OpenIPC's stock IMX415
+/// driver, 1728x972 / 1728x816 on waybeam's). 1280x720 fits 1472x816 after
+/// a 1.5 % crop, but not waybeam's 2.12:1 120 fps mode, where the drone
+/// refuses it. Native: the widest non-binned window, 1:1 pixels and a
+/// zoomed view; up to 60 fps every driver has one (2560x1440 stock, 2944x1656
+/// waybeam), 61-100 only waybeam's six-mode build, so only 60 is offered.
 /// 720p also needs venc.slices to divide its 12 CTU rows (1, 2, 3, 4, 6, 12).
 fn presets(id: &str) -> &'static [&'static str] {
     match id {
         "VENC_MODE" => &[
-            "60@1920x1080",
-            "90@1920x1080",
-            "60@1280x720",
-            "90@1280x720",
-            "100@1280x720",
-            "120@1280x720",
+            "60@1920x1080/binned",
+            "90@1920x1080/binned",
+            "60@1280x720/binned",
+            "90@1280x720/binned",
+            "100@1280x720/binned",
+            "120@1280x720/binned",
+            "60@1920x1080/native",
+            "60@1280x720/native",
         ],
         "REC_SIZE" => &["1920x1080", "1280x720"],
         _ => &[],

@@ -45,7 +45,7 @@ pub struct Row {
 pub const TABLE: &[Row] = &[
     Row { id: "RADIO_WALL_MARGN", section: "radio", key: "wall_margin_db", ty: PType::Real32, apply: Apply::Reprogram, help: "Safety margin below the calibrated TX-power walls; raise to lower TX power" },
     Row { id: "RADIO_LDPC", section: "radio", key: "ldpc", ty: PType::Bool, apply: Apply::Reprogram, help: "LDPC coding on every frame; turn off only for a ground card that cannot decode it" },
-    Row { id: "VENC_MODE", section: "venc", key: "fps", ty: PType::Str, apply: Apply::Rebuild, help: "Camera frame rate and encoder size, <fps>@<WxH>; the rate picks the sensor's field-of-view mode and the size must fit it" },
+    Row { id: "VENC_MODE", section: "venc", key: "fps", ty: PType::Str, apply: Apply::Rebuild, help: "Camera frame rate, encoder size and sensor readout, <fps>@<WxH>/binned|native; the rate and readout pick the sensor mode and the size must fit it" },
     Row { id: "VENC_SLICES", section: "venc", key: "slices", ty: PType::Int32, apply: Apply::Rebuild, help: "H.265 row slices on the link channel; 1 disables slice salvage" },
     Row { id: "ENC_BITRATE_MAX", section: "encoder", key: "bitrate_max_kbps", ty: PType::Int32, apply: Apply::Knob, help: "Bitrate ceiling, kbps" },
     Row { id: "ENC_AIRTIME", section: "encoder", key: "airtime_budget", ty: PType::Real32, apply: Apply::Knob, help: "Share of the link's real capacity the video may use" },
@@ -75,8 +75,10 @@ fn mode_digits(b: &[u8], i: &mut usize) -> Option<i32> {
     (*i != start).then_some(v)
 }
 
-/// `<fps>@<W>x<H>`, each at most 6 digits, nothing else.
-pub fn parse_mode_text(t: &str) -> Option<(i32, i32, i32)> {
+/// `<fps>@<W>x<H>/binned` or `.../native`, each number at most 6 digits,
+/// nothing else (mabur `cfgparam::parse_mode_text`). The last field is the
+/// readout: true = binned.
+pub fn parse_mode_text(t: &str) -> Option<(i32, i32, i32, bool)> {
     let b = t.as_bytes();
     let mut i = 0;
     let fps = mode_digits(b, &mut i)?;
@@ -90,7 +92,12 @@ pub fn parse_mode_text(t: &str) -> Option<(i32, i32, i32)> {
     }
     i += 1;
     let h = mode_digits(b, &mut i)?;
-    (i == b.len()).then_some((fps, w, h))
+    let binning = match &t[i..] {
+        "/binned" => true,
+        "/native" => false,
+        _ => return None,
+    };
+    Some((fps, w, h, binning))
 }
 
 /// strncmp(id, id16, 16) == 0, id16 not necessarily NUL-terminated.
@@ -1062,16 +1069,16 @@ mod tests {
         let row = find(b"VENC_MODE\0\0\0\0\0\0\0").expect("row");
         let mut pc = ParamClient::default();
         pc.set_linked(true, 0);
-        pc.on_packet(&value_pkt(row, "90@1920x1080"), 10);
+        pc.on_packet(&value_pkt(row, "90@1920x1080/binned"), 10);
         // Let the list run out its re-read rounds so only the set talks.
         for t in [2000, 4000, 6000, 8000] {
             pc.tick(t);
         }
         assert_eq!(pc.state().list, ListState::Partial);
         let t0 = 10_000;
-        pc.set(row, "120@1280x720", t0).expect("set");
+        pc.set(row, "120@1280x720/binned", t0).expect("set");
         pc.on_packet(
-            &ack_pkt(row, "90@1920x1080", PARAM_ACK_IN_PROGRESS),
+            &ack_pkt(row, "90@1920x1080/binned", PARAM_ACK_IN_PROGRESS),
             t0 + 100,
         );
         pc.take_out();
@@ -1081,11 +1088,11 @@ mod tests {
         let o = pc.take_out();
         assert_eq!(o.len(), 1);
         assert_eq!(o[0][7], 0x40); // PARAM_EXT_REQUEST_READ = 320
-        pc.on_packet(&value_pkt(row, "90@1920x1080"), t0 + 2050);
+        pc.on_packet(&value_pkt(row, "90@1920x1080/binned"), t0 + 2050);
         assert_eq!(pc.state().rows[row].st, RowState::InProgress);
         pc.tick(t0 + 4000);
         assert_eq!(pc.take_out().len(), 1);
-        pc.on_packet(&value_pkt(row, "120@1280x720"), t0 + 4050);
+        pc.on_packet(&value_pkt(row, "120@1280x720/binned"), t0 + 4050);
         assert_eq!(pc.state().rows[row].st, RowState::Accepted);
         assert_eq!(pc.state().rows[row].result_ms, t0 + 4050);
         assert_eq!(pc.state().pending_row, None);
@@ -1095,7 +1102,18 @@ mod tests {
 
     #[test]
     fn mode_text() {
-        assert_eq!(parse_mode_text("120@1920x1080"), Some((120, 1920, 1080)));
+        assert_eq!(
+            parse_mode_text("120@1920x1080/binned"),
+            Some((120, 1920, 1080, true))
+        );
+        assert_eq!(
+            parse_mode_text("60@2944x1656/native"),
+            Some((60, 2944, 1656, false))
+        );
+        assert_eq!(parse_mode_text("120@1920x1080"), None); // the old shape
+        assert_eq!(parse_mode_text("120@1920x1080/"), None);
+        assert_eq!(parse_mode_text("120@1920x1080/Binned"), None);
+        assert_eq!(parse_mode_text("120@1920x1080/binned "), None);
         assert_eq!(parse_mode_text("120@1920x"), None);
         assert_eq!(parse_mode_text("1234567@1x1"), None);
     }
