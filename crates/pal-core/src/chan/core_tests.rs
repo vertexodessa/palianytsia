@@ -454,6 +454,20 @@ fn one_card_prelude_commits_before_first_disc() {
     assert_eq!(g.core.snapshot(0).scan_state, "scouting");
 }
 
+/// radio.use narrowed to one member that nothing has ranked yet: the
+/// prelude still commits to it, never to the unmeasured op outside it.
+#[test]
+fn one_card_prelude_never_picks_outside_radio_use() {
+    let mut g = Rig::with_use(1, false, 0, &[112]);
+    g.until(800, false, "one-card prelude ranking picks");
+    assert!(
+        g.has_line("one-card prelude ranking picks 112"),
+        "{:?}",
+        g.rec().lines
+    );
+    assert_eq!(g.core.op(), 112);
+}
+
 #[test]
 fn two_card_no_link_commits_at_maturity() {
     let mut g = Rig::auto(2);

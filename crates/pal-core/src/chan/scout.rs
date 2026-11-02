@@ -237,7 +237,13 @@ fn dwell_channels(c: &ScoutCfg) -> Vec<u8> {
 impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     pub fn new(cfg: ScoutCfg, radio: std::sync::Arc<R>, now: NowFn, sleep: SleepFn) -> Self {
         let dc = dwell_channels(&cfg);
-        let first = cfg.channels.first().copied().unwrap_or(0);
+        // The first pick: the first usable member (radio.use narrows it).
+        let first = cfg
+            .usable
+            .first()
+            .or(cfg.channels.first())
+            .copied()
+            .unwrap_or(0);
         let prelude = cfg.one_card && cfg.measure;
         Self {
             usable: Mutex::new(cfg.usable.clone()),
@@ -711,6 +717,17 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             )
         } else {
             sh.ranker.proposal_among(op, mr, &self.usable())
+        };
+        // Nothing usable ranked yet: the proposal stays op, which may be
+        // outside radio.use (the drone's channel). A pick must never name
+        // one: op if it is usable, else the first usable member.
+        let usable = self.usable();
+        let p = if usable.contains(&p) {
+            p
+        } else if usable.contains(&op) {
+            op
+        } else {
+            usable[0]
         };
         self.proposal.store(p, Release);
     }
