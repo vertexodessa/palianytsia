@@ -55,8 +55,9 @@ pub const TABLE: &[Row] = &[
     Row { id: "REC_SIZE", section: "record", key: "size", ty: PType::Str, apply: Apply::Rebuild, help: "Onboard recording resolution, same aspect ratio as the camera's" },
     Row { id: "LOWPWR_ENABLE", section: "low_power", key: "enable", ty: PType::Bool, apply: Apply::Knob, help: "Lower bitrate and frame rate while disarmed to keep the VTX cool; needs msp.enable for arm state" },
     Row { id: "MSP_ENABLE", section: "msp", key: "enable", ty: PType::Bool, apply: Apply::Reprogram, help: "Flight-controller link for the OSD and arm state" },
+    Row { id: "RADIO_PWR_MODE", section: "radio", key: "power_mode", ty: PType::Str, apply: Apply::Reprogram, help: "TX power table: offset flies the calibrated walls, none the chip's own; none undoes a calibration" },
 ];
-pub const COUNT: usize = 12;
+pub const COUNT: usize = 13;
 const _: () = assert!(TABLE.len() == COUNT);
 const MAX_ID_LEN: usize = 16;
 const VENC_MODE_ROW: usize = 2;

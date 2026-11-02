@@ -2,10 +2,15 @@
 //! confirm step, the run's progress, the result table and Abort. The core
 //! is mabur's CalSession (`pal_core::cal`); this only reads its JSON
 //! (`cal` in the UI stats line) and sends `Cmd::CalStart` / `Cmd::CalAbort`.
+//! Reset calibration is the drone parameter RADIO_PWR_MODE set to "none":
+//! the card's own TX power table again, walls kept in the file but unused.
 use egui::{Color32, RichText, Ui};
 use serde_json::Value;
 
-use crate::params::Cmd;
+use crate::params::{Cmd, Table};
+
+/// The drone row whose "none" undoes a calibration (mabur cfgparam).
+const PWR_MODE: &str = "RADIO_PWR_MODE";
 
 const OK: Color32 = Color32::from_rgb(110, 220, 140);
 const WARN: Color32 = Color32::from_rgb(240, 190, 60);
@@ -163,8 +168,33 @@ fn flag_words(wall: u64, cap: u64) -> String {
     w.join(", ")
 }
 
-/// The block; `confirm` is the panel's two-step state across frames.
-pub fn ui(ui: &mut Ui, v: Option<&CalView>, confirm: &mut bool, touch: bool) -> Option<Cmd> {
+/// The two-step buttons' state, kept by the panel across frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Confirm {
+    #[default]
+    None,
+    Calibrate,
+    Reset,
+}
+
+/// The RADIO_PWR_MODE row and whether a reset would change anything: the
+/// drone flies calibrated walls and the link is up. None on a drone whose
+/// table has no such row (before mabur's RADIO_PWR_MODE).
+fn reset_row(t: Option<&Table>) -> Option<(usize, bool)> {
+    let t = t?;
+    let i = t.rows.iter().position(|r| r.id == PWR_MODE)?;
+    let flying_walls = t.rows[i].value.as_deref() == Some("offset");
+    Some((i, flying_walls && t.linked && t.pending.is_none()))
+}
+
+/// The block.
+pub fn ui(
+    ui: &mut Ui,
+    v: Option<&CalView>,
+    table: Option<&Table>,
+    confirm: &mut Confirm,
+    touch: bool,
+) -> Option<Cmd> {
     let mut cmd = None;
     let h = if touch { 40.0 } else { 0.0 };
     ui.label(RichText::new("TX power calibration").strong());
@@ -172,9 +202,10 @@ pub fn ui(ui: &mut Ui, v: Option<&CalView>, confirm: &mut bool, touch: bool) -> 
         ui.label(RichText::new("not available on this core").color(Color32::GRAY));
         return None;
     };
+    let reset = reset_row(table);
     if v.state == "picking" {
         // Before the run reaches the drone: video still flows.
-        *confirm = false;
+        *confirm = Confirm::None;
         ui.label(
             RichText::new(format!(
                 "choosing the channel: {} (ch {})",
@@ -189,7 +220,7 @@ pub fn ui(ui: &mut Ui, v: Option<&CalView>, confirm: &mut bool, touch: bool) -> 
             cmd = Some(Cmd::CalAbort);
         }
     } else if v.running {
-        *confirm = false;
+        *confirm = Confirm::None;
         ui.label(
             RichText::new(format!(
                 "running: sweep {}/{} {} {} MHz on ch {}, {} ({})",
@@ -214,7 +245,7 @@ pub fn ui(ui: &mut Ui, v: Option<&CalView>, confirm: &mut bool, touch: bool) -> 
         {
             cmd = Some(Cmd::CalAbort);
         }
-    } else if *confirm {
+    } else if *confirm == Confirm::Calibrate {
         ui.label(
             RichText::new(
                 "The drone sweeps its TX power on every MCS and writes its own walls \
@@ -230,19 +261,69 @@ pub fn ui(ui: &mut Ui, v: Option<&CalView>, confirm: &mut bool, touch: bool) -> 
                 .clicked()
             {
                 cmd = Some(Cmd::CalStart);
-                *confirm = false;
+                *confirm = Confirm::None;
             }
             if ui
                 .add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, h)))
                 .clicked()
             {
-                *confirm = false;
+                *confirm = Confirm::None;
+            }
+        });
+    } else if let (Confirm::Reset, Some((row, true))) = (*confirm, reset) {
+        ui.label(
+            RichText::new(
+                "The drone goes back to its card's own TX power table (power_mode = none), \
+                 at once and across restarts. The measured walls stay in its config, \
+                 unused; the next calibration replaces them.",
+            )
+            .color(WARN),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new("Reset calibration").min_size(egui::vec2(0.0, h)))
+                .clicked()
+            {
+                cmd = Some(Cmd::Set(row, "none".into()));
+                *confirm = Confirm::None;
+            }
+            if ui
+                .add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, h)))
+                .clicked()
+            {
+                *confirm = Confirm::None;
             }
         });
     } else {
-        let b = egui::Button::new("Calibrate").min_size(egui::vec2(0.0, h));
-        if ui.add_enabled(v.capable, b).clicked() {
-            *confirm = true;
+        *confirm = Confirm::None;
+        ui.horizontal(|ui| {
+            let b = egui::Button::new("Calibrate").min_size(egui::vec2(0.0, h));
+            if ui.add_enabled(v.capable, b).clicked() {
+                *confirm = Confirm::Calibrate;
+            }
+            if let Some((_, can)) = reset {
+                let b = egui::Button::new("Reset calibration").min_size(egui::vec2(0.0, h));
+                if ui.add_enabled(can, b).clicked() {
+                    *confirm = Confirm::Reset;
+                }
+            }
+        });
+        match reset {
+            Some((_, false)) => {
+                ui.label(
+                    RichText::new("TX power: the card's own table (not calibrated)")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+            Some((_, true)) => {
+                ui.label(
+                    RichText::new("TX power: calibrated walls")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+            None => {}
         }
         if !v.capable {
             ui.label(
@@ -358,23 +439,23 @@ mod tests {
         assert_eq!(v.hud_line().unwrap(), "CALIBRATING 1/2 verify 20 MHz  42%");
     }
 
-    fn draw(v: Option<&CalView>, confirm: &mut bool) -> Option<Cmd> {
+    fn draw(v: Option<&CalView>, confirm: &mut Confirm) -> Option<Cmd> {
+        draw_t(v, None, confirm)
+    }
+    fn draw_t(v: Option<&CalView>, t: Option<&Table>, confirm: &mut Confirm) -> Option<Cmd> {
         let ctx = egui::Context::default();
         let mut cmd = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                cmd = ui_fn(ui, v, confirm);
+                cmd = super::ui(ui, v, t, confirm, true);
             });
         });
         cmd
     }
-    fn ui_fn(ui: &mut Ui, v: Option<&CalView>, confirm: &mut bool) -> Option<Cmd> {
-        super::ui(ui, v, confirm, true)
-    }
 
     #[test]
     fn every_state_draws() {
-        let mut confirm = false;
+        let mut confirm = Confirm::None;
         assert!(draw(None, &mut confirm).is_none());
         let mut v = CalView {
             state: "idle".into(),
@@ -382,19 +463,27 @@ mod tests {
             ..CalView::default()
         };
         draw(Some(&v), &mut confirm);
-        confirm = true;
+        confirm = Confirm::Calibrate;
         draw(Some(&v), &mut confirm);
-        assert!(confirm, "the confirm step stays until answered");
+        assert_eq!(
+            confirm,
+            Confirm::Calibrate,
+            "the confirm step stays until answered"
+        );
         v.state = "picking".into();
         v.pick = "relocating 40 -> 112".into();
         draw(Some(&v), &mut confirm);
-        assert!(!confirm, "a pick in progress clears the confirm");
+        assert_eq!(
+            confirm,
+            Confirm::None,
+            "a pick in progress clears the confirm"
+        );
         assert!(v.hud_line().is_none(), "video still flows while it picks");
-        confirm = true;
+        confirm = Confirm::Calibrate;
         v.running = true;
         v.state = "sweep".into();
         draw(Some(&v), &mut confirm);
-        assert!(!confirm, "a running run clears the confirm");
+        assert_eq!(confirm, Confirm::None, "a running run clears the confirm");
         v.running = false;
         v.state = "failed".into();
         v.fail_reason = "calibration ack timeout".into();
@@ -418,5 +507,65 @@ mod tests {
             });
         }
         draw(Some(&v), &mut confirm);
+    }
+
+    fn table(mode: Option<&str>, linked: bool) -> Table {
+        let mut t = Table {
+            linked,
+            ..Table::default()
+        };
+        t.rows.push(crate::params::Row {
+            id: "MSP_ENABLE".into(),
+            ..Default::default()
+        });
+        if let Some(m) = mode {
+            t.rows.push(crate::params::Row {
+                id: PWR_MODE.into(),
+                value: Some(m.into()),
+                ..Default::default()
+            });
+        }
+        t
+    }
+
+    #[test]
+    fn reset_is_offered_only_while_walls_fly_on_a_live_link() {
+        assert_eq!(reset_row(None), None);
+        assert_eq!(
+            reset_row(Some(&table(None, true))),
+            None,
+            "older drone: no row"
+        );
+        assert_eq!(
+            reset_row(Some(&table(Some("offset"), true))),
+            Some((1, true))
+        );
+        assert_eq!(
+            reset_row(Some(&table(Some("none"), true))),
+            Some((1, false))
+        );
+        assert_eq!(
+            reset_row(Some(&table(Some("offset"), false))),
+            Some((1, false))
+        );
+        let mut t = table(Some("offset"), true);
+        t.pending = Some(1);
+        assert_eq!(reset_row(Some(&t)), Some((1, false)), "a set in flight");
+    }
+
+    #[test]
+    fn the_reset_confirm_waits_and_drops_when_reset_goes_away() {
+        let v = CalView {
+            state: "idle".into(),
+            capable: true,
+            ..CalView::default()
+        };
+        let mut confirm = Confirm::Reset;
+        let t = table(Some("offset"), true);
+        assert!(draw_t(Some(&v), Some(&t), &mut confirm).is_none());
+        assert_eq!(confirm, Confirm::Reset, "stays until answered");
+        let t = table(Some("none"), true);
+        draw_t(Some(&v), Some(&t), &mut confirm);
+        assert_eq!(confirm, Confirm::None, "nothing left to reset");
     }
 }
