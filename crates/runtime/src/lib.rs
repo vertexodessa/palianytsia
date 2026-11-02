@@ -327,6 +327,10 @@ impl CoreLoop {
                 pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
                 pal_osd::params::Cmd::CalStart => self.cal_cmd(true),
                 pal_osd::params::Cmd::CalAbort => self.cal_cmd(false),
+                pal_osd::params::Cmd::ChannelScan(chs) => {
+                    let r = self.core.chan_scan(&chs);
+                    eprintln!("pal: channel scan {chs:?}: {r:?}");
+                }
                 pal_osd::params::Cmd::Channels(chs) => {
                     let r = self.core.set_channels(&chs);
                     eprintln!("pal: channels {chs:?}: {r:?}");
@@ -373,9 +377,14 @@ impl CoreLoop {
             // The ladder and calibration views go to the UI only: the
             // flight log keeps the webgs stats line both cores agree on.
             let ladder = self.core.ladder_json();
+            let scan = self.core.chan_scan_json();
             let cal = self.cal_line();
             let ui = match stats {
-                Some(s) => stats_line::ui_line(s, ladder.as_deref(), cal),
+                Some(s) => stats_line::ui_line(
+                    s,
+                    &[("ladder", ladder.as_deref()), ("chscan", scan.as_deref())],
+                    cal,
+                ),
                 None => line,
             };
             let _ = self.ports.stats_tx.try_send(ui);

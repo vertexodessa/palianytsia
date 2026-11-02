@@ -132,6 +132,16 @@ pub trait GsCore {
     fn set_channels(&mut self, _chosen: &[u8]) -> Result<(), String> {
         Err("channel choice needs the Rust channel core".into())
     }
+    /// Start the operator's channel scan over `set` (empty = the drone's
+    /// set); its view comes back through `chan_scan_json`.
+    fn chan_scan(&mut self, _set: &[u8]) -> Result<(), String> {
+        Err("channel scan needs the Rust channel core".into())
+    }
+    /// The scan's state and rows as one JSON object; UI only, like
+    /// `ladder_json`.
+    fn chan_scan_json(&self) -> Option<String> {
+        None
+    }
     /// The run's state and result table as one JSON object (`cal::status_json`).
     fn cal_json(&self) -> Option<String> {
         None

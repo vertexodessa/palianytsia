@@ -3,6 +3,55 @@
 //! result (`pal_core::config::with_channels` at start, `Cmd::Channels`
 //! live); here only the rules the operator sees.
 use pal_wire::ht40::ht40_offset;
+use serde_json::Value;
+
+/// The core's channel scan (`"chscan"` in the UI line).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScanView {
+    pub running: bool,
+    pub pass: u64,
+    pub passes: u64,
+    pub rows: Vec<ScanRowView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScanRowView {
+    pub ch: u8,
+    /// Mean busy share of the air, percent; None before a reading.
+    pub busy: Option<f64>,
+    /// Foreign frames per second heard on it.
+    pub foreign: Option<f64>,
+    /// The link's channel: its reading includes the link itself.
+    pub op: bool,
+}
+
+impl ScanView {
+    pub fn parse(v: &Value) -> Option<Self> {
+        let rows = v
+            .get("rows")?
+            .as_array()?
+            .iter()
+            .filter_map(|r| {
+                Some(ScanRowView {
+                    ch: u8::try_from(r.get("ch")?.as_u64()?).ok()?,
+                    busy: r.get("busy").and_then(Value::as_f64),
+                    foreign: r.get("foreign").and_then(Value::as_f64),
+                    op: r.get("op").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect();
+        Some(Self {
+            running: v.get("state").and_then(Value::as_str) == Some("running"),
+            pass: v.get("pass").and_then(Value::as_u64).unwrap_or(0),
+            passes: v.get("passes").and_then(Value::as_u64).unwrap_or(0),
+            rows,
+        })
+    }
+
+    pub fn row(&self, ch: u8) -> Option<&ScanRowView> {
+        self.rows.iter().find(|r| r.ch == ch)
+    }
+}
 
 /// The set's channels a link at `bw` MHz can use: at 40 only those with a
 /// standard HT40 pair.
@@ -66,6 +115,19 @@ mod tests {
     use super::*;
 
     const SET: [u8; 5] = [40, 64, 112, 144, 165];
+
+    #[test]
+    fn scan_view_reads_the_core_line() {
+        let j = r#"{"pass":2,"passes":4,"state":"running","rows":[
+            {"busy":12.5,"ch":40,"foreign":30.0,"n":2,"op":true},
+            {"busy":null,"ch":64,"foreign":null,"n":0,"op":false}]}"#;
+        let v = ScanView::parse(&serde_json::from_str(j).unwrap()).unwrap();
+        assert!(v.running && v.pass == 2 && v.passes == 4);
+        assert_eq!(v.row(40).unwrap().busy, Some(12.5));
+        assert!(v.row(40).unwrap().op);
+        assert_eq!(v.row(64).unwrap().busy, None);
+        assert!(v.row(112).is_none());
+    }
 
     #[test]
     fn forty_offers_only_pair_channels() {

@@ -32,6 +32,7 @@ use super::hop::{
 };
 use super::hop_ranker::{HopRanker, HopVisit};
 use super::inflight::{InflightScout, InflightScoutCfg};
+use super::op_scan::{self, OpScan, Reading};
 use super::pair::{any_pair_ranked, scan_half_set};
 use super::plan::{ChannelPlan, ChannelPlanCfg, MoveEvent};
 use super::radio::{
@@ -369,6 +370,9 @@ pub struct ChannelCore {
     frozen_pick: Option<u8>,
     /// The last steer_into_use order.
     steer_ms: Option<f64>,
+    /// The operator's channel scan (op_scan.rs) and its dweller.
+    op_scan: OpScan,
+    scanner: Option<InflightScout>,
     last_bi: BootPickIn,
 
     hop_lead_latched: Option<usize>,
@@ -519,6 +523,22 @@ impl ChannelCore {
             },
             gates.clone(),
         ));
+        // The operator scan's own dweller (its radio is set per step).
+        let scanner = cards.first().map(|c| {
+            let (nu, sl) = (now_us.clone(), sleep_ms.clone());
+            InflightScout::new(
+                InflightScoutCfg {
+                    observe_ms: op_scan::OBSERVE_MS,
+                    period_ms: 0,
+                    candidates: Vec::new(),
+                    width_mhz: cfg.radio.width,
+                    busy_dbm: scan.busy.busy_dbm,
+                },
+                c.clone() as Arc<dyn ScoutRadio>,
+                Box::new(move || nu() as i64),
+                Box::new(move |ms| sl(ms)),
+            )
+        });
         let live = Arc::new(Live {
             cards,
             gates,
@@ -585,6 +605,8 @@ impl ChannelCore {
             pending_relocate: None,
             frozen_pick: pinned.then_some(cfg.start_ch),
             steer_ms: None,
+            op_scan: OpScan::default(),
+            scanner,
             last_bi: BootPickIn::default(),
             hop_lead_latched: None,
             recovered_prev_window: 0,
@@ -914,6 +936,7 @@ impl ChannelCore {
         self.step_hop_edge_and_window(inp, vrx);
         self.step_cal(inp);
         self.step_controller(inp, vrx);
+        self.step_op_scan(inp);
         self.step_move_edge(inp.now_ms, vrx);
         self.step_drains();
         self.step_width_resync();
@@ -1122,6 +1145,86 @@ impl ChannelCore {
             "maburgs channel: operator channels {usable:?} (link on {op})"
         ));
         Ok(())
+    }
+
+    /// Start the operator's channel scan over `set` (empty = the drone's
+    /// whole set); a running scan restarts.
+    pub fn begin_op_scan(&mut self, set: &[u8]) {
+        let set = if set.is_empty() {
+            self.cfg.radio.channels.clone()
+        } else {
+            set.to_vec()
+        };
+        self.op_scan.start(&set, self.now_ms_cur);
+        self.log(format!("maburgs channel: operator scan of {set:?}"));
+    }
+
+    /// The scan's view for the UI line; None before the first scan.
+    pub fn op_scan_json(&self) -> Option<String> {
+        self.op_scan.json(self.plan.op())
+    }
+
+    /// One scan step: a few short dwells on the spare card (two cards) or
+    /// the link card (one), each straight back to where the card was. It
+    /// waits while a hop or relocation is under way or the boot scout holds
+    /// the card.
+    fn step_op_scan(&mut self, inp: &ChannelTickIn) {
+        let now = inp.now_ms;
+        let due = self.op_scan.due(now);
+        if due.is_empty() {
+            return;
+        }
+        let card = if self.n_cards >= 2 {
+            pick_inflight_scout(&self.live.can_scout, inp.tx_card)
+        } else {
+            self.live
+                .can_scout
+                .first()
+                .copied()
+                .unwrap_or(false)
+                .then_some(0)
+        };
+        let blocked = self.plan.hopping()
+            || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
+            || self.boot_pick.relocating()
+            || self.pending_relocate.is_some()
+            || card.is_none_or(|c| {
+                (self.scout_owns() && self.is_scout_card(c)) || !self.live.cards[c].ready()
+            });
+        let (Some(card), Some(sc), false) = (card, self.scanner.as_mut(), blocked) else {
+            self.op_scan.defer(now);
+            return;
+        };
+        let live = self.live.clone();
+        let fe = &live.cards[card];
+        let back = fe.channel();
+        let mut recs = Vec::with_capacity(due.len());
+        {
+            // The in-flight dweller's lock first, as burst() and
+            // inflight_body() take it, then the card's device-use lock.
+            let _ilk = live.inflight.lock().unwrap();
+            let _hold = live.sampler.hold_card(card);
+            live.gates.tune_gen[card].fetch_add(1, std::sync::atomic::Ordering::Release);
+            sc.set_radio(fe.clone() as Arc<dyn ScoutRadio>);
+            for ch in due {
+                let (d, v) = sc.dwell(ch, back);
+                self.op_scan.record(
+                    Reading {
+                        ok: v.is_some(),
+                        busy: d.busy_valid.then_some(d.busy_pct),
+                        foreign: d.frames.wrapping_sub(d.dvr_frames),
+                        observe_ms: d.observe_ms.max(0) as u64,
+                    },
+                    now,
+                );
+                recs.push(d);
+            }
+            live.gates.tune_gen[card].fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.cur_ch[card] = fe.channel();
+        }
+        for d in &recs {
+            self.sink.dwell(now, card, d);
+        }
     }
 
     /// A link found on a member outside `radio.use` (the drone parked

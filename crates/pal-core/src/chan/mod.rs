@@ -10,6 +10,7 @@ pub mod gate;
 pub mod hop;
 pub mod hop_ranker;
 pub mod inflight;
+pub mod op_scan;
 pub mod own_air;
 pub mod pair;
 pub mod plan;

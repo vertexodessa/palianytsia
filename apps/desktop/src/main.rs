@@ -795,7 +795,7 @@ fn main() {
                             Default::default()
                         },
                         touch: false,
-                        cal_confirm: Default::default(),
+                        ..Default::default()
                     },
                 ),
                 radio: (o.ch, o.width),

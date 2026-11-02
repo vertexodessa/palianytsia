@@ -55,6 +55,8 @@ pub struct Snapshot {
     pub ladder: Option<Ladder>,
     /// The TX-power calibration block (UI stats line only).
     pub cal: Option<cal::CalView>,
+    /// The operator's channel scan (UI stats line only).
+    pub chscan: Option<channels::ScanView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -244,6 +246,7 @@ impl Snapshot {
                 .and_then(Value::as_f64),
             ladder: v.get("ladder").and_then(Ladder::parse),
             cal: v.get("cal").and_then(cal::CalView::parse),
+            chscan: v.get("chscan").and_then(channels::ScanView::parse),
         })
     }
 }

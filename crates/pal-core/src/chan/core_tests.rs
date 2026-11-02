@@ -667,6 +667,37 @@ fn set_usable_moves_a_live_link_by_hop() {
     assert!(p.core.set_usable(&[64]).is_err());
 }
 
+/// The operator scan on a live one-card link: every channel read over
+/// every pass, the card back on op after each step, the link not moved.
+#[test]
+fn op_scan_reads_every_channel_and_leaves_the_link_alone() {
+    let mut g = Rig::auto(1);
+    g.freeze_auto();
+    assert!(g.core.op_scan_json().is_none());
+    g.core.begin_op_scan(&[]);
+    for _ in 0..2000 {
+        g.vrx.on_video(g.ms());
+        g.tick(true);
+        assert_eq!(g.ch(0), 40, "the card is back on op between steps");
+        if g.core
+            .op_scan_json()
+            .unwrap()
+            .contains("\"state\":\"done\"")
+        {
+            break;
+        }
+    }
+    let j = g.core.op_scan_json().unwrap();
+    assert!(j.contains("\"state\":\"done\""), "{j}");
+    for ch in [40, 64, 112, 144] {
+        let n = format!("\"ch\":{ch},\"foreign\"");
+        assert!(j.contains(&n), "{ch} missing: {j}");
+    }
+    assert!(!j.contains("\"n\":0"), "a channel was never read: {j}");
+    assert_eq!(g.core.op(), 40);
+    assert!(g.has_line("operator scan of [40, 64, 112, 144]"));
+}
+
 #[test]
 fn without_radio_use_a_link_on_any_member_stays() {
     let mut g = Rig::auto(2);

@@ -153,6 +153,7 @@ impl Console {
                 link_info,
                 log_info,
                 cal: self.hist.last().and_then(|s| s.cal.as_ref()),
+                scan: self.hist.last().and_then(|s| s.chscan.as_ref()),
                 channels,
             },
         )

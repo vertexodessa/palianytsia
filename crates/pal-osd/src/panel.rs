@@ -49,6 +49,8 @@ pub struct Panel {
     pub touch: bool,
     /// Calibrate or Reset calibration pressed, waiting for the confirm.
     pub cal_confirm: crate::cal::Confirm,
+    /// The Link tab shows the channel menu instead of its rows.
+    pub chan_menu: bool,
 }
 
 /// What the panel needs from the app, and the facts it shows read-only.
@@ -64,6 +66,8 @@ pub struct PanelIn<'a> {
     pub cal: Option<&'a crate::cal::CalView>,
     /// The config's channel set; empty = no channel choice (desktop).
     pub channels: &'a [u8],
+    /// The latest channel scan, for the channel menu.
+    pub scan: Option<&'a crate::channels::ScanView>,
 }
 
 #[derive(Default)]
@@ -345,6 +349,16 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                                         .color(Color32::GRAY),
                                 );
                             }
+                            Tab::Link if p.chan_menu && !i.channels.is_empty() => {
+                                let m = channel_menu(ui, i.prefs, i.channels, i.scan, touch);
+                                p.chan_menu = !m.back;
+                                if let Some(c) = m.choose {
+                                    out.prefs_changed = true;
+                                    out.cmd = Some(Cmd::Channels(c));
+                                } else if let Some(set) = m.rescan {
+                                    out.cmd = Some(Cmd::ChannelScan(set));
+                                }
+                            }
                             Tab::Link => {
                                 ui.label(RichText::new(&i.link_info).monospace());
                                 ui.separator();
@@ -376,9 +390,11 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                                 );
                                 if !i.channels.is_empty() {
                                     ui.separator();
-                                    if let Some(c) = channel_row(ui, i.prefs, i.channels, touch) {
-                                        out.prefs_changed = true;
-                                        out.cmd = Some(Cmd::Channels(c));
+                                    if let Some(set) =
+                                        channels_button(ui, i.prefs, i.channels, touch)
+                                    {
+                                        p.chan_menu = true;
+                                        out.cmd = Some(Cmd::ChannelScan(set));
                                     }
                                 }
                                 ui.separator();
@@ -444,22 +460,69 @@ fn osd_ui(ui: &mut Ui, p: &mut HudPrefs) -> bool {
     *p != before
 }
 
-/// The channel choice: one toggle per channel the width offers, plus
-/// "all". Returns the channels to fly when a click changed them (saved in
-/// `prefs` already).
-fn channel_row(
-    ui: &mut egui::Ui,
+/// The Link tab's "Channels" button with the current choice on it.
+/// Clicked: the channels to scan as the menu opens (the ones the width
+/// offers).
+fn channels_button(ui: &mut Ui, prefs: &HudPrefs, set: &[u8], touch: bool) -> Option<Vec<u8>> {
+    use crate::channels::{chosen, offered};
+    let offer = offered(set, prefs.link_bw);
+    let cur = chosen(&prefs.link_channels, &offer);
+    let what = if cur.len() == offer.len() {
+        "all, auto".to_string()
+    } else if cur.len() == 1 {
+        format!("{} only", cur[0])
+    } else {
+        let l: Vec<String> = cur.iter().map(u8::to_string).collect();
+        format!("{}, auto", l.join(" "))
+    };
+    let h = if touch { 40.0 } else { 0.0 };
+    let b = egui::Button::new(format!("Channels: {what}  >")).min_size(egui::vec2(0.0, h));
+    ui.add(b).clicked().then_some(offer)
+}
+
+#[derive(Default)]
+struct MenuOut {
+    back: bool,
+    /// The channels to fly, changed by a click (saved in prefs already).
+    choose: Option<Vec<u8>>,
+    /// Scan these again.
+    rescan: Option<Vec<u8>>,
+}
+
+/// Bar colour for a busy share: what the boot pick would call clean,
+/// contested, blocked (radio.scan.blocked_pct is 50 in the bundle).
+fn busy_color(b: f64) -> Color32 {
+    if b < 20.0 {
+        OK
+    } else if b < 50.0 {
+        WARN
+    } else {
+        BAD
+    }
+}
+
+/// The channel menu: one row per channel the width offers, its toggle, the
+/// scan's reading of it, and "all" / "rescan" / back.
+fn channel_menu(
+    ui: &mut Ui,
     prefs: &mut HudPrefs,
     set: &[u8],
+    scan: Option<&crate::channels::ScanView>,
     touch: bool,
-) -> Option<Vec<u8>> {
+) -> MenuOut {
     use crate::channels::{chosen, offered, toggle};
+    let mut out = MenuOut::default();
     let offer = offered(set, prefs.link_bw);
     let cur = chosen(&prefs.link_channels, &offer);
     let h = if touch { 40.0 } else { 0.0 };
     let mut next = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Channels");
+    ui.horizontal(|ui| {
+        if ui
+            .add(egui::Button::new("<  Link").min_size(egui::vec2(0.0, h)))
+            .clicked()
+        {
+            out.back = true;
+        }
         let all = cur.len() == offer.len();
         let b = egui::Button::new("all")
             .selected(all)
@@ -467,34 +530,74 @@ fn channel_row(
         if ui.add(b).clicked() && !all {
             next = Some(Vec::new());
         }
-        for &ch in &offer {
-            let b = egui::Button::new(ch.to_string())
-                .selected(cur.contains(&ch))
-                .min_size(egui::vec2(0.0, h));
-            if ui.add(b).clicked() {
-                if let Some(n) = toggle(&prefs.link_channels, &offer, prefs.link_bw, ch) {
-                    next = Some(n);
-                }
-            }
+        let running = scan.is_some_and(|s| s.running);
+        let b = egui::Button::new("rescan").min_size(egui::vec2(0.0, h));
+        if ui.add_enabled(!running, b).clicked() {
+            out.rescan = Some(offer.clone());
         }
     });
+    let status = match scan {
+        Some(s) if s.running => format!("scanning, pass {} of {}", s.pass + 1, s.passes),
+        Some(_) => "scan done".to_string(),
+        None => "no scan (no link core yet)".to_string(),
+    };
+    ui.label(RichText::new(status).small().color(Color32::GRAY));
+    egui::Grid::new("pal-chan-menu")
+        .num_columns(3)
+        .spacing(egui::vec2(10.0, if touch { 6.0 } else { 2.0 }))
+        .show(ui, |ui| {
+            for &ch in &offer {
+                let b = egui::Button::new(format!("{ch:>3}"))
+                    .selected(cur.contains(&ch))
+                    .min_size(egui::vec2(56.0, h));
+                if ui.add(b).clicked() {
+                    if let Some(n) = toggle(&prefs.link_channels, &offer, prefs.link_bw, ch) {
+                        next = Some(n);
+                    }
+                }
+                let row = scan.and_then(|s| s.row(ch));
+                match row.and_then(|r| r.busy) {
+                    Some(b) => {
+                        ui.add(
+                            egui::ProgressBar::new((b / 100.0).clamp(0.0, 1.0) as f32)
+                                .desired_width(120.0)
+                                .fill(busy_color(b))
+                                .text(format!("{b:.0}% busy")),
+                        );
+                    }
+                    None => {
+                        ui.label(RichText::new("-").color(Color32::GRAY));
+                    }
+                }
+                let mut note = row
+                    .and_then(|r| r.foreign)
+                    .map_or(String::new(), |f| format!("{f:.0} foreign/s"));
+                if row.is_some_and(|r| r.op) {
+                    note.push_str("  link here");
+                }
+                ui.label(RichText::new(note).small());
+                ui.end_row();
+            }
+        });
     let mode = if cur.len() == 1 {
-        format!("fixed on {}: the link never leaves it.", cur[0])
+        format!("Fixed on {}: the link never leaves it.", cur[0])
     } else {
-        "auto: the link starts on the quietest of these and hops among them away from \
+        "Auto: the link sits on the quietest chosen channel and hops among them away from \
          interference."
             .to_string()
     };
     ui.label(
         RichText::new(format!(
-            "{mode} The GS finds the drone on any channel of its set and moves it onto \
-             the choice by a hop, without restarting the link. One channel: use it to \
-             calibrate, or where you know the air."
+            "{mode} A change moves the link by a hop, without restarting it. The link \
+             channel's reading includes the link itself. With one card the scan leaves the \
+             link channel for 10 ms at a time: expect a few dropped frames while it runs."
         ))
         .small()
         .color(Color32::GRAY),
     );
-    let next = next?;
-    prefs.link_channels = next;
-    Some(chosen(&prefs.link_channels, &offer))
+    if let Some(n) = next {
+        prefs.link_channels = n;
+        out.choose = Some(chosen(&prefs.link_channels, &offer));
+    }
+    out
 }

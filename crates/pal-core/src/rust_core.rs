@@ -1071,6 +1071,20 @@ impl GsCore for RustCore {
         }
     }
 
+    fn chan_scan(&mut self, set: &[u8]) -> Result<(), String> {
+        match self.gs.as_mut().and_then(|g| g.chan.as_mut()) {
+            Some(c) => {
+                c.begin_op_scan(set);
+                Ok(())
+            }
+            None => Err("no channel core (a spotter or a card-less replay)".into()),
+        }
+    }
+
+    fn chan_scan_json(&self) -> Option<String> {
+        self.gs.as_ref()?.chan.as_ref()?.op_scan_json()
+    }
+
     fn cal_abort(&mut self) {
         if let Some(g) = self.gs.as_mut() {
             if g.cal.running() || g.cal.picking() {

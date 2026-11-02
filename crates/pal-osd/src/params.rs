@@ -77,6 +77,8 @@ pub enum Cmd {
     /// The channels the link may sit on, applied on the live link
     /// (`GsCore::set_channels`).
     Channels(Vec<u8>),
+    /// Scan these channels (empty = the drone's set) for the channel menu.
+    ChannelScan(Vec<u8>),
 }
 
 /// Per-row edit buffers (empty: the current value shows as a hint) and the
