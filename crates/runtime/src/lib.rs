@@ -138,12 +138,10 @@ impl CoreIo for Sink {
             let _ = l.au(self.now_us, &a);
         }
         if let Some(off) = self.pts_off_us {
-            // webgs cap_to_complete_us: capture stamp to this AU's completion.
-            let cap = (self.now_us as i64 + off) as u32;
-            let d = cap.wrapping_sub(a.pts_us) as i32;
+            let d = pal_core::uplink::cap_to_complete_us(a.pts_us, self.now_us, off).max(0) as u64;
             let lat = &self.shared.lat;
-            lat.cap_au_max.fetch_max(d.max(0) as u64, Ordering::Relaxed);
-            lat.cap_au_last.store(d.max(0) as u64, Ordering::Relaxed);
+            lat.cap_au_max.fetch_max(d, Ordering::Relaxed);
+            lat.cap_au_last.store(d, Ordering::Relaxed);
         }
         self.shared.lat.aus_in.fetch_add(1, Ordering::Relaxed);
         self.shared
@@ -835,6 +833,36 @@ fn pump(
         }
         if !after(cl, now)? {
             return Ok(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The formula Sink computed inline before it called
+    /// pal_core::uplink::cap_to_complete_us: kept to prove the two agree.
+    fn inline_before(now_us: u64, off: i64, pts: u32) -> u64 {
+        let cap = (now_us as i64 + off) as u32;
+        (cap.wrapping_sub(pts) as i32).max(0) as u64
+    }
+
+    #[test]
+    fn cap_latency_matches_the_formula_it_replaced() {
+        let nows = [
+            1_000_000u64,
+            5_123_456_789,
+            u64::from(u32::MAX) - 3,
+            1 << 40,
+        ];
+        let offs = [0i64, -123_456_789, 987_654_321, -(1 << 33), 1 << 33];
+        let ptss = [0u32, 1, 0x7fff_ffff, 0x8000_0000, u32::MAX, 123_456_789];
+        for &n in &nows {
+            for &o in &offs {
+                for &p in &ptss {
+                    let lib = pal_core::uplink::cap_to_complete_us(p, n, o).max(0) as u64;
+                    assert_eq!(lib, inline_before(n, o, p), "now {n} off {o} pts {p}");
+                }
+            }
         }
     }
 }
