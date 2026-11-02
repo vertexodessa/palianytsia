@@ -14,10 +14,8 @@ use std::time::{Duration, Instant};
 
 use glow::HasContext;
 use openxr as xr;
-use pal_osd::panel::{Panel, PanelIn};
-use pal_osd::params::{Edits, Table};
-use pal_osd::prefs::HudPrefs;
-use pal_osd::{History, Snapshot};
+use pal_osd::console::{Console, Feeds};
+use pal_osd::panel::Panel;
 
 use crate::input::Frame;
 use crate::supervisor::{Hub, LinkUi};
@@ -43,18 +41,12 @@ pub struct Osd {
     /// A released image exists: the layer can be submitted.
     pub ready: bool,
     link: Option<LinkUi>,
-    hist: History,
-    telem: pal_osd::telem::Telemetry,
-    prefs: HudPrefs,
-    prefs_path: PathBuf,
-    panel: Panel,
-    table: Option<Table>,
-    edits: Edits,
+    console: Console,
     /// Last pointer position, for the cursor and the release event.
     pointer: Option<egui::Pos2>,
     t0: Instant,
     last_draw: Option<Instant>,
-    fps: (f64, u64, Instant),
+    fps: f64,
 }
 
 impl Osd {
@@ -91,21 +83,18 @@ impl Osd {
             images,
             ready: false,
             link: None,
-            hist: History::default(),
-            telem: Default::default(),
-            prefs: HudPrefs::load(&prefs_path),
-            prefs_path,
-            panel: Panel {
-                // Finger-sized rows suit a hand-held ray too.
-                touch: true,
-                ..Default::default()
-            },
-            table: None,
-            edits: Edits::default(),
+            console: Console::new(
+                prefs_path,
+                Panel {
+                    // Finger-sized rows suit a hand-held ray too.
+                    touch: true,
+                    ..Default::default()
+                },
+            ),
             pointer: None,
             t0: Instant::now(),
             last_draw: None,
-            fps: (0.0, 0, Instant::now()),
+            fps: 0.0,
         })
     }
 
@@ -114,12 +103,11 @@ impl Osd {
     pub fn tick(&mut self, hub: &Hub, inp: Frame) {
         let mut changed = false;
         if inp.menu {
-            self.panel.open = !self.panel.open;
+            self.console.panel.open = !self.console.panel.open;
             changed = true;
         }
         if inp.stats {
-            self.prefs.stats = !self.prefs.stats;
-            self.prefs.save(&self.prefs_path);
+            self.console.toggle_stats();
             changed = true;
         }
         if let Some(l) = hub.ui.lock().unwrap_or_else(|p| p.into_inner()).take() {
@@ -128,59 +116,29 @@ impl Osd {
                 l.shared.radio_label(l.info.width),
                 l.info.log_info
             );
-            // A new link is a new session: fresh history.
-            self.hist = History::default();
-            self.telem = Default::default();
+            self.console.new_session();
             self.link = Some(l);
         }
         let now = self.t0.elapsed().as_secs_f64();
         let mut fresh = false;
         if let Some(l) = &self.link {
-            while let Ok(s) = l.ports.stats_rx.try_recv() {
-                if let Some(snap) = Snapshot::parse(&s) {
-                    self.hist.push(now, snap);
-                    fresh = true;
-                }
+            fresh = self.console.drain_stats(now, &l.ports.stats_rx);
+            let feeds = Feeds {
+                mav: &l.ports.mav_rx,
+                params: &l.ports.params_rx,
+                set_res: &l.ports.set_res_rx,
+            };
+            // Row state changes into logcat: a set that "hangs" shows here
+            // whether the drone's answer arrived.
+            for c in self.console.drain(now, feeds) {
+                log::info!("{c}");
             }
-            while let Ok(p) = l.ports.mav_rx.try_recv() {
-                self.telem.on_packet(&p, now);
-            }
-            while let Ok(t) = l.ports.params_rx.try_recv() {
-                if let Some(t) = Table::parse(&t) {
-                    // Row state changes into logcat: a set that "hangs"
-                    // shows here whether the drone's answer arrived.
-                    for (i, r) in t.rows.iter().enumerate() {
-                        let old = self.table.as_ref().and_then(|o| o.rows.get(i));
-                        if old.is_none_or(|o| o.state != r.state || o.value != r.value) {
-                            log::info!(
-                                "param {} = {:?}: {} {}",
-                                r.id,
-                                r.value.as_deref().unwrap_or("-"),
-                                r.state,
-                                r.status
-                            );
-                        }
-                    }
-                    self.table = Some(t);
-                }
-            }
-            while let Ok(r) = l.ports.set_res_rx.try_recv() {
-                self.edits.last = Some(r);
-            }
-            let frames = l.shared.frames.load(Ordering::Relaxed);
-            let dt = self.fps.2.elapsed().as_secs_f64();
-            if dt >= 1.0 {
-                self.fps = (
-                    frames.saturating_sub(self.fps.1) as f64 / dt,
-                    frames,
-                    Instant::now(),
-                );
-            }
+            self.fps = self.console.fps(l.shared.frames.load(Ordering::Relaxed));
         }
         // Pointer events only while the panel is open: in flight the ray
         // and the trigger do nothing.
         let mut events = Vec::new();
-        if self.panel.open {
+        if self.console.panel.open {
             let button = |pos, pressed| egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
@@ -208,7 +166,7 @@ impl Osd {
         } else {
             self.pointer = None;
         }
-        let every = if self.panel.open { 33 } else { 250 };
+        let every = if self.console.panel.open { 33 } else { 250 };
         let due = self
             .last_draw
             .is_none_or(|t| t.elapsed() >= Duration::from_millis(every));
@@ -239,21 +197,16 @@ impl Osd {
             ..Default::default()
         };
         self.ctx.set_pixels_per_point(PPP);
-        let (hist, telem, fps) = (&self.hist, &self.telem, self.fps.0);
+        let fps = self.fps;
         let kbps = self.link.as_ref().map_or(0.0, |l| l.shared.rx_kbps());
-        let (panel, edits, prefs, table) = (
-            &mut self.panel,
-            &mut self.edits,
-            &mut self.prefs,
-            self.table.as_ref(),
-        );
+        let console = &mut self.console;
         let link_info = self.link.as_ref().map_or_else(
             || "no link".to_string(),
             |l| {
                 format!(
                     "{}, key {}",
                     l.shared.radio_label(l.info.width),
-                    hist.last().map_or("?", |s| s.key_fp.as_str())
+                    console.hist.last().map_or("?", |s| s.key_fp.as_str())
                 )
             },
         );
@@ -264,7 +217,7 @@ impl Osd {
             )
         });
         let channels: &[u8] = self.link.as_ref().map_or(&[], |l| &l.info.channels);
-        let cursor = self.pointer.filter(|_| panel.open);
+        let cursor = self.pointer.filter(|_| console.panel.open);
         let mut pout = pal_osd::panel::PanelOut::default();
         let dec = self.link.as_ref().map_or((0, 0), |l| {
             (
@@ -273,20 +226,9 @@ impl Osd {
             )
         });
         let out = self.ctx.run(input, |ctx| {
-            pout = pal_osd::panel::show(
-                ctx,
-                panel,
-                PanelIn {
-                    table,
-                    edits,
-                    prefs,
-                    link_info: link_info.clone(),
-                    log_info: log_info.clone(),
-                    cal: hist.last().and_then(|s| s.cal.as_ref()),
-                    channels,
-                },
-            );
-            let prefs = &*prefs;
+            pout = console.show_panel(ctx, link_info.clone(), log_info.clone(), channels);
+            let c = &*console;
+            let (hist, telem, prefs, panel) = (&c.hist, &c.telem, &c.prefs, &c.panel);
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
@@ -326,16 +268,10 @@ impl Osd {
                 );
             }
         });
-        if let Some(c) = pout.cmd {
-            if let Some(l) = &self.link {
-                let _ = l.ports.cmd_tx.send(c);
-            }
-        }
+        self.console
+            .settle(&mut pout, self.link.as_ref().map(|l| &l.ports.cmd_tx));
         if pout.relink {
             hub.relink.store(true, Ordering::Relaxed);
-        }
-        if pout.prefs_changed {
-            self.prefs.save(&self.prefs_path);
         }
         let prims = self.ctx.tessellate(out.shapes, out.pixels_per_point);
         let idx = self.sc.acquire_image().map_err(|e| e.to_string())?;
