@@ -104,7 +104,9 @@ fn step(id: &str) -> f64 {
 /// a 1.5 % crop, but not waybeam's 2.12:1 120 fps mode, where the drone
 /// refuses it. Native: the widest non-binned window, 1:1 pixels and a
 /// zoomed view; up to 60 fps every driver has one (2560x1440 stock, 2944x1656
-/// waybeam), 61-100 only waybeam's six-mode build, so only 60 is offered.
+/// waybeam), 61-100 only waybeam's six-mode build (2304x1296). On any other
+/// driver 90/100 native fails the pipeline start and maburd restores the
+/// previous mode (mabur docs/mavlink.md), so offering them is safe.
 /// 720p also needs venc.slices to divide its 12 CTU rows (1, 2, 3, 4, 6, 12).
 fn presets(id: &str) -> &'static [&'static str] {
     match id {
@@ -116,6 +118,8 @@ fn presets(id: &str) -> &'static [&'static str] {
             "100@1280x720/binned",
             "120@1280x720/binned",
             "60@1920x1080/native",
+            "90@1920x1080/native",
+            "100@1920x1080/native",
             "60@1280x720/native",
         ],
         "REC_SIZE" => &["1920x1080", "1280x720"],
