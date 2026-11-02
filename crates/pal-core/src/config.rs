@@ -812,6 +812,29 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     Ok(out)
 }
 
+/// `radio.channel` set to `ch` (a member of radio.channels), or "auto" for
+/// 0. A fixed channel never measures and never hops; the channel core still
+/// searches the whole set for the drone and relocates it onto the pin.
+/// Comments are not kept; the result is validated as a whole.
+pub fn with_channel(text: &str, ch: u8) -> R<String> {
+    let mut j = text
+        .parse::<Table>()
+        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    let v = if ch == 0 {
+        Value::String("auto".into())
+    } else {
+        Value::Integer(ch.into())
+    };
+    j.entry("radio")
+        .or_insert_with(|| Value::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError("config: radio is not a table".into()))?
+        .insert("channel".into(), v);
+    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
+    parse_config_str(&out)?;
+    Ok(out)
+}
+
 pub fn parse_config_str(text: &str) -> R<Config> {
     let j = text
         .parse::<Table>()
@@ -1455,6 +1478,19 @@ mod tests {
         assert!(c.link.ladder_cfg.ladder.iter().all(|r| r.bw == 40));
         assert_eq!(c.radio.width, 40);
         assert!(with_link_bw(&text, 30).is_err());
+    }
+
+    #[test]
+    fn channel_pins_a_member_or_goes_auto() {
+        let text = std::fs::read_to_string(repo("configs/gs-auto.toml")).unwrap();
+        let c = parse_config_str(&with_channel(&text, 144).unwrap()).unwrap();
+        assert_eq!(c.radio.pin, Some(144));
+        let orig = parse_config_str(&text).unwrap();
+        assert_eq!(c.radio.channels, orig.radio.channels);
+        let pinned = std::fs::read_to_string(repo("configs/gs.toml")).unwrap();
+        let a = parse_config_str(&with_channel(&pinned, 0).unwrap()).unwrap();
+        assert_eq!(a.radio.pin, None);
+        assert!(with_channel(&text, 36).is_err(), "not a member");
     }
 
     #[test]

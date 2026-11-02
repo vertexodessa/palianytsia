@@ -35,6 +35,7 @@ pub struct OsdIn {
     pub set_res_rx: Receiver<(usize, Result<(), String>)>,
     /// "ch 40 / 40 MHz", for the Link tab.
     pub width: u8,
+    pub channels: Vec<u8>,
     /// Where this session's flight log goes, for the Logs tab.
     pub log_info: String,
     /// HUD prefs file in the app's files dir.
@@ -227,6 +228,7 @@ pub fn run(o: OsdIn) {
                         o.log_info
                     ),
                     cal: hist.last().and_then(|s| s.cal.as_ref()),
+                    channels: &o.channels,
                 },
             );
             egui::CentralPanel::default()
@@ -273,7 +275,7 @@ pub fn run(o: OsdIn) {
         if pout.relink {
             // The width applies at link start: end this link; the Activity
             // sees it stop and starts a new one with the saved prefs.
-            pal_android::set_err("link width changed");
+            pal_android::set_err("link settings changed");
             o.shared.quit.store(true, Ordering::Relaxed);
         }
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);

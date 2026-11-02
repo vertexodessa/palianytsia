@@ -19,6 +19,7 @@ pub struct LinkUi {
     pub ports: Ports,
     pub shared: Arc<Shared>,
     pub width: u8,
+    pub channels: Vec<u8>,
     pub log_info: String,
 }
 
@@ -34,7 +35,7 @@ pub struct Hub {
     /// One line for the OSD while there is no link ("" when linked).
     pub status: Mutex<String>,
     pub quit: AtomicBool,
-    /// The OSD changed a start-time setting (the link width): restart the
+    /// The OSD changed a start-time setting (width, channel): restart the
     /// link at once with the new prefs.
     pub relink: AtomicBool,
 }
@@ -168,6 +169,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
             toml: toml.clone(),
             log_dir: log_dir.clone(),
             link_bw: pal_osd::prefs::HudPrefs::load(&prefs).link_bw,
+            link_channel: pal_osd::prefs::HudPrefs::load(&prefs).link_channel,
         };
         log::info!(
             "supervisor: starting on {} card(s): {}",
@@ -190,6 +192,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
             ports,
             shared: link.shared.clone(),
             width: link.width,
+            channels: link.channels.clone(),
             log_info: link.log_info.clone(),
         });
         hub.set_status("");
@@ -199,7 +202,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
                 break "app closing".to_string();
             }
             if hub.relink.swap(false, Ordering::Relaxed) {
-                break "link width changed".to_string();
+                break "link settings changed".to_string();
             }
             if !link.running() {
                 break format!("link stopped: {}", last_error());
@@ -236,7 +239,7 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
         for o in opens {
             Usb::close(&mut env, o);
         }
-        if why == "link width changed" || why.ends_with(" added") {
+        if why == "link settings changed" || why.ends_with(" added") {
             // The cards stay attached: reopen right away.
             hub.set_status(format!("{why}, restarting"));
             nap(Duration::from_millis(300));

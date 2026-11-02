@@ -43,6 +43,8 @@ pub struct LinkCfg {
     pub log_dir: PathBuf,
     /// Video link width (HudPrefs::link_bw): every ladder rung at this bw.
     pub link_bw: u8,
+    /// A fixed channel (HudPrefs::link_channel), or 0 = the config's own.
+    pub link_channel: u8,
 }
 
 /// What the UI side reads and sends while the link runs.
@@ -62,6 +64,8 @@ pub struct Link {
     /// Channel width; the channel itself is `shared.radio_label(width)`,
     /// which follows the drone search.
     pub width: u8,
+    /// The config's channel set, for the panel's channel picker.
+    pub channels: Vec<u8>,
     /// Where the flight log goes, or why there is none.
     pub log_info: String,
     core: Option<JoinHandle<()>>,
@@ -79,6 +83,13 @@ impl Link {
             // A 40 MHz pick on a 20 MHz radio config: fly the config as is.
             Err(e) => log::warn!("link width {} MHz not applied: {e}", c.link_bw),
         }
+        if c.link_channel != 0 {
+            match pal_core::config::with_channel(&c.toml, c.link_channel) {
+                Ok(t) => c.toml = t,
+                // A channel saved under another config: fly the config as is.
+                Err(e) => log::warn!("channel {} not applied: {e}", c.link_channel),
+            }
+        }
         let cfg = pal_core::config::parse_config_str(&c.toml).map_err(|e| e.to_string())?;
         let ch = cfg
             .radio
@@ -86,6 +97,7 @@ impl Link {
             .or(cfg.radio.channels.first().copied())
             .ok_or("config: no channel")?;
         let width = cfg.radio.width;
+        let channels = cfg.radio.channels.clone();
         let dec = MediaCodecDecoder::new(win, 1920, 1080)?;
 
         let (au_tx, au_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(8);
@@ -158,19 +170,15 @@ impl Link {
                     Ok(c) => mk_cl(Box::new(c)),
                     Err(e) => return set_err(format!("core: {e}")),
                 };
-                // radio.channel = "auto": the channel core drives the card
-                // (finds the drone, moves the link to the cleanest member,
-                // hops), in the Rust core that replaces the one above.
-                // Pinned: the runtime holds the card on `ch` and transmits.
-                let drive = match cfg.radio.pin {
-                    None => runtime::Drive::Core {
-                        attach: runtime::dev_card::rust_channel_core(cfg.clone(), opts, width),
-                        extra,
-                    },
-                    Some(_) => runtime::Drive::Runtime {
-                        gs: true,
-                        search: None,
-                    },
+                // The channel core drives the card, in the Rust core that
+                // replaces the one above. "auto": it finds the drone, moves
+                // the link to the cleanest member and hops. Pinned: it still
+                // finds the drone on any member (the drone parks on the
+                // channel it last used) and relocates it onto the pin; the
+                // runtime's fixed drive would wait on the pin forever.
+                let drive = runtime::Drive::Core {
+                    attach: runtime::dev_card::rust_channel_core(cfg.clone(), opts, width),
+                    extra,
                 };
                 let lc = LiveCfg {
                     select: devourer_sys::Select::Fd(fd),
@@ -190,6 +198,7 @@ impl Link {
             Link {
                 shared,
                 width,
+                channels,
                 log_info,
                 core: Some(core_t),
                 dec: Some(dec_t),

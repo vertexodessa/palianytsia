@@ -263,6 +263,7 @@ impl Osd {
                 l.log_info
             )
         });
+        let channels: &[u8] = self.link.as_ref().map_or(&[], |l| &l.channels);
         let cursor = self.pointer.filter(|_| panel.open);
         let mut pout = pal_osd::panel::PanelOut::default();
         let dec = self.link.as_ref().map_or((0, 0), |l| {
@@ -282,6 +283,7 @@ impl Osd {
                     link_info: link_info.clone(),
                     log_info: log_info.clone(),
                     cal: hist.last().and_then(|s| s.cal.as_ref()),
+                    channels,
                 },
             );
             let prefs = &*prefs;

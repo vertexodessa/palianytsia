@@ -20,6 +20,9 @@ pub struct HudPrefs {
     /// Video link width in MHz (20 or 40): every ladder rung's `bw`
     /// (`pal_core::config::with_link_bw`), applied when the link starts.
     pub link_bw: u8,
+    /// A fixed link channel, or 0 = auto (`pal_core::config::with_channel`),
+    /// applied when the link starts.
+    pub link_channel: u8,
 }
 
 impl Default for HudPrefs {
@@ -34,6 +37,7 @@ impl Default for HudPrefs {
             stats: false,
             scale: 1.0,
             link_bw: 20,
+            link_channel: 0,
         }
     }
 }
@@ -44,6 +48,7 @@ impl HudPrefs {
             "dot": self.dot, "battery": self.battery, "timer": self.timer,
             "nav": self.nav, "link": self.link, "messages": self.messages,
             "stats": self.stats, "scale": self.scale, "link_bw": self.link_bw,
+            "link_channel": self.link_channel,
         })
         .to_string()
     }
@@ -70,6 +75,11 @@ impl HudPrefs {
                 Some(40) => 40,
                 _ => 20,
             },
+            link_channel: v
+                .get("link_channel")
+                .and_then(Value::as_u64)
+                .and_then(|c| u8::try_from(c).ok())
+                .unwrap_or(0),
         }
     }
 
@@ -96,6 +106,7 @@ mod tests {
             stats: true,
             scale: 1.4,
             link_bw: 40,
+            link_channel: 144,
             ..Default::default()
         };
         assert_eq!(HudPrefs::from_json(&p.to_json()), p);

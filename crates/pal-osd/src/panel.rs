@@ -47,8 +47,8 @@ pub struct Panel {
     pub tab: Tab,
     /// Phone: steppers and presets instead of text fields.
     pub touch: bool,
-    /// Calibrate pressed, waiting for the confirm.
-    pub cal_confirm: bool,
+    /// Calibrate or Reset calibration pressed, waiting for the confirm.
+    pub cal_confirm: crate::cal::Confirm,
 }
 
 /// What the panel needs from the app, and the facts it shows read-only.
@@ -62,13 +62,16 @@ pub struct PanelIn<'a> {
     pub log_info: String,
     /// The calibration block from the latest stats line.
     pub cal: Option<&'a crate::cal::CalView>,
+    /// The config's channel set; empty = no channel choice (desktop).
+    pub channels: &'a [u8],
 }
 
 #[derive(Default)]
 pub struct PanelOut {
     pub cmd: Option<Cmd>,
     pub prefs_changed: bool,
-    /// `prefs.link_bw` changed: restart the link so the core picks it up.
+    /// `prefs.link_bw` or `prefs.link_channel` changed: restart the link
+    /// so the core picks it up.
     pub relink: bool,
 }
 
@@ -371,13 +374,49 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                                     .small()
                                     .color(Color32::GRAY),
                                 );
+                                if !i.channels.is_empty() {
+                                    ui.separator();
+                                    let h = if touch { 40.0 } else { 0.0 };
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Channel");
+                                        let opts =
+                                            std::iter::once(0u8).chain(i.channels.iter().copied());
+                                        for ch in opts {
+                                            let on = i.prefs.link_channel == ch;
+                                            let t = if ch == 0 {
+                                                "auto".to_string()
+                                            } else {
+                                                ch.to_string()
+                                            };
+                                            let b = egui::Button::new(t)
+                                                .selected(on)
+                                                .min_size(egui::vec2(0.0, h));
+                                            if ui.add(b).clicked() && !on {
+                                                i.prefs.link_channel = ch;
+                                                out.prefs_changed = true;
+                                                out.relink = true;
+                                            }
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "auto moves the link to the quietest channel and \
+                                             hops away from interference. A fixed channel never \
+                                             moves: use it to calibrate, or where you know the \
+                                             air. The GS finds the drone on any channel of the \
+                                             set and moves it there. Switching restarts the link.",
+                                        )
+                                        .small()
+                                        .color(Color32::GRAY),
+                                    );
+                                }
                                 ui.separator();
                                 out.cmd = rows_ui(ui, &LINK, i.table, i.edits, touch);
                             }
                             Tab::Osd => out.prefs_changed = osd_ui(ui, i.prefs),
                             Tab::Drone => {
                                 if let Some(c) =
-                                    crate::cal::ui(ui, i.cal, &mut p.cal_confirm, touch)
+                                    crate::cal::ui(ui, i.cal, i.table, &mut p.cal_confirm, touch)
                                 {
                                     out.cmd = Some(c);
                                 }

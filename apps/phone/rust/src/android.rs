@@ -26,13 +26,14 @@ fn start(
     prefs_path: std::path::PathBuf,
     log_dir: std::path::PathBuf,
 ) -> Result<Phone, String> {
-    let link_bw = pal_osd::prefs::HudPrefs::load(&prefs_path).link_bw;
+    let hp = pal_osd::prefs::HudPrefs::load(&prefs_path);
     let (link, ports) = Link::start(
         LinkCfg {
             fds: vec![fd],
             toml,
             log_dir,
-            link_bw,
+            link_bw: hp.link_bw,
+            link_channel: hp.link_channel,
         },
         win,
     )?;
@@ -46,6 +47,7 @@ fn start(
         set_res_rx: ports.set_res_rx,
         prefs_path,
         width: link.width,
+        channels: link.channels.clone(),
         log_info: link.log_info.clone(),
         win: osd_win,
         density,

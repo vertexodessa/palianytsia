@@ -505,6 +505,8 @@ impl eframe::App for App {
                 link_info: format!("{}, key {key}", self.shared.radio_label(self.radio.1)),
                 log_info: self.log_info.clone(),
                 cal: self.hist.last().and_then(|s| s.cal.as_ref()),
+                // The desktop picks its channel on the command line (--ch).
+                channels: &[],
             },
         );
         if let Some(c) = out.cmd {
@@ -812,7 +814,7 @@ fn main() {
                         Default::default()
                     },
                     touch: false,
-                    cal_confirm: false,
+                    cal_confirm: Default::default(),
                 },
                 prefs: pal_osd::prefs::HudPrefs::load(&prefs_path),
                 prefs_path: prefs_path.clone(),
