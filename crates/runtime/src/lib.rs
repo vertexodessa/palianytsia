@@ -259,7 +259,7 @@ impl CoreLoop {
 
     /// The core's calibration JSON with the refusal spliced in; a state
     /// change goes to the flight log (with the result table on the way out).
-    fn cal_line(&mut self) -> Option<String> {
+    fn cal_line(&mut self) -> Option<serde_json::Value> {
         let j = self.core.cal_json()?;
         let v: serde_json::Value = serde_json::from_str(&j).ok()?;
         let st = v
@@ -274,7 +274,7 @@ impl CoreLoop {
             }
             self.cal.last_state = st;
         }
-        Some(stats_line::with_refusal(j, self.cal.refusal.as_deref()))
+        Some(stats_line::with_refusal(v, self.cal.refusal.as_deref()))
     }
 
     pub fn rx(&mut self, b: &RxBody) {
@@ -361,12 +361,16 @@ impl CoreLoop {
                     let _ = l.flush();
                 }
             }
-            self.sink.pts_off_us = stats_line::pts_off_us(&line);
+            let stats = stats_line::parse(&line);
+            self.sink.pts_off_us = stats.as_ref().and_then(stats_line::pts_off_us);
             // The ladder and calibration views go to the UI only: the
             // flight log keeps the webgs stats line both cores agree on.
             let ladder = self.core.ladder_json();
             let cal = self.cal_line();
-            let ui = stats_line::ui_line(line, ladder.as_deref(), cal.as_deref());
+            let ui = match stats {
+                Some(s) => stats_line::ui_line(s, ladder.as_deref(), cal),
+                None => line,
+            };
             let _ = self.ports.stats_tx.try_send(ui);
         }
         if now >= self.last_lat_us + 1_000_000 {
