@@ -13,6 +13,7 @@ use pal_core::{Au, CoreIo, GsCore, RxBody};
 use pal_wire::dot11;
 
 pub mod dev_card;
+pub mod stats_line;
 
 /// Core tick period.
 pub const TICK_US: u64 = 2000;
@@ -273,14 +274,7 @@ impl CoreLoop {
             }
             self.cal.last_state = st;
         }
-        match &self.cal.refusal {
-            Some(r) if j.ends_with('}') => Some(format!(
-                "{},\"refusal\":{}}}",
-                &j[..j.len() - 1],
-                serde_json::Value::from(r.as_str())
-            )),
-            _ => Some(j),
-        }
+        Some(stats_line::with_refusal(j, self.cal.refusal.as_deref()))
     }
 
     pub fn rx(&mut self, b: &RxBody) {
@@ -367,25 +361,13 @@ impl CoreLoop {
                     let _ = l.flush();
                 }
             }
-            self.sink.pts_off_us = line
-                .split("\"pts_off_us\":")
-                .nth(1)
-                .and_then(|r| r.split([',', '}']).next())
-                .and_then(|v| v.parse().ok());
-            // The ladder view goes to the UI only: the flight log keeps the
-            // webgs stats line both cores agree on.
-            let mut ui_line = match self.core.ladder_json() {
-                Some(l) if line.ends_with('}') => {
-                    format!("{},\"ladder\":{l}}}", &line[..line.len() - 1])
-                }
-                _ => line,
-            };
-            if let Some(c) = self.cal_line() {
-                if ui_line.ends_with('}') {
-                    ui_line = format!("{},\"cal\":{c}}}", &ui_line[..ui_line.len() - 1]);
-                }
-            }
-            let _ = self.ports.stats_tx.try_send(ui_line);
+            self.sink.pts_off_us = stats_line::pts_off_us(&line);
+            // The ladder and calibration views go to the UI only: the
+            // flight log keeps the webgs stats line both cores agree on.
+            let ladder = self.core.ladder_json();
+            let cal = self.cal_line();
+            let ui = stats_line::ui_line(line, ladder.as_deref(), cal.as_deref());
+            let _ = self.ports.stats_tx.try_send(ui);
         }
         if now >= self.last_lat_us + 1_000_000 {
             self.last_lat_us = now;
