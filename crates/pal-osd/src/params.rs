@@ -74,6 +74,9 @@ pub enum Cmd {
     /// TX-power calibration with the default sweeps (pal_core::cal).
     CalStart,
     CalAbort,
+    /// The channels the link may sit on, applied on the live link
+    /// (`GsCore::set_channels`).
+    Channels(Vec<u8>),
 }
 
 /// Per-row edit buffers (empty: the current value shows as a hint) and the

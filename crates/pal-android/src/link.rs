@@ -39,7 +39,7 @@ pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
     let p = pal_osd::prefs::HudPrefs::load(prefs);
     pal_core::config::LinkPick {
         bw: p.link_bw,
-        channel: p.link_channel,
+        channels: p.link_channels,
     }
 }
 

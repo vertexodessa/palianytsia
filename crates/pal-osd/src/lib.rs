@@ -2,6 +2,7 @@
 //! every app and both cores share one OSD. Reads only the snapshot it is
 //! handed: no locks toward the RX or core path.
 pub mod cal;
+pub mod channels;
 pub mod console;
 pub mod hud;
 pub mod panel;

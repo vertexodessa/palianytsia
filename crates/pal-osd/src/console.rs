@@ -235,7 +235,7 @@ mod tests {
         let path = tmp("settle");
         let mut c = Console::new(path.clone(), Panel::default());
         let (tx, rx) = mpsc::channel();
-        c.prefs.link_channel = 144;
+        c.prefs.link_channels = vec![144];
         let mut out = PanelOut {
             cmd: Some(Cmd::Refresh),
             prefs_changed: true,
@@ -244,7 +244,7 @@ mod tests {
         c.settle(&mut out, Some(&tx));
         assert_eq!(rx.try_recv(), Ok(Cmd::Refresh));
         assert!(out.relink, "relink stays the front end's");
-        assert_eq!(HudPrefs::load(&path).link_channel, 144);
+        assert_eq!(HudPrefs::load(&path).link_channels, vec![144]);
         // No link: the command is dropped, prefs still saved.
         let mut out = PanelOut {
             cmd: Some(Cmd::Refresh),

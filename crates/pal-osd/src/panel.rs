@@ -70,8 +70,8 @@ pub struct PanelIn<'a> {
 pub struct PanelOut {
     pub cmd: Option<Cmd>,
     pub prefs_changed: bool,
-    /// `prefs.link_bw` or `prefs.link_channel` changed: restart the link
-    /// so the core picks it up.
+    /// `prefs.link_bw` changed: restart the link so the core picks it up.
+    /// (A channel choice goes to the live link as `Cmd::Channels`.)
     pub relink: bool,
 }
 
@@ -376,42 +376,15 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                                 );
                                 if !i.channels.is_empty() {
                                     ui.separator();
-                                    let h = if touch { 40.0 } else { 0.0 };
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label("Channel");
-                                        let opts =
-                                            std::iter::once(0u8).chain(i.channels.iter().copied());
-                                        for ch in opts {
-                                            let on = i.prefs.link_channel == ch;
-                                            let t = if ch == 0 {
-                                                "auto".to_string()
-                                            } else {
-                                                ch.to_string()
-                                            };
-                                            let b = egui::Button::new(t)
-                                                .selected(on)
-                                                .min_size(egui::vec2(0.0, h));
-                                            if ui.add(b).clicked() && !on {
-                                                i.prefs.link_channel = ch;
-                                                out.prefs_changed = true;
-                                                out.relink = true;
-                                            }
-                                        }
-                                    });
-                                    ui.label(
-                                        RichText::new(
-                                            "auto moves the link to the quietest channel and \
-                                             hops away from interference. A fixed channel never \
-                                             moves: use it to calibrate, or where you know the \
-                                             air. The GS finds the drone on any channel of the \
-                                             set and moves it there. Switching restarts the link.",
-                                        )
-                                        .small()
-                                        .color(Color32::GRAY),
-                                    );
+                                    if let Some(c) = channel_row(ui, i.prefs, i.channels, touch) {
+                                        out.prefs_changed = true;
+                                        out.cmd = Some(Cmd::Channels(c));
+                                    }
                                 }
                                 ui.separator();
-                                out.cmd = rows_ui(ui, &LINK, i.table, i.edits, touch);
+                                if let Some(c) = rows_ui(ui, &LINK, i.table, i.edits, touch) {
+                                    out.cmd = Some(c);
+                                }
                             }
                             Tab::Osd => out.prefs_changed = osd_ui(ui, i.prefs),
                             Tab::Drone => {
@@ -469,4 +442,59 @@ fn osd_ui(ui: &mut Ui, p: &mut HudPrefs) -> bool {
     ui.checkbox(&mut p.stats, "Link statistics (detailed)");
     ui.add(egui::Slider::new(&mut p.scale, 0.6..=2.0).text("text size"));
     *p != before
+}
+
+/// The channel choice: one toggle per channel the width offers, plus
+/// "all". Returns the channels to fly when a click changed them (saved in
+/// `prefs` already).
+fn channel_row(
+    ui: &mut egui::Ui,
+    prefs: &mut HudPrefs,
+    set: &[u8],
+    touch: bool,
+) -> Option<Vec<u8>> {
+    use crate::channels::{chosen, offered, toggle};
+    let offer = offered(set, prefs.link_bw);
+    let cur = chosen(&prefs.link_channels, &offer);
+    let h = if touch { 40.0 } else { 0.0 };
+    let mut next = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Channels");
+        let all = cur.len() == offer.len();
+        let b = egui::Button::new("all")
+            .selected(all)
+            .min_size(egui::vec2(0.0, h));
+        if ui.add(b).clicked() && !all {
+            next = Some(Vec::new());
+        }
+        for &ch in &offer {
+            let b = egui::Button::new(ch.to_string())
+                .selected(cur.contains(&ch))
+                .min_size(egui::vec2(0.0, h));
+            if ui.add(b).clicked() {
+                if let Some(n) = toggle(&prefs.link_channels, &offer, prefs.link_bw, ch) {
+                    next = Some(n);
+                }
+            }
+        }
+    });
+    let mode = if cur.len() == 1 {
+        format!("fixed on {}: the link never leaves it.", cur[0])
+    } else {
+        "auto: the link starts on the quietest of these and hops among them away from \
+         interference."
+            .to_string()
+    };
+    ui.label(
+        RichText::new(format!(
+            "{mode} The GS finds the drone on any channel of its set and moves it onto \
+             the choice by a hop, without restarting the link. One channel: use it to \
+             calibrate, or where you know the air."
+        ))
+        .small()
+        .color(Color32::GRAY),
+    );
+    let next = next?;
+    prefs.link_channels = next;
+    Some(chosen(&prefs.link_channels, &offer))
 }

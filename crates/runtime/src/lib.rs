@@ -327,6 +327,15 @@ impl CoreLoop {
                 pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
                 pal_osd::params::Cmd::CalStart => self.cal_cmd(true),
                 pal_osd::params::Cmd::CalAbort => self.cal_cmd(false),
+                pal_osd::params::Cmd::Channels(chs) => {
+                    let r = self.core.set_channels(&chs);
+                    eprintln!("pal: channels {chs:?}: {r:?}");
+                    self.sink.shared.event(
+                        "channels",
+                        serde_json::json!({"channels": chs,
+                            "result": match &r { Ok(()) => "ok".to_string(), Err(e) => e.clone() }}),
+                    );
+                }
             }
         }
         if !self.cal.log_dir_set {

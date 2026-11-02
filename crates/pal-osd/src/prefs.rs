@@ -20,9 +20,10 @@ pub struct HudPrefs {
     /// Video link width in MHz (20 or 40): every ladder rung's `bw`
     /// (`pal_core::config::with_link_bw`), applied when the link starts.
     pub link_bw: u8,
-    /// A fixed link channel, or 0 = auto (`pal_core::config::with_channel`),
-    /// applied when the link starts.
-    pub link_channel: u8,
+    /// The channels the link may sit on (`pal_core::config::with_channels`),
+    /// empty = every channel of the set; one = that channel only. Applied
+    /// when the link starts and, changed in the panel, on the live link.
+    pub link_channels: Vec<u8>,
 }
 
 impl Default for HudPrefs {
@@ -37,7 +38,7 @@ impl Default for HudPrefs {
             stats: false,
             scale: 1.0,
             link_bw: 20,
-            link_channel: 0,
+            link_channels: Vec::new(),
         }
     }
 }
@@ -48,7 +49,7 @@ impl HudPrefs {
             "dot": self.dot, "battery": self.battery, "timer": self.timer,
             "nav": self.nav, "link": self.link, "messages": self.messages,
             "stats": self.stats, "scale": self.scale, "link_bw": self.link_bw,
-            "link_channel": self.link_channel,
+            "link_channels": self.link_channels,
         })
         .to_string()
     }
@@ -75,11 +76,20 @@ impl HudPrefs {
                 Some(40) => 40,
                 _ => 20,
             },
-            link_channel: v
-                .get("link_channel")
-                .and_then(Value::as_u64)
-                .and_then(|c| u8::try_from(c).ok())
-                .unwrap_or(0),
+            link_channels: match v.get("link_channels").and_then(Value::as_array) {
+                Some(a) => a
+                    .iter()
+                    .filter_map(|c| c.as_u64().and_then(|c| u8::try_from(c).ok()))
+                    .collect(),
+                // The single fixed channel of earlier versions (0 = auto).
+                None => v
+                    .get("link_channel")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| u8::try_from(c).ok())
+                    .filter(|&c| c != 0)
+                    .into_iter()
+                    .collect(),
+            },
         }
     }
 
@@ -106,10 +116,17 @@ mod tests {
             stats: true,
             scale: 1.4,
             link_bw: 40,
-            link_channel: 144,
+            link_channels: vec![144, 40],
             ..Default::default()
         };
         assert_eq!(HudPrefs::from_json(&p.to_json()), p);
+        assert_eq!(
+            HudPrefs::from_json(r#"{"link_channel":64}"#).link_channels,
+            vec![64]
+        );
+        assert!(HudPrefs::from_json(r#"{"link_channel":0}"#)
+            .link_channels
+            .is_empty());
         assert_eq!(HudPrefs::from_json("garbage"), HudPrefs::default());
         let q = HudPrefs::from_json(r#"{"dot":false,"scale":9,"unknown":1}"#);
         assert!(!q.dot && q.battery && q.scale == 2.0 && q.link_bw == 20);
