@@ -15,6 +15,15 @@ use runtime::Shared;
 use crate::usb::{Open, Usb};
 
 /// What the OSD needs from a freshly started link.
+/// How the supervisor goes on after a link ends.
+#[derive(Clone, Copy)]
+enum Reopen {
+    /// The cards stay attached (new prefs, a card added): reopen at once.
+    Now,
+    /// Something went away or failed: wait RETRY first.
+    AfterRetry,
+}
+
 pub struct LinkUi {
     pub ports: Ports,
     pub shared: Arc<Shared>,
@@ -191,21 +200,29 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
             info: link.info.clone(),
         });
         hub.set_status("");
-        let why = loop {
+        // Each end of the link says, where it is decided, whether the cards
+        // are still there to reopen at once.
+        let (why, reopen) = loop {
             nap(Duration::from_millis(500));
             if hub.quit.load(Ordering::Relaxed) {
-                break "app closing".to_string();
+                break ("app closing".to_string(), Reopen::AfterRetry);
             }
             if hub.relink.swap(false, Ordering::Relaxed) {
-                break "link settings changed".to_string();
+                break ("link settings changed".to_string(), Reopen::Now);
             }
             if !link.running() {
-                break format!("link stopped: {}", last_error());
+                break (
+                    format!("link stopped: {}", last_error()),
+                    Reopen::AfterRetry,
+                );
             }
             let check = env.with_local_frame(32, |env| {
                 for o in &opens {
                     if !usb.present(env, &o.name)? {
-                        return Ok(Some(format!("card {} detached", o.id)));
+                        return Ok(Some((
+                            format!("card {} detached", o.id),
+                            Reopen::AfterRetry,
+                        )));
                     }
                 }
                 if opens.len() < MAX_CARDS {
@@ -214,14 +231,14 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
                             continue;
                         }
                         if usb.permitted(env, &d.name, &mut asked)? {
-                            return Ok(Some(format!("card {} added", d.id)));
+                            return Ok(Some((format!("card {} added", d.id), Reopen::Now)));
                         }
                     }
                 }
                 Ok::<_, jni::errors::Error>(None)
             });
             match check {
-                Ok(Some(why)) => break why,
+                Ok(Some(end)) => break end,
                 Ok(None) => {}
                 Err(_) => {
                     let _ = env.exception_clear();
@@ -234,13 +251,15 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
         for o in opens {
             Usb::close(&mut env, o);
         }
-        if why == "link settings changed" || why.ends_with(" added") {
-            // The cards stay attached: reopen right away.
-            hub.set_status(format!("{why}, restarting"));
-            nap(Duration::from_millis(300));
-        } else {
-            hub.set_status(format!("{why}; retrying"));
-            nap(RETRY);
+        match reopen {
+            Reopen::Now => {
+                hub.set_status(format!("{why}, restarting"));
+                nap(Duration::from_millis(300));
+            }
+            Reopen::AfterRetry => {
+                hub.set_status(format!("{why}; retrying"));
+                nap(RETRY);
+            }
         }
     }
 }
