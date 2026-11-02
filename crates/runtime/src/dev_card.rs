@@ -51,6 +51,9 @@ pub struct DevCard {
     own_air: Mutex<OwnAirAcc>,
     channel: AtomicU8,
     width: AtomicU8,
+    /// What the chip is tuned at: `width`, except 20 while a 40 MHz link
+    /// sits on a channel without a pair (165).
+    tuned_w: AtomicU8,
     /// The stamp RX bodies get; 0 while a retune is in flight.
     rx_channel: AtomicU8,
 }
@@ -101,6 +104,7 @@ impl DevCard {
             own_air: Mutex::new(OwnAirAcc::default()),
             channel: AtomicU8::new(ch),
             width: AtomicU8::new(if width == 40 { 40 } else { 20 }),
+            tuned_w: AtomicU8::new(if width == 40 { 40 } else { 20 }),
             rx_channel: AtomicU8::new(ch),
         }
     }
@@ -148,8 +152,55 @@ impl RxTap for DevCard {
     }
 }
 
+impl DevCard {
+    /// The full channel set (`set_monitor`) at `w`; `width()` is not
+    /// touched (a 40 MHz link on 165 tunes 20 and stays a 40 MHz link).
+    fn tune_full(&self, ch: u8, w: u8) -> bool {
+        let was = self.tuned_w.load(Ordering::Acquire);
+        self.tuned_w.store(w, Ordering::Release);
+        self.with_ctl(|c| {
+            self.rx_channel.store(0, Ordering::Release);
+            let r = c.set_monitor(ch, w);
+            self.channel.store(ch, Ordering::Release);
+            self.rx_channel.store(ch, Ordering::Release);
+            match r {
+                Ok(()) => {
+                    eprintln!(
+                        "pal radio: card {} width {was} -> {w} MHz on ch {ch}",
+                        self.idx
+                    );
+                    true
+                }
+                Err(e) => {
+                    eprintln!("pal radio: card {}: {e}", self.idx);
+                    false
+                }
+            }
+        })
+        .unwrap_or(false)
+    }
+}
+
+/// How a move from `from` to `to` must be tuned: None = FastRetune (it
+/// keeps width and HT40 offset), Some(w) = the full channel set at `w`.
+/// The operator may choose channels on both sides of the pair grid (36 is
+/// HT40+, 40 HT40-) and 165, which has no pair; at 40 MHz those moves cannot
+/// keep the offset.
+fn retune_plan(width: u8, tuned_w: u8, from: u8, to: u8) -> Option<u8> {
+    let w = if width == 40 && ht40_offset(to) == 0 {
+        20
+    } else {
+        width
+    };
+    (w != tuned_w || (w == 40 && ht40_offset(to) != ht40_offset(from))).then_some(w)
+}
+
 impl ScoutRadio for DevCard {
     fn retune(&self, ch: u8) -> bool {
+        let from = self.channel.load(Ordering::Acquire);
+        if let Some(w) = retune_plan(self.width(), self.tuned_w.load(Ordering::Acquire), from, ch) {
+            return self.tune_full(ch, w);
+        }
         self.with_ctl(|c| {
             // Blind the body stamp for the move: a frame picked up during
             // it reads 0 = unknown, not the new channel.
@@ -228,28 +279,8 @@ impl LinkCard for DevCard {
         if w == 40 && ht40_offset(ch) == 0 {
             return false;
         }
-        let was = self.width();
         self.width.store(w, Ordering::Release);
-        self.with_ctl(|c| {
-            self.rx_channel.store(0, Ordering::Release);
-            let r = c.set_monitor(ch, w);
-            self.channel.store(ch, Ordering::Release);
-            self.rx_channel.store(ch, Ordering::Release);
-            match r {
-                Ok(()) => {
-                    eprintln!(
-                        "pal radio: card {} width {was} -> {w} MHz on ch {ch}",
-                        self.idx
-                    );
-                    true
-                }
-                Err(e) => {
-                    eprintln!("pal radio: card {}: {e}", self.idx);
-                    false
-                }
-            }
-        })
-        .unwrap_or(false)
+        self.tune_full(ch, w)
     }
     fn channel(&self) -> u8 {
         self.channel.load(Ordering::Acquire)
@@ -299,4 +330,23 @@ pub fn rust_channel_core(cfg: Config, opts: RustOpts, width: u8) -> Attach {
             clock: mono_default,
         })
     })
+}
+
+#[cfg(test)]
+mod retune_tests {
+    use super::retune_plan;
+
+    #[test]
+    fn fast_retune_only_where_it_keeps_width_and_offset() {
+        assert_eq!(retune_plan(20, 20, 36, 40), None);
+        assert_eq!(retune_plan(40, 40, 40, 64), None, "both HT40-");
+        assert_eq!(retune_plan(40, 40, 40, 36), Some(40), "HT40- to HT40+");
+        assert_eq!(retune_plan(40, 40, 161, 165), Some(20), "165 has no pair");
+        assert_eq!(
+            retune_plan(40, 20, 165, 161),
+            Some(40),
+            "back to 40 on a pair"
+        );
+        assert_eq!(retune_plan(40, 20, 165, 165), None);
+    }
 }

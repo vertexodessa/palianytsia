@@ -538,7 +538,7 @@ impl Config {
     }
 }
 
-pub use pal_wire::ht40::{ht40_offset, ht40_pair_other};
+pub use pal_wire::ht40::{grid_5g, ht40_offset, ht40_pair_other};
 
 const NHM_EDGES: [i32; 11] = [-104, -101, -98, -95, -92, -89, -86, -83, -80, -75, -70];
 
@@ -681,8 +681,10 @@ pub fn load_key_file(path: &str) -> Result<(LinkKey, bool, String), String> {
 }
 
 fn channel_set_issue(set: &[u8], width: u8, field: &str) -> R<()> {
-    if set.is_empty() || set.len() > 8 {
-        return fail(field, "must list 1 to 8 channels");
+    // Pal: up to the whole 5 GHz grid (mabur: 8), so the GS can search
+    // every channel the drone may have been moved to.
+    if set.is_empty() || set.len() > pal_wire::ht40::GRID_5G.len() {
+        return fail(field, "must list 1 to 25 channels");
     }
     for (i, &ch) in set.iter().enumerate() {
         if !(1..=177).contains(&ch) {
@@ -692,25 +694,15 @@ fn channel_set_issue(set: &[u8], width: u8, field: &str) -> R<()> {
             return fail(field, &format!("duplicate channel {ch}"));
         }
     }
+    // Pal: members may sit on both sides of the pair grid; both ends take
+    // the full channel set for a move across it (runtime dev_card, mabur
+    // fork 44069eb4), where mabur requires one offset for FastRetune.
     if width == 40 {
-        let off0 = ht40_offset(set[0]);
-        for &ch in set {
-            let off = ht40_offset(ch);
-            if off == 0 {
-                return fail(
-                    field,
-                    &format!("channel {ch} has no 40 MHz pair (docs/bw40.md)"),
-                );
-            }
-            if off != off0 {
-                return fail(
-                    field,
-                    &format!(
-                        "channel {ch} is on the other side of the pair grid from channel {}; FastRetune keeps the offset, every member must share one (docs/bw40.md)",
-                        set[0]
-                    ),
-                );
-            }
+        if let Some(ch) = set.iter().find(|&&c| ht40_offset(c) == 0) {
+            return fail(
+                field,
+                &format!("channel {ch} has no 40 MHz pair (docs/bw40.md)"),
+            );
         }
     }
     Ok(())
@@ -789,6 +781,13 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
         Ok(t) => out = t,
         Err(e) => skipped.push(format!("link width {} MHz not applied: {e}", pick.bw)),
     }
+    // The GS searches, and the operator chooses from, the whole 5 GHz grid
+    // at the link's width: the drone follows the GS to any grid channel
+    // (mabur fork 44069eb4), so it may have been left on any of them.
+    match with_search_grid(&out) {
+        Ok(t) => out = t,
+        Err(e) => skipped.push(format!("search grid not applied: {e}")),
+    }
     // The choice was saved against a set and a width: what is no longer a
     // member, or has no pair at 40 MHz, drops out; nothing left = all.
     let fly: Vec<u8> = match parse_config_str(&out) {
@@ -814,6 +813,31 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
         }
     }
     (out, skipped)
+}
+
+/// `radio.channels` = every 5 GHz grid channel the config's width can use
+/// (`grid_5g`); a `radio.use` and a pin stay as they are.
+pub fn with_search_grid(text: &str) -> R<String> {
+    let width = parse_config_str(text)?.radio.width;
+    let mut j = text
+        .parse::<Table>()
+        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    j.entry("radio")
+        .or_insert_with(|| Value::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError("config: radio is not a table".into()))?
+        .insert(
+            "channels".into(),
+            Value::Array(
+                grid_5g(width)
+                    .into_iter()
+                    .map(|c| Value::Integer(c.into()))
+                    .collect(),
+            ),
+        );
+    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
+    parse_config_str(&out)?;
+    Ok(out)
 }
 
 /// The operator's channel choice over the drone's set (`radio.channels`,
@@ -1567,32 +1591,30 @@ mod tests {
             bw,
             channels: chs.to_vec(),
         };
-        let (t, skipped) = with_link_pick(&auto, pick(20, &[144]));
-        assert!(skipped.is_empty());
-        assert_eq!(
-            t,
-            with_channels(&with_link_bw(&auto, 20).unwrap(), &[144]).unwrap()
-        );
+        let grid20 = with_search_grid(&with_link_bw(&auto, 20).unwrap()).unwrap();
+        let (t, skipped) = with_link_pick(&auto, pick(20, &[161]));
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(t, with_channels(&grid20, &[161]).unwrap());
+        let c = parse_config_str(&t).unwrap();
+        assert_eq!(c.radio.channels, grid_5g(20), "the search covers the grid");
+        assert_eq!(c.radio.usable(), &[161]);
         let (t, skipped) = with_link_pick(&auto, pick(20, &[]));
         assert!(skipped.is_empty());
-        assert_eq!(
-            t,
-            with_link_bw(&auto, 20).unwrap(),
-            "none leaves the channel alone"
-        );
-        let (t, skipped) = with_link_pick(&auto, pick(20, &[64, 36]));
+        assert_eq!(t, grid20, "none: every grid channel");
+        let (t, skipped) = with_link_pick(&auto, pick(20, &[64, 68]));
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].starts_with("channels [64, 36]: flying [64]"));
+        assert!(
+            skipped[0].starts_with("channels [64, 68]: flying [64]"),
+            "{skipped:?}"
+        );
+        assert_eq!(parse_config_str(&t).unwrap().radio.use_, vec![64]);
+        // At 40 MHz 165 (no pair) drops out of the grid and the choice.
+        let (t, skipped) = with_link_pick(&auto, pick(40, &[36, 40, 165]));
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
         let c = parse_config_str(&t).unwrap();
-        assert_eq!(
-            c.radio.use_,
-            vec![64],
-            "the members that are left still fly"
-        );
-        assert_eq!(c.radio.width, 20, "the width still applies");
-        let (t, skipped) = with_link_pick(&auto, pick(20, &[36]));
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(t, with_link_bw(&auto, 20).unwrap(), "nothing left = all");
+        assert_eq!(c.radio.width, 40);
+        assert_eq!(c.radio.channels, grid_5g(40));
+        assert_eq!(c.radio.use_, vec![36, 40], "both sides of the pair grid");
     }
 
     #[test]

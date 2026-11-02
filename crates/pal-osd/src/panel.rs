@@ -572,6 +572,11 @@ fn channel_menu(
                 let mut note = row
                     .and_then(|r| r.foreign)
                     .map_or(String::new(), |f| format!("{f:.0} foreign/s"));
+                if (52..=144).contains(&ch) {
+                    // Radar channels: the rules want a listen-before-talk
+                    // check this link does not do.
+                    note.push_str("  DFS");
+                }
                 if row.is_some_and(|r| r.op) {
                     note.push_str("  link here");
                 }
