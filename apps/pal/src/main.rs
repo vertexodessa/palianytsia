@@ -368,20 +368,7 @@ fn live(o: Opts) {
                     foreign.fetch_add(1, Ordering::Relaxed);
                 }
                 dot11::Verdict::Body(p) => {
-                    let b = RxBody {
-                        card_id: 0,
-                        mono_us: mono_us(t0),
-                        rssi: f.rssi,
-                        snr: f.snr,
-                        evm: f.evm,
-                        phy_valid: f.physt,
-                        crc_ok: !f.crc_err,
-                        mac_seq: p.mac_seq,
-                        tsfl: f.tsfl,
-                        mcs: p.mcs,
-                        rx_channel: ch,
-                        body: f.frame[p.body_off..].to_vec(),
-                    };
+                    let b = runtime::rx_body(0, f, &p, mono_us(t0), ch);
                     if tx.try_send(b).is_err() {
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }

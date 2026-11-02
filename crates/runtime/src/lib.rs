@@ -591,6 +591,32 @@ pub fn run_live(cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<
 type Stamp =
     Arc<dyn Fn(u8, &devourer_sys::RxFrame, &dot11::Verdict) -> Option<(u8, u64)> + Send + Sync>;
 
+/// The core's view of one received frame: `f` as the card delivered it,
+/// `p` its dot11 body, stamped with the card, the core clock and the
+/// channel it was heard on. The one place that maps the chip's RX fields.
+pub fn rx_body(
+    card_id: u8,
+    f: &devourer_sys::RxFrame,
+    p: &dot11::Parsed,
+    mono_us: u64,
+    rx_channel: u8,
+) -> RxBody {
+    RxBody {
+        card_id,
+        mono_us,
+        rssi: f.rssi,
+        snr: f.snr,
+        evm: f.evm,
+        phy_valid: f.physt,
+        crc_ok: !f.crc_err,
+        mac_seq: p.mac_seq,
+        tsfl: f.tsfl,
+        mcs: p.mcs,
+        rx_channel,
+        body: f.frame[p.body_off..].to_vec(),
+    }
+}
+
 /// Opens the cards; each RX thread hands its bodies, as `stamp` stamps
 /// them, to `tx`. Card 0 must open; a further card that will not come up
 /// costs diversity, not the link: it is skipped. Ids stay contiguous over
@@ -632,20 +658,7 @@ fn open_cards(
             };
             if let dot11::Verdict::Body(p) = v {
                 shared.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
-                let r = tx.try_send(RxBody {
-                    card_id,
-                    mono_us: now,
-                    rssi: f.rssi,
-                    snr: f.snr,
-                    evm: f.evm,
-                    phy_valid: f.physt,
-                    crc_ok: !f.crc_err,
-                    mac_seq: p.mac_seq,
-                    tsfl: f.tsfl,
-                    mcs: p.mcs,
-                    rx_channel: ch,
-                    body: f.frame[p.body_off..].to_vec(),
-                });
+                let r = tx.try_send(rx_body(card_id, f, &p, now, ch));
                 if r.is_err() {
                     shared.lat.rx_full.fetch_add(1, Ordering::Relaxed);
                 }
