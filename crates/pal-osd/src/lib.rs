@@ -7,6 +7,7 @@ pub mod console;
 pub mod hud;
 pub mod panel;
 pub mod params;
+pub mod pointer;
 pub mod prefs;
 pub mod telem;
 

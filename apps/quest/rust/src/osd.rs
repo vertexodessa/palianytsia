@@ -44,6 +44,8 @@ pub struct Osd {
     console: Console,
     /// Last pointer position, for the cursor and the release event.
     pointer: Option<egui::Pos2>,
+    /// Holds a pressed click still against hand jitter.
+    lock: pal_osd::pointer::ClickLock,
     t0: Instant,
     last_draw: Option<Instant>,
     fps: f64,
@@ -77,7 +79,13 @@ impl Osd {
         Ok(Self {
             gl,
             painter,
-            ctx: egui::Context::default(),
+            ctx: {
+                let ctx = egui::Context::default();
+                // A held trigger is still a click: a ray press is slower
+                // than a tap (egui's 0.8 s is made for touch long-press).
+                ctx.options_mut(|o| o.input_options.max_click_duration = 3.0);
+                ctx
+            },
             fbo,
             sc,
             images,
@@ -92,6 +100,7 @@ impl Osd {
                 },
             ),
             pointer: None,
+            lock: Default::default(),
             t0: Instant::now(),
             last_draw: None,
             fps: 0.0,
@@ -147,6 +156,7 @@ impl Osd {
             };
             match (inp.pointer, self.pointer) {
                 (Some(p), _) => {
+                    let p = self.lock.place(p, inp.click);
                     events.push(egui::Event::PointerMoved(p));
                     if let Some(pressed) = inp.click {
                         events.push(button(p, pressed));
@@ -155,7 +165,7 @@ impl Osd {
                 (None, Some(last)) => {
                     // Off the quad: finish a held click where it was.
                     if inp.click == Some(false) {
-                        events.push(button(last, false));
+                        events.push(button(self.lock.place(last, Some(false)), false));
                     }
                     events.push(egui::Event::PointerGone);
                 }
