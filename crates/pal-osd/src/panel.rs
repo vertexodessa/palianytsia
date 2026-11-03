@@ -84,12 +84,14 @@ const WARN: Color32 = Color32::from_rgb(240, 190, 60);
 const BAD: Color32 = Color32::from_rgb(240, 80, 70);
 
 /// Rows per tab, by F18 id.
-const VIDEO: [&str; 5] = [
+const VIDEO: [&str; 7] = [
     "VENC_MODE",
     "ENC_BITRATE_MAX",
     "ENC_AIRTIME",
     "VENC_SLICES",
     "LOWPWR_ENABLE",
+    "VENC_MIRROR",
+    "VENC_FLIP",
 ];
 const RECORD: [&str; 4] = ["REC_ENABLE", "REC_BITRATE", "REC_FPS", "REC_SIZE"];
 const LINK: [&str; 2] = ["RADIO_WALL_MARGN", "RADIO_LDPC"];
@@ -176,8 +178,8 @@ fn parse_mode(s: &str) -> Option<DriverMode> {
     })
 }
 
-/// mabur's camera_mode_pick for one readout: of the modes reaching `fps`,
-/// the largest, then the lowest top rate.
+/// mabur's camera_mode_for on the reported list, for one readout: of the
+/// modes reaching `fps`, the largest, then the lowest top rate.
 fn pick(modes: &[DriverMode], binned: bool, fps: u32) -> Option<DriverMode> {
     modes
         .iter()
@@ -193,20 +195,10 @@ fn pick(modes: &[DriverMode], binned: bool, fps: u32) -> Option<DriverMode> {
         })
 }
 
-/// mabur's camera_mode_size_ok: the aspect within 2 % of the mode's and the
-/// size inside the mode's keep-aspect window.
+/// mabur's camera_mode_size_ok: the mode's own aspect, exactly, and no
+/// larger than the mode (the VPE scales down, never crops or up).
 fn size_fits(m: DriverMode, w: u32, h: u32) -> bool {
-    let (a, b) = (u64::from(w) * u64::from(m.h), u64::from(h) * u64::from(m.w));
-    if w == 0 || h == 0 || a.abs_diff(b) * 50 > b {
-        return false;
-    }
-    let (mut cw, mut ch) = (m.w, m.h);
-    if b > a {
-        cw = ((u64::from(m.h) * u64::from(w) / u64::from(h)) as u32) & !1;
-    } else if a > b {
-        ch = ((u64::from(m.w) * u64::from(h) / u64::from(w)) as u32) & !1;
-    }
-    w <= cw && h <= ch
+    w > 0 && u64::from(w) * u64::from(m.h) == u64::from(h) * u64::from(m.w) && w <= m.w && h <= m.h
 }
 
 /// The VENC_MODE menu from the drone's driver list: each mode at its own
@@ -780,14 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn stock_driver_has_no_720p_at_120_and_no_native_above_60() {
-        let m = mode_menu("60@2560x1440/native,90@1920x1080/binned,120@1472x816/binned");
-        // 1280x720 is 1.5 % off 1472x816's aspect and inside its window.
-        assert!(m.contains(&"120@1280x720/binned".to_string()));
-        assert!(m.contains(&"120@1472x816/binned".to_string()));
+    fn a_driver_without_native_100_offers_no_native_above_60() {
+        let m = mode_menu("60@2944x1656/native,90@1920x1080/binned,120@1728x816/binned");
+        // 1280x720 is 16:9, 1728x816 is not: no 720p at 120.
+        assert!(!m.contains(&"120@1280x720/binned".to_string()));
+        assert!(m.contains(&"120@1728x816/binned".to_string()));
         assert!(!m
             .iter()
-            .any(|s| s.starts_with("100@") || s.starts_with("90@2560")));
+            .any(|s| s.starts_with("100@") || s.starts_with("90@2944")));
         assert!(m.contains(&"60@2560x1440/native".to_string()));
     }
 

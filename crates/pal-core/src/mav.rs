@@ -57,10 +57,12 @@ pub const TABLE: &[Row] = &[
     Row { id: "REC_SIZE", section: "record", key: "size", ty: PType::Str, apply: Apply::Rebuild, help: "Onboard recording resolution, same aspect ratio as the camera's" },
     Row { id: "LOWPWR_ENABLE", section: "low_power", key: "enable", ty: PType::Bool, apply: Apply::Knob, help: "Lower bitrate and frame rate while disarmed to keep the VTX cool; needs msp.enable for arm state" },
     Row { id: "MSP_ENABLE", section: "msp", key: "enable", ty: PType::Bool, apply: Apply::Reprogram, help: "Flight-controller link for the OSD and arm state" },
+    Row { id: "VENC_MIRROR", section: "venc", key: "mirror", ty: PType::Bool, apply: Apply::Rebuild, help: "Flip the picture left-right, for a camera mounted mirrored" },
+    Row { id: "VENC_FLIP", section: "venc", key: "flip", ty: PType::Bool, apply: Apply::Rebuild, help: "Flip the picture upside down, for a camera mounted upside down" },
     Row { id: "RADIO_PWR_MODE", section: "radio", key: "power_mode", ty: PType::Str, apply: Apply::Reprogram, help: "TX power table: offset flies the calibrated walls, none the chip's own; none undoes a calibration" },
     Row { id: "VENC_MODES", section: "venc", key: "driver_modes", ty: PType::Str, apply: Apply::ReadOnly, help: "The camera driver's modes as VENC_MODE values at each mode's full size and top rate, comma-separated; empty until the camera starts" },
 ];
-pub const COUNT: usize = 14;
+pub const COUNT: usize = 16;
 const _: () = assert!(TABLE.len() == COUNT);
 const MAX_ID_LEN: usize = 16;
 const VENC_MODE_ROW: usize = 2;
