@@ -259,6 +259,41 @@ fn drain_input(app: &AndroidApp) {
     }
 }
 
+/// The Activity in ndk_context while one `run` lasts. android-activity sets
+/// the Application there once per process, and the Activity's global ref
+/// dies with its AndroidApp; Quest re-creates the Activity in the same
+/// process, and the next `xrInitializeLoaderKHR` aborted on the dead ref
+/// (tombstones of 2026-11-01/02: "invalid global reference", "java_object
+/// == null", 6 min into the process).
+struct ActivityContext {
+    vm: *mut std::ffi::c_void,
+    app: *mut std::ffi::c_void,
+}
+
+impl ActivityContext {
+    /// # Safety
+    /// `activity` stays a valid global ref until the guard drops.
+    unsafe fn swap_in(activity: *mut std::ffi::c_void) -> Self {
+        let c = ndk_context::android_context();
+        ndk_context::release_android_context();
+        ndk_context::initialize_android_context(c.vm(), activity);
+        Self {
+            vm: c.vm(),
+            app: c.context(),
+        }
+    }
+}
+
+impl Drop for ActivityContext {
+    fn drop(&mut self) {
+        // SAFETY: android-activity's leaked Application global ref.
+        unsafe {
+            ndk_context::release_android_context();
+            ndk_context::initialize_android_context(self.vm, self.app);
+        }
+    }
+}
+
 pub fn run(app: &AndroidApp) -> Result<(), String> {
     let toml = asset(app, "gs.toml")?;
     let ext_dir = app.external_data_path().ok_or("no external files dir")?;
@@ -288,11 +323,10 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     // android-activity 0.6 puts the Application into ndk_context and
     // openxr hands that over as applicationActivity; the Meta runtime then
     // holds the session in IDLE for good. Give it the Activity.
+    // SAFETY: the activity global ref lives as long as `app`, which outlives
+    // this guard; the guard puts the Application back when run returns.
+    let _ctx = unsafe { ActivityContext::swap_in(app.activity_as_ptr()) };
     let vm_ptr = ndk_context::android_context().vm();
-    unsafe {
-        ndk_context::release_android_context();
-        ndk_context::initialize_android_context(vm_ptr, app.activity_as_ptr());
-    }
     // SAFETY: the process's JavaVM.
     let vm = unsafe { jni::JavaVM::from_raw(vm_ptr.cast()) }.map_err(|e| e.to_string())?;
     let mut want = xr::ExtensionSet::default();
