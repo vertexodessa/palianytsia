@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pal_android::{clear_err, last_error, Link, LinkCfg, Ports};
+use pal_android::{clear_err, last_error, Cards, Link, LinkCfg, Ports};
 use runtime::Shared;
 
 use crate::usb::{Open, Usb};
@@ -18,7 +18,9 @@ use crate::usb::{Open, Usb};
 /// How the supervisor goes on after a link ends.
 #[derive(Clone, Copy)]
 enum Reopen {
-    /// The cards stay attached (new prefs, a card added): reopen at once.
+    /// A start-time setting changed: a new link on the cards still open.
+    SameCards,
+    /// The cards stay attached (a card added): reopen at once.
     Now,
     /// Something went away or failed: wait RETRY first.
     AfterRetry,
@@ -171,19 +173,11 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
         }
         clear_err();
         hub.set_status(format!("card {} up, starting", ids(&opens)));
-        let cfg = LinkCfg {
-            fds: opens.iter().map(|o| o.fd).collect(),
-            toml: toml.clone(),
-            log_dir: log_dir.clone(),
-            pick: pal_android::link_pick(&prefs),
-        };
-        log::info!(
-            "supervisor: starting on {} card(s): {}",
-            opens.len(),
-            ids(&opens)
-        );
-        let (link, ports) = match Link::start(cfg, win) {
-            Ok(x) => x,
+        let fds: Vec<i32> = opens.iter().map(|o| o.fd).collect();
+        // The bring-up (seconds per card) runs once per attach: a restart
+        // for new settings runs on the cards still open.
+        let set = match pal_android::open_cards(&fds, &toml, pal_android::link_pick(&prefs)) {
+            Ok(s) => s,
             Err(e) => {
                 for o in opens {
                     Usb::close(&mut env, o);
@@ -193,66 +187,93 @@ pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: Pat
                 continue;
             }
         };
-        *hub.shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(link.shared.clone());
-        *hub.ui.lock().unwrap_or_else(|p| p.into_inner()) = Some(LinkUi {
-            ports,
-            shared: link.shared.clone(),
-            info: link.info.clone(),
-        });
-        hub.set_status("");
-        // Each end of the link says, where it is decided, whether the cards
-        // are still there to reopen at once.
+        log::info!(
+            "supervisor: {} card(s) open: {} ({})",
+            opens.len(),
+            ids(&opens),
+            set.chips()
+        );
         let (why, reopen) = loop {
-            nap(Duration::from_millis(500));
-            if hub.quit.load(Ordering::Relaxed) {
-                break ("app closing".to_string(), Reopen::AfterRetry);
-            }
-            if hub.relink.swap(false, Ordering::Relaxed) {
-                break ("link settings changed".to_string(), Reopen::Now);
-            }
-            if !link.running() {
-                break (
-                    format!("link stopped: {}", last_error()),
-                    Reopen::AfterRetry,
-                );
-            }
-            let check = env.with_local_frame(32, |env| {
-                for o in &opens {
-                    if !usb.present(env, &o.name)? {
-                        return Ok(Some((
-                            format!("card {} detached", o.id),
-                            Reopen::AfterRetry,
-                        )));
-                    }
-                }
-                if opens.len() < MAX_CARDS {
-                    for d in usb.cards(env)? {
-                        if opens.iter().any(|o| o.name == d.name) {
-                            continue;
-                        }
-                        if usb.permitted(env, &d.name, &mut asked)? {
-                            return Ok(Some((format!("card {} added", d.id), Reopen::Now)));
-                        }
-                    }
-                }
-                Ok::<_, jni::errors::Error>(None)
+            let cfg = LinkCfg {
+                cards: Cards::Open(set.clone()),
+                toml: toml.clone(),
+                log_dir: log_dir.clone(),
+                pick: pal_android::link_pick(&prefs),
+            };
+            let (link, ports) = match Link::start(cfg, win.clone()) {
+                Ok(x) => x,
+                Err(e) => break (format!("start failed: {e}"), Reopen::AfterRetry),
+            };
+            *hub.shared.lock().unwrap_or_else(|p| p.into_inner()) = Some(link.shared.clone());
+            *hub.ui.lock().unwrap_or_else(|p| p.into_inner()) = Some(LinkUi {
+                ports,
+                shared: link.shared.clone(),
+                info: link.info.clone(),
             });
-            match check {
-                Ok(Some(end)) => break end,
-                Ok(None) => {}
-                Err(_) => {
-                    let _ = env.exception_clear();
+            hub.set_status("");
+            // Each end of the link says, where it is decided, whether the
+            // cards are still there to reopen at once.
+            let (why, reopen) = loop {
+                nap(Duration::from_millis(500));
+                if hub.quit.load(Ordering::Relaxed) {
+                    break ("app closing".to_string(), Reopen::AfterRetry);
                 }
+                if hub.relink.swap(false, Ordering::Relaxed) {
+                    break ("link settings changed".to_string(), Reopen::SameCards);
+                }
+                if !link.running() {
+                    break (
+                        format!("link stopped: {}", last_error()),
+                        Reopen::AfterRetry,
+                    );
+                }
+                let check = env.with_local_frame(32, |env| {
+                    for o in &opens {
+                        if !usb.present(env, &o.name)? {
+                            return Ok(Some((
+                                format!("card {} detached", o.id),
+                                Reopen::AfterRetry,
+                            )));
+                        }
+                    }
+                    if opens.len() < MAX_CARDS {
+                        for d in usb.cards(env)? {
+                            if opens.iter().any(|o| o.name == d.name) {
+                                continue;
+                            }
+                            if usb.permitted(env, &d.name, &mut asked)? {
+                                return Ok(Some((format!("card {} added", d.id), Reopen::Now)));
+                            }
+                        }
+                    }
+                    Ok::<_, jni::errors::Error>(None)
+                });
+                match check {
+                    Ok(Some(end)) => break end,
+                    Ok(None) => {}
+                    Err(_) => {
+                        let _ = env.exception_clear();
+                    }
+                }
+            };
+            log::warn!("supervisor: {why}");
+            *hub.shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            let clean = link.stop();
+            if matches!(reopen, Reopen::SameCards) && clean && !hub.quit.load(Ordering::Relaxed) {
+                hub.set_status(format!("{why}, restarting"));
+                continue;
             }
+            // A core thread left wedged may still be on the cards: reopen
+            // them from scratch.
+            break (why, if clean { reopen } else { Reopen::AfterRetry });
         };
-        log::warn!("supervisor: {why}");
-        *hub.shared.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        link.stop();
+        // The cards close before their fds do.
+        drop(set);
         for o in opens {
             Usb::close(&mut env, o);
         }
         match reopen {
-            Reopen::Now => {
+            Reopen::Now | Reopen::SameCards => {
                 hub.set_status(format!("{why}, restarting"));
                 nap(Duration::from_millis(300));
             }

@@ -145,6 +145,8 @@ pub struct Caps {
 
 fn c_str(b: &[c_char]) -> String {
     let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    // c_char is i8 on x86_64 and u8 on aarch64: the cast is a no-op there.
+    #[allow(clippy::unnecessary_cast)]
     let bytes: Vec<u8> = b[..n].iter().map(|&c| c as u8).collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }

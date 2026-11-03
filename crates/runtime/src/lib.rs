@@ -593,10 +593,14 @@ pub fn run_live(cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<
         Drive::Core { attach, extra } => {
             let mut selects = vec![o.select];
             selects.extend(extra);
-            run_core_owned(cl, selects, o.ch, o.width, attach, on_open)
+            let set = CardSet::open(selects, o.ch, o.width)?;
+            on_open(set.chips());
+            run_core_on(cl, &set, o.ch, o.width, attach)
         }
         Drive::Runtime { gs, search } => {
-            run_runtime_owned(cl, o.select, o.ch, o.width, gs, search, on_open)
+            let set = CardSet::open(vec![o.select], o.ch, o.width)?;
+            on_open(set.chips());
+            run_runtime_owned(cl, &set, o.ch, o.width, gs, search)
         }
     }
 }
@@ -633,67 +637,134 @@ pub fn rx_body(
     }
 }
 
-/// Opens the cards; each RX thread hands its bodies, as `stamp` stamps
-/// them, to `tx`. Card 0 must open; a further card that will not come up
-/// costs diversity, not the link: it is skipped. Ids stay contiguous over
-/// the cards that opened (the core's roster).
-fn open_cards(
-    selects: Vec<devourer_sys::Select>,
-    ch: u8,
-    width: u8,
-    stamp: Stamp,
+/// Where the cards' RX threads deliver while a session runs: its body
+/// channel, its stamp, its counters. None between sessions: frames drop.
+struct Route {
     tx: SyncSender<RxBody>,
-    shared: &Arc<Shared>,
-) -> Result<(Vec<Arc<devourer_sys::Card>>, String), String> {
-    let mut cards = Vec::with_capacity(selects.len());
-    let mut chips = Vec::with_capacity(selects.len());
-    for (i, sel) in selects.into_iter().enumerate() {
-        let mut card = match devourer_sys::Card::open(&devourer_sys::Config {
-            select: sel,
-            channel: ch,
-            width_mhz: width,
-        }) {
-            Ok(c) => c,
-            Err(e) if i == 0 => return Err(format!("card: {e}")),
-            Err(e) => {
-                eprintln!("pal: card {i} skipped: {e}");
-                shared.event(
-                    "card_skipped",
-                    serde_json::json!({"card": i, "err": e.to_string()}),
-                );
-                continue;
-            }
-        };
-        chips.push(card.chip().unwrap_or("?".into()));
-        let (tx, shared, stamp) = (tx.clone(), shared.clone(), stamp.clone());
-        let card_id = cards.len() as u8;
-        card.start_rx(move |f| {
-            let v = dot11::parse(f.frame, f.crc_err, f.data_rate);
-            let Some((ch, now)) = stamp(card_id, f, &v) else {
-                return;
-            };
-            if let dot11::Verdict::Body(p) = v {
-                shared.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
-                let r = tx.try_send(rx_body(card_id, f, &p, now, ch));
-                if r.is_err() {
-                    shared.lat.rx_full.fetch_add(1, Ordering::Relaxed);
+    stamp: Stamp,
+    shared: Arc<Shared>,
+}
+
+/// Open cards that outlive a session. Opening a card is the slow part of a
+/// start (an RTL8822E takes ~4.8 s on the Quest); a session that only
+/// changes settings (the video width) runs on the cards the last one left,
+/// retuned to its own channel and width. Ids are contiguous over the cards
+/// that opened (the core's roster).
+pub struct CardSet {
+    cards: Vec<Arc<devourer_sys::Card>>,
+    chips: String,
+    /// Further cards that would not open: (select index, error).
+    skipped: Vec<(usize, String)>,
+    route: Arc<std::sync::RwLock<Option<Route>>>,
+    /// Sessions run so far: the first finds the cards where open put them.
+    sessions: AtomicU32,
+}
+
+impl CardSet {
+    /// Card 0 must open; a further card that will not come up costs
+    /// diversity, not the link: it is skipped.
+    pub fn open(selects: Vec<devourer_sys::Select>, ch: u8, width: u8) -> Result<Self, String> {
+        let route: Arc<std::sync::RwLock<Option<Route>>> = Arc::default();
+        let mut cards = Vec::with_capacity(selects.len());
+        let mut chips = Vec::with_capacity(selects.len());
+        let mut skipped = Vec::new();
+        for (i, sel) in selects.into_iter().enumerate() {
+            let mut card = match devourer_sys::Card::open(&devourer_sys::Config {
+                select: sel,
+                channel: ch,
+                width_mhz: width,
+            }) {
+                Ok(c) => c,
+                Err(e) if i == 0 => return Err(format!("card: {e}")),
+                Err(e) => {
+                    eprintln!("pal: card {i} skipped: {e}");
+                    skipped.push((i, e.to_string()));
+                    continue;
                 }
-            }
-        })?;
-        cards.push(Arc::new(card));
+            };
+            chips.push(card.chip().unwrap_or("?".into()));
+            let route = route.clone();
+            let card_id = cards.len() as u8;
+            card.start_rx(move |f| {
+                let r = route.read().unwrap_or_else(|p| p.into_inner());
+                let Some(r) = r.as_ref() else { return };
+                let v = dot11::parse(f.frame, f.crc_err, f.data_rate);
+                let Some((ch, now)) = (r.stamp)(card_id, f, &v) else {
+                    return;
+                };
+                if let dot11::Verdict::Body(p) = v {
+                    r.shared.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
+                    if r.tx.try_send(rx_body(card_id, f, &p, now, ch)).is_err() {
+                        r.shared.lat.rx_full.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })?;
+            cards.push(Arc::new(card));
+        }
+        Ok(CardSet {
+            cards,
+            chips: chips.join(" + "),
+            skipped,
+            route,
+            sessions: AtomicU32::new(0),
+        })
     }
-    Ok((cards, chips.join(" + ")))
+
+    /// "8822e + 8812a": the chips that opened, in roster order.
+    pub fn chips(&self) -> &str {
+        &self.chips
+    }
+
+    /// Starts a session: its skipped-card events, the cards on (`ch`,
+    /// `width`) when an earlier session left them elsewhere, and the RX
+    /// threads delivering to `tx` as `stamp` says until the guard drops.
+    fn begin(
+        &self,
+        ch: u8,
+        width: u8,
+        stamp: Stamp,
+        tx: SyncSender<RxBody>,
+        shared: &Arc<Shared>,
+    ) -> Result<SessionRoute<'_>, String> {
+        for (i, e) in &self.skipped {
+            shared.event("card_skipped", serde_json::json!({"card": i, "err": e}));
+        }
+        if self.sessions.fetch_add(1, Ordering::Relaxed) > 0 {
+            for (i, c) in self.cards.iter().enumerate() {
+                c.ctl()
+                    .set_monitor(ch, width)
+                    .map_err(|e| format!("card {i}: {e}"))?;
+            }
+        }
+        *self.route.write().unwrap_or_else(|p| p.into_inner()) = Some(Route {
+            tx,
+            stamp,
+            shared: shared.clone(),
+        });
+        Ok(SessionRoute(self))
+    }
+}
+
+/// A session's hold on the cards' RX: dropped, frames drop until the next
+/// session begins.
+struct SessionRoute<'a>(&'a CardSet);
+
+impl Drop for SessionRoute<'_> {
+    fn drop(&mut self) {
+        *self.0.route.write().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 /// A core that owns the cards: every frame passes its card's tap first
 /// (counters, the channel stamp), the core retunes and transmits itself.
-fn run_core_owned(
+/// `set` is the caller's: it stays open when this returns, for the next
+/// session (`run_live` drops it at once).
+pub fn run_core_on(
     mut cl: CoreLoop,
-    selects: Vec<devourer_sys::Select>,
+    set: &CardSet,
     ch: u8,
     width: u8,
     attach: Attach,
-    on_open: impl FnOnce(&str),
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
     // Set once the core exists; frames before it are dropped.
@@ -705,10 +776,9 @@ fn run_core_owned(
         Some((ch, clock()))
     });
     let shared = cl.sink.shared.clone();
-    let (cards, chips) = open_cards(selects, ch, width, stamp, tx, &shared)?;
-    on_open(&chips);
+    let _route = set.begin(ch, width, stamp, tx, &shared)?;
     shared.channel.store(ch, Ordering::Relaxed);
-    let at = attach(&cards)?;
+    let at = attach(&set.cards)?;
     cl.set_core(at.core);
     let clock = at.clock;
     // The link card's channel is the one the UI shows.
@@ -725,10 +795,10 @@ fn run_core_owned(
         },
         |_, _| Ok(true),
     );
-    // The core's threads use the cards: they stop before those close.
+    // The core's threads use the cards: they stop before the next session
+    // (or the set's owner) takes them.
     drop(cl);
     drop(link);
-    drop(cards);
     r
 }
 
@@ -736,12 +806,11 @@ fn run_core_owned(
 /// drone and rebuilding the core for the channel it is found on.
 fn run_runtime_owned(
     mut cl: CoreLoop,
-    select: devourer_sys::Select,
+    set: &CardSet,
     ch: u8,
     width: u8,
     gs: bool,
     search: Option<Search>,
-    on_open: impl FnOnce(&str),
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
     // The channel RX frames are stamped with; 0 while the card retunes.
@@ -760,10 +829,9 @@ fn run_runtime_owned(
         Some((ch, mono_default()))
     });
     let shared = cl.sink.shared.clone();
-    let (cards, chips) = open_cards(vec![select], ch, width, stamp, tx, &shared)?;
-    on_open(&chips);
+    let _route = set.begin(ch, width, stamp, tx, &shared)?;
     shared.channel.store(ch, Ordering::Relaxed);
-    let card = &cards[0];
+    let card = &set.cards[0];
     let clock: fn() -> u64 = mono_default;
     let mut srch = search.filter(|s| !s.set.is_empty());
     let searching = srch.is_some();
@@ -789,7 +857,7 @@ fn run_runtime_owned(
         cl.sink.card = Some(card.clone());
     }
     let mut seen = (hits.load(Ordering::Relaxed), clock());
-    pump(
+    let r = pump(
         &mut cl,
         &rx,
         clock,
@@ -813,7 +881,9 @@ fn run_runtime_owned(
             }
             Ok(true)
         },
-    )
+    );
+    drop(cl);
+    r
 }
 
 /// Bodies into the core and its ticks on `clock` until `shared.quit`.

@@ -28,7 +28,7 @@ fn start(
 ) -> Result<Phone, String> {
     let (link, ports) = Link::start(
         LinkCfg {
-            fds: vec![fd],
+            cards: pal_android::Cards::Fds(vec![fd]),
             toml,
             log_dir,
             pick: pal_android::link_pick(&prefs_path),

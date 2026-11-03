@@ -43,11 +43,51 @@ pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
     }
 }
 
-pub struct LinkCfg {
+/// The cards a link runs on.
+pub enum Cards {
     /// usbfs fds from UsbDeviceConnection.getFileDescriptor(), one per
     /// card; the first is the link card, the rest receive (and scout) with
-    /// it under the channel core.
-    pub fds: Vec<i32>,
+    /// it under the channel core. Opened by the link, closed when it ends.
+    Fds(Vec<i32>),
+    /// Cards the caller opened (`open_cards`) and keeps across links: a
+    /// restart for new settings skips the card bring-up.
+    Open(Arc<runtime::CardSet>),
+}
+
+/// The config a link runs, its start channel and its width: the toml with
+/// the operator's start-time choices applied.
+fn link_radio(
+    toml: &str,
+    pick: pal_core::config::LinkPick,
+) -> Result<(String, pal_core::config::Config, u8, u8), String> {
+    let (toml, skipped) = pal_core::config::with_link_pick(toml, pick);
+    for s in skipped {
+        log::warn!("{s}");
+    }
+    let cfg = pal_core::config::parse_config_str(&toml).map_err(|e| e.to_string())?;
+    let ch = cfg
+        .radio
+        .pin
+        .or(cfg.radio.channels.first().copied())
+        .ok_or("config: no channel")?;
+    let width = cfg.radio.width;
+    Ok((toml, cfg, ch, width))
+}
+
+/// Opens the cards behind `fds` where a link on `toml` + `pick` starts, so
+/// its first session needs no retune. Blocks for the bring-up (seconds).
+pub fn open_cards(
+    fds: &[i32],
+    toml: &str,
+    pick: pal_core::config::LinkPick,
+) -> Result<Arc<runtime::CardSet>, String> {
+    let (_, _, ch, width) = link_radio(toml, pick)?;
+    let selects = fds.iter().map(|&f| devourer_sys::Select::Fd(f)).collect();
+    runtime::CardSet::open(selects, ch, width).map(Arc::new)
+}
+
+pub struct LinkCfg {
+    pub cards: Cards,
     pub toml: String,
     /// Flight log root; one `fl-NNNN_*` directory per start.
     pub log_dir: PathBuf,
@@ -91,19 +131,7 @@ impl Link {
         c: LinkCfg,
         win: ndk::native_window::NativeWindow,
     ) -> Result<(Link, Ports), String> {
-        let mut c = c;
-        let (toml, skipped) = pal_core::config::with_link_pick(&c.toml, c.pick);
-        c.toml = toml;
-        for s in skipped {
-            log::warn!("{s}");
-        }
-        let cfg = pal_core::config::parse_config_str(&c.toml).map_err(|e| e.to_string())?;
-        let ch = cfg
-            .radio
-            .pin
-            .or(cfg.radio.channels.first().copied())
-            .ok_or("config: no channel")?;
-        let width = cfg.radio.width;
+        let (_, cfg, ch, width) = link_radio(&c.toml, c.pick.clone())?;
         let channels = cfg.radio.channels.clone();
         let dec = MediaCodecDecoder::new(win, 1920, 1080)?;
 
@@ -159,11 +187,10 @@ impl Link {
             .name("pal-decode".into())
             .spawn(move || decode_loop(dec, au_rx, &sh))
             .map_err(|e| e.to_string())?;
-        let fd = *c.fds.first().ok_or("no card fd")?;
-        let extra: Vec<devourer_sys::Select> = c.fds[1..]
-            .iter()
-            .map(|&f| devourer_sys::Select::Fd(f))
-            .collect();
+        if let Cards::Fds(f) = &c.cards {
+            f.first().ok_or("no card fd")?;
+        }
+        let cards = c.cards;
         let core_t = std::thread::Builder::new()
             .name("pal-core".into())
             .spawn(move || {
@@ -183,19 +210,31 @@ impl Link {
                 // finds the drone on any member (the drone parks on the
                 // channel it last used) and relocates it onto the pin; the
                 // runtime's fixed drive would wait on the pin forever.
-                let drive = runtime::Drive::Core {
-                    attach: runtime::dev_card::rust_channel_core(cfg.clone(), opts, width),
-                    extra,
+                let attach = runtime::dev_card::rust_channel_core(cfg.clone(), opts, width);
+                let r = match cards {
+                    Cards::Fds(fds) => {
+                        let lc = LiveCfg {
+                            select: devourer_sys::Select::Fd(fds[0]),
+                            ch,
+                            width,
+                            drive: runtime::Drive::Core {
+                                attach,
+                                extra: fds[1..]
+                                    .iter()
+                                    .map(|&f| devourer_sys::Select::Fd(f))
+                                    .collect(),
+                            },
+                        };
+                        runtime::run_live(cl, lc, |chip| {
+                            log::info!("card {chip} on ch {ch} / {width} MHz")
+                        })
+                    }
+                    Cards::Open(set) => {
+                        log::info!("card {} (kept open) on ch {ch} / {width} MHz", set.chips());
+                        runtime::run_core_on(cl, &set, ch, width, attach)
+                    }
                 };
-                let lc = LiveCfg {
-                    select: devourer_sys::Select::Fd(fd),
-                    ch,
-                    width,
-                    drive,
-                };
-                match runtime::run_live(cl, lc, |chip| {
-                    log::info!("card {chip} on ch {ch} / {width} MHz")
-                }) {
+                match r {
                     Ok(()) => log::info!("core loop ended"),
                     Err(e) => set_err(e),
                 }
@@ -235,7 +274,9 @@ impl Link {
     /// Bounded stop (spec 5.5: 3 s): a core thread wedged in USB is left
     /// behind rather than hanging the caller, and then so is the decoder,
     /// which only ends when the core loop drops the AU sender.
-    pub fn stop(mut self) {
+    /// True when the core thread ended (its cards are free again); false
+    /// when it was left behind wedged.
+    pub fn stop(mut self) -> bool {
         self.request_quit();
         let t0 = Instant::now();
         let mut core_done = true;
@@ -257,6 +298,7 @@ impl Link {
                 log::warn!("decoder left with the wedged core thread");
             }
         }
+        core_done
     }
 }
 
