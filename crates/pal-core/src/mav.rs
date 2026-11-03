@@ -31,6 +31,8 @@ pub enum Apply {
     Knob,
     Reprogram,
     Rebuild,
+    /// Reports what the drone found (VENC_MODES); every set is refused there.
+    ReadOnly,
 }
 
 pub struct Row {
@@ -56,8 +58,9 @@ pub const TABLE: &[Row] = &[
     Row { id: "LOWPWR_ENABLE", section: "low_power", key: "enable", ty: PType::Bool, apply: Apply::Knob, help: "Lower bitrate and frame rate while disarmed to keep the VTX cool; needs msp.enable for arm state" },
     Row { id: "MSP_ENABLE", section: "msp", key: "enable", ty: PType::Bool, apply: Apply::Reprogram, help: "Flight-controller link for the OSD and arm state" },
     Row { id: "RADIO_PWR_MODE", section: "radio", key: "power_mode", ty: PType::Str, apply: Apply::Reprogram, help: "TX power table: offset flies the calibrated walls, none the chip's own; none undoes a calibration" },
+    Row { id: "VENC_MODES", section: "venc", key: "driver_modes", ty: PType::Str, apply: Apply::ReadOnly, help: "The camera driver's modes as VENC_MODE values at each mode's full size and top rate, comma-separated; empty until the camera starts" },
 ];
-pub const COUNT: usize = 13;
+pub const COUNT: usize = 14;
 const _: () = assert!(TABLE.len() == COUNT);
 const MAX_ID_LEN: usize = 16;
 const VENC_MODE_ROW: usize = 2;

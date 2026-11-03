@@ -104,45 +104,145 @@ fn step(id: &str) -> f64 {
     }
 }
 
-/// Choices for string rows on touch. maburd picks the sensor mode from the
-/// driver's own list. Binned: the widest 2x2-binned mode that reaches the
-/// fps (1920x1080 up to 90; above it 1472x816 on OpenIPC's stock IMX415
-/// driver, 1728x972 / 1728x816 on waybeam's). 1280x720 fits 1472x816 after
-/// a 1.5 % crop, but not waybeam's 2.12:1 120 fps mode, where the drone
-/// refuses it: the 120 fps preset is that mode's own 1728x816 (on the stock
-/// driver it does not fit and the drone keeps the previous mode). The GS
-/// cannot see the driver's list, so these stay a fixed menu. Native: the widest non-binned window, 1:1 pixels and a
-/// zoomed view; up to 60 fps every driver has one (2560x1440 stock, 2944x1656
-/// waybeam), 61-100 only waybeam's six-mode build
-/// (2272x1278 since its 581804a build; 2304x1296 before). On any other
-/// driver 90/100 native fails the pipeline start and maburd restores the
-/// previous mode (mabur docs/mavlink.md), so offering them is safe.
-/// Above 1080p: the native window itself or a 16:9 size inside it; maburd
-/// checks only that the size fits the mode, not that the H.265 engine keeps
-/// up (1728x972@100 already reads 158 % of its rated macroblock rate), and
-/// the Quest scales into a 1920x1080 surface. 2560x1440 is the stock
-/// driver's native 60 fps window, so every driver serves it at 60.
-/// 720p also needs venc.slices to divide its 12 CTU rows (1, 2, 3, 4, 6, 12).
-fn presets(id: &str) -> &'static [&'static str] {
+/// Choices for string rows on touch. VENC_MODE's come from the drone's
+/// VENC_MODES row, the list its camera driver offers ([`mode_menu`]); a
+/// drone without that row (maburd before mabur's VENC_MODES), or one whose
+/// camera has not started, gets [`FALLBACK_MODES`].
+fn presets(id: &str, t: &Table) -> Vec<String> {
     match id {
-        "VENC_MODE" => &[
-            "60@1920x1080/binned",
-            "90@1920x1080/binned",
-            "60@1280x720/binned",
-            "90@1280x720/binned",
-            "100@1280x720/binned",
-            "120@1728x816/binned",
-            "60@1920x1080/native",
-            "90@1920x1080/native",
-            "100@1920x1080/native",
-            "60@1280x720/native",
-            "100@2272x1278/native",
-            "60@2560x1440/native",
-            "60@2944x1656/native",
-        ],
-        "REC_SIZE" => &["1920x1080", "1280x720"],
-        _ => &[],
+        "VENC_MODE" => {
+            let listed = t
+                .rows
+                .iter()
+                .find(|r| r.id == "VENC_MODES")
+                .and_then(|r| r.value.as_deref())
+                .map(mode_menu)
+                .unwrap_or_default();
+            if listed.is_empty() {
+                FALLBACK_MODES.iter().map(|s| s.to_string()).collect()
+            } else {
+                listed
+            }
+        }
+        "REC_SIZE" => vec!["1920x1080".into(), "1280x720".into()],
+        _ => vec![],
     }
+}
+
+/// The menu for a drone that does not report its driver's list (maburd
+/// before VENC_MODES): binned 1920x1080 up to 90 and 720p; 100 fps 720p and
+/// the 1728x816 120 fps crop on waybeam's driver; native windows of waybeam's
+/// six-mode driver (2944x1656@60, 2272x1278@100) and the stock one
+/// (2560x1440@60). A mode the loaded driver lacks costs only a refusal:
+/// maburd keeps the previous mode.
+const FALLBACK_MODES: [&str; 13] = [
+    "60@1920x1080/binned",
+    "90@1920x1080/binned",
+    "60@1280x720/binned",
+    "90@1280x720/binned",
+    "100@1280x720/binned",
+    "120@1728x816/binned",
+    "60@1920x1080/native",
+    "90@1920x1080/native",
+    "100@1920x1080/native",
+    "60@1280x720/native",
+    "100@2272x1278/native",
+    "60@2560x1440/native",
+    "60@2944x1656/native",
+];
+
+/// One driver mode from VENC_MODES: its top rate, size and readout.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct DriverMode {
+    fps: u32,
+    w: u32,
+    h: u32,
+    binned: bool,
+}
+
+fn parse_mode(s: &str) -> Option<DriverMode> {
+    let (fps, rest) = s.split_once('@')?;
+    let (size, readout) = rest.split_once('/')?;
+    let (w, h) = size.split_once('x')?;
+    Some(DriverMode {
+        fps: fps.parse().ok()?,
+        w: w.parse().ok()?,
+        h: h.parse().ok()?,
+        binned: match readout {
+            "binned" => true,
+            "native" => false,
+            _ => return None,
+        },
+    })
+}
+
+/// mabur's camera_mode_pick for one readout: of the modes reaching `fps`,
+/// the largest, then the lowest top rate.
+fn pick(modes: &[DriverMode], binned: bool, fps: u32) -> Option<DriverMode> {
+    modes
+        .iter()
+        .filter(|m| m.binned == binned && m.fps >= fps)
+        .copied()
+        .reduce(|b, m| {
+            let (a, ba) = (m.w * m.h, b.w * b.h);
+            if a > ba || (a == ba && m.fps < b.fps) {
+                m
+            } else {
+                b
+            }
+        })
+}
+
+/// mabur's camera_mode_size_ok: the aspect within 2 % of the mode's and the
+/// size inside the mode's keep-aspect window.
+fn size_fits(m: DriverMode, w: u32, h: u32) -> bool {
+    let (a, b) = (u64::from(w) * u64::from(m.h), u64::from(h) * u64::from(m.w));
+    if w == 0 || h == 0 || a.abs_diff(b) * 50 > b {
+        return false;
+    }
+    let (mut cw, mut ch) = (m.w, m.h);
+    if b > a {
+        cw = ((u64::from(m.h) * u64::from(w) / u64::from(h)) as u32) & !1;
+    } else if a > b {
+        ch = ((u64::from(m.w) * u64::from(h) / u64::from(w)) as u32) & !1;
+    }
+    w <= cw && h <= ch
+}
+
+/// The VENC_MODE menu from the drone's driver list: each mode at its own
+/// size and top rate, plus the 60 and 90 fps rates that still pick that
+/// mode, each at the mode's size and at the 16:9 sizes below it that fit
+/// its window. Every entry is one the drone takes, since it runs the same
+/// pick and fit; binned first, then by rate and size.
+fn mode_menu(list: &str) -> Vec<String> {
+    const RATES: [u32; 2] = [60, 90];
+    const SIZES: [(u32, u32); 3] = [(2560, 1440), (1920, 1080), (1280, 720)];
+    let modes: Vec<DriverMode> = list.split(',').filter_map(parse_mode).collect();
+    let mut out: Vec<(bool, u32, u32, String)> = Vec::new();
+    for &m in &modes {
+        let rates = RATES
+            .iter()
+            .copied()
+            .filter(|&r| r < m.fps && pick(&modes, m.binned, r) == Some(m))
+            .chain(std::iter::once(m.fps));
+        for fps in rates {
+            let sizes = std::iter::once((m.w, m.h)).chain(
+                SIZES
+                    .iter()
+                    .copied()
+                    .filter(|&(w, h)| (w, h) != (m.w, m.h) && size_fits(m, w, h)),
+            );
+            for (w, h) in sizes {
+                let readout = if m.binned { "binned" } else { "native" };
+                let text = format!("{fps}@{w}x{h}/{readout}");
+                if !out.iter().any(|o| o.3 == text) {
+                    out.push((!m.binned, fps, u32::MAX - w * h, text));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.into_iter().map(|o| o.3).collect()
 }
 
 fn state_color(st: &str) -> Color32 {
@@ -191,13 +291,13 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool)
                     cmd = Some(Cmd::Set(i, fmt(x + s)));
                 }
             }
-            "str" if touch && !presets(&r.id).is_empty() => {
+            "str" if touch && !presets(&r.id, t).is_empty() => {
                 egui::ComboBox::from_id_salt(&r.id)
                     .selected_text(&v)
                     .show_ui(ui, |ui| {
-                        for p in presets(&r.id) {
-                            if ui.add_enabled(can, egui::Button::new(*p)).clicked() {
-                                cmd = Some(Cmd::Set(i, (*p).into()));
+                        for p in presets(&r.id, t) {
+                            if ui.add_enabled(can, egui::Button::new(&p)).clicked() {
+                                cmd = Some(Cmd::Set(i, p));
                             }
                         }
                     });
@@ -644,4 +744,77 @@ fn channel_menu(
         out.choose = Some(chosen(&prefs.link_channels, &offer));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_from_waybeams_six_mode_driver() {
+        let m = mode_menu(
+            "60@2944x1656/native,90@1920x1080/binned,100@2272x1278/native,100@1728x972/binned,120@1728x816/binned",
+        );
+        assert_eq!(
+            m,
+            [
+                "60@1920x1080/binned",
+                "60@1280x720/binned",
+                "90@1920x1080/binned",
+                "90@1280x720/binned",
+                "100@1728x972/binned",
+                "100@1280x720/binned",
+                "120@1728x816/binned",
+                "60@2944x1656/native",
+                "60@2560x1440/native",
+                "60@1920x1080/native",
+                "60@1280x720/native",
+                "90@2272x1278/native",
+                "90@1920x1080/native",
+                "90@1280x720/native",
+                "100@2272x1278/native",
+                "100@1920x1080/native",
+                "100@1280x720/native",
+            ]
+        );
+    }
+
+    #[test]
+    fn stock_driver_has_no_720p_at_120_and_no_native_above_60() {
+        let m = mode_menu("60@2560x1440/native,90@1920x1080/binned,120@1472x816/binned");
+        // 1280x720 is 1.5 % off 1472x816's aspect and inside its window.
+        assert!(m.contains(&"120@1280x720/binned".to_string()));
+        assert!(m.contains(&"120@1472x816/binned".to_string()));
+        assert!(!m
+            .iter()
+            .any(|s| s.starts_with("100@") || s.starts_with("90@2560")));
+        assert!(m.contains(&"60@2560x1440/native".to_string()));
+    }
+
+    #[test]
+    fn empty_or_garbled_list_falls_back() {
+        let row = |v: &str| {
+            format!(
+                r#"{{"age_ms":null,"apply":"read-only","help":"h","id":"VENC_MODES","key":"driver_modes","section":"venc","state":"idle","status":"","type":"str","value":"{v}"}}"#
+            )
+        };
+        for v in ["", "junk"] {
+            let t = Table::parse(&format!(r#"{{"linked":true,"rows":[{}]}}"#, row(v))).unwrap();
+            assert_eq!(presets("VENC_MODE", &t).len(), FALLBACK_MODES.len());
+        }
+        let t = Table::parse(&format!(
+            r#"{{"linked":true,"rows":[{}]}}"#,
+            row("90@1920x1080/binned")
+        ))
+        .unwrap();
+        assert_eq!(
+            presets("VENC_MODE", &t),
+            [
+                "60@1920x1080/binned",
+                "60@1280x720/binned",
+                "90@1920x1080/binned",
+                "90@1280x720/binned"
+            ]
+        );
+    }
 }

@@ -167,6 +167,7 @@ pub fn widget(ui: &mut egui::Ui, t: &Table, e: &mut Edits) -> Option<Cmd> {
                 let can = t.linked
                     && t.pending.is_none()
                     && r.value.is_some()
+                    && r.apply != "read-only"
                     && !e.text[i].trim().is_empty();
                 if ui.add_enabled(can, egui::Button::new("set")).clicked() {
                     cmd = Some(Cmd::Set(i, e.text[i].trim().to_string()));

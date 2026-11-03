@@ -54,6 +54,7 @@ pub(super) fn params_json(pc: Option<&ParamClient>, now_ms: u64) -> String {
             Apply::Knob => "knob",
             Apply::Reprogram => "reprogram",
             Apply::Rebuild => "rebuild",
+            Apply::ReadOnly => "read-only",
         }
     }
     let mut j = J::obj();
