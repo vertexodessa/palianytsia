@@ -195,6 +195,8 @@ pub struct CoreLoop {
     cal: CalUi,
     /// Per-card deaf/hearing flips for the flight log.
     deaf: pal_osd::DeafWatch,
+    /// Core time (ms) of the last ladder transition logged as rung_reason.
+    rung_seen_ms: i64,
 }
 
 /// The loop's channels to the UI.
@@ -232,6 +234,7 @@ impl CoreLoop {
             last_log_us: 0,
             cal: CalUi::default(),
             deaf: pal_osd::DeafWatch::default(),
+            rung_seen_ms: i64::MIN,
         }
     }
 
@@ -269,6 +272,34 @@ impl CoreLoop {
 
     /// The core's calibration JSON with the refusal spliced in; a state
     /// change goes to the flight log (with the result table on the way out).
+    /// The ladder's last transition with its reason, once per transition:
+    /// the stats line has the rung but not why it moved (a demote with no
+    /// loss in sight was unexplained, 2026-11-03). Sampled with the stats
+    /// line, so of two moves within one tick only the second shows.
+    fn log_rung_reason(&mut self, now_us: u64, ladder: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(ladder) else {
+            return;
+        };
+        let (Some(age), Some(reason)) = (
+            v.get("last_age_ms").and_then(serde_json::Value::as_i64),
+            v.get("last_reason").and_then(serde_json::Value::as_str),
+        ) else {
+            return;
+        };
+        let at_ms = (now_us / 1000) as i64 - age;
+        // The age is rounded: the same transition reads up to 1 ms apart.
+        if (at_ms - self.rung_seen_ms).abs() <= 2 {
+            return;
+        }
+        self.rung_seen_ms = at_ms;
+        let g = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+        self.sink.shared.event(
+            "rung_reason",
+            serde_json::json!({"reason": reason, "from": g("last_from"), "to": g("last_to"),
+                "age_ms": age, "u": g("u"), "probe": g("probe"), "probe_u": g("probe_u")}),
+        );
+    }
+
     fn cal_line(&mut self) -> Option<serde_json::Value> {
         let j = self.core.cal_json()?;
         let v: serde_json::Value = serde_json::from_str(&j).ok()?;
@@ -402,6 +433,9 @@ impl CoreLoop {
             // The ladder and calibration views go to the UI only: the
             // flight log keeps the webgs stats line both cores agree on.
             let ladder = self.core.ladder_json();
+            if let Some(l) = ladder.as_deref() {
+                self.log_rung_reason(now, l);
+            }
             let scan = self.core.chan_scan_json();
             let cal = self.cal_line();
             let ui = match stats {
