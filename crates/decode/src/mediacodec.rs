@@ -3,6 +3,12 @@
 //! ANativeWindow (no copy, no GL pass). An output thread releases each frame
 //! as it comes out; a frame older than `STALE_US` since its AU was queued is
 //! dropped instead of shown. No flush on loss: the next IDR heals.
+//!
+//! The codec is the platform's pick for video/hevc unless the system
+//! property `debug.pal.decoder` names one (the Quest also lists
+//! `c2.qti.hevc.decoder.low_latency`); every `LAT_WINDOW` frames the log
+//! gets the queue-to-output time per frame, so two codecs compare on one
+//! headset by `setprop` and a relaunch.
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,9 +26,43 @@ use crate::Decoder;
 
 /// PixelPilot's stale cap: a frame this late would only add latency.
 const STALE_US: u64 = 150_000;
+/// Frames per latency line in the log (~5 s at 60 fps).
+const LAT_WINDOW: usize = 300;
+const DECODER_PROP: &std::ffi::CStr = c"debug.pal.decoder";
+
+extern "C" {
+    // bionic; PROP_VALUE_MAX is 92 bytes with the NUL.
+    fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> i32;
+}
+
+/// `debug.pal.decoder`, if set.
+fn decoder_prop() -> Option<String> {
+    let mut v = [0 as std::ffi::c_char; 92];
+    // SAFETY: a NUL-terminated name and a PROP_VALUE_MAX buffer.
+    let n = unsafe { __system_property_get(DECODER_PROP.as_ptr(), v.as_mut_ptr()) };
+    if n <= 0 {
+        return None;
+    }
+    // SAFETY: bionic NUL-terminates within PROP_VALUE_MAX.
+    let s = unsafe { std::ffi::CStr::from_ptr(v.as_ptr()) };
+    Some(s.to_string_lossy().into_owned())
+}
+
+/// The named codec when the property names one that opens, else the
+/// platform's pick for the type.
+fn open_codec() -> Result<MediaCodec, String> {
+    if let Some(name) = decoder_prop() {
+        match MediaCodec::from_codec_name(&name) {
+            Some(c) => return Ok(c),
+            None => log::warn!("mediacodec: {name} (debug.pal.decoder) did not open"),
+        }
+    }
+    MediaCodec::from_decoder_type("video/hevc").ok_or_else(|| "no video/hevc decoder".into())
+}
 
 struct Shared {
     codec: MediaCodec,
+    name: String,
     stop: AtomicBool,
     frames: AtomicU64,
     stale: AtomicU64,
@@ -50,7 +90,9 @@ pub struct MediaCodecDecoder {
 impl MediaCodecDecoder {
     /// `w`/`h` are a hint for the first buffers; the stream's SPS rules.
     pub fn new(win: NativeWindow, w: i32, h: i32) -> Result<Self, String> {
-        let codec = MediaCodec::from_decoder_type("video/hevc").ok_or("no video/hevc decoder")?;
+        let codec = open_codec()?;
+        let name = codec.name().unwrap_or_else(|_| "?".into());
+        log::info!("mediacodec: {name}");
         let mut fmt = MediaFormat::new();
         fmt.set_str("mime", "video/hevc");
         fmt.set_i32("width", w);
@@ -64,6 +106,7 @@ impl MediaCodecDecoder {
         codec.start().map_err(|e| format!("start: {e:?}"))?;
         let sh = Arc::new(Shared {
             codec,
+            name,
             stop: AtomicBool::new(false),
             frames: AtomicU64::new(0),
             stale: AtomicU64::new(0),
@@ -95,7 +138,24 @@ impl MediaCodecDecoder {
     }
 }
 
+/// Queue-to-output microseconds of the frames in one window.
+fn log_latency(name: &str, ages: &mut Vec<u64>) {
+    ages.sort_unstable();
+    let at = |q: usize| ages[(ages.len() - 1) * q / 100];
+    let mean = ages.iter().sum::<u64>() / ages.len() as u64;
+    log::info!(
+        "mediacodec {name}: queue->out us n={} mean={mean} p50={} p90={} p99={} max={}",
+        ages.len(),
+        at(50),
+        at(90),
+        at(99),
+        at(100)
+    );
+    ages.clear();
+}
+
 fn output_loop(sh: &Shared) {
+    let mut ages = Vec::with_capacity(LAT_WINDOW);
     while !sh.stop.load(Ordering::Relaxed) {
         match sh.codec.dequeue_output_buffer(Duration::from_millis(10)) {
             Ok(Out::Buffer(ob)) => {
@@ -110,6 +170,12 @@ fn output_loop(sh: &Shared) {
                         .filter(|(p, _)| *p == pts)
                         .map(|(_, t)| t.elapsed().as_micros() as u64)
                 };
+                if let Some(a) = age {
+                    ages.push(a);
+                    if ages.len() == LAT_WINDOW {
+                        log_latency(&sh.name, &mut ages);
+                    }
+                }
                 let show = age.is_none_or(|a| a <= STALE_US);
                 if sh.codec.release_output_buffer(ob, show).is_err() {
                     sh.errors.fetch_add(1, Ordering::Relaxed);
