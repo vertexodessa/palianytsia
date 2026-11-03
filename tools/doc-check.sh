@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Checks the facts the docs have to repeat against the tree they describe:
 #   1. each submodule's .gitmodules branch contains its pinned commit;
-#   2. release/MABUR_RELEASE is the tip of mabur's release/<latest tag> branch;
+#   2. release/MABUR_RELEASE is the tip of a mabur release/v* branch (a GS-only patch release
+#      reuses the previous one's);
 #   3. every `RC_VERSION N` in README.md, CLAUDE.md and release/README.md equals rc_proto.h;
 #   4. the latest release/notes tag heads release/README.md, is both APKs' versionName
 #      and is named in docs/spec.md Status and CLAUDE.md;
@@ -36,13 +37,11 @@ tag=$(ls release/notes | sed -n 's/^\(v[0-9.]*\)\.md$/\1/p' | sort -V | tail -1)
 
 # 2. The release builds maburd from this commit, not from the submodule pin.
 want=$(tr -d '[:space:]' < release/MABUR_RELEASE)
-if tip=$(git -C third_party/mabur ls-remote origin "refs/heads/release/$tag" 2>/dev/null); then
-  tip=${tip%%[[:space:]]*}
-  [ -n "$tip" ] || err "mabur has no branch release/$tag"
-  [ -z "$tip" ] || [ "$tip" = "$want" ] ||
-    err "release/MABUR_RELEASE ${want:0:8} != mabur release/$tag tip ${tip:0:8}"
+if tips=$(git -C third_party/mabur ls-remote origin 'refs/heads/release/*' 2>/dev/null); then
+  br=$(awk -v w="$want" '$1 == w { sub("refs/heads/", "", $2); print $2 }' <<<"$tips" | head -1)
+  [ -n "$br" ] || err "release/MABUR_RELEASE ${want:0:8} is not the tip of any mabur release/* branch"
 else
-  net "cannot reach the mabur remote for release/$tag"
+  net "cannot reach the mabur remote for its release/* branches"
 fi
 
 # 3-5 are text checks.

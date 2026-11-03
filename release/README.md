@@ -1,11 +1,11 @@
-# Palianytsia v0.7
+# Palianytsia v0.7.1
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.7.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.7.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.7.1.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.7.1.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,15 +14,12 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.sh` installs it on an imx415 drone. |
 
-## What changed since v0.6
+## What changed since v0.7
 
-Update the drone and the GS together: v0.7 renumbers the drone parameters after row 11, so a v0.6 GS and a v0.7 drone (or the other way round) read each other's camera-mode list, calibration reset and mirror/flip rows wrong.
+A ground-station-only update: the drone daemon is the same as in v0.7, so a v0.7 drone needs nothing. Coming from v0.6, update the drone too (v0.7 renumbered the drone parameters).
 
-- **mabur brought up to date.** The drone daemon is now based on the current upstream mabur (master c8e2d20e of 2026-11-03) plus Palianytsia's own changes. From upstream: the sensor rate trim settles fast just under the target rate and never steps above it; the native 100 fps window timed slightly above 100 Hz for the phase lock; refusal reasons that fit the GS status line.
-- **Mirror and flip.** Gear, Video: "venc.mirror" and "venc.flip" switches for a camera mounted mirrored or upside down (new drone parameters `VENC_MIRROR` / `VENC_FLIP`; the drone restarts its video pipeline to apply them).
-- **Faster channel return after a GS restart.** When the GS restarts and finds the drone on a channel outside the ticked ones, it moves the link to a ticked channel at once. v0.6 stayed on the drone's channel for 15-20 s first.
-- **Camera sizes.** The camera-mode menu offers only sizes with the sensor mode's exact aspect ratio, as the drone now requires (v0.6 allowed 2 % off).
-- **One sensor driver.** The drone picks camera modes from waybeam's six-mode IMX415 driver lineup (the driver `install.sh` installs). A drone left on OpenIPC's stock driver runs up to 90 fps only.
+- **Movable OSD chips.** Each stats chip can be dragged anywhere; the position is saved, and a double click puts the chip back in its row. Chips keep a fixed width, so a number gaining a digit no longer pushes its neighbours around.
+- **Quest: room beside the picture.** The OSD layer is 1.5 times the size of the video and centred on it, so chips can be parked outside the picture. On the Quest, chips move while the settings panel is open.
 
 ## Ground station
 
@@ -31,7 +28,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.7.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.7.1.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -111,9 +108,9 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 ./install.sh --remove 192.168.1.10
 ```
 
-maburd refuses config keys it does not know. v0.7 adds no config keys, so a v0.4 to v0.6 drone config works unchanged (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
+maburd refuses config keys it does not know. v0.7 and v0.7.1 add no config keys, so a v0.4 to v0.6 drone config works unchanged (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
 
-## Known limits in v0.7
+## Known limits in v0.7.1
 
 - Pairing uses the default link key on both ends.
 - While disarmed, the drone runs low power: 30 fps at 1 Mbps. Full rate starts on arming.
