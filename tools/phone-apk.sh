@@ -20,7 +20,8 @@ cd "$ROOT/apps/phone/android"
 [[ -f local.properties ]] || echo "sdk.dir=${ANDROID_HOME:-$HOME/Android/Sdk}" > local.properties
 if [[ ${PAL_RELEASE:-0} == 1 ]]; then
   ./gradlew -q assembleRelease
-  ls -la app/build/outputs/apk/release/app-release.apk
+  # Unsigned without a release key: app-release-unsigned.apk.
+  ls -la app/build/outputs/apk/release/*.apk
 else
   ./gradlew -q assembleDebug
   ls -la app/build/outputs/apk/debug/app-debug.apk

@@ -4,7 +4,7 @@
 # runs without the system's FFmpeg. GPU decode: nvdec loads the NVIDIA
 # driver with dlopen (no link dependency); vaapi (Intel/AMD) and vdpau link
 # libva/libva-drm/libva-x11/libvdpau/libX11, which every desktop with a
-# Mesa or NVIDIA driver has. Needs libva-dev, libvdpau-dev, libx11-dev. The system
+# Mesa or NVIDIA driver has. Needs libva-dev, libvdpau-dev, libx11-dev, libxext-dev, libxv-dev, nasm. The system
 # libavcodec pulls ~100 shared libraries and its soname changes with every
 # FFmpeg major, so a desktop build linked to it starts only on the distro it
 # was built on.

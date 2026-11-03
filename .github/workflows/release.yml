@@ -107,8 +107,10 @@ jobs:
       - name: Collect
         run: |
           mkdir -p out
-          cp apps/quest/android/app/build/outputs/apk/release/app-release.apk out/quest.apk
-          cp apps/phone/android/app/build/outputs/apk/release/app-release.apk out/phone.apk
+          # Signed: app-release.apk; a dry run without the key: -unsigned.
+          for a in quest phone; do
+            cp apps/$a/android/app/build/outputs/apk/release/app-release*.apk out/$a.apk
+          done
           rm -f "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/signing.properties"
       - uses: actions/upload-artifact@v4
         with:
@@ -124,7 +126,7 @@ jobs:
         with:
           submodules: true
       - name: Host packages
-        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libudev-dev libva-dev libvdpau-dev libx11-dev nasm pkg-config cmake
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libudev-dev libva-dev libvdpau-dev libx11-dev libxext-dev libxv-dev nasm pkg-config cmake
       - uses: dtolnay/rust-toolchain@stable
       - name: Static FFmpeg
         run: tools/ffmpeg-static.sh > ffmpeg.log 2>&1 || { tail -40 ffmpeg.log; exit 1; }
