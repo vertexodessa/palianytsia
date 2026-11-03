@@ -33,4 +33,10 @@ fn android_main(app: android_activity::AndroidApp) {
     if let Err(e) = xr::run(&app) {
         log::error!("quest: {e}");
     }
+    // run returns once the link is stopped and the supervisor joined, so
+    // nothing is left to flush. The process must not outlive the activity:
+    // after a Quit from the Meta menu it stayed, the next launch reused it,
+    // and the menu offered no Quit for that second activity (2026-11-03).
+    log::info!("quest: activity gone, process exits");
+    std::process::exit(0);
 }
