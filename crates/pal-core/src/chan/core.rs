@@ -1236,9 +1236,7 @@ impl ChannelCore {
             || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
             || self.boot_pick.relocating()
             || self.pending_relocate.is_some()
-            || card.is_none_or(|c| {
-                (self.scout_owns() && self.is_scout_card(c)) || !self.live.cards[c].ready()
-            });
+            || card.is_none_or(|c| self.scout_owns_card(c) || !self.live.cards[c].ready());
         let (Some(card), Some(sc), false) = (card, self.scanner.as_mut(), blocked) else {
             self.op_scan.defer(now);
             return;
