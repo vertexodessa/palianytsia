@@ -239,7 +239,14 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             // The Rust OSD shows the link; this text is only for errors.
             String err = Native.lastError();
             if (!Native.running(handle)) {
+                // New link settings: the next link starts on the open card.
+                if (Native.relink(handle)) {
+                    osd.setText("");
+                    ui.postDelayed(this, 500);
+                    return;
+                }
                 // The core gave up (USB error, card wedged): start over.
+                err = Native.lastError();
                 stopLink();
                 show("link stopped: " + err + "; retrying");
                 retry();

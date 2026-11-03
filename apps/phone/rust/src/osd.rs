@@ -3,7 +3,7 @@
 //! chips as pal-desktop and the Quest can reuse this for its OSD layer.
 //! One thread owns the EGL context; it redraws when a stats line arrives
 //! (10 Hz) and clears to transparent around the widgets.
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +36,9 @@ pub struct OsdIn {
     pub info: pal_android::LinkInfo,
     /// HUD prefs file in the app's files dir.
     pub prefs_path: std::path::PathBuf,
+    /// Raised with quit when a start-time setting changed: the handle
+    /// starts the next link on the same card.
+    pub relink: Arc<AtomicBool>,
 }
 
 /// One MotionEvent: action 0 down, 1 up, 2 move, 3 cancel.
@@ -247,8 +250,8 @@ pub fn run(o: OsdIn) {
         }
         if pout.relink {
             // The width applies at link start: end this link; the Activity
-            // sees it stop and starts a new one with the saved prefs.
-            pal_android::set_err("link settings changed");
+            // sees it stop and asks for the next one (Native.relink).
+            o.relink.store(true, Ordering::Relaxed);
             o.shared.quit.store(true, Ordering::Relaxed);
         }
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);

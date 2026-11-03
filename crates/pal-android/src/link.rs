@@ -52,6 +52,13 @@ pub enum Cards {
     /// Cards the caller opened (`open_cards`) and keeps across links: a
     /// restart for new settings skips the card bring-up.
     Open(Arc<runtime::CardSet>),
+    /// Like `Fds`, but the link that finds `slot` empty opens the cards on
+    /// its core thread and leaves them there; the next link on the same
+    /// slot runs on them. The caller's thread never waits for a bring-up.
+    Kept {
+        fds: Vec<i32>,
+        slot: Arc<Mutex<Option<Arc<runtime::CardSet>>>>,
+    },
 }
 
 /// The config a link runs, its start channel and its width: the toml with
@@ -187,7 +194,7 @@ impl Link {
             .name("pal-decode".into())
             .spawn(move || decode_loop(dec, au_rx, &sh))
             .map_err(|e| e.to_string())?;
-        if let Cards::Fds(f) = &c.cards {
+        if let Cards::Fds(f) | Cards::Kept { fds: f, .. } = &c.cards {
             f.first().ok_or("no card fd")?;
         }
         let cards = c.cards;
@@ -232,6 +239,30 @@ impl Link {
                     Cards::Open(set) => {
                         log::info!("card {} (kept open) on ch {ch} / {width} MHz", set.chips());
                         runtime::run_core_on(cl, &set, ch, width, attach)
+                    }
+                    Cards::Kept { fds, slot } => {
+                        let kept = slot.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                        let set = match kept {
+                            Some(set) => {
+                                log::info!(
+                                    "card {} (kept open) on ch {ch} / {width} MHz",
+                                    set.chips()
+                                );
+                                Ok(set)
+                            }
+                            None => {
+                                let selects =
+                                    fds.iter().map(|&f| devourer_sys::Select::Fd(f)).collect();
+                                runtime::CardSet::open(selects, ch, width).map(|set| {
+                                    log::info!("card {} on ch {ch} / {width} MHz", set.chips());
+                                    let set = Arc::new(set);
+                                    *slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                                        Some(set.clone());
+                                    set
+                                })
+                            }
+                        };
+                        set.and_then(|set| runtime::run_core_on(cl, &set, ch, width, attach))
                     }
                 };
                 match r {

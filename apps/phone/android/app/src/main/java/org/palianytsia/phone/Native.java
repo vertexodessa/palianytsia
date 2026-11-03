@@ -2,7 +2,7 @@ package org.palianytsia.phone;
 
 import android.view.Surface;
 
-/** libpalphone (apps/phone/rust): the whole GS behind four calls. */
+/** libpalphone (apps/phone/rust): the whole GS behind a few calls. */
 final class Native {
     static {
         System.loadLibrary("palphone");
@@ -23,6 +23,11 @@ final class Native {
 
     /** False once the core thread has returned (card gone, USB error). */
     static native boolean running(long handle);
+
+    /** After running() turned false: true when new link settings ended the
+     *  link and the next one started on the same open card; false means
+     *  stop and start over. */
+    static native boolean relink(long handle);
 
     static native String lastError();
 
