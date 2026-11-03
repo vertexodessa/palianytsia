@@ -12,7 +12,7 @@ channels = [40, 64, 112, 144]   # the channel set: the drone parks on a member, 
                                 # (weather radar) left out. A CPE510 relay cannot tune 144: drop it here.
                                 # PROVISIONAL until bench row 8 (maburcal on 64 and 112; swap 64 for 128
                                 # if it fails), docs/channel-select.md "Config".
-channel  = 40                   # pal: pinned, devourer-sys cannot retune yet; pal live --ch must equal it. "auto" = measure the set at start and move the link to the cleanest
+channel  = 40                   # pal: pinned. pal-desktop and the APKs run the channel core, which moves the link here and never hops; `pal live` has no channel core, so its --ch must equal the pin. "auto" = measure the set at start and move the link to the cleanest
                                 # member once (boot hop); a member number = pin the link there.
                                 # Either way the link first forms wherever the drone is found, then
                                 # a hop order moves it to the pick or the pin. A pinned member is static:

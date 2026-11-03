@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Palianytsia: a Rust ground station for the mabur FPV link (spec and milestone
-status: `docs/spec.md`; read its M1/M2 status sections first).
+status: `docs/spec.md`; read its "Status (2026-11-03)" section first; the dated M-notes are history).
 
 ## Layout
 | Path | Role |

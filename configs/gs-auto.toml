@@ -1,5 +1,6 @@
-# Phone/Quest default: configs/gs.toml with channel = "auto", so the GS finds the drone
-# on any member of radio.channels (crates/runtime search). The parity gates keep gs.toml.
+# Phone/Quest/desktop default: configs/gs.toml with channel = "auto": the channel core finds the
+# drone on any member of radio.channels, picks the cleanest and hops in flight. The parity gates
+# keep gs.toml.
 # maburgs — ground-station link daemon configuration (/etc/maburgs.toml)
 #
 # maburgs refuses to start on an unknown or misspelled key, and restarts
@@ -13,7 +14,7 @@ channels = [40, 64, 112, 144]   # the channel set: the drone parks on a member, 
                                 # (weather radar) left out. A CPE510 relay cannot tune 144: drop it here.
                                 # PROVISIONAL until bench row 8 (maburcal on 64 and 112; swap 64 for 128
                                 # if it fails), docs/channel-select.md "Config".
-channel  = "auto"               # pal (Rust core): sweep radio.channels for the drone at start and after 8 s without its frames, then stay; no boot hop yet. "auto" in mabur = measure the set at start and move the link to the cleanest
+channel  = "auto"               # pal: the channel core, as in mabur (a spotter on "auto" still sweeps the set: 400 ms per member, again after 8 s without drone frames). "auto" = measure the set at start and move the link to the cleanest
                                 # member once (boot hop); a member number = pin the link there.
                                 # Either way the link first forms wherever the drone is found, then
                                 # a hop order moves it to the pick or the pin. A pinned member is static:

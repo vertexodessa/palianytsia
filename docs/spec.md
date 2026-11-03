@@ -1,6 +1,6 @@
 # Palianytsia: a Rust ground-station client for mabur
 
-Status: Draft 2, 2026-10-31 (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
+Status: Draft 2, 2026-10-31; current state in "Status (2026-11-03)" below (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
 The name is a choice, not decoration: the word is the 2022 shibboleth used to tell a Russian speaker from a Ukrainian one, and no Russian military unit will want it on a ground station.
 Paths like `exp-orig-backport/...`, `exp-mabur-fluke-pxp/...` and `devourer_stack/...` are on the author's machine, relative to `/mnt/sdb2/moved_from_ssd/home/ihor/build/drone/BUILD/devourer_stack/` (`devourer_stack/...` relative to its parent `BUILD/`); palianytsia itself is the sibling `BUILD/palianytsia`. Verified 2026-11-01: `exp-mabur-fluke-pxp/pixelpilot` is at e2d0c90, `exp-orig-backport/pixelpilot` at 33978f8, `devourer_stack/openipc-rs` at v0.1.40+1.
 Home: `vertexodessa/palianytsia`, a **private** GitHub repo (not OpenIPC, not this workspace). The mabur and devourer forks it pins stay public.
@@ -11,6 +11,28 @@ Sources read for this draft:
 - openipc-rs `devourer_stack/openipc-rs` (v0.1.40, upstream last commit 2026-07-10).
 
 The unify tree (RC 21, `T_CFG_SET`/`T_LOG`, `phone_wall_us`) is a reference only. This app does not speak it.
+
+## Status (2026-11-03)
+
+The dated milestone notes in sections 10 and 14 are history: each says what was true that day, and
+their "not ported" / "still owed" lines are superseded by later ones. The current state:
+
+- M0-M2 done. Desktop (`pal-desktop`, `pal`) flies the quad on the Rust core, 1..N cards; ref==rust
+  byte parity on every capture (`tools/m1-replay.sh`, local only: captures never go to GitHub).
+  NV12/I420 planes go to GL textures and convert in a shader (b7370f5); VA-API still untested.
+- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.5, signed APKs). The G2G and RCF-heard
+  comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
+- M3b (latency block in a matched mabur release): not started.
+- M4, done: the channel core (Rust port of ChannelCore/scout/hop, checked against mabur's record by
+  record in `pal-ref/tests/chan_trace.rs`), the channel menu and scan, TxSelector, per-card OSD
+  (frames/s, CRC, DEAF) and `card_deaf` flight-log events, MAVLink telemetry widgets, TX-power
+  calibration with the channel pick. Not done: GS-side DVR, VTX recording control beyond the
+  REC_* parameters, preflight.
+- M5: the parameter client is done; MSP OSD and Quest hand tracking are not.
+- Owed on hardware (none run on air yet): TxSelector switching, field calibration at distance,
+  the Quest relink with the cards kept open, card_deaf on a real deaf card.
+- Deferred (would change original mabur): the calibration measure card chosen by role at request
+  time, a hop right after a rung climb.
 
 ---
 
