@@ -75,7 +75,7 @@ pairing key.
   the drone toml and S96mabur are carried over from v0.4 (the release branch bundle files are older than base's).
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
-  `release/notes/<tag>.md`. Before tagging: bump both APK `versionName`, head `release/README.md` with `# Palianytsia <tag>`, write the
+  `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally (CI has no captures and never will: no recordings on GitHub), bump both APK `versionName`, head `release/README.md` with `# Palianytsia <tag>`, write the
   notes, pin the fork commit. The IMX415 driver is an asset of the `deps` release (sha in `release/`). Run workflow_dispatch with a tag
   for a dry run (package as an artifact, nothing published).
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.

@@ -2,6 +2,7 @@ name: release
 # A tag vX.Y or vX.Y.Z builds every part of the release, packs it with
 # tools/pack-release.sh and publishes a GitHub release with the tarball, the
 # loose files and release/notes/<tag>.md as its text. Before tagging:
+# tools/m1-replay.sh passes locally (captures never go to GitHub);
 # release/README.md heads "# Palianytsia <tag>", release/notes/<tag>.md
 # exists, both APKs carry versionName X.Y.Z, release/MABUR_RELEASE names
 # the fork commit (a release/vX.Y branch commit, palianytsia/base without

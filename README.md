@@ -81,7 +81,7 @@ Captures are not in git; `tools/m1-replay.sh` reads `PAL_CAPTURES` and exits
 Pushing a tag `vX.Y` or `vX.Y.Z` runs `.github/workflows/release.yml`: the
 gates, maburd, signed APKs and the static desktop, packed by
 `tools/pack-release.sh` and published with `release/notes/<tag>.md`. Before
-tagging, bump both APKs' `versionName`, head `release/README.md` with
+tagging, run `tools/m1-replay.sh` locally (captures stay off GitHub, so CI cannot), bump both APKs' `versionName`, head `release/README.md` with
 `# Palianytsia <tag>`, write the notes and pin the fork commit. Running the
 workflow by hand with a tag is a dry run that keeps the package as an
 artifact.
