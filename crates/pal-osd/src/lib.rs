@@ -465,21 +465,47 @@ impl History {
     }
 }
 
-fn chip(ui: &mut Ui, label: &str, text: &str, color: Color32) {
-    chip_frame(ui, label, text, color);
+/// One stats chip: what it says, before placement.
+struct Chip {
+    label: &'static str,
+    text: String,
+    color: Color32,
+    hover: Option<String>,
 }
 
-fn chip_hover(ui: &mut Ui, label: &str, text: &str, color: Color32, hover: &str) {
-    chip_frame(ui, label, text, color).on_hover_text(hover);
+/// Columns of each chip's text, the longest text it shows in flight, so a
+/// chip never changes size when a number gains or loses a digit and the
+/// operator can park it next to another without the two colliding later.
+/// A calibration line or a many-card row can still be longer and widens its
+/// chip while it lasts.
+fn chip_cols(label: &str, n_cards: usize) -> usize {
+    match label {
+        // "rung 12 MCS7 40M", "spotter MCS7 40M"
+        "link" => 16,
+        // "-100 dBm  SNR 30"
+        "signal" => 16,
+        "cards" => n_cards * CARD_COLS + 2 * n_cards.saturating_sub(1),
+        // "trunc 100.0 %  salv 9999  pre 100.0 %  post 100.0 %"
+        "loss" => 49,
+        // "120 fps  99.9 Mbit/s  dec err 999"
+        "video" => 33,
+        // "rendezvous  100 C"
+        "drone" => 17,
+        // "wait 100 %  rtt 1000 ms"
+        "uplink" => 23,
+        // "fill 99999  9999/s"
+        "nack" => 18,
+        "up" => UP_WIDTH,
+        _ => 0,
+    }
 }
 
-fn chip_frame(ui: &mut Ui, label: &str, text: &str, color: Color32) -> egui::Response {
-    let text = &steady(ui, label, text);
-    // horizontal_wrapped cannot see a Frame's width before it is drawn, so
-    // on a narrow screen (the phone, ~890 points) the last chips ran off
-    // the edge. Measure the two labels and break the row ourselves.
-    let style = ui.style().clone();
-    let w = |t: egui::RichText| {
+/// One card's entry in the cards chip: "c0 TX -100 dBm 999/s crc 99 %".
+const CARD_COLS: usize = 29;
+
+/// Size of a chip whose text is `cols` monospace columns.
+fn chip_size(ui: &Ui, label: &str, cols: usize) -> Vec2 {
+    let galley = |t: egui::RichText| {
         egui::WidgetText::from(t)
             .into_galley(
                 ui,
@@ -488,40 +514,94 @@ fn chip_frame(ui: &mut Ui, label: &str, text: &str, color: Color32) -> egui::Res
                 egui::TextStyle::Body,
             )
             .size()
-            .x
     };
-    let need = w(egui::RichText::new(label).small())
-        + w(egui::RichText::new(text).monospace())
-        + style.spacing.item_spacing.x
-        + 2.0 * 6.0;
-    if need > ui.available_size_before_wrap().x && ui.cursor().min.x > ui.max_rect().min.x + 1.0 {
-        ui.end_row();
-    }
+    let l = galley(egui::RichText::new(label).small());
+    let t = galley(egui::RichText::new(" ".repeat(cols.max(1))).monospace());
+    Vec2::new(
+        l.x + t.x + ui.spacing().item_spacing.x + 2.0 * 6.0,
+        l.y.max(t.y) + 2.0 * 3.0,
+    )
+}
+
+fn draw_chip(ui: &mut Ui, c: &Chip, cols: usize) -> egui::Response {
     egui::Frame::NONE
         .fill(Color32::from_black_alpha(160))
         .corner_radius(4.0)
         .inner_margin(Vec2::new(6.0, 3.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(label).small().color(Color32::GRAY));
-                ui.label(egui::RichText::new(text).monospace().color(color));
+                ui.label(egui::RichText::new(c.label).small().color(Color32::GRAY));
+                ui.label(
+                    egui::RichText::new(format!("{:<cols$}", c.text))
+                        .monospace()
+                        .color(c.color),
+                );
             });
         })
         .response
 }
 
-/// `text` padded to the longest text this chip has shown: a chip that
-/// shrinks when a number loses a digit moves every chip after it, so a chip
-/// only ever grows (monospace, so characters are columns).
-fn steady(ui: &Ui, label: &str, text: &str) -> String {
-    let id = egui::Id::new(("chip-width", label));
-    let n = text.chars().count();
-    let w = ui.ctx().data_mut(|d| {
-        let m = d.get_temp_mut_or(id, 0usize);
-        *m = (*m).max(n);
-        *m
-    });
-    format!("{text:<w$}")
+/// Lays the chips out and draws each in its own Area: an unmoved chip
+/// takes the next place in rows that wrap at the right edge of `region`, a
+/// moved one sits at its `pos` offset from `region`'s top-left, which may
+/// be outside `region` (anywhere on the egui screen). Dragging a chip moves
+/// it, a double click puts it back in the row. Returns the height of the
+/// rows and whether `pos` changed (the caller saves the prefs).
+fn place_chips(
+    ui: &Ui,
+    region: Rect,
+    chips: &[Chip],
+    n_cards: usize,
+    pos: &mut std::collections::BTreeMap<String, [f32; 2]>,
+) -> (f32, bool) {
+    let gap = ui.spacing().item_spacing;
+    let (mut x, mut y, mut row_h) = (region.min.x, region.min.y, 0.0f32);
+    let mut changed = false;
+    for c in chips {
+        let cols = chip_cols(c.label, n_cards).max(c.text.chars().count());
+        let size = chip_size(ui, c.label, cols);
+        let at = if let Some(&[dx, dy]) = pos.get(c.label) {
+            region.min + Vec2::new(dx, dy)
+        } else {
+            if x + size.x > region.max.x && x > region.min.x + 1.0 {
+                x = region.min.x;
+                y += row_h + gap.y;
+                row_h = 0.0;
+            }
+            let p = Pos2::new(x, y);
+            x += size.x + gap.x;
+            row_h = row_h.max(size.y);
+            p
+        };
+        let id = egui::Id::new(("pal-chip", c.label));
+        egui::Area::new(id)
+            .order(egui::Order::Middle)
+            .fixed_pos(at)
+            .show(ui.ctx(), |ui| {
+                let r = draw_chip(ui, c, cols);
+                let r = ui.interact(r.rect, id.with("drag"), egui::Sense::click_and_drag());
+                if r.dragged() {
+                    let d = r.drag_delta();
+                    let o = at - region.min + d;
+                    pos.insert(c.label.to_string(), [o.x, o.y]);
+                }
+                if r.drag_stopped() {
+                    changed = true;
+                }
+                if r.double_clicked() && pos.remove(c.label).is_some() {
+                    changed = true;
+                }
+                if let Some(h) = &c.hover {
+                    r.on_hover_text(h.as_str());
+                }
+            });
+    }
+    let h = if row_h > 0.0 {
+        y + row_h - region.min.y
+    } else {
+        0.0
+    };
+    (h, changed)
 }
 
 /// What the pairing-key banner says, if anything (F5): a mismatch is an
@@ -579,14 +659,30 @@ const UP_WIDTH: usize = 46;
 /// How long the signal chip keeps the last rssi/SNR through null windows.
 pub(crate) const SIGNAL_HOLD_S: f64 = 1.5;
 
-/// The top OSD row: link, signal, loss, uplink side.
+/// The stats chips: link, signal, loss, uplink side, laid out from the top
+/// of `ui`'s rect (see `place_chips`; `pos` is `HudPrefs::chip_pos`). The
+/// rows' height is allocated in `ui`, so what the caller adds next lands
+/// below them. Returns true when the operator moved a chip: save the prefs.
 /// `kbps`: the received video bitrate (runtime::Shared::rx_kbps).
-pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) {
-    let Some(s) = h.last() else {
-        chip(ui, "core", "waiting for stats", WARN);
-        return;
+pub fn chips(
+    ui: &mut Ui,
+    pos: &mut std::collections::BTreeMap<String, [f32; 2]>,
+    h: &History,
+    fps: f64,
+    kbps: f64,
+    decode: (u64, u64),
+) -> bool {
+    let mut out: Vec<Chip> = Vec::new();
+    let mut n_cards = 0;
+    let mut chip = |label: &'static str, text: &str, color: Color32, hover: Option<String>| {
+        out.push(Chip {
+            label,
+            text: text.to_string(),
+            color,
+            hover,
+        })
     };
-    ui.horizontal_wrapped(|ui| {
+    if let Some(s) = h.last() {
         let cal = s.cal.as_ref().and_then(cal::CalView::hud_line);
         let (link, c) = if s.key_mismatch {
             ("KEY MISMATCH".to_string(), BAD)
@@ -600,14 +696,13 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
         } else {
             ("beaconing".to_string(), WARN)
         };
-        chip(ui, "link", &link, c);
+        chip("link", &link, c, None);
         let held = h.signal(SIGNAL_HOLD_S);
         let sig = match held {
             Some((r, n)) => format!("{r:>4.0} dBm  SNR {n:>2.0}"),
             None => "no signal".into(),
         };
         chip(
-            ui,
             "signal",
             &sig,
             if held.is_some_and(|(_, n)| n > 15.0) {
@@ -615,15 +710,17 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
             } else {
                 WARN
             },
+            None,
         );
         let rates = h.card_rates();
         if !rates.is_empty() {
             let deaf = rates.iter().any(|c| c.deaf);
+            n_cards = rates.len();
             chip(
-                ui,
                 "cards",
                 &cards_line(&rates, s.tx_card),
                 if deaf { BAD } else { OK },
+                None,
             );
         }
         let total = s.aus + s.trunc;
@@ -640,7 +737,6 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
             loss += &format!("  post {}", self::pct(r));
         }
         chip(
-            ui,
             "loss",
             &loss,
             if pct < 2.0 {
@@ -650,9 +746,9 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
             } else {
                 BAD
             },
+            None,
         );
         chip(
-            ui,
             "video",
             &format!(
                 "{fps:>3.0} fps  {:>4.1} Mbit/s  dec err {:>3}",
@@ -660,6 +756,7 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
                 decode.1
             ),
             OK,
+            None,
         );
         if let Some(d) = s.drone_state {
             let mut c = if d == 2 { OK } else { WARN };
@@ -672,7 +769,7 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
                     c = c.max_warn();
                 }
             }
-            chip(ui, "drone", &t, c);
+            chip("drone", &t, c, None);
         }
         if s.mode == "gs" {
             let mut up = match s.uplink_pct {
@@ -687,12 +784,12 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
                 ("ok", _) | ("wait", _) | ("none", _) => WARN,
                 _ => BAD,
             };
-            chip(ui, "uplink", &up, c);
+            chip("uplink", &up, c, None);
             let mut nack = format!("fill {:>5}", s.nack_fill);
             if let Some(r) = s.nack_fill_pps {
                 nack += &format!("  {r:>4.0}/s");
             }
-            chip(ui, "nack", &nack, OK);
+            chip("nack", &nack, OK, None);
         }
         if let (true, Some(l)) = (s.session, s.ladder.as_ref()) {
             let (txt, blocked) = l.summary();
@@ -703,17 +800,15 @@ pub fn chips(ui: &mut Ui, h: &History, fps: f64, kbps: f64, decode: (u64, u64)) 
                     *age as f64 / 1000.0
                 );
             }
-            // Last in the row and padded: its text length changes every
-            // window, and a chip before others would make them all jump.
-            chip_hover(
-                ui,
-                "up",
-                &format!("{txt:<UP_WIDTH$}"),
-                if blocked { WARN } else { OK },
-                &hover,
-            );
+            chip("up", &txt, if blocked { WARN } else { OK }, Some(hover));
         }
-    });
+    } else {
+        chip("core", "waiting for stats", WARN, None);
+    }
+    let region = ui.max_rect();
+    let (height, moved) = place_chips(ui, region, &out, n_cards, pos);
+    ui.allocate_space(Vec2::new(region.width(), height));
+    moved
 }
 
 fn plot(ui: &mut Ui, title: &str, pts: &[(f64, f64)], now: f64, color: Color32) {
@@ -777,6 +872,113 @@ pub fn monitor(ui: &mut Ui, h: &History, now: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One egui frame of the chips over a 1280x720 screen, `region` the
+    /// chips' rect; returns whether `chips` reported a move.
+    fn chip_frame(
+        ctx: &egui::Context,
+        region: Rect,
+        pos: &mut std::collections::BTreeMap<String, [f32; 2]>,
+        h: &History,
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 720.0))),
+            events,
+            ..Default::default()
+        };
+        let mut moved = false;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(region), |ui| {
+                        moved = chips(ui, pos, h, 120.0, 9000.0, (100, 0));
+                    });
+                });
+        });
+        moved
+    }
+
+    fn chip_rect(ctx: &egui::Context, label: &str) -> Rect {
+        ctx.memory(|m| m.area_rect(egui::Id::new(("pal-chip", label))))
+            .expect("chip drawn")
+    }
+
+    #[test]
+    fn chips_keep_their_size_and_drag_anywhere() {
+        let ctx = egui::Context::default();
+        let region = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(600.0, 400.0));
+        let mut pos = Default::default();
+        let mut h = History::default();
+        let snap = |trunc, salv| Snapshot {
+            mode: "gs".into(),
+            session: true,
+            aus: 1000,
+            trunc,
+            salvaged: salv,
+            uplink: "ok".into(),
+            ..Default::default()
+        };
+        h.push(0.0, snap(0, 0));
+        chip_frame(&ctx, region, &mut pos, &h, vec![]);
+        chip_frame(&ctx, region, &mut pos, &h, vec![]);
+        let loss = chip_rect(&ctx, "loss");
+        let video = chip_rect(&ctx, "video");
+        // More digits and the pre/post fields do not resize the chip.
+        h.push(
+            1.0,
+            Snapshot {
+                pre_fec_loss: Some(0.123),
+                residual: Some(0.01),
+                ..snap(150, 1234)
+            },
+        );
+        chip_frame(&ctx, region, &mut pos, &h, vec![]);
+        assert_eq!(chip_rect(&ctx, "loss"), loss);
+        // The rows wrap inside the region.
+        assert!(loss.max.x <= region.max.x && video.min.x >= region.min.x);
+        assert!(video.min.y > loss.min.y || video.min.x > loss.max.x);
+
+        // Drag the video chip to the screen's left of the region.
+        let p0 = video.center();
+        let mv = |p: Pos2| egui::Event::PointerMoved(p);
+        let btn = |p: Pos2, pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        chip_frame(&ctx, region, &mut pos, &h, vec![mv(p0)]);
+        chip_frame(&ctx, region, &mut pos, &h, vec![btn(p0, true)]);
+        let mut moved = false;
+        for i in 1..=10 {
+            let p = p0 + Vec2::new(-15.0 * i as f32, 20.0 * i as f32);
+            moved |= chip_frame(&ctx, region, &mut pos, &h, vec![mv(p)]);
+        }
+        let end = p0 + Vec2::new(-150.0, 200.0);
+        moved |= chip_frame(&ctx, region, &mut pos, &h, vec![btn(end, false)]);
+        assert!(moved, "a drag reports a move");
+        let [dx, dy] = pos["video"];
+        let want = video.min - region.min + Vec2::new(-150.0, 200.0);
+        assert!(
+            (dx - want.x).abs() < 0.5 && (dy - want.y).abs() < 0.5,
+            "{dx},{dy} vs {want:?}"
+        );
+        chip_frame(&ctx, region, &mut pos, &h, vec![]);
+        let r = chip_rect(&ctx, "video");
+        assert!(r.min.x < region.min.x, "outside the region: {r:?}");
+        assert_eq!(r.size(), video.size());
+
+        // A double click puts it back in the row.
+        let c = r.center();
+        let mut back = false;
+        for _ in 0..2 {
+            back |= chip_frame(&ctx, region, &mut pos, &h, vec![mv(c), btn(c, true)]);
+            back |= chip_frame(&ctx, region, &mut pos, &h, vec![btn(c, false)]);
+        }
+        assert!(back && pos.is_empty());
+    }
 
     #[test]
     fn parses_rust_core_line() {

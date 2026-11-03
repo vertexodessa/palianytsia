@@ -32,6 +32,10 @@ pub struct HudPrefs {
     /// (`link.s3_demote`), applied when the link starts. On the bench it
     /// caused 15 of 24 demotes with the base layer clean (2026-11-03).
     pub s3_demote: bool,
+    /// Stats chips the operator dragged away from their row: chip label to
+    /// offset in points from the video's top-left corner (may lie outside
+    /// the video). A chip not in the map keeps its place in the row.
+    pub chip_pos: std::collections::BTreeMap<String, [f32; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,6 +79,7 @@ impl Default for HudPrefs {
             link_channels: Vec::new(),
             video_filter: VideoFilter::Off,
             s3_demote: true,
+            chip_pos: Default::default(),
         }
     }
 }
@@ -87,6 +92,7 @@ impl HudPrefs {
             "stats": self.stats, "scale": self.scale, "link_bw": self.link_bw,
             "link_channels": self.link_channels,
             "video_filter": self.video_filter.key(), "s3_demote": self.s3_demote,
+            "chip_pos": self.chip_pos,
         })
         .to_string()
     }
@@ -131,6 +137,20 @@ impl HudPrefs {
                 v.get("video_filter").and_then(Value::as_str).unwrap_or(""),
             ),
             s3_demote: b("s3_demote", d.s3_demote),
+            chip_pos: v
+                .get("chip_pos")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, p)| {
+                            let a = p.as_array()?;
+                            let x = a.first()?.as_f64()? as f32;
+                            let y = a.get(1)?.as_f64()? as f32;
+                            (x.is_finite() && y.is_finite()).then(|| (k.clone(), [x, y]))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -160,6 +180,7 @@ mod tests {
             link_channels: vec![144, 40],
             video_filter: super::VideoFilter::Supersample,
             s3_demote: false,
+            chip_pos: [("loss".to_string(), [-120.5, 40.0])].into(),
             ..Default::default()
         };
         assert_eq!(HudPrefs::from_json(&p.to_json()), p);

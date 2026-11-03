@@ -371,7 +371,10 @@ pub fn gear(ctx: &egui::Context, p: &mut Panel) {
     if p.open {
         return;
     }
+    // Foreground: the stats chips are Middle Areas the operator may drag
+    // anywhere, and the gear and the panel must stay above them.
     egui::Area::new(egui::Id::new("pal-gear"))
+        .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-8.0, 0.0))
         .show(ctx, |ui| {
             let b = egui::Button::new(RichText::new("⚙").size(22.0))
@@ -408,6 +411,7 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
     let screen = ctx.screen_rect();
     let w = width(screen);
     egui::Area::new(egui::Id::new("pal-panel"))
+        .order(egui::Order::Foreground)
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             egui::Frame::NONE

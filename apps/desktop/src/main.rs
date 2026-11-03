@@ -515,6 +515,7 @@ impl eframe::App for App {
                     }
                 });
         }
+        let mut chips_moved = false;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
@@ -579,8 +580,9 @@ impl eframe::App for App {
                     let top = vr.shrink(8.0).translate(egui::vec2(0.0, 40.0));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
                         if self.console.prefs.stats {
-                            pal_osd::chips(
+                            chips_moved = pal_osd::chips(
                                 ui,
+                                &mut self.console.prefs.chip_pos,
                                 &self.console.hist,
                                 self.fps,
                                 self.shared.rx_kbps(),
@@ -591,6 +593,9 @@ impl eframe::App for App {
                     });
                 }
             });
+        if chips_moved {
+            self.console.save_prefs();
+        }
         if self.console.prefs.stats {
             egui::Area::new(egui::Id::new("telem"))
                 .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -120.0))

@@ -202,6 +202,7 @@ pub fn run(o: OsdIn) {
         let dec = (frames, o.shared.dec_errors.load(Ordering::Relaxed));
         let mut pout = pal_osd::panel::PanelOut::default();
         let mut stats_flip = false;
+        let mut chips_moved = false;
         let out = ctx.run(input, |ctx| {
             pal_osd::panel::gear(ctx, &mut console.panel);
             let link_info = format!(
@@ -226,11 +227,12 @@ pub fn run(o: OsdIn) {
                         console.prefs.stats = !console.prefs.stats;
                         stats_flip = true;
                     }
-                    let c = &console;
+                    let c = &mut console;
                     let hist = &c.hist;
                     let r = pal_osd::panel::hud_rect(ctx, &c.panel, ui.max_rect());
                     pal_osd::hud::hud(ui, r, ui.max_rect().center(), &c.telem, hist, now, &c.prefs);
                     let stats = c.prefs.stats;
+                    let chip_pos = &mut c.prefs.chip_pos;
                     let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
                     let searching = o.shared.searching.load(Ordering::Relaxed);
                     if stats || mismatch || searching {
@@ -244,7 +246,14 @@ pub fn run(o: OsdIn) {
                                 );
                             }
                             if stats {
-                                pal_osd::chips(ui, hist, fps, o.shared.rx_kbps(), dec);
+                                chips_moved = pal_osd::chips(
+                                    ui,
+                                    chip_pos,
+                                    hist,
+                                    fps,
+                                    o.shared.rx_kbps(),
+                                    dec,
+                                );
                             }
                             pal_osd::key_banner(ui, hist);
                         });
@@ -252,7 +261,7 @@ pub fn run(o: OsdIn) {
                 });
         });
         console.settle(&mut pout, Some(&o.cmd_tx));
-        if stats_flip && !pout.prefs_changed {
+        if (stats_flip || chips_moved) && !pout.prefs_changed {
             console.save_prefs();
         }
         if pout.relink {

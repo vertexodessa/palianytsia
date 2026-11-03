@@ -20,15 +20,25 @@ use pal_osd::panel::Panel;
 use crate::input::Frame;
 use crate::supervisor::{Hub, LinkUi};
 
-/// Swapchain size in pixels and egui points per pixel: 1280x720 points,
-/// so pal-osd's sizes match a 720p screen.
-pub const W: u32 = 1920;
-pub const H: u32 = 1080;
+/// The OSD quad is SPAN times the video quad in each direction, centred
+/// on it, so stats chips can be parked beside the picture.
+pub const SPAN: f32 = 1.5;
+
+/// Swapchain size in pixels and egui points per pixel: the video part is
+/// 1280x720 points, so pal-osd's sizes match a 720p screen.
+pub const W: u32 = 2880;
+pub const H: u32 = 1620;
 const PPP: f32 = 1.5;
 
 /// The OSD's size in egui points.
 pub fn points() -> egui::Vec2 {
     egui::vec2(W as f32 / PPP, H as f32 / PPP)
+}
+
+/// Where the video quad lies on the OSD, in points.
+pub fn video_rect() -> egui::Rect {
+    let p = points();
+    egui::Rect::from_center_size((p / 2.0).to_pos2(), p / SPAN)
 }
 
 pub struct Osd {
@@ -242,15 +252,17 @@ impl Osd {
                 l.shared.dec_errors.load(Ordering::Relaxed),
             )
         });
+        let mut chips_moved = false;
         let out = self.ctx.run(input, |ctx| {
             pout = console.show_panel(ctx, link_info.clone(), log_info.clone(), channels);
-            let c = &*console;
-            let (hist, telem, prefs, panel) = (&c.hist, &c.telem, &c.prefs, &c.panel);
+            let c = &mut *console;
+            let (hist, telem, prefs, panel) = (&c.hist, &c.telem, &mut c.prefs, &c.panel);
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
-                    let r = pal_osd::panel::hud_rect(ctx, panel, ui.max_rect());
-                    pal_osd::hud::hud(ui, r, ui.max_rect().center(), telem, hist, now, prefs);
+                    let vr = video_rect();
+                    let r = pal_osd::panel::hud_rect(ctx, panel, vr);
+                    pal_osd::hud::hud(ui, r, vr.center(), telem, hist, now, prefs);
                     let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
                     if prefs.stats || mismatch || !status.is_empty() {
                         let top = r.shrink(8.0).translate(egui::vec2(0.0, 36.0));
@@ -264,7 +276,8 @@ impl Osd {
                                 );
                             }
                             if prefs.stats {
-                                pal_osd::chips(ui, hist, fps, kbps, dec);
+                                chips_moved =
+                                    pal_osd::chips(ui, &mut prefs.chip_pos, hist, fps, kbps, dec);
                             }
                             pal_osd::key_banner(ui, hist);
                         });
@@ -287,6 +300,9 @@ impl Osd {
         });
         self.console
             .settle(&mut pout, self.link.as_ref().map(|l| &l.ports.cmd_tx));
+        if chips_moved && !pout.prefs_changed {
+            self.console.save_prefs();
+        }
         if pout.relink {
             hub.relink.store(true, Ordering::Relaxed);
         }

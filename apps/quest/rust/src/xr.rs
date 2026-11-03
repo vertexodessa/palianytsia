@@ -186,8 +186,11 @@ fn video_swapchain(
     Ok((sc, win))
 }
 
+/// `span`: the quad's size as a multiple of the video screen's.
+#[allow(clippy::too_many_arguments)]
 fn quad(
     scr: &Screen,
+    span: f32,
     space: sys::Space,
     sc: sys::Swapchain,
     w: u32,
@@ -226,8 +229,8 @@ fn quad(
             },
         },
         size: sys::Extent2Df {
-            width: scr.width_m,
-            height: scr.width_m * 9.0 / 16.0,
+            width: scr.width_m * span,
+            height: scr.width_m * span * 9.0 / 16.0,
         },
     }
 }
@@ -543,7 +546,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 &space,
                 fs.predicted_display_time,
                 scr.dist_m,
-                scr.width_m,
+                scr.width_m * crate::osd::SPAN,
                 crate::osd::points(),
             )
         });
@@ -591,6 +594,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         if let Some(sc) = video {
             quads.push(quad(
                 &scr,
+                1.0,
                 space.as_raw(),
                 sc,
                 VW,
@@ -602,6 +606,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         if let Some(o) = osd.as_ref().filter(|o| o.ready) {
             quads.push(quad(
                 &scr,
+                crate::osd::SPAN,
                 space.as_raw(),
                 o.sc.as_raw(),
                 crate::osd::W,
