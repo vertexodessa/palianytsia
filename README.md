@@ -27,7 +27,7 @@ the decisions and the milestones are in [docs/spec.md](docs/spec.md).
 | `apps/phone` | phone app: Rust cdylib + Java shell |
 | `apps/quest` | Quest 3 app: Rust NativeActivity (OpenXR) |
 | `release/` | what a release carries besides the builds: package README, notes per tag, drone config and init script, the fork commit maburd is built from |
-| `third_party/mabur`, `third_party/devourer` | pinned submodules of the vertexodessa forks: mabur on branch `palianytsia/base-v2` (upstream master c8e2d20e plus Palianytsia's commits, RC_VERSION 18), devourer on `palianytsia/base` |
+| `third_party/mabur`, `third_party/devourer` | pinned submodules of the vertexodessa forks: mabur on branch `palianytsia/base-v2` (upstream master plus Palianytsia's commits, RC_VERSION 18), devourer on `palianytsia/base` |
 | `third_party/libusb` | upstream libusb v1.0.27, Android builds only |
 
 Clone with submodules:
@@ -70,7 +70,11 @@ cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 tools/m0-parity.sh     # pal-ref == mabur's own webgs replay
 tools/m1-replay.sh     # Rust core == C++ reference on recorded captures
+tools/doc-check.sh     # the facts the docs repeat (pins, RC_VERSION, release, paths) match the tree
 ```
+
+Facts that live in the tree (submodule pins, `RC_VERSION`, versions) are not copied into
+the docs; where a doc must name one, `tools/doc-check.sh` holds it to the tree.
 
 Every core change keeps the Rust core byte-identical to the C++ reference.
 Captures are not in git; `tools/m1-replay.sh` reads `PAL_CAPTURES` and exits

@@ -37,8 +37,8 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   calibration with the channel pick. Not done: GS-side DVR, VTX recording control beyond the
   REC_* parameters, preflight.
 - M5: the parameter client is done; MSP OSD and Quest hand tracking are not.
-- Pins now: mabur `palianytsia/base-v2` @ 8d599432 (upstream master c8e2d20e plus ours, RC 18), devourer
-  `palianytsia/base` @ c2fd35b. Releases build maburd from `release/MABUR_RELEASE` (v0.7: `release/v0.7` @ ae590193).
+- Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
+  builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).
 - Owed on hardware (none run on air yet): TxSelector switching, field calibration at distance,
   the Quest relink with the cards kept open, card_deaf on a real deaf card.
@@ -424,7 +424,7 @@ C++ units the Rust core replaces (h+cpp lines, pinned tree): rc_proto 787, sbi 1
 
 Decided 2026-10-31:
 1. **Licence:** not a blocker; gilankpam is a friend of the project. Still ask for a LICENSE file in mabur before anything derived from it goes public. Palianytsia itself links devourer (GPL-2.0, read as GPL-2.0-only), so it is GPL-2.0; `cargo-deny` in CI rejects Apache-2.0-only dependencies.
-2. **Pins:** branch `palianytsia/base` in both public forks, pushed 2026-10-31 (superseded on 2026-11-03: mabur moved to `palianytsia/base-v2`, a rebase onto upstream master c8e2d20e; current pins in Status):
+2. **Pins:** branch `palianytsia/base` in both public forks, pushed 2026-10-31 (superseded on 2026-11-03: mabur moved to `palianytsia/base-v2`, a rebase onto upstream master c8e2d20e; current pins: `git submodule status`):
    - `vertexodessa/mabur` @ `51cea32f`: gilankpam master `f901ee2a` + 4 commits (maburd build stamp, toml list, `venc.mirror`/`venc.flip`, MSP FC telemetry over T_MAV), RC 18, the build the quad flies.
    - `vertexodessa/devourer` @ `5deca84`: identical to gilankpam/devourer master.
 3. **Core strategy C:** the Rust core is the product; `pal-ref` (C++ WebGs) is a test-only oracle and never ships.
@@ -483,7 +483,7 @@ The current mabur code is hard to maintain; the plan is to rewrite it later, dro
 
 - `pal-wire` and `pal-fec` are symmetric: they encode as well as decode, have no GS-only assumptions, and are `no_std + alloc`, so they build for the armv7 drone. The FEC encoder is tested against the C++ encoder's golden vectors from the start, even though the GS does not need it.
 - `pal-core` stays sans-IO, so the drone-side controller can be built the same way.
-- A written wire spec, `docs/wire.md`, lives in the Palianytsia repo, derived from the code and checked by the golden vectors. Today the wire exists only as C++. The document becomes the contract once a Rust drone replaces maburd.
+- A written wire spec (planned as docs/wire.md, not written yet) lives in the Palianytsia repo, derived from the code and checked by the golden vectors. Today the wire exists only as C++. The document becomes the contract once a Rust drone replaces maburd.
 - After the rewrite, `pal-ref` (the C++ oracle) retires, and the wire may drop what the C++ carries for history (for example two 802.11 frame types for drone frames).
 - Order: GS (this spec), then drone. Exit criterion for the drone rewrite: the same loss, ladder behaviour and latency chain numbers as maburd on the bench and in one flight, measured with section 13.
 - Risk to manage: maburd holds hardware knowledge that is not in any interface (MI VENC quirks, IDR storms, the txq IDR gate, the devourer bring-up race). The rewrite carries it from `mabur/docs/*findings*`, the vault and file memory, read before the matching module is written, not rediscovered in flight.
