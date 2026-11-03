@@ -71,6 +71,8 @@ pairing key.
   (`--fresh` forces those steps, `--remove` undoes them; an update keeps the drone's mabur.toml), GPU decode in the desktop;
   v0.4 = maburd from mabur `release/v0.4` (24e9d368 = `release/v0.2` + native readout), `sensor_imx415_star6e.ko`
   installed by `drone-install.sh` (patches the drone's `load_sigmastar`, original kept as `.palianytsia`), APKs 0.4.0.
+  v0.5 = maburd from mabur `release/v0.5` (61dba4ee = `release/v0.4` + RADIO_PWR_MODE + any 5 GHz grid channel), APKs 0.5.0;
+  the drone toml and S96mabur are carried over from v0.4 (the release branch bundle files are older than base's).
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
