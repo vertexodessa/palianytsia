@@ -11,6 +11,11 @@ mod input;
 #[cfg(target_os = "android")]
 mod osd;
 #[cfg(target_os = "android")]
+mod perf;
+// Called from xr (Android); host builds run its tests.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod rate;
+#[cfg(target_os = "android")]
 mod supervisor;
 #[cfg(target_os = "android")]
 mod usb;

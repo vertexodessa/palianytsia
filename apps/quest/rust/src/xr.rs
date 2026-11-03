@@ -142,23 +142,6 @@ fn asset(app: &AndroidApp, name: &str) -> Result<String, String> {
     Ok(s)
 }
 
-/// The display rate a video fps divides evenly (spec 5.6 "Frame rate"),
-/// or None while the fps is unknown.
-fn rate_for(fps: f64, offered: &[f32]) -> Option<f32> {
-    let want = if fps > 100.0 {
-        120.0
-    } else if fps > 75.0 {
-        90.0
-    } else if fps > 45.0 {
-        120.0
-    } else if fps > 20.0 {
-        90.0
-    } else {
-        return None;
-    };
-    offered.iter().copied().find(|r| (r - want).abs() < 1.0)
-}
-
 /// Surface swapchain plus its Android Surface as a NativeWindow.
 fn video_swapchain(
     inst: &xr::Instance,
@@ -371,6 +354,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     want.khr_opengl_es_enable = true;
     want.fb_display_refresh_rate = exts.fb_display_refresh_rate;
     want.fb_composition_layer_image_layout = exts.fb_composition_layer_image_layout;
+    want.meta_performance_metrics = exts.meta_performance_metrics;
     let inst = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -452,6 +436,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             None
         }
     };
+    let perf = crate::perf::PerfMetrics::new(&inst, &session);
     let mut scr = Screen::load(int_dir.join("screen.json"));
     let mut t_frame = Instant::now();
     let mut video: Option<sys::Swapchain> = None;
@@ -461,6 +446,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let (mut running, mut quit) = (false, false);
     let (mut frames, mut t_log) = (0u64, Instant::now());
     let mut rate = (0.0f32, Instant::now(), 0u64);
+    let mut fps_est = crate::rate::FpsEstimate::default();
     while !quit {
         drain_input(app);
         app.poll_events(Some(Duration::ZERO), |e| {
@@ -508,11 +494,12 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         if exts.fb_display_refresh_rate && rate.1.elapsed() >= Duration::from_secs(2) {
             let sh = hub.shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let f = sh.map_or(0, |s| s.frames.load(Ordering::Relaxed));
-            let fps = f.saturating_sub(rate.2) as f64 / rate.1.elapsed().as_secs_f64();
+            let fps =
+                fps_est.push(f.saturating_sub(rate.2) as f64 / rate.1.elapsed().as_secs_f64());
             let offered = session
                 .enumerate_display_refresh_rates()
                 .unwrap_or_default();
-            if let Some(r) = rate_for(fps, &offered) {
+            if let Some(r) = crate::rate::rate_for(fps, &offered) {
                 if (r - rate.0).abs() > 0.5 {
                     match session.request_display_refresh_rate(r) {
                         Ok(()) => log::info!("display {r} Hz for video {fps:.0} fps"),
@@ -625,6 +612,9 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 frames as f64 / t_log.elapsed().as_secs_f64(),
                 fs.predicted_display_period.as_nanos() / 1000
             );
+            if let Some(p) = &perf {
+                log::info!("xr perf: {}", p.sample());
+            }
             frames = 0;
             t_log = Instant::now();
         }

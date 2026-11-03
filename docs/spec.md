@@ -262,7 +262,7 @@ Video path, zero-copy (the point of the whole exercise):
 Fallback if the runtime does not expose that extension: MediaCodec into an `AImageReader` (AHardwareBuffer), import as an EGLImage, blit into a normal swapchain image. That costs one GPU copy. **M0 spike: list the runtime's extensions on our Quest 3 and decode one capture through the primary path.** This spec does not claim that the primary path works until that spike runs.
 
 Frame rate:
-- `XR_FB_display_refresh_rate`: request the rate that the video fps divides evenly (120 Hz for 120 or 60 fps, 90 Hz for 90 or 30 fps). Re-request when the drone's camera mode changes (fps is known from the AU cadence or the encoder param).
+- `XR_FB_display_refresh_rate`: request the rate that the video fps divides evenly (120 Hz for 120 or 60 fps, 90 Hz for 90 or 30 fps); 100 fps, which no Quest 3 rate divides, gets 120 Hz (every frame shown, one in five twice) rather than 90 Hz (one in ten dropped). The measured fps rounds up to the camera mode it came from, since loss only lowers it. Re-request when the drone's camera mode changes (fps is known from the AU cadence or the encoder param).
 - The XR frame loop (`xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`) runs on its own thread and never waits for video: it submits whatever the swapchain holds. Video arrival and display refresh are decoupled, so a late AU repeats one refresh and never blocks the loop.
 - Measured as: refreshes at video rate with no repeated or dropped video frame over 10 min at 120 fps (`XR_FB` performance counters or the compositor's frame stats), and G2G on the LED rig against PixelPilot on the same Quest.
 
