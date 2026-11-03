@@ -191,6 +191,22 @@ struct Gs {
 }
 
 impl Gs {
+    /// In SESSION: the one reading of the link state every lane gates on.
+    fn linked(&self) -> bool {
+        self.vrx.link_state() == VrxState::Session
+    }
+
+    /// Linked to a peer that advertises `cap` (CAP_FRAME_WIRE, CAP_CALIBRATE).
+    fn peer_can(&self, cap: u16) -> bool {
+        self.linked() && self.vrx.peer_caps() & cap != 0
+    }
+
+    /// The calibration session's view of the peer, from the controller's.
+    fn sync_cal_peer(&mut self) {
+        let (linked, capable) = (self.linked(), self.peer_can(rc::CAP_CALIBRATE));
+        self.cal.set_peer(linked, capable, self.vrx.session_ctx());
+    }
+
     /// WebGs::send_: false = the scout gate dropped it (counted by the core),
     /// or a calibration sweep owns the air (anything sent would corrupt
     /// the measurement; the slotter's backlog must not go out either).
@@ -567,24 +583,19 @@ impl RustCore {
             return;
         }
         if let Some(g) = self.gs.as_mut() {
-            let was_session = g.vrx.link_state() == VrxState::Session;
+            let was_session = g.linked();
             g.vrx.on_rc_frame(body, us as f64 / 1000.0);
-            if ft == Some(rc::T_DISC_ACK) {
-                if let Some(ack) = rc::parse_disc_ack(body) {
-                    g.peer_width = ack.agreed_width;
-                }
+            let ack = (ft == Some(rc::T_DISC_ACK))
+                .then(|| rc::parse_disc_ack(body))
+                .flatten();
+            if let Some(ack) = &ack {
+                g.peer_width = ack.agreed_width;
             }
             // The ack that OPENED the session links where it was heard
             // (on_rc_body handed the core its rx channel).
-            if let Some(c) = g.chan.as_mut() {
-                if !was_session
-                    && g.vrx.link_state() == VrxState::Session
-                    && ft == Some(rc::T_DISC_ACK)
-                {
-                    if let Some(ack) = rc::parse_disc_ack(body) {
-                        c.on_session_opened(&ack, us as f64 / 1000.0, &mut g.vrx);
-                    }
-                }
+            let opened = !was_session && g.linked();
+            if let (true, Some(ack), Some(c)) = (opened, &ack, g.chan.as_mut()) {
+                c.on_session_opened(ack, us as f64 / 1000.0, &mut g.vrx);
             }
         }
     }
@@ -806,13 +817,14 @@ impl GsCore for RustCore {
             }
         }
         if let Some(g) = self.gs.as_mut() {
+            let in_session = g.linked();
             if let Some(c) = g.chan.as_mut() {
                 // maburgs main.cpp's per-tick block, on the TX selector's
                 // card as it stood after the last RCF step.
                 let tx = g.sel.selected();
                 let cin = ChannelTickIn {
                     now_ms: now_ms as f64,
-                    in_session: g.vrx.link_state() == VrxState::Session,
+                    in_session,
                     cal_running: g.cal.running(),
                     tx_card: tx,
                     agg: Some(&self.agg),
@@ -823,8 +835,7 @@ impl GsCore for RustCore {
         if let Some(g) = self.gs.as_ref() {
             // Video tail only in SESSION with a CAP_FRAME_WIRE peer; any
             // change drops FRAG-seq continuity and half-assembled frames.
-            let fw = g.vrx.link_state() == VrxState::Session
-                && g.vrx.peer_caps() & rc::CAP_FRAME_WIRE != 0;
+            let fw = g.peer_can(rc::CAP_FRAME_WIRE);
             if fw != self.frame_wire {
                 self.frame_wire = fw;
                 self.reset_video(io);
@@ -840,7 +851,7 @@ impl GsCore for RustCore {
         let now_us = self.now_us;
         if let Some(g) = self.gs.as_mut() {
             // Tag outbound MAVLink under the live session only.
-            let linked = g.vrx.link_state() == VrxState::Session;
+            let linked = g.linked();
             g.mav.set_session(if linked {
                 g.vrx.session_ctx()
             } else {
@@ -865,12 +876,7 @@ impl GsCore for RustCore {
             // of any live MAVLink backlog. The one hold: a SweepCmd while a
             // scout dwell begun just before the start is still off-channel
             // (repeated every 200 ms, so only late).
-            let caps = g.vrx.peer_caps();
-            g.cal.set_peer(
-                linked,
-                linked && caps & rc::CAP_CALIBRATE != 0,
-                g.vrx.session_ctx(),
-            );
+            g.sync_cal_peer();
             if let Some(c) = g.chan.as_mut() {
                 g.cal.step_pick(now_ms, c);
             }
@@ -1022,8 +1028,7 @@ impl GsCore for RustCore {
         let Some(g) = self.gs.as_mut() else {
             return Err("refused: a spotter does not transmit".into());
         };
-        let linked = g.vrx.link_state() == VrxState::Session;
-        let width = effective_width(g.radio_width, linked, g.peer_width);
+        let width = effective_width(g.radio_width, g.linked(), g.peer_width);
         let sweeps = if sweeps.is_empty() {
             default_sweeps(width, &g.ladder)
         } else {
@@ -1033,12 +1038,7 @@ impl GsCore for RustCore {
             sweeps.to_vec()
         };
         // Refusals first, from the session's own last view of the peer.
-        let caps = g.vrx.peer_caps();
-        g.cal.set_peer(
-            linked,
-            linked && caps & rc::CAP_CALIBRATE != 0,
-            g.vrx.session_ctx(),
-        );
+        g.sync_cal_peer();
         // The channel core picks the channel first when it can measure (auto,
         // a spare card); without one the run sweeps on the configured channel.
         let mut fixed = FixedPicker {
@@ -1097,9 +1097,11 @@ impl GsCore for RustCore {
 
     fn cal_json(&self) -> Option<String> {
         let g = self.gs.as_ref()?;
-        let capable =
-            g.vrx.link_state() == VrxState::Session && g.vrx.peer_caps() & rc::CAP_CALIBRATE != 0;
-        Some(cal_status_json(&g.cal.snapshot(), g.cal.sweeps(), capable))
+        Some(cal_status_json(
+            &g.cal.snapshot(),
+            g.cal.sweeps(),
+            g.peer_can(rc::CAP_CALIBRATE),
+        ))
     }
 
     fn set_cal_log_dir(&mut self, dir: &std::path::Path) {
@@ -1121,10 +1123,7 @@ impl GsCore for RustCore {
                 "spotter"
             },
         );
-        j.set(
-            "session",
-            g.is_some_and(|g| g.vrx.link_state() == VrxState::Session),
-        );
+        j.set("session", g.is_some_and(Gs::linked));
         j.set("peer_acked", g.is_some_and(|g| g.vrx.peer_acked()));
         j.set("rung", g.map_or(-1, |g| g.vrx.ctl().rung()));
         j.set("mcs", g.map_or(self.air_mcs, |g| g.vrx.cur_op().mcs));
