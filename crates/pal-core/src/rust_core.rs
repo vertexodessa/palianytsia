@@ -31,7 +31,7 @@ use crate::json::J;
 use crate::ladder::LinkHealth;
 use crate::link_health::{LinkHealthAssembler, LinkHealthInputs, OpPoint};
 use crate::mav::{MavTunnel, ParamClient};
-use crate::nack::{NackInputs, NackTailView, NackTracker};
+use crate::nack::{NackInputs, NackTailView};
 use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelectorCfg};
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
 use crate::vrx::{
@@ -41,6 +41,9 @@ use crate::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_wire::cal::{self, SweepSpec};
 use pal_wire::frame_wire::FrameHdr;
 use pal_wire::{rc, sbi, sw};
+
+mod nack_lane;
+use nack_lane::NackLane;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RustOpts {
@@ -141,32 +144,13 @@ impl FrameOut for AuOut<'_> {
     }
 }
 
-/// NACK block state (web_gs.cpp poll_nack_/drain_nack_window_).
-struct NackState {
-    t: NackTracker,
-    lookback: u32,
-    down_util: f64,
-    vtx_seen: u32,
-    sent: u64,
-    tlm_seen: Option<u16>,
-    drone_nack_rx: u64,
-    drone_retx_syms: u64,
-    drone_retx_refused: u64,
-    win_t0_ms: u64,
-    fill_pps: Option<f64>,
-    late_max: u32,
-    fill_p50: Option<u32>,
-    fill_p90: Option<u32>,
-    fill_max: Option<u32>,
-}
-
 /// Everything only GS mode owns.
 struct Gs {
     vrx: VrxController,
     slot: RcfSlotter,
     rtt: RttEstimator,
     uplink: UplinkDelivery,
-    nack: Option<NackState>,
+    nack: Option<NackLane>,
     mav: MavTunnel,
     params: ParamClient,
     param_linked: bool,
@@ -403,23 +387,7 @@ impl RustCore {
                 }),
                 rtt: RttEstimator::default(),
                 uplink: UplinkDelivery::default(),
-                nack: cfg.link.nack.enable.then(|| NackState {
-                    t: NackTracker::new(cfg.link.nack.clone()),
-                    lookback: cfg.link.nack.lookback as u32,
-                    down_util: cfg.link.ladder_cfg.down_util,
-                    vtx_seen: 0,
-                    sent: 0,
-                    tlm_seen: None,
-                    drone_nack_rx: 0,
-                    drone_retx_syms: 0,
-                    drone_retx_refused: 0,
-                    win_t0_ms: 0,
-                    fill_pps: None,
-                    late_max: 0,
-                    fill_p50: None,
-                    fill_p90: None,
-                    fill_max: None,
-                }),
+                nack: NackLane::from_config(cfg),
                 mav: MavTunnel::new(cfg.link.key),
                 params: ParamClient::default(),
                 param_linked: false,
@@ -570,12 +538,8 @@ impl RustCore {
                         us,
                     );
                     g.uplink.on_telem(seq, t.rcf_rx, state, us / 1000);
-                    // Drone NACK counters are per Telem period: sum each once.
-                    if let Some(n) = g.nack.as_mut().filter(|n| n.tlm_seen != Some(seq)) {
-                        n.tlm_seen = Some(seq);
-                        n.drone_nack_rx += u64::from(t.nack_rx);
-                        n.drone_retx_syms += u64::from(t.retx_syms);
-                        n.drone_retx_refused += u64::from(t.retx_refused);
+                    if let Some(n) = g.nack.as_mut() {
+                        n.drone.on_telem(&t);
                     }
                 }
                 self.telem = Some(t);
@@ -660,37 +624,6 @@ impl RustCore {
                 }
             }
         }
-    }
-
-    /// Once a second: the tracker's window into the stats readout.
-    fn drain_nack_window(&mut self, now_ms: u64) {
-        let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) else {
-            return;
-        };
-        if n.win_t0_ms == 0 {
-            n.win_t0_ms = now_ms;
-            return;
-        }
-        if now_ms < n.win_t0_ms + 1000 {
-            return;
-        }
-        let mut w = n.t.take_window();
-        let secs = (now_ms - n.win_t0_ms) as f64 / 1000.0;
-        n.win_t0_ms = now_ms;
-        n.fill_pps = Some(w.filled as f64 / secs);
-        n.late_max = w.late_ms_max;
-        w.fill_ms.sort_unstable();
-        let pct = |p: f64| -> Option<u32> {
-            if w.fill_ms.is_empty() {
-                return None;
-            }
-            let rank = (p * w.fill_ms.len() as f64).ceil();
-            let i = if rank < 1.0 { 0 } else { rank as usize - 1 };
-            Some(w.fill_ms[i.min(w.fill_ms.len() - 1)])
-        };
-        n.fill_p50 = pct(0.5);
-        n.fill_p90 = pct(0.9);
-        n.fill_max = w.fill_ms.last().copied();
     }
 
     /// Replay only: a DISC_ACK from a drone that does not exist, so the
@@ -846,7 +779,9 @@ impl GsCore for RustCore {
         }
         if self.gs.as_ref().is_some_and(|g| g.nack.is_some()) {
             self.poll_nack(now_ms, io);
-            self.drain_nack_window(now_ms);
+            if let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) {
+                n.win.drain(now_ms, &mut n.t);
+            }
         }
         let now_us = self.now_us;
         if let Some(g) = self.gs.as_mut() {
@@ -1240,31 +1175,8 @@ impl GsCore for RustCore {
         j.set("osd_screens", 0u64);
         j.set(
             "nack",
-            g.and_then(|g| g.nack.as_ref()).map_or(J::Null, |n| {
-                let c = n.t.stats();
-                let mut o = J::obj();
-                o.set("req", c.requests);
-                o.set("rep", c.repeats);
-                o.set("syms", c.syms_requested);
-                o.set("tail", c.tail_requests);
-                o.set("fill", c.filled);
-                o.set("late", c.late_fill);
-                o.set("waste", c.wasted);
-                o.set("drop", c.dropped_deadline);
-                o.set("sup", c.suppressed);
-                o.set("lead", c.lead_skipped);
-                o.set("sent", n.sent);
-                o.set("settle_ms", n.t.settle_ms());
-                o.set("fill_pps", n.fill_pps);
-                o.set("fill_p50", n.fill_p50);
-                o.set("fill_p90", n.fill_p90);
-                o.set("fill_max", n.fill_max);
-                o.set("late_max", n.late_max);
-                o.set("drone_rx", n.drone_nack_rx);
-                o.set("drone_syms", n.drone_retx_syms);
-                o.set("drone_refused", n.drone_retx_refused);
-                o
-            }),
+            g.and_then(|g| g.nack.as_ref())
+                .map_or(J::Null, NackLane::json),
         );
         j.dump()
     }
