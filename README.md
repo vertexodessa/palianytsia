@@ -60,7 +60,7 @@ without one they are unsigned. A desktop binary that runs without the
 system FFmpeg: `tools/ffmpeg-static.sh` once, then
 `PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release -p pal-desktop`.
 
-Run the desktop GS on a live card with `pal-desktop -c configs/gs-auto.toml --live --core rust`,
+Run the desktop GS on a live card with `pal-desktop -c configs/gs-auto.toml --live`,
 or on a capture with `--replay`.
 
 ## Tests

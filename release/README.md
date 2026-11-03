@@ -59,10 +59,10 @@ The decoder is picked at start and named on the console. `decode: hwaccel vdpau`
 Run it as:
 
 ```
-./pal-desktop-linux-x86_64 -c gs.toml --core rust
+./pal-desktop-linux-x86_64 -c gs.toml
 ```
 
-`--core rust` runs the same channel logic as the APKs, including the channel menu (`--core ref`, the default, has no channel menu). The card needs USB access, either through a udev rule or by running as root.
+It runs the same core and channel logic as the APKs, including the channel menu (`--core ref` runs mabur's C++ core instead, without the channel menu). The card needs USB access, either through a udev rule or by running as root.
 
 ## Drone
 

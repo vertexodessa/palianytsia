@@ -90,7 +90,9 @@ fn die(msg: &str) -> ! {
 fn parse() -> Opts {
     let mut o = Opts {
         hwdec: "auto".into(),
-        rust: false, // mabur's core and ChannelCore, as the APKs run
+        // The Rust core and channel core, as the APKs run; --core ref is
+        // mabur's C++ one through pal-ref.
+        rust: true,
         secs: 5.0,
         ..Opts::default()
     };

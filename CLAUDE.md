@@ -53,7 +53,7 @@ pairing key.
 - `configs/gs-auto.toml` (the APK default): `gs.toml` with `channel = "auto"`. A GS on an auto
   config (pal-desktop with no `--ch`, the phone/Quest APKs) runs the channel core on the card through
   `runtime::LiveCfg::attach`: prelude ranking, boot pick, relocation, in-flight hops, transmitting
-  through the card. `--card2 N` (desktop) / a second adapter (Quest) adds a receive+scout card (`LiveCfg::extra`, stats `cards`, OSD chip `cards`). `--core rust` (and the APKs) use the Rust port (`RustCore::with_cards` +
+  through the card. `--card2 N` (desktop) / a second adapter (Quest) adds a receive+scout card (`LiveCfg::extra`, stats `cards`, OSD chip `cards`). `--core rust` (the desktop default, and the APKs) use the Rust port (`RustCore::with_cards` +
   `runtime::dev_card::rust_channel_core`, clock `runtime` mono); `--core ref` uses mabur's C++ one
   (`pal_ref::live`, clock `pal_ref::now_us`). pal-ref is no longer in the Android build. A Rust
   spotter on an auto config still uses the old `runtime::run_live` sweep (400 ms per channel, 3
