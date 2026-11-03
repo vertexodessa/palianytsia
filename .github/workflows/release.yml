@@ -158,9 +158,13 @@ jobs:
         with:
           path: parts
       - name: Sensor driver
-        # Not in git (a vendor binary): an asset of the "deps" release,
-        # checked against release/sensor_imx415_star6e.sha256 by the packer.
-        run: gh release download deps -p sensor_imx415_star6e.ko -D parts
+        # Not in git (a vendor binary): an asset of the "deps" release named
+        # by its sha prefix, so an older tag still finds the driver it pinned;
+        # the packer checks it against release/sensor_imx415_star6e.sha256.
+        run: |
+          sha=$(cut -c1-8 release/sensor_imx415_star6e.sha256)
+          gh release download deps -p "sensor_imx415_star6e-$sha.ko" -D parts
+          mv "parts/sensor_imx415_star6e-$sha.ko" parts/sensor_imx415_star6e.ko
       - name: Pack
         run: |
           export PATH="$PATH:$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"

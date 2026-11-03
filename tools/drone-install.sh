@@ -296,14 +296,17 @@ if [ "$MOD_TODO" = 1 ]; then
   # once maburd has let go of the sensor: it can take seconds to exit. Never
   # fatal: on any failure the stock driver stays or comes back, and the next
   # boot loads the new one through load_sigmastar.
-  if [ "$FRESH" != 1 ] && lsmod | grep -q '^sensor_imx415_mipi '; then
+  # An update swaps a loaded six-mode driver too: otherwise the new file
+  # sat on flash and the old modes ran until a reboot (2026-11-03).
+  OLDMOD=\$(lsmod | grep -oE '^sensor_imx415_(mipi|star6e)' | head -1)
+  if [ "$FRESH" != 1 ] && [ -n "\$OLDMOD" ]; then
     for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do pidof maburd >/dev/null || break; sleep 1; done
     if pidof maburd >/dev/null; then
       echo "   maburd still running: the six-mode driver loads on the next boot"
-    elif rmmod sensor_imx415_mipi; then
+    elif rmmod \$OLDMOD; then
       insmod \$MD/sensor_imx415_star6e.ko chmap=1 || { echo "   six-mode module did not load, stock driver back"; insmod \$MD/sensor_imx415_mipi.ko chmap=1 || echo "   stock driver did not load either: reboot the drone"; }
     else
-      echo "   stock driver busy: the six-mode driver loads on the next boot"
+      echo "   \$OLDMOD busy: the new six-mode driver loads on the next boot"
     fi
   fi
   rm -f /tmp/sensor_imx415_star6e.ko.new /tmp/load_sigmastar.new

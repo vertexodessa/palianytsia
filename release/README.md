@@ -94,7 +94,7 @@ On an imx415 drone, both ways, it also installs the six-mode sensor driver:
 2. patches the drone's `/usr/bin/load_sigmastar` on the PC so that it loads the six-mode driver when present and the stock one otherwise, and keeps the original as `/usr/bin/load_sigmastar.palianytsia`;
 3. on an update, swaps the running driver once maburd has stopped. If the swap fails, the stock driver stays loaded and the next boot loads the new one.
 
-`/proc/mi_modules/mi_sensor/mi_sensor0` then lists 6 modes; with native 90 it shows `Cur 2304x1296@100fps` (the encoder runs 1920x1080@90 from it).
+`/proc/mi_modules/mi_sensor/mi_sensor0` then lists 6 modes; with native 90 or 100 it shows `Cur 2272x1278@100fps` (the encoder runs 1920x1080 from it).
 
 Both ways it asks for confirmation (`-y` skips it), uploads to `/tmp` and checks the hashes there (a broken upload changes nothing), then checks the files on flash and waits for maburd's build line in `/tmp/mabur.log`. Expected:
 
@@ -131,6 +131,6 @@ maburd refuses config keys it does not know. v0.5 adds no config keys, so a v0.4
 
 - palianytsia: `main` @ @PAL_SHA@.
 - mabur: fork branch `release/v0.5` @ @MABUR_SHA@ (`release/MABUR_RELEASE`). This is `release/v0.4` plus `RADIO_PWR_MODE` (70b1623c) and the GS-led move to any 5 GHz channel (61dba4ee). Like `release/v0.4`, it is `palianytsia/base` without the bench-only `/sim` debug route.
-- `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `c639856a...`), as shipped in openipc-builder's mabur image.
+- `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
