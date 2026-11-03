@@ -52,6 +52,13 @@ pub struct Osd {
 }
 
 impl Osd {
+    /// The operator's video layer filter, read every frame by xr.
+    pub fn video_filter(&self) -> pal_osd::prefs::VideoFilter {
+        self.console.prefs.video_filter
+    }
+}
+
+impl Osd {
     pub fn new(
         session: &xr::Session<xr::OpenGlEs>,
         gl: Arc<glow::Context>,

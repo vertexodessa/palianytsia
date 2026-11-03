@@ -355,6 +355,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     want.fb_display_refresh_rate = exts.fb_display_refresh_rate;
     want.fb_composition_layer_image_layout = exts.fb_composition_layer_image_layout;
     want.meta_performance_metrics = exts.meta_performance_metrics;
+    want.fb_composition_layer_settings = exts.fb_composition_layer_settings;
     let inst = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -490,12 +491,15 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        // Match the display to the video every 2 s from the decoded fps.
+        // Match the display to the video every 2 s: the camera rate from
+        // the AU stamps, else (stamps not in yet) the decoded fps.
         if exts.fb_display_refresh_rate && rate.1.elapsed() >= Duration::from_secs(2) {
             let sh = hub.shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            let f = sh.map_or(0, |s| s.frames.load(Ordering::Relaxed));
-            let fps =
+            let f = sh.as_ref().map_or(0, |s| s.frames.load(Ordering::Relaxed));
+            let decoded =
                 fps_est.push(f.saturating_sub(rate.2) as f64 / rate.1.elapsed().as_secs_f64());
+            let cam = sh.map_or(0, |s| s.cam_fps_x10.load(Ordering::Relaxed));
+            let fps = if cam > 0 { cam as f64 / 10.0 } else { decoded };
             let offered = session
                 .enumerate_display_refresh_rates()
                 .unwrap_or_default();
@@ -553,16 +557,35 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         unsafe {
             (fp.begin_frame)(session.as_raw(), &bi);
         }
+        // The operator's filter for the video quad (OSD tab), chained
+        // after the flip.
+        use pal_osd::prefs::VideoFilter;
+        use sys::CompositionLayerSettingsFlagsFB as LF;
+        let filter = osd.as_ref().map_or(VideoFilter::Off, |o| o.video_filter());
+        let settings = sys::CompositionLayerSettingsFB {
+            ty: sys::CompositionLayerSettingsFB::TYPE,
+            next: ptr::null(),
+            layer_flags: match filter {
+                VideoFilter::Off => LF::EMPTY,
+                VideoFilter::Sharpen => LF::QUALITY_SHARPENING,
+                VideoFilter::Supersample => LF::QUALITY_SUPER_SAMPLING,
+            },
+        };
+        let settings_ptr = if exts.fb_composition_layer_settings && filter != VideoFilter::Off {
+            &settings as *const _ as *const std::ffi::c_void
+        } else {
+            ptr::null()
+        };
         // A decoder Surface stores rows top-down; OpenXR samples bottom-up.
         let flip = sys::CompositionLayerImageLayoutFB {
             ty: sys::CompositionLayerImageLayoutFB::TYPE,
-            next: ptr::null_mut(),
+            next: settings_ptr as *mut _,
             flags: sys::CompositionLayerImageLayoutFlagsFB::VERTICAL_FLIP,
         };
         let flip_ptr = if exts.fb_composition_layer_image_layout {
             &flip as *const _ as *const std::ffi::c_void
         } else {
-            ptr::null()
+            settings_ptr
         };
         let mut quads = Vec::with_capacity(2);
         if let Some(sc) = video {

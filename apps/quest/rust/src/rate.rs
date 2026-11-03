@@ -14,7 +14,7 @@ const NOMINAL: &[f64] = &[30.0, 60.0, 90.0, 100.0, 120.0];
 /// twice) on an 8.3 ms period, where 90 Hz drops one frame in ten; it got
 /// 90 Hz until 2026-11-03, a decoded 99.x fps falling under a `> 100` band.
 pub fn rate_for(fps: f64, offered: &[f32]) -> Option<f32> {
-    if fps <= 20.0 {
+    if fps <= MIN_FPS {
         return None;
     }
     let nominal = NOMINAL
@@ -33,6 +33,9 @@ pub fn rate_for(fps: f64, offered: &[f32]) -> Option<f32> {
         .or_else(|| offered.iter().copied().reduce(f32::max))
 }
 
+/// At or under this a window is an outage, not a frame rate.
+const MIN_FPS: f64 = 20.0;
+
 /// Windows the estimate spans (2 s each in xr).
 const WINDOWS: usize = 5;
 
@@ -46,7 +49,13 @@ pub struct FpsEstimate {
 }
 
 impl FpsEstimate {
+    /// A window with no video to speak of (an outage) says nothing about
+    /// the camera mode: it keeps the windows from before, so the display
+    /// does not drop to 90 Hz for the seconds video takes to come back.
     pub fn push(&mut self, fps: f64) -> f64 {
+        if fps <= MIN_FPS {
+            return self.recent.iter().copied().fold(0.0, f64::max);
+        }
         if self.recent.len() == WINDOWS {
             self.recent.pop_front();
         }
@@ -110,5 +119,18 @@ mod tests {
         let r: Vec<_> = (0..5).map(|_| rate_for(e.push(90.0), QUEST3)).collect();
         assert_eq!(r[3], Some(120.0));
         assert_eq!(r[4], Some(90.0));
+    }
+
+    #[test]
+    fn an_outage_keeps_the_mode() {
+        let mut e = FpsEstimate::default();
+        for _ in 0..5 {
+            e.push(99.0);
+        }
+        let r: Vec<_> = [0.0, 0.0, 0.0, 12.0, 88.0, 95.0]
+            .iter()
+            .map(|f| rate_for(e.push(*f), QUEST3))
+            .collect();
+        assert!(r.iter().all(|x| *x == Some(120.0)), "{r:?}");
     }
 }

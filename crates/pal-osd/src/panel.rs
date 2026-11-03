@@ -457,6 +457,14 @@ fn osd_ui(ui: &mut Ui, p: &mut HudPrefs) -> bool {
     ui.separator();
     ui.checkbox(&mut p.stats, "Link statistics (detailed)");
     ui.add(egui::Slider::new(&mut p.scale, 0.6..=2.0).text("text size"));
+    ui.separator();
+    ui.horizontal(|ui| {
+        use crate::prefs::VideoFilter as F;
+        ui.label("Video filter (Quest)");
+        ui.radio_value(&mut p.video_filter, F::Off, "off");
+        ui.radio_value(&mut p.video_filter, F::Sharpen, "sharpen");
+        ui.radio_value(&mut p.video_filter, F::Supersample, "supersample");
+    });
     *p != before
 }
 

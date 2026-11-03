@@ -24,6 +24,36 @@ pub struct HudPrefs {
     /// empty = every channel of the set; one = that channel only. Applied
     /// when the link starts and, changed in the panel, on the live link.
     pub link_channels: Vec<u8>,
+    /// Quest video layer filter (XR_FB_composition_layer_settings): the
+    /// 1920 px video lands on fewer display pixels, so supersampling may
+    /// beat sharpening; judged by eye. Other front ends ignore it.
+    pub video_filter: VideoFilter,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VideoFilter {
+    #[default]
+    Off,
+    Sharpen,
+    Supersample,
+}
+
+impl VideoFilter {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Sharpen => "sharpen",
+            Self::Supersample => "supersample",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "sharpen" => Self::Sharpen,
+            "supersample" => Self::Supersample,
+            _ => Self::Off,
+        }
+    }
 }
 
 impl Default for HudPrefs {
@@ -39,6 +69,7 @@ impl Default for HudPrefs {
             scale: 1.0,
             link_bw: 20,
             link_channels: Vec::new(),
+            video_filter: VideoFilter::Off,
         }
     }
 }
@@ -50,6 +81,7 @@ impl HudPrefs {
             "nav": self.nav, "link": self.link, "messages": self.messages,
             "stats": self.stats, "scale": self.scale, "link_bw": self.link_bw,
             "link_channels": self.link_channels,
+            "video_filter": self.video_filter.key(),
         })
         .to_string()
     }
@@ -90,6 +122,9 @@ impl HudPrefs {
                     .into_iter()
                     .collect(),
             },
+            video_filter: VideoFilter::parse(
+                v.get("video_filter").and_then(Value::as_str).unwrap_or(""),
+            ),
         }
     }
 
@@ -117,6 +152,7 @@ mod tests {
             scale: 1.4,
             link_bw: 40,
             link_channels: vec![144, 40],
+            video_filter: super::VideoFilter::Supersample,
             ..Default::default()
         };
         assert_eq!(HudPrefs::from_json(&p.to_json()), p);

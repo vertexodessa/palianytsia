@@ -195,6 +195,7 @@ impl Link {
             pts_off_us: None,
             shared: shared.clone(),
             idr: Some(IdrDriver::default()),
+            cam_fps: Default::default(),
         };
         // RustCore is built on the core thread (GsCore is not Send); a
         // config it refuses still shows up in last_error().
@@ -356,6 +357,9 @@ fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>,
     // Once a second: a line when AUs came in but no frame came out, so a
     // stall on the glass leaves its cause in logcat.
     let (mut t, mut aus, mut f0, mut s0, mut n0) = (Instant::now(), 0u64, 0u64, 0u64, 0u64);
+    // Since when no AU has come (after video once flowed): one line and one
+    // event per outage, not one a second (60 a minute with the drone off).
+    let mut starved: Option<Instant> = None;
     loop {
         let got = match au_rx.recv_timeout(Duration::from_millis(250)) {
             Ok(x) => Some(x),
@@ -390,9 +394,17 @@ fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>,
                     serde_json::json!({"aus_in": aus, "stale": st - s0, "no_input": ni - n0,
                         "dec_errors": errs, "au_drops": drops}),
                 );
-            } else if aus == 0 && sh.frames.load(Ordering::Relaxed) > 0 {
+            } else if aus == 0 && sh.frames.load(Ordering::Relaxed) > 0 && starved.is_none() {
                 log::warn!("video stalled: no AUs from the core for 1 s");
                 sh.event("video_stall", serde_json::json!({"aus_in": 0}));
+                starved = Some(t);
+            }
+            if aus > 0 {
+                if let Some(s) = starved.take() {
+                    let ms = s.elapsed().as_millis() as u64;
+                    log::info!("video back after {ms} ms without AUs");
+                    sh.event("video_back", serde_json::json!({ "after_ms": ms }));
+                }
             }
             (t, aus, f0, s0, n0) = (Instant::now(), 0, f, st, ni);
         }

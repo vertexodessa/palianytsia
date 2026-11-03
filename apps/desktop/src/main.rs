@@ -713,6 +713,7 @@ fn main() {
         pts_off_us: None,
         shared: shared.clone(),
         idr: (o.mode == Some(Mode::Gs) && o.idr.unwrap_or(o.live)).then(IdrDriver::default),
+        cam_fps: Default::default(),
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

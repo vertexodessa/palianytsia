@@ -12,6 +12,7 @@ use pal_core::refresh::IdrDriver;
 use pal_core::{Au, CoreIo, GsCore, RxBody};
 use pal_wire::dot11;
 
+pub mod cam_fps;
 pub mod dev_card;
 pub mod stats_line;
 
@@ -52,6 +53,9 @@ pub struct Shared {
     pub au_bytes: AtomicU64,
     /// (window start, au_bytes then, last rate) behind rx_kbps().
     rate: Mutex<Option<(Instant, u64, f64)>>,
+    /// The camera's frame rate x10 from AU capture stamps (`cam_fps`); 0
+    /// until known. Not in the stats line: M1 compares that byte for byte.
+    pub cam_fps_x10: AtomicU32,
 }
 
 impl Shared {
@@ -126,6 +130,7 @@ pub struct Sink {
     pub shared: Arc<Shared>,
     /// GS mode only: AU damage and decoder errors into IDR requests.
     pub idr: Option<IdrDriver>,
+    pub cam_fps: cam_fps::CamFps,
 }
 
 impl CoreIo for Sink {
@@ -142,6 +147,10 @@ impl CoreIo for Sink {
             let lat = &self.shared.lat;
             lat.cap_au_max.fetch_max(d, Ordering::Relaxed);
             lat.cap_au_last.store(d, Ordering::Relaxed);
+        }
+        if let Some(f) = self.cam_fps.push(a.pts_us) {
+            let x10 = (f * 10.0).round() as u32;
+            self.shared.cam_fps_x10.store(x10, Ordering::Relaxed);
         }
         self.shared.lat.aus_in.fetch_add(1, Ordering::Relaxed);
         self.shared
