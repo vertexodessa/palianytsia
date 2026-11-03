@@ -416,10 +416,14 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     }
     .map_err(|e| format!("create_session: {e}"))?;
     if exts.fb_display_refresh_rate {
-        log::info!(
-            "display refresh rates: {:?}",
-            session.enumerate_display_refresh_rates()
-        );
+        let rates = session.enumerate_display_refresh_rates();
+        log::info!("display refresh rates: {rates:?}");
+        let top = rates.iter().flatten().copied().reduce(f32::max);
+        if top.is_some_and(|t| t <= crate::rate::STOCK_MAX_HZ + 0.5) {
+            log::info!(
+                "up to 207 Hz cuts video latency ~5 ms: `adb shell setprop debug.oculus.allRefreshRates 1` (again after each reboot), then restart the app"
+            );
+        }
     }
     // SAFETY: the context made current in make_egl().
     let gl = Arc::new(unsafe {

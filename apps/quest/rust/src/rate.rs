@@ -13,9 +13,20 @@ const NOMINAL: &[f64] = &[30.0, 60.0, 90.0, 100.0, 120.0];
 /// divides none of 72/80/90/120: 120 Hz shows every frame (one in five
 /// twice) on an 8.3 ms period, where 90 Hz drops one frame in ten; it got
 /// 90 Hz until 2026-11-03, a decoded 99.x fps falling under a `> 100` band.
+///
+/// A runtime that offers rates above 120 Hz (`debug.oculus.allRefreshRates`
+/// set over adb) gets its highest: the compositor latch wait and the panel's
+/// scan-to-backlight time both shrink with the period. Measured on the
+/// Quest 3 with 120 fps video, codec input to backlight flash p50 18.75 ms
+/// at 120 Hz, 13.53 ms at 207 Hz; frames replaced before the latch 17 % ->
+/// 3.2 %.
 pub fn rate_for(fps: f64, offered: &[f32]) -> Option<f32> {
     if fps <= MIN_FPS {
         return None;
+    }
+    let top = offered.iter().copied().reduce(f32::max)?;
+    if top > STOCK_MAX_HZ + 0.5 {
+        return Some(top);
     }
     let nominal = NOMINAL
         .iter()
@@ -32,6 +43,9 @@ pub fn rate_for(fps: f64, offered: &[f32]) -> Option<f32> {
         .find(|r| (r - want).abs() < 1.0)
         .or_else(|| offered.iter().copied().reduce(f32::max))
 }
+
+/// The highest rate a stock runtime offers.
+pub const STOCK_MAX_HZ: f32 = 120.0;
 
 /// At or under this a window is an outage, not a frame rate.
 const MIN_FPS: f64 = 20.0;
@@ -98,6 +112,14 @@ mod tests {
         assert_eq!(rate_for(15.0, QUEST3), None);
         assert_eq!(rate_for(90.0, &[72.0, 120.0]), Some(120.0));
         assert_eq!(rate_for(90.0, &[]), None);
+    }
+
+    #[test]
+    fn unlocked_rates_take_the_highest_for_any_video() {
+        let all: Vec<f32> = (72..=207).map(|r| r as f32).collect();
+        assert_eq!(rate_for(120.0, &all), Some(207.0));
+        assert_eq!(rate_for(30.0, &all), Some(207.0));
+        assert_eq!(rate_for(15.0, &all), None);
     }
 
     #[test]
