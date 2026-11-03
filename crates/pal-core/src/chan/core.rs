@@ -1317,6 +1317,7 @@ impl ChannelCore {
             scout_owns: self.scout_owns(),
             op: self.plan.op(),
             want: self.plan.want(),
+            op_usable: self.cfg.radio.usable().contains(&self.plan.op()),
             relocate_due: self.plan.relocate_due(),
             plan_hopping: self.plan.hopping(),
             hop_active: hop_active(inp.in_session, inp.cal_running),

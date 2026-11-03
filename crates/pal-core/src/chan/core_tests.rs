@@ -648,6 +648,27 @@ fn a_link_outside_radio_use_is_moved_into_it() {
     );
 }
 
+/// A GS restart finds the drone outside radio.use while the boot pick is
+/// still open: the link leaves for a usable member at once, not after the
+/// scout matures (Quest 2026-11-03: 15-20 s on an unchosen channel).
+#[test]
+fn a_link_found_outside_radio_use_leaves_before_the_pick_matures() {
+    let mut g = Rig::with_use(2, false, 0, &[64, 112]);
+    g.tick(false);
+    assert!(g.core.pick_open());
+    g.link_up();
+    g.until(300, true, "relocate 40 -> ");
+    assert!(g.has_line("boot pick wants"), "{:?}", g.rec().lines);
+    assert!(!g.has_line("pick frozen on 40"));
+    let to = g.pump_rcf().unwrap().hop_ch;
+    assert!(to == 64 || to == 112, "relocated to {to}");
+    g.core.note_video(to);
+    g.tick(true);
+    g.verify_window();
+    assert!(g.has_hop("verify_pass"));
+    assert_eq!(g.core.op(), to);
+}
+
 /// The operator's channel choice on a live link: one member moves the
 /// link there by the relocate hop (no relink), all of them leaves it be,
 /// a pinned config refuses.

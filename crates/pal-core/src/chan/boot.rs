@@ -26,6 +26,9 @@ pub struct BootPickIn {
     pub scout_owns: bool,
     pub proposal: u8,
     pub op: u8,
+    /// op is a `radio.use` member (always, without one). Pal only: mabur
+    /// has no radio.use.
+    pub op_usable: bool,
     pub want: u8,
     /// In session, no hop in flight, op != want.
     pub relocate_due: bool,
@@ -52,6 +55,7 @@ impl Default for BootPickIn {
             scout_owns: false,
             proposal: 0,
             op: 0,
+            op_usable: true,
             want: 0,
             relocate_due: false,
             plan_hopping: false,
@@ -172,6 +176,15 @@ impl BootPick {
             }
             if self.one_card_linked {
                 return self.freeze("one-card linked", false);
+            }
+            // A link formed outside radio.use (the drone was left there, e.g.
+            // by a GS restart) leaves at once for the best usable member so
+            // far: waiting for maturity kept it 15-20 s on a channel the
+            // operator did not choose (Quest fl-1783..1785, 2026-11-03).
+            if !k.one_card && !self.pick_wanted && k.in_session && !k.op_usable {
+                self.pick_wanted = true;
+                self.tried = false;
+                return BootPickOut::WantPick(k.proposal);
             }
             if k.since_start_ms >= k.max_ms.max(0) as u64 {
                 if !self.relocating {
@@ -311,6 +324,27 @@ mod tests {
             proposal,
             ..k
         }
+    }
+
+    #[test]
+    fn a_link_outside_radio_use_wants_the_proposal_before_maturity() {
+        let mut b = BootPick::new(true);
+        let k = BootPickIn {
+            op: 120,
+            op_usable: false,
+            proposal: 144,
+            ..linked(base())
+        };
+        assert_eq!(
+            b.tick(&BootPickIn {
+                in_session: false,
+                ..k
+            }),
+            BootPickOut::None
+        );
+        assert_eq!(b.tick(&k), BootPickOut::WantPick(144));
+        assert!(b.open() && b.pick_wanted());
+        assert_eq!(b.tick(&k), BootPickOut::None, "wanted once");
     }
 
     #[test]
