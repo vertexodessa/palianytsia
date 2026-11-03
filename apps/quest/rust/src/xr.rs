@@ -294,6 +294,41 @@ impl Drop for ActivityContext {
     }
 }
 
+/// Every extension the runtime offers, by name, into the log: the list in
+/// the vault was read from VrDriver.apk strings, which shows what the
+/// runtime knows, not what it gives this app.
+fn log_extensions(entry: &xr::Entry) {
+    let f = entry.fp().enumerate_instance_extension_properties;
+    let mut n = 0u32;
+    // SAFETY: the two-call idiom; the second call fills `n` entries.
+    let names = unsafe {
+        if f(ptr::null(), 0, &mut n, ptr::null_mut()) != sys::Result::SUCCESS {
+            return;
+        }
+        let mut v = vec![
+            sys::ExtensionProperties {
+                ty: sys::ExtensionProperties::TYPE,
+                next: ptr::null_mut(),
+                extension_name: [0; sys::MAX_EXTENSION_NAME_SIZE],
+                extension_version: 0,
+            };
+            n as usize
+        ];
+        if f(ptr::null(), n, &mut n, v.as_mut_ptr()) != sys::Result::SUCCESS {
+            return;
+        }
+        v.truncate(n as usize);
+        v.iter()
+            .map(|p| {
+                std::ffi::CStr::from_ptr(p.extension_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    log::info!("openxr extensions ({}): {}", names.len(), names.join(" "));
+}
+
 pub fn run(app: &AndroidApp) -> Result<(), String> {
     let toml = asset(app, "gs.toml")?;
     let ext_dir = app.external_data_path().ok_or("no external files dir")?;
@@ -317,6 +352,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let exts = entry
         .enumerate_extensions()
         .map_err(|e| format!("extensions: {e}"))?;
+    log_extensions(&entry);
     if !exts.khr_android_surface_swapchain {
         return Err("runtime lacks XR_KHR_android_surface_swapchain".into());
     }
@@ -391,6 +427,12 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         )
     }
     .map_err(|e| format!("create_session: {e}"))?;
+    if exts.fb_display_refresh_rate {
+        log::info!(
+            "display refresh rates: {:?}",
+            session.enumerate_display_refresh_rates()
+        );
+    }
     // SAFETY: the context made current in make_egl().
     let gl = Arc::new(unsafe {
         glow::Context::from_loader_function(|n| {
