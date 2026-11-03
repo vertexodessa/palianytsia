@@ -1,11 +1,11 @@
-# Palianytsia v0.6
+# Palianytsia v0.7
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.6.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.6.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.7.0.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.7.0.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,21 +14,15 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.sh` installs it on an imx415 drone. |
 
-## What changed since v0.5
+## What changed since v0.6
 
-Update the drone together with the GS for the camera menu: a v0.5 drone does not report its driver's modes, so a v0.6 GS offers it the old fixed list.
+Update the drone and the GS together: v0.7 renumbers the drone parameters after row 11, so a v0.6 GS and a v0.7 drone (or the other way round) read each other's camera-mode list, calibration reset and mirror/flip rows wrong.
 
-- **Camera modes from the drone.** The v0.6 drone reports the modes its camera driver has (new read-only parameter `VENC_MODES`), and the camera-mode menu lists exactly those, plus 60/90 fps and smaller 16:9 sizes that run on the same mode. v0.5 offered a fixed list, and some of its entries, 1280x720 at 120 fps among them, did not run on waybeam's driver: the drone refused them and kept the old mode.
-- **Modes above 1080p.** With the six-mode driver the menu offers native 2272x1278 at 100 fps and 2944x1656 / 2560x1440 at 60 fps. The 120 fps mode on waybeam's driver is 1728x816.
-- **New IMX415 driver.** `drone/sensor_imx415_star6e.ko` is waybeam_venc 581804a: the native 100 fps window is 2272x1278 at 100.52 Hz, not 2304x1296 at 99.63 Hz. `install.sh` also swaps an already loaded six-mode driver, not only the stock one.
-- **Quest display rate from the camera.** The Quest picks its refresh rate from the camera's frame timestamps, so a lossy 100 fps link stays on 120 Hz instead of dropping to 90 Hz.
-- **Video filter (Quest).** OSD tab: off, sharpen or supersample for the video on the Quest.
-- **Quest Quit.** After Quit from the Meta menu the app process exits, so the next launch offers Quit again.
-- **40 MHz channel pick.** At 40 MHz the GS keeps one ticked channel per 40 MHz block (36/40, 44/48, ...), so two picks never share a block.
-- **Enhance-layer step-down switch.** Gear, Link: "Step down on enhance-layer loss" (on by default). Off, the bitrate ladder no longer steps down when only enhance-layer packets are lost; in one bench session that loss caused 15 of 24 step-downs.
-- **Flight log.** Each ladder move records why it moved (`rung_reason`), and a card that stops receiving logs `card_deaf` / `card_hearing`. A device keeps up to 10 GB of captures and 2000 sessions.
-- **Phone.** A settings change that restarts the link keeps the settings panel open on its tab.
-- **Desktop.** `--core rust` is the default.
+- **mabur brought up to date.** The drone daemon is now based on the current upstream mabur (master of 2026-11-04) plus Palianytsia's own changes. From upstream: the sensor rate trim settles fast just under the target rate and never steps above it; the native 100 fps window timed slightly above 100 Hz for the phase lock; refusal reasons that fit the GS status line.
+- **Mirror and flip.** Gear, Video: "venc.mirror" and "venc.flip" switches for a camera mounted mirrored or upside down (new drone parameters `VENC_MIRROR` / `VENC_FLIP`; the drone restarts its video pipeline to apply them).
+- **Faster channel return after a GS restart.** When the GS restarts and finds the drone on a channel outside the ticked ones, it moves the link to a ticked channel at once. v0.6 stayed on the drone's channel for 15-20 s first.
+- **Camera sizes.** The camera-mode menu offers only sizes with the sensor mode's exact aspect ratio, as the drone now requires (v0.6 allowed 2 % off).
+- **One sensor driver.** The drone picks camera modes from waybeam's six-mode IMX415 driver lineup (the driver `install.sh` installs). A drone left on OpenIPC's stock driver runs up to 90 fps only.
 
 ## Ground station
 
@@ -37,7 +31,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.6.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.7.0.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -117,13 +111,13 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 ./install.sh --remove 192.168.1.10
 ```
 
-maburd refuses config keys it does not know. v0.6 adds no config keys (`VENC_MODES` is a read-only parameter, not a config key), so a v0.4 or v0.5 drone config works unchanged (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
+maburd refuses config keys it does not know. v0.7 adds no config keys, so a v0.4 to v0.6 drone config works unchanged (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
 
-## Known limits in v0.6
+## Known limits in v0.7
 
 - Pairing uses the default link key on both ends.
 - While disarmed, the drone runs low power: 30 fps at 1 Mbps. Full rate starts on arming.
-- Native 61-100 fps needs the six-mode driver; on any other sensor driver those modes are refused.
+- Above 90 fps and every native mode need waybeam's six-mode driver (`install.sh` installs it); on any other sensor driver those modes are refused.
 - DFS channels (52-144) are marked in the channel menu but neither end detects radar. Whether you may use them is up to your local rules.
 - On one card the channel scan dwells on the link card in short slices; expect a little more loss while it runs. With two cards the spare card scans.
 - Calibration with two cards measures the channels on the second card. If the second card does not receive, the link drops during the measure and the run fails with "calibration ack timeout". The OSD cards chip now shows such a card as DEAF; replug it before calibrating.
@@ -133,7 +127,7 @@ maburd refuses config keys it does not know. v0.6 adds no config keys (`VENC_MOD
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.6` @ @MABUR_SHA@ (`release/MABUR_RELEASE`). This is `release/v0.5` plus `VENC_MODES`, the camera driver's mode list as a read-only parameter. Like `release/v0.5`, it is `palianytsia/base` without the bench-only `/sim` debug route.
+- mabur: fork branch `release/v0.7` @ @MABUR_SHA@ (`release/MABUR_RELEASE`). This is upstream mabur master c8e2d20e plus Palianytsia's commits (`palianytsia/base-v2`) without the bench-only `/sim` debug route.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
