@@ -8,7 +8,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$ROOT/third_party/libusb
-NDK=${ANDROID_NDK_HOME:-$(ls -d "$HOME"/Android/Sdk/ndk/* | sort -V | tail -1)}
+NDK=${ANDROID_NDK_HOME:-$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/* | sort -V | tail -1)}
 API=${ANDROID_API:-29}
 OUT=$ROOT/target/android/libusb
 REV=$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo none)

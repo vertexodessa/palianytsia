@@ -19,7 +19,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - name: M1 capture replay
-        run: tools/m1-replay.sh
+        # Captures live outside git; without them the script exits 77
+        # (skipped), which is a notice here, not a failure.
+        run: |
+          rc=0; tools/m1-replay.sh || rc=$?
+          if [ "$rc" = 77 ]; then echo "::notice::M1 skipped: no captures on the runner"
+          elif [ "$rc" != 0 ]; then exit "$rc"; fi
       - name: M0 parity (pal-ref vs webgs replay)
         run: tools/m0-parity.sh
 

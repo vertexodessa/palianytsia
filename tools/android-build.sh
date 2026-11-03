@@ -4,7 +4,7 @@
 # libusb comes from third_party/libusb via tools/android-libusb.sh.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-export ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$(ls -d "$HOME"/Android/Sdk/ndk/* | sort -V | tail -1)}
+export ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/* | sort -V | tail -1)}
 API=${ANDROID_API:-29}
 TC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
 PAL_ANDROID_LIBUSB=$("$ROOT/tools/android-libusb.sh")

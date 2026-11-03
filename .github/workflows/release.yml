@@ -1,0 +1,178 @@
+name: release
+# A tag vX.Y or vX.Y.Z builds every part of the release, packs it with
+# tools/pack-release.sh and publishes a GitHub release with the tarball, the
+# loose files and release/notes/<tag>.md as its text. Before tagging:
+# release/README.md heads "# Palianytsia <tag>", release/notes/<tag>.md
+# exists, both APKs carry versionName X.Y.Z, release/MABUR_RELEASE names
+# the fork commit (a release/vX.Y branch commit, palianytsia/base without
+# the bench-only /sim route). pack-release.sh refuses any mismatch.
+# workflow_dispatch with a tag name is a dry run: the same builds and the
+# pack, the package kept as a workflow artifact, nothing published; without
+# the signing secrets it packs unsigned APKs.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'release to pack, e.g. v0.5 (dry run, nothing published)'
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  PUBLISH: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Host packages
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libavcodec-dev libavutil-dev libswscale-dev pkg-config cmake
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: M0 parity (pal-ref vs webgs replay)
+        run: tools/m0-parity.sh
+
+  maburd:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: mabur at the release commit
+        run: |
+          sha=$(tr -d '[:space:]' < release/MABUR_RELEASE)
+          git -C third_party/mabur fetch --depth=1 origin "$sha"
+          git -C third_party/mabur checkout --detach "$sha"
+      - name: Host packages
+        run: sudo apt-get update && sudo apt-get install -y pkg-config cmake bzip2
+      - name: Build maburd (pinned OpenIPC toolchain, sha256-checked)
+        run: PAL_FETCH_TOOLCHAIN=1 tools/build-maburd.sh "$TAG"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maburd
+          path: dist/maburd-${{ env.TAG }}-ssc338q-8822e
+
+  apks:
+    runs-on: ubuntu-24.04
+    env:
+      # The NDK the local release builds use (the newest in ~/Android/Sdk).
+      NDK_VERSION: 29.0.14206865
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Release signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.PAL_RELEASE_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.PAL_RELEASE_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.PAL_RELEASE_KEY_PASSWORD }}
+        run: |
+          # Unsigned APKs would publish a release no device can update to;
+          # a dry run packs them unsigned.
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            if [ "$PUBLISH" = true ]; then echo "::error::PAL_RELEASE_* secrets are not set"; exit 1; fi
+            echo "::warning::no signing secrets: unsigned APKs (dry run)"; exit 0
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          umask 077
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=palianytsia\nkeyPassword=%s\n' \
+            "$RUNNER_TEMP/release.jks" "$STORE_PASSWORD" "$KEY_PASSWORD" > "$RUNNER_TEMP/signing.properties"
+          echo "PAL_SIGNING=$RUNNER_TEMP/signing.properties" >> "$GITHUB_ENV"
+      - name: Quest APK
+        run: PAL_RELEASE=1 tools/quest-apk.sh
+      - name: Phone APK
+        run: PAL_RELEASE=1 tools/phone-apk.sh
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp apps/quest/android/app/build/outputs/apk/release/app-release.apk out/quest.apk
+          cp apps/phone/android/app/build/outputs/apk/release/app-release.apk out/phone.apk
+          rm -f "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/signing.properties"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: out/
+
+  desktop:
+    # glibc 2.39: the binary starts on Ubuntu 24.04 / Debian 13 / Fedora 40
+    # and newer (README).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Host packages
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libudev-dev libva-dev libvdpau-dev libx11-dev nasm pkg-config cmake
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Static FFmpeg
+        run: tools/ffmpeg-static.sh > ffmpeg.log 2>&1 || { tail -40 ffmpeg.log; exit 1; }
+      - name: pal-desktop
+        run: PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release --locked -p pal-desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: target/release/pal-desktop
+
+  release:
+    needs: [gates, maburd, apks, desktop]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: mabur at the release commit
+        run: |
+          sha=$(tr -d '[:space:]' < release/MABUR_RELEASE)
+          git -C third_party/mabur fetch --depth=1 origin "$sha"
+          git -C third_party/mabur checkout --detach "$sha"
+      - uses: actions/download-artifact@v4
+        with:
+          path: parts
+      - name: Sensor driver
+        # Not in git (a vendor binary): an asset of the "deps" release,
+        # checked against release/sensor_imx415_star6e.sha256 by the packer.
+        run: gh release download deps -p sensor_imx415_star6e.ko -D parts
+      - name: Pack
+        run: |
+          export PATH="$PATH:$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          tools/pack-release.sh "$TAG" "parts/maburd/maburd-$TAG-ssc338q-8822e" \
+            parts/apks/quest.apk parts/apks/phone.apk parts/desktop/pal-desktop \
+            parts/sensor_imx415_star6e.ko
+          cat "dist/palianytsia-$TAG/SHA256SUMS" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: palianytsia-${{ env.TAG }}
+          path: dist/palianytsia-${{ env.TAG }}.tar.gz
+      - name: Publish
+        if: env.PUBLISH == 'true'
+        run: |
+          d=dist/palianytsia-$TAG
+          gh release create "$TAG" --verify-tag --title "Palianytsia $TAG" \
+            --notes-file "release/notes/$TAG.md" \
+            "$d.tar.gz" "$d"/gs/*.apk "$d/gs/pal-desktop-linux-x86_64" "$d/SHA256SUMS"
