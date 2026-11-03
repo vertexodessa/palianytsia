@@ -22,6 +22,14 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   NV12/I420 planes go to GL textures and convert in a shader (b7370f5); VA-API still untested.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.7, signed APKs). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
+  Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):
+  one Perfetto trace with kernel USB/IRQ events (xhci/usb tracepoints, usbfs reap, kprobes) and
+  pal-quest trace markers (devourer read, FEC/AU assembly, MediaCodec queue/dequeue, compositor
+  submit, present), which gives stages t3-t7 of 13.2. Baseline first, in one session together with
+  the G2G LED rig (13.4: medians within 3 ms). Then A/B one setting at a time, judged on the rig:
+  performance governor or a higher min freq on policy2, SCHED_FIFO + CPU pinning for the RX and
+  decode threads, USB IRQ affinity, `usbfs_memory_mb`, USB autosuspend off, fan forced high. All
+  of them are runtime settings and reset on reboot.
 - M3b (latency block in a matched mabur release): not started.
 - M4, done: the channel core (Rust port of ChannelCore/scout/hop, checked against mabur's record by
   record in `pal-ref/tests/chan_trace.rs`), the channel menu and scan, TxSelector, per-card OSD
