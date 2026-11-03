@@ -77,6 +77,10 @@ pub struct Session {
     capture_cap: u64,
     capture_bytes: u64,
     last: Option<Map<String, Value>>,
+    /// `channel` as last logged, and a new value seen once: the stat is
+    /// card 0's tuning, so a scout dwell on card 0 shows for one line.
+    channel: Option<Value>,
+    channel_seen: Option<Value>,
 }
 
 fn create(dir: &Path, name: &str) -> io::Result<BufWriter<File>> {
@@ -116,6 +120,8 @@ impl Session {
             capture_cap,
             capture_bytes: 0,
             last: None,
+            channel: None,
+            channel_seen: None,
         })
     }
 
@@ -129,8 +135,25 @@ impl Session {
         let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(line) else {
             return self.event(t_us, "bad_stats", json!({ "line": line }));
         };
+        let ch = m.get("channel").cloned();
+        if self.last.is_none() {
+            self.channel = ch.clone();
+        } else if ch == self.channel {
+            self.channel_seen = None;
+        } else if ch == self.channel_seen {
+            // Two lines in a row: a hop or a pick, not a dwell.
+            let from = std::mem::replace(&mut self.channel, ch.clone());
+            self.channel_seen = None;
+            self.event(
+                t_us,
+                "channel",
+                json!({"from": from.unwrap_or(Value::Null), "to": ch.unwrap_or(Value::Null)}),
+            )?;
+        } else {
+            self.channel_seen = ch;
+        }
         if let Some(prev) = self.last.take() {
-            for k in WATCHED {
+            for k in WATCHED.iter().filter(|k| **k != "channel") {
                 let (a, b) = (prev.get(*k), m.get(*k));
                 if a != b {
                     self.event(
@@ -397,10 +420,32 @@ mod tests {
         );
         assert_eq!(sum.session_edges.len(), 1);
         assert!(sum.events.iter().any(|(k, n)| k == "rung" && *n == 1));
+        assert!(!sum.events.iter().any(|(k, _)| k == "channel"));
         assert!((sum.span_s - 1.0).abs() < 1e-9);
         let second = Session::create(&root, UNIX_EPOCH, 0).expect("create");
         assert!(second.dir().to_string_lossy().contains("fl-0002_"));
         drop(second);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_one_line_channel_blip_is_not_a_hop() {
+        let root = std::env::temp_dir().join(format!("pal-fl-chan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = {
+            let mut s = Session::create(&root, UNIX_EPOCH, 0).expect("create");
+            // 36, a scout dwell on 149 for one line, then a real hop to 149.
+            for (i, ch) in [36, 36, 149, 36, 36, 149, 149, 149].iter().enumerate() {
+                s.stats(i as u64 * 1_000_000, &format!(r#"{{"channel":{ch}}}"#))
+                    .expect("stats");
+            }
+            s.dir().to_path_buf()
+        };
+        let ev = fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        let hops: Vec<&str> = ev.lines().filter(|l| l.contains(r#""channel""#)).collect();
+        assert_eq!(hops.len(), 1, "{ev}");
+        assert!(hops[0].contains(r#""from":36"#) && hops[0].contains(r#""to":149"#));
+        assert!(hops[0].contains(r#""t_us":6000000"#), "{}", hops[0]);
         let _ = fs::remove_dir_all(&root);
     }
 }
