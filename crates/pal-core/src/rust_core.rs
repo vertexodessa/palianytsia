@@ -25,7 +25,7 @@ use crate::gap::{DroneRestartDetector, GapTimeoutPolicy};
 use crate::json::J;
 use crate::ladder::LinkHealth;
 use crate::link_health::{LinkHealthAssembler, LinkHealthInputs, OpPoint};
-use crate::mav::{MavTunnel, ParamClient};
+use crate::mav::MavTunnel;
 use crate::nack::{NackInputs, NackTailView};
 use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelectorCfg};
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
@@ -37,8 +37,10 @@ use pal_wire::{rc, sbi, sw};
 
 mod cal_lane;
 mod nack_lane;
+mod param_lane;
 use cal_lane::CalLane;
 use nack_lane::NackLane;
+use param_lane::{params_json, ParamLane};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RustOpts {
@@ -144,9 +146,7 @@ struct Gs {
     uplink: UplinkDelivery,
     nack: Option<NackLane>,
     mav: MavTunnel,
-    params: ParamClient,
-    param_linked: bool,
-    param_vtx_seen: u32,
+    params: ParamLane,
     key: rc::LinkKey,
     sends: u64,
     rcf_sent: u64,
@@ -257,12 +257,6 @@ impl Gs {
             if !self.slot.offer(&mut sf, now_us / 1000, false) {
                 self.send(&sf, now_us, io);
             }
-        }
-    }
-
-    fn drain_params(&mut self) {
-        for p in self.params.take_out() {
-            self.mav.push_outbound(&p);
         }
     }
 }
@@ -376,9 +370,7 @@ impl RustCore {
                 uplink: UplinkDelivery::default(),
                 nack: NackLane::from_config(cfg),
                 mav: MavTunnel::new(cfg.link.key),
-                params: ParamClient::default(),
-                param_linked: false,
-                param_vtx_seen: 0,
+                params: ParamLane::default(),
                 key: cfg.link.key,
                 sends: 0,
                 rcf_sent: 0,
@@ -487,14 +479,14 @@ impl RustCore {
         if let (Some(rc::T_MAV), Some(g)) = (ft, self.gs.as_mut()) {
             for pkt in g.mav.on_rc_frame(body) {
                 io.on_mav(&pkt);
-                g.params.on_packet(&pkt, self.now_us / 1000);
+                g.params.client.on_packet(&pkt, self.now_us / 1000);
                 // The drone replies whatever the session's state; it
                 // ignores what does not fit.
                 for m in cal::decode_all(&pkt) {
                     g.cal.session.on_mav(&m, us / 1000);
                 }
             }
-            g.drain_params();
+            g.params.drain(&mut g.mav);
             return;
         }
         if ft == Some(rc::T_TELEM) {
@@ -772,21 +764,8 @@ impl GsCore for RustCore {
             } else {
                 rc::TagCtx::default()
             });
-            // ParamClient re-lists on every session edge and on a vtx_nonce
-            // change while linked; before flush() so the request leaves this tick.
             let nonce = g.vrx.session_ctx().vtx_nonce;
-            if linked != g.param_linked || (linked && nonce != g.param_vtx_seen) {
-                if g.param_linked {
-                    g.params.set_linked(false, now_ms);
-                }
-                if linked {
-                    g.params.set_linked(true, now_ms);
-                }
-                g.param_linked = linked;
-                g.param_vtx_seen = nonce;
-            }
-            g.params.tick(now_ms);
-            g.drain_params();
+            g.params.tick(linked, nonce, now_ms, &mut g.mav);
             // Calibration first, so a run's message leaves this tick, ahead
             // of any live MAVLink backlog.
             g.sync_cal_peer();
@@ -896,7 +875,7 @@ impl GsCore for RustCore {
     }
 
     fn params_json(&self, now_us: u64) -> String {
-        params_json(self.gs.as_ref().map(|g| &g.params), now_us / 1000)
+        params_json(self.gs.as_ref().map(|g| &g.params.client), now_us / 1000)
     }
 
     fn param_set(&mut self, row: usize, text: &str) -> Result<(), String> {
@@ -904,17 +883,16 @@ impl GsCore for RustCore {
         let Some(g) = self.gs.as_mut() else {
             return Err("not linked".into());
         };
-        let r = g.params.set(row, text, now_ms);
-        // WebGs's client pushes onto the tunnel as it sends.
-        g.drain_params();
+        let r = g.params.client.set(row, text, now_ms);
+        g.params.drain(&mut g.mav);
         r
     }
 
     fn param_refresh(&mut self) {
         let now_ms = self.now_us / 1000;
         if let Some(g) = self.gs.as_mut() {
-            g.params.refresh(now_ms);
-            g.drain_params();
+            g.params.client.refresh(now_ms);
+            g.params.drain(&mut g.mav);
         }
     }
 
@@ -1115,88 +1093,6 @@ impl GsCore for RustCore {
         );
         j.dump()
     }
-}
-
-/// `webgs::params_json`: the table with the client's state, or (Spotter,
-/// no client) the static table with every value unknown.
-fn params_json(pc: Option<&ParamClient>, now_ms: u64) -> String {
-    use crate::mav::{Apply, ListState, PType, RowState, TABLE};
-    fn ty(t: PType) -> &'static str {
-        match t {
-            PType::Bool => "bool",
-            PType::Int32 => "int",
-            PType::Real32 => "real",
-            PType::Str => "str",
-        }
-    }
-    fn apply(a: Apply) -> &'static str {
-        match a {
-            Apply::Knob => "knob",
-            Apply::Reprogram => "reprogram",
-            Apply::Rebuild => "rebuild",
-        }
-    }
-    let mut j = J::obj();
-    let mut rows = J::arr();
-    let st = pc.map(ParamClient::state);
-    for (i, row) in TABLE.iter().enumerate() {
-        let mut r = J::obj();
-        r.set("id", row.id);
-        r.set("section", row.section);
-        r.set("key", row.key);
-        r.set("type", ty(row.ty));
-        r.set("apply", apply(row.apply));
-        r.set("help", row.help);
-        match st {
-            None => {
-                r.set("value", J::Null);
-                r.set("state", "idle");
-                r.set("status", "");
-                r.set("age_ms", J::Null);
-            }
-            Some(st) => {
-                let rs = &st.rows[i];
-                r.set("value", rs.value.as_ref().map(crate::mav::format_text));
-                r.set("state", rs.st.as_str());
-                r.set("status", rs.status.as_str());
-                let terminal = matches!(
-                    rs.st,
-                    RowState::Accepted
-                        | RowState::Failed
-                        | RowState::Unsupported
-                        | RowState::Timeout
-                );
-                r.set(
-                    "age_ms",
-                    terminal.then(|| now_ms.wrapping_sub(rs.result_ms) as i64),
-                );
-            }
-        }
-        rows.push(r);
-    }
-    match (pc, st) {
-        (Some(pc), Some(st)) => {
-            j.set("linked", st.linked);
-            j.set("alive", (st.alive_ms != 0).then(|| pc.alive(now_ms)));
-            j.set(
-                "list",
-                match st.list {
-                    ListState::None => "none",
-                    ListState::Pending => "pending",
-                    ListState::Complete => "complete",
-                    ListState::Partial => "partial",
-                },
-            );
-            j.set("mismatch", st.table_mismatch);
-            j.set("pending", st.pending_row.map_or(-1, |r| r as i64));
-        }
-        _ => {
-            j.set("linked", false);
-            j.set("mode", "spotter");
-        }
-    }
-    j.set("rows", rows);
-    j.dump()
 }
 
 #[cfg(test)]
