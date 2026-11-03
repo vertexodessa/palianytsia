@@ -39,6 +39,10 @@ pub struct OsdIn {
     /// Raised with quit when a start-time setting changed: the handle
     /// starts the next link on the same card.
     pub relink: Arc<AtomicBool>,
+    /// The panel's tab when a relink ended the previous OSD with the panel
+    /// open: the next one opens there, so a width change does not close
+    /// the settings under the operator's finger.
+    pub reopen: Arc<Mutex<Option<pal_osd::panel::Tab>>>,
 }
 
 /// One MotionEvent: action 0 down, 1 up, 2 move, 3 cancel.
@@ -146,10 +150,13 @@ pub fn run(o: OsdIn) {
     };
     let ctx = egui::Context::default();
     let t0 = Instant::now();
+    let reopen = o.reopen.lock().unwrap_or_else(|p| p.into_inner()).take();
     let mut console = Console::new(
         o.prefs_path.clone(),
         Panel {
             touch: true,
+            open: reopen.is_some(),
+            tab: reopen.unwrap_or_default(),
             ..Default::default()
         },
     );
@@ -251,6 +258,8 @@ pub fn run(o: OsdIn) {
         if pout.relink {
             // The width applies at link start: end this link; the Activity
             // sees it stop and asks for the next one (Native.relink).
+            *o.reopen.lock().unwrap_or_else(|p| p.into_inner()) =
+                console.panel.open.then_some(console.panel.tab);
             o.relink.store(true, Ordering::Relaxed);
             o.shared.quit.store(true, Ordering::Relaxed);
         }

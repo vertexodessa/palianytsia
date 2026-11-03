@@ -23,6 +23,8 @@ struct Phone {
     touch_tx: mpsc::Sender<crate::osd::Touch>,
     /// Set by the OSD when the operator changed a start-time setting.
     relink: Arc<AtomicBool>,
+    /// Panel tab carried from one OSD to the next across a relink.
+    reopen: Arc<Mutex<Option<pal_osd::panel::Tab>>>,
 }
 
 /// What every link on this connection starts with.
@@ -46,6 +48,7 @@ fn start(fd: i32, args: Args) -> Result<Phone, String> {
         osd: None,
         touch_tx: mpsc::channel().0,
         relink: Arc::new(AtomicBool::new(false)),
+        reopen: Arc::default(),
     };
     p.launch()?;
     Ok(p)
@@ -82,6 +85,7 @@ impl Phone {
             last: self.last.clone(),
             shared: link.shared.clone(),
             relink: self.relink.clone(),
+            reopen: self.reopen.clone(),
         };
         let osd_t = match std::thread::Builder::new()
             .name("pal-osd".into())
