@@ -109,7 +109,9 @@ fn step(id: &str) -> f64 {
 /// fps (1920x1080 up to 90; above it 1472x816 on OpenIPC's stock IMX415
 /// driver, 1728x972 / 1728x816 on waybeam's). 1280x720 fits 1472x816 after
 /// a 1.5 % crop, but not waybeam's 2.12:1 120 fps mode, where the drone
-/// refuses it. Native: the widest non-binned window, 1:1 pixels and a
+/// refuses it: the 120 fps preset is that mode's own 1728x816 (on the stock
+/// driver it does not fit and the drone keeps the previous mode). The GS
+/// cannot see the driver's list, so these stay a fixed menu. Native: the widest non-binned window, 1:1 pixels and a
 /// zoomed view; up to 60 fps every driver has one (2560x1440 stock, 2944x1656
 /// waybeam), 61-100 only waybeam's six-mode build
 /// (2272x1278 since its 581804a build; 2304x1296 before). On any other
@@ -129,7 +131,7 @@ fn presets(id: &str) -> &'static [&'static str] {
             "60@1280x720/binned",
             "90@1280x720/binned",
             "100@1280x720/binned",
-            "120@1280x720/binned",
+            "120@1728x816/binned",
             "60@1920x1080/native",
             "90@1920x1080/native",
             "100@1920x1080/native",
