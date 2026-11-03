@@ -1,7 +1,7 @@
 [submodule "third_party/mabur"]
 	path = third_party/mabur
 	url = https://github.com/vertexodessa/mabur.git
-	branch = palianytsia/base
+	branch = palianytsia/base-v2
 [submodule "third_party/devourer"]
 	path = third_party/devourer
 	url = https://github.com/vertexodessa/devourer.git

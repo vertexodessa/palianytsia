@@ -73,6 +73,9 @@ pairing key.
   installed by `drone-install.sh` (patches the drone's `load_sigmastar`, original kept as `.palianytsia`), APKs 0.4.0.
   v0.5 = maburd from mabur `release/v0.5` (61dba4ee = `release/v0.4` + RADIO_PWR_MODE + any 5 GHz grid channel), APKs 0.5.0;
   the drone toml and S96mabur are carried over from v0.4 (the release branch bundle files are older than base's).
+  v0.6 = maburd from mabur `release/v0.6` (8d2056a0, + VENC_MODES), the six-mode driver of waybeam_venc 581804a, APKs 0.6.0.
+  v0.7 = maburd from mabur `release/v0.7` (ae590193 = upstream master c8e2d20e + `palianytsia/base-v2` minus `/sim`),
+  APKs 0.7.0; drone parameters renumbered after row 11, so GS and drone must be updated together.
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
   `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally (CI has no captures and never will: no recordings on GitHub), bump both APK `versionName`, head `release/README.md` with `# Palianytsia <tag>`, write the

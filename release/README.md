@@ -120,7 +120,7 @@ maburd refuses config keys it does not know. v0.7 adds no config keys, so a v0.4
 - Above 90 fps and every native mode need waybeam's six-mode driver (`install.sh` installs it); on any other sensor driver those modes are refused.
 - DFS channels (52-144) are marked in the channel menu but neither end detects radar. Whether you may use them is up to your local rules.
 - On one card the channel scan dwells on the link card in short slices; expect a little more loss while it runs. With two cards the spare card scans.
-- Calibration with two cards measures the channels on the second card. If the second card does not receive, the link drops during the measure and the run fails with "calibration ack timeout". The OSD cards chip now shows such a card as DEAF; replug it before calibrating.
+- Calibration with two cards measures the channels on the second card. If the second card does not receive, the link drops during the measure and the run fails with "calibration ack timeout". The OSD cards chip shows such a card as DEAF; replug it before calibrating.
 - Calibrate in the field with the drone at a distance, never next to the GS. Next to the GS (RSSI around -30 dBm) the receivers overload and the higher MCS rungs fail, so the bitrate ladder also stays low on the bench.
 - The two-card transmit switch, the channel menu and hops between any grid channels are tested on the bench, not yet in flight.
 

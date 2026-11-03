@@ -27,7 +27,7 @@ the decisions and the milestones are in [docs/spec.md](docs/spec.md).
 | `apps/phone` | phone app: Rust cdylib + Java shell |
 | `apps/quest` | Quest 3 app: Rust NativeActivity (OpenXR) |
 | `release/` | what a release carries besides the builds: package README, notes per tag, drone config and init script, the fork commit maburd is built from |
-| `third_party/mabur`, `third_party/devourer` | pinned at branch `palianytsia/base` of the vertexodessa forks (RC_VERSION 18) |
+| `third_party/mabur`, `third_party/devourer` | pinned submodules of the vertexodessa forks: mabur on branch `palianytsia/base-v2` (upstream master c8e2d20e plus Palianytsia's commits, RC_VERSION 18), devourer on `palianytsia/base` |
 | `third_party/libusb` | upstream libusb v1.0.27, Android builds only |
 
 Clone with submodules:
@@ -38,8 +38,8 @@ git clone --recurse-submodules git@github.com:vertexodessa/palianytsia.git
 
 The drone daemon (`maburd`) and the GS are a matched pair and are released
 together. A release builds maburd from the fork commit in
-`release/MABUR_RELEASE` (`palianytsia/base` without its bench-only debug
-route), not from the submodule pin.
+`release/MABUR_RELEASE` (a `release/vX.Y` branch of the fork: `palianytsia/base-v2`
+without its bench-only `/sim` debug route), not from the submodule pin.
 
 ## Build
 

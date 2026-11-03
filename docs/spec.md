@@ -1,6 +1,6 @@
 # Palianytsia: a Rust ground-station client for mabur
 
-Status: Draft 2, 2026-10-31; current state in "Status (2026-11-03)" below (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
+Status: Draft 2 of 2026-10-31, kept as written except for dated notes; the current state is "Status (2026-11-03)" below (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
 The name is a choice, not decoration: the word is the 2022 shibboleth used to tell a Russian speaker from a Ukrainian one, and no Russian military unit will want it on a ground station.
 Paths like `exp-orig-backport/...`, `exp-mabur-fluke-pxp/...` and `devourer_stack/...` are on the author's machine, relative to `/mnt/sdb2/moved_from_ssd/home/ihor/build/drone/BUILD/devourer_stack/` (`devourer_stack/...` relative to its parent `BUILD/`); palianytsia itself is the sibling `BUILD/palianytsia`. Verified 2026-11-01: `exp-mabur-fluke-pxp/pixelpilot` is at e2d0c90, `exp-orig-backport/pixelpilot` at 33978f8, `devourer_stack/openipc-rs` at v0.1.40+1.
 Home: `vertexodessa/palianytsia`, a **private** GitHub repo (not OpenIPC, not this workspace). The mabur and devourer forks it pins stay public.
@@ -20,7 +20,7 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
 - M0-M2 done. Desktop (`pal-desktop`, `pal`) flies the quad on the Rust core, 1..N cards; ref==rust
   byte parity on every capture (`tools/m1-replay.sh`, local only: captures never go to GitHub).
   NV12/I420 planes go to GL textures and convert in a shader (b7370f5); VA-API still untested.
-- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.5, signed APKs). The G2G and RCF-heard
+- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.7, signed APKs). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
 - M3b (latency block in a matched mabur release): not started.
 - M4, done: the channel core (Rust port of ChannelCore/scout/hop, checked against mabur's record by
@@ -29,6 +29,9 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   calibration with the channel pick. Not done: GS-side DVR, VTX recording control beyond the
   REC_* parameters, preflight.
 - M5: the parameter client is done; MSP OSD and Quest hand tracking are not.
+- Pins now: mabur `palianytsia/base-v2` @ 8d599432 (upstream master c8e2d20e plus ours, RC 18), devourer
+  `palianytsia/base` @ c2fd35b. Releases build maburd from `release/MABUR_RELEASE` (v0.7: `release/v0.7` @ ae590193).
+- Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).
 - Owed on hardware (none run on air yet): TxSelector switching, field calibration at distance,
   the Quest relink with the cards kept open, card_deaf on a real deaf card.
 - Deferred (would change original mabur): the calibration measure card chosen by role at request
@@ -56,7 +59,7 @@ Success is measured, not judged by reading:
 - H.264. mabur is H.265-only; there is no codec byte in `FrameHdr`.
 - Audio (Opus). Nothing in mabur carries it.
 - The drone web UI WebView, UDP video forwarding, pie charts, LDPC/STBC/FHSS toggles.
-- The calibration lane, the CPE510 relay radio, `MABUR_LOSS_SIM`. The `Card` trait leaves room for a relay later.
+- The CPE510 relay radio, `MABUR_LOSS_SIM`. (The calibration lane was a non-goal in this draft; it was built in M4 after all, see `docs/calibration-port.md`.) The `Card` trait leaves room for a relay later.
 - A browser build. Original mabur already ships a WebUSB + WASM GS (`web/`, gilankpam.github.io/mabur).
 - A pure-Rust RTL88xx driver (see 5.2).
 - armeabi-v7a. arm64-v8a only.
@@ -164,6 +167,11 @@ devourer is the driver with hardware proof on 8812EU, 8812AU and 8822C in this r
 - Revisit `openipc-rtl88xx` after v1 only with a hardware A/B (RX loss and RCF heard % on the same card).
 
 ### 5.3 Crates
+
+The plan as drafted. As built (see `README.md` for the current layout): the channel core lives in
+`pal-core::chan`, not in a `pal-chan` crate; there is no `radio` crate (cards are `devourer-sys` plus
+`runtime::dev_card`) and no `dvr` crate yet (GS-side DVR is not done); `pal-android` holds the Android
+link shared by the phone and the Quest; the phone shell is Java, not Kotlin.
 
 ```
 crates/
@@ -277,7 +285,7 @@ OSD and menus:
 Quest specifics:
 - USB: one USB-C port, so cards plus charging go through a powered hub. Get USB permission without a dialog in immersive mode: a `USB_DEVICE_ATTACHED` intent filter with the device filter, so the system grants on attach. Verify on the device in the M0 spike; a permission dialog that cannot be seen from inside the headset is the failure to rule out.
 - Keep the link up when the headset is lifted (the proximity sensor pauses the session). The radio and core threads ignore XR session state, and only the frame loop stops. PixelPilot learnt the same lesson with its 30 s hide.
-- Development over wireless adb (`192.168.178.77:5555`).
+- Development over wireless adb (`192.168.178.118:5555` since 2026-10-31; it moves, find it with `nmap -p5555`).
 
 ### 5.7 Native Linux GS (first platform)
 
@@ -329,7 +337,10 @@ third_party/devourer   -> vertexodessa/devourer (fork of OpenIPC/devourer; the p
 
 Every release tag builds both ends from the same gitlinks and ships them together, so "which maburd goes with this app" never has an answer other than "the one in the same release".
 
-Release assets for tag `vX.Y.Z`:
+Release assets for tag `vX.Y.Z` (the plan; as built, `tools/pack-release.sh` packs `gs/` with both APKs, the
+static desktop binary and `gs.toml`, `drone/` with `maburd`, `install.sh` (from `tools/drone-install.sh`),
+`S96mabur`, `mabur.toml` and the IMX415 driver, plus `README.md` and `SHA256SUMS`; no CLI and no `PAIR.txt`,
+the shas are in the README's Sources section):
 
 | Asset | Built from |
 |---|---|
@@ -405,7 +416,7 @@ C++ units the Rust core replaces (h+cpp lines, pinned tree): rc_proto 787, sbi 1
 
 Decided 2026-10-31:
 1. **Licence:** not a blocker; gilankpam is a friend of the project. Still ask for a LICENSE file in mabur before anything derived from it goes public. Palianytsia itself links devourer (GPL-2.0, read as GPL-2.0-only), so it is GPL-2.0; `cargo-deny` in CI rejects Apache-2.0-only dependencies.
-2. **Pins:** branch `palianytsia/base` in both public forks, pushed 2026-10-31:
+2. **Pins:** branch `palianytsia/base` in both public forks, pushed 2026-10-31 (superseded on 2026-11-03: mabur moved to `palianytsia/base-v2`, a rebase onto upstream master c8e2d20e; current pins in Status):
    - `vertexodessa/mabur` @ `51cea32f`: gilankpam master `f901ee2a` + 4 commits (maburd build stamp, toml list, `venc.mirror`/`venc.flip`, MSP FC telemetry over T_MAV), RC 18, the build the quad flies.
    - `vertexodessa/devourer` @ `5deca84`: identical to gilankpam/devourer master.
 3. **Core strategy C:** the Rust core is the product; `pal-ref` (C++ WebGs) is a test-only oracle and never ships.
@@ -418,7 +429,7 @@ Still open:
 Known issues, deferred by Ihor (2026-11-01):
 7. **Grey picture on loss, CPU decode.** libavcodec's software HEVC decoder fills a missing reference with grey, so on a lossy link the desktop picture goes grey until the next intra refresh; vdpau and MediaCodec keep the last picture. Seen on `2026-10-31-bench-gs-ch40w40-idr.bin` with `--hwdec sw`, same with the system FFmpeg. Fix: hold the last clean frame while the decoder reports missing refs.
 8. **Desktop GPU decoders.** `--hwdec cuda` segfaults at exit (`cuCtxPopCurrent failed` in teardown); `--hwdec vaapi` stalls after 4 frames on NVIDIA's VA-API wrapper. Both reproduce with the system FFmpeg; `auto` picks vdpau first and is unaffected.
-9. **The APKs ship pal-ref.** The channel search (`channel = "auto"`) runs mabur's C++ ChannelCore through pal-ref, against decision 3. The Rust port of ChannelCore (ref == rust parity, like the rest of the core) retires it.
+9. **The APKs ship pal-ref.** Resolved 2026-11-01: the APKs run the Rust port of ChannelCore (`docs/channel-core-port.md`, level 4) and pal-ref left the Android build.
 
 ## 13 Latency measurement (needs the mabur fork)
 
