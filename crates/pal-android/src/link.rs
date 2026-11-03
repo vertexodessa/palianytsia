@@ -152,6 +152,22 @@ impl Link {
         if let Some(r) = cfg.link.ladder_cfg.ladder.last() {
             shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
         }
+        // A device keeps 10 GB of captures (Ihor, 2026-11-03) and the text
+        // of 2000 sessions (~30 KB each); a desktop picks its own --log-dir
+        // and prunes nothing.
+        match flightlog::retain::prune(
+            &c.log_dir,
+            flightlog::retain::Budget {
+                capture_bytes: 10 << 30,
+                sessions: 2000,
+            },
+        ) {
+            Ok(p) if p != flightlog::retain::Pruned::default() => {
+                log::info!("flight logs pruned: {p:?}")
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("flight log prune: {}: {e}", c.log_dir.display()),
+        }
         // Same layout as pal-desktop --log-dir (pal log reads it), bodies
         // capped at 256 MB per session so a replay can rerun a bad flight.
         let (log, log_info) = match flightlog::session::Session::create(
