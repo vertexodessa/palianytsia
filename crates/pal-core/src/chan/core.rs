@@ -17,7 +17,9 @@
 //! Not ported: the calibration pick (CalPicker, `cal_running`) and the relay
 //! cards (sweeps, survey windows); Palianytsia has neither.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::Release,
+};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
@@ -259,7 +261,53 @@ struct Live {
     dwell_period_ms: i32,
 }
 
+/// A card away from op and back (burst, operator scan): the in-flight lock,
+/// then the card's device-use lock, the order every holder of both follows,
+/// with the card's `tune_gen` bumped on the way out and again on the way
+/// back. The card may return to the channel it left, so only the generation
+/// can mark an NHM arm from before the excursion stale; the device-use lock
+/// keeps the sampler from seeing the retune away (a card stores its channel
+/// only after each retune returns).
+struct Away<'a> {
+    // Released before `inflight`, as the locals it replaces were.
+    _hold: MutexGuard<'a, ()>,
+    inflight: MutexGuard<'a, Option<InflightScout>>,
+    tune_gen: &'a AtomicU32,
+}
+
+impl Drop for Away<'_> {
+    fn drop(&mut self) {
+        self.tune_gen.fetch_add(1, Release);
+    }
+}
+
 impl Live {
+    fn away_locked<'a>(
+        &'a self,
+        card: usize,
+        inflight: MutexGuard<'a, Option<InflightScout>>,
+    ) -> Away<'a> {
+        let hold = self.sampler.hold_card(card);
+        let tune_gen = &self.gates.tune_gen[card];
+        tune_gen.fetch_add(1, Release);
+        Away {
+            _hold: hold,
+            inflight,
+            tune_gen,
+        }
+    }
+
+    fn away(&self, card: usize) -> Away<'_> {
+        self.away_locked(card, self.inflight.lock().unwrap())
+    }
+
+    /// `away`, only while the in-flight scout exists: otherwise nothing is
+    /// held and the generation does not move.
+    fn away_with_scout(&self, card: usize) -> Option<Away<'_>> {
+        let ilk = self.inflight.lock().unwrap();
+        ilk.is_some().then(|| self.away_locked(card, ilk))
+    }
+
     fn dwelling(&self, card: usize) -> bool {
         self.gates.dwell_busy.load(Relaxed) && self.gates.dwell_card.load(Relaxed) == card as i32
     }
@@ -1200,11 +1248,7 @@ impl ChannelCore {
         let back = fe.channel();
         let mut recs = Vec::with_capacity(due.len());
         {
-            // The in-flight dweller's lock first, as burst() and
-            // inflight_body() take it, then the card's device-use lock.
-            let _ilk = live.inflight.lock().unwrap();
-            let _hold = live.sampler.hold_card(card);
-            live.gates.tune_gen[card].fetch_add(1, std::sync::atomic::Ordering::Release);
+            let _away = live.away(card);
             sc.set_radio(fe.clone() as Arc<dyn ScoutRadio>);
             for ch in due {
                 let (d, v) = sc.dwell(ch, back);
@@ -1219,7 +1263,6 @@ impl ChannelCore {
                 );
                 recs.push(d);
             }
-            live.gates.tune_gen[card].fetch_add(1, std::sync::atomic::Ordering::Release);
             self.cur_ch[card] = fe.channel();
         }
         for d in &recs {
@@ -1543,22 +1586,19 @@ impl ChannelCore {
         let live = self.live.clone();
         let mut recs = Vec::new();
         {
-            let mut ilk = live.inflight.lock().unwrap();
-            let Some(sc) = ilk.as_mut() else { return };
+            let Some(mut away) = live.away_with_scout(card) else {
+                return;
+            };
+            let sc = away
+                .inflight
+                .as_mut()
+                .expect("away_with_scout: scout present");
             let fe = &live.cards[card];
             sc.set_radio(fe.clone() as Arc<dyn ScoutRadio>);
-            // The burst leaves op and returns to it, so only the generation
-            // (not the channel) can mark an NHM arm stale across it; bump on
-            // both sides. The device-use lock is held throughout: the
-            // sampler cannot see the retune-away (the card stores its
-            // channel only after each retune returns).
-            let _hold = live.sampler.hold_card(card);
-            live.gates.tune_gen[card].fetch_add(1, std::sync::atomic::Ordering::Release);
             for v in sc.burst(self.plan.op(), &mut recs) {
                 self.ranker.add(v);
             }
             self.cur_ch[card] = fe.channel();
-            live.gates.tune_gen[card].fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         for d in &recs {
             self.sink.dwell(now_ms, card, d);
