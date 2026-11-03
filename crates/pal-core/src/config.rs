@@ -790,19 +790,33 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
     }
     // The choice was saved against a set and a width: what is no longer a
     // member, or has no pair at 40 MHz, drops out; nothing left = all.
+    // At 40 MHz both halves of a pair are one block of air (149 and 153 =
+    // 149-153): a hop between them escapes nothing, so the first-picked
+    // half stands for the block.
     let fly: Vec<u8> = match parse_config_str(&out) {
-        Ok(c) => pick
-            .channels
-            .iter()
-            .copied()
-            .filter(|ch| c.radio.channels.contains(ch))
-            .filter(|&ch| c.radio.width != 40 || ht40_offset(ch) != 0)
-            .collect(),
+        Ok(c) => {
+            let mut blocks = Vec::new();
+            pick.channels
+                .iter()
+                .copied()
+                .filter(|ch| c.radio.channels.contains(ch))
+                .filter(|&ch| c.radio.width != 40 || ht40_offset(ch) != 0)
+                .filter(|&ch| {
+                    if c.radio.width != 40 {
+                        return true;
+                    }
+                    let low = if ht40_offset(ch) == 1 { ch } else { ch - 4 };
+                    let new = !blocks.contains(&low);
+                    blocks.push(low);
+                    new
+                })
+                .collect()
+        }
         Err(_) => Vec::new(),
     };
     if fly.len() != pick.channels.len() {
         skipped.push(format!(
-            "channels {:?}: flying {:?} (the rest are not in this set or width)",
+            "channels {:?}: flying {:?} (the rest are not in this set or width, or share a 40 MHz block)",
             pick.channels, fly
         ));
     }
@@ -1614,7 +1628,14 @@ mod tests {
         let c = parse_config_str(&t).unwrap();
         assert_eq!(c.radio.width, 40);
         assert_eq!(c.radio.channels, grid_5g(40));
-        assert_eq!(c.radio.use_, vec![36, 40], "both sides of the pair grid");
+        assert_eq!(c.radio.use_, vec![36], "36 and 40 are one 40 MHz block");
+        // The Quest's pick on 2026-11-03: six channels, four blocks.
+        let (t, _) = with_link_pick(&auto, pick(40, &[100, 144, 149, 153, 157, 161, 165]));
+        let c = parse_config_str(&t).unwrap();
+        assert_eq!(c.radio.use_, vec![100, 144, 149, 157]);
+        // At 20 MHz every channel is its own.
+        let (t, _) = with_link_pick(&auto, pick(20, &[149, 153]));
+        assert_eq!(parse_config_str(&t).unwrap().radio.use_, vec![149, 153]);
     }
 
     #[test]
