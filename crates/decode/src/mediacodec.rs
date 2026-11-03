@@ -72,6 +72,8 @@ struct Shared {
     no_input: AtomicU64,
     /// (pts, queued at) of AUs in flight, oldest first.
     queued: Mutex<VecDeque<(u64, Instant)>>,
+    /// The output surface, to log the buffer size the codec gave it.
+    win: NativeWindow,
 }
 
 // SAFETY: AMediaCodec allows one thread queueing input while another
@@ -113,6 +115,7 @@ impl MediaCodecDecoder {
             errors: AtomicU64::new(0),
             no_input: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
+            win: win.clone(),
         });
         let s2 = sh.clone();
         let out = std::thread::Builder::new()
@@ -185,7 +188,15 @@ fn output_loop(sh: &Shared) {
                     sh.stale.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Ok(Out::OutputFormatChanged) => log::info!("mediacodec: output format changed"),
+            // The codec sizes the surface's buffers to the stream, whatever
+            // size the surface was created with: this line says which
+            // resolution reaches the compositor.
+            Ok(Out::OutputFormatChanged) => log::info!(
+                "mediacodec: output format {}; surface buffers {}x{}",
+                sh.codec.output_format(),
+                sh.win.width(),
+                sh.win.height()
+            ),
             Ok(_) => {}
             Err(e) => {
                 sh.errors.fetch_add(1, Ordering::Relaxed);

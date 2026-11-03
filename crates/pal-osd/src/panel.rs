@@ -115,6 +115,11 @@ fn step(id: &str) -> f64 {
 /// (2272x1278 since its 581804a build; 2304x1296 before). On any other
 /// driver 90/100 native fails the pipeline start and maburd restores the
 /// previous mode (mabur docs/mavlink.md), so offering them is safe.
+/// Above 1080p: the native window itself or a 16:9 size inside it; maburd
+/// checks only that the size fits the mode, not that the H.265 engine keeps
+/// up (1728x972@100 already reads 158 % of its rated macroblock rate), and
+/// the Quest scales into a 1920x1080 surface. 2560x1440 is the stock
+/// driver's native 60 fps window, so every driver serves it at 60.
 /// 720p also needs venc.slices to divide its 12 CTU rows (1, 2, 3, 4, 6, 12).
 fn presets(id: &str) -> &'static [&'static str] {
     match id {
@@ -129,6 +134,9 @@ fn presets(id: &str) -> &'static [&'static str] {
             "90@1920x1080/native",
             "100@1920x1080/native",
             "60@1280x720/native",
+            "100@2272x1278/native",
+            "60@2560x1440/native",
+            "60@2944x1656/native",
         ],
         "REC_SIZE" => &["1920x1080", "1280x720"],
         _ => &[],
