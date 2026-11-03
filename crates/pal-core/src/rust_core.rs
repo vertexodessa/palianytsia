@@ -10,14 +10,9 @@ use std::sync::Arc;
 
 use crate::aggregator::{Aggregator, Route};
 use crate::cal::log::CalLog;
-use crate::cal::picker::{CalPicker, FixedPicker, Mode as PickMode};
-use crate::cal::plan::{default_sweeps, effective_width};
-use crate::cal::session::{sweep_token, CalSession, CalSessionCfg};
-use crate::cal::status_json as cal_status_json;
 use crate::chan::core::{
     ChannelCore, ChannelCoreCfg, ChannelSink, ChannelTickIn, MsClock, Sleeper, UsClock,
 };
-use crate::chan::gate::cal_cmd_clear;
 use crate::chan::hop::HopEvent;
 use crate::chan::plan::MoveEvent;
 use crate::chan::radio::LinkCard;
@@ -34,15 +29,15 @@ use crate::mav::{MavTunnel, ParamClient};
 use crate::nack::{NackInputs, NackTailView};
 use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelectorCfg};
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
-use crate::vrx::{
-    random_nonce, RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState,
-};
+use crate::vrx::{RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState};
 use crate::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_wire::cal::{self, SweepSpec};
 use pal_wire::frame_wire::FrameHdr;
 use pal_wire::{rc, sbi, sw};
 
+mod cal_lane;
 mod nack_lane;
+use cal_lane::CalLane;
 use nack_lane::NackLane;
 
 #[derive(Clone, Copy, Debug)]
@@ -83,9 +78,6 @@ struct Counters {
 /// add it and the FCS back.
 const CAL_DOT11_HEADER_LEN: usize = 26;
 const CAL_FCS_LEN: usize = 4;
-/// maburgs' MAVLink identity for the calibration kit.
-const CAL_SYSID: u8 = 255;
-const CAL_COMPID: u8 = 190;
 
 /// FrameStream's sink: builds the AU in flight and hands it to the host.
 struct AuOut<'a> {
@@ -161,15 +153,8 @@ struct Gs {
     /// Live cards; empty = send through `CoreIo`.
     cards: Vec<Arc<dyn LinkCard>>,
     chan: Option<ChannelCore>,
-    /// TX-power calibration (maburgs' CalSession); idle unless started.
-    cal: CalSession,
-    /// The GS's own radio.width: the widest sweep a run may ask for.
-    radio_width: u8,
-    ladder: Vec<crate::config::Rung>,
-    /// The linked drone's DiscAck agreed_width (0 = none heard yet).
-    peer_width: u8,
-    /// MAVLink packet seq of the cal packets.
-    cal_mav_seq: u8,
+    /// TX-power calibration (maburgs' CalSession wiring).
+    cal: CalLane,
     /// The uplink TX card among `cards` (card 0 without a roster).
     sel: TxSelector,
 }
@@ -188,14 +173,16 @@ impl Gs {
     /// The calibration session's view of the peer, from the controller's.
     fn sync_cal_peer(&mut self) {
         let (linked, capable) = (self.linked(), self.peer_can(rc::CAP_CALIBRATE));
-        self.cal.set_peer(linked, capable, self.vrx.session_ctx());
+        self.cal
+            .session
+            .set_peer(linked, capable, self.vrx.session_ctx());
     }
 
     /// WebGs::send_: false = the scout gate dropped it (counted by the core),
     /// or a calibration sweep owns the air (anything sent would corrupt
     /// the measurement; the slotter's backlog must not go out either).
     fn send(&mut self, f: &SlotFrame, now_us: u64, io: &mut dyn CoreIo) -> bool {
-        if self.cal.radio_silent(now_us / 1000) {
+        if self.cal.session.radio_silent(now_us / 1000) {
             return false;
         }
         self.send_now(f, now_us, io)
@@ -397,14 +384,7 @@ impl RustCore {
                 rcf_sent: 0,
                 cards: Vec::new(),
                 chan: None,
-                // maburgs' defaults: margin 1 dB only predicts the verify
-                // parks, and verify tallies by rate whatever the drone's
-                // own margin parks at.
-                cal: CalSession::new(CalSessionCfg::default(), CalLog::none()),
-                radio_width: cfg.radio.width,
-                ladder: cfg.link.ladder_cfg.ladder.clone(),
-                peer_width: 0,
-                cal_mav_seq: 0,
+                cal: CalLane::new(cfg),
                 sel: TxSelector::new(
                     TxSelectorCfg {
                         pinned: effective_tx_card(cfg.radio.tx_card, n_cards),
@@ -511,7 +491,7 @@ impl RustCore {
                 // The drone replies whatever the session's state; it
                 // ignores what does not fit.
                 for m in cal::decode_all(&pkt) {
-                    g.cal.on_mav(&m, us / 1000);
+                    g.cal.session.on_mav(&m, us / 1000);
                 }
             }
             g.drain_params();
@@ -553,7 +533,7 @@ impl RustCore {
                 .then(|| rc::parse_disc_ack(body))
                 .flatten();
             if let Some(ack) = &ack {
-                g.peer_width = ack.agreed_width;
+                g.cal.peer_width = ack.agreed_width;
             }
             // The ack that OPENED the session links where it was heard
             // (on_rc_body handed the core its rx channel).
@@ -667,7 +647,7 @@ impl GsCore for RustCore {
         if let Some(g) = self.gs.as_mut() {
             if let Some(info) = cal::parse_payload(&m.body) {
                 let rssi = i32::from(m.rssi[0].max(m.rssi[1])) - 110;
-                g.cal.on_cal_frame(
+                g.cal.session.on_cal_frame(
                     usize::from(m.card_id),
                     &info,
                     rssi,
@@ -758,7 +738,7 @@ impl GsCore for RustCore {
                 let cin = ChannelTickIn {
                     now_ms: now_ms as f64,
                     in_session,
-                    cal_running: g.cal.running(),
+                    cal_running: g.cal.session.running(),
                     tx_card: tx,
                     agg: Some(&self.agg),
                 };
@@ -808,23 +788,9 @@ impl GsCore for RustCore {
             g.params.tick(now_ms);
             g.drain_params();
             // Calibration first, so a run's message leaves this tick, ahead
-            // of any live MAVLink backlog. The one hold: a SweepCmd while a
-            // scout dwell begun just before the start is still off-channel
-            // (repeated every 200 ms, so only late).
+            // of any live MAVLink backlog.
             g.sync_cal_peer();
-            if let Some(c) = g.chan.as_mut() {
-                g.cal.step_pick(now_ms, c);
-            }
-            if let Some(m) = g.cal.due_mav(now_ms) {
-                let dwell_busy = g.chan.as_ref().is_some_and(|c| c.dwell_busy());
-                let held = matches!(m, cal::CalMsg::Sweep(_))
-                    && !cal_cmd_clear(g.cal.radio_silent(now_ms), dwell_busy);
-                if !held {
-                    let pkt = cal::encode(&m, CAL_SYSID, CAL_COMPID, g.cal_mav_seq);
-                    g.cal_mav_seq = g.cal_mav_seq.wrapping_add(1);
-                    g.mav.push_cal(pkt, g.cal.tag_ctx());
-                }
-            }
+            g.cal.tick(now_ms, g.chan.as_mut(), &mut g.mav);
             for frame in g.mav.flush_cal() {
                 let sf = SlotFrame {
                     frame,
@@ -963,40 +929,17 @@ impl GsCore for RustCore {
         let Some(g) = self.gs.as_mut() else {
             return Err("refused: a spotter does not transmit".into());
         };
-        let width = effective_width(g.radio_width, g.linked(), g.peer_width);
-        let sweeps = if sweeps.is_empty() {
-            default_sweeps(width, &g.ladder)
-        } else {
-            if sweeps.iter().any(|s| s.bw > width) {
-                return Err(format!("refused: the link flies {width} MHz at most"));
-            }
-            sweeps.to_vec()
-        };
         // Refusals first, from the session's own last view of the peer.
         g.sync_cal_peer();
-        // The channel core picks the channel first when it can measure (auto,
-        // a spare card); without one the run sweeps on the configured channel.
-        let mut fixed = FixedPicker {
-            mode: if g.cards.len() >= 2 {
-                PickMode::Pinned
-            } else {
-                PickMode::OneCard
-            },
-            op: self.channel,
-        };
-        let picker: &mut dyn CalPicker = match g.chan.as_mut() {
-            Some(c) => c,
-            None => &mut fixed,
-        };
-        g.cal.start(random_nonce(), sweeps, now_ms, Some(picker))?;
-        let snap = g.cal.snapshot();
-        eprintln!(
-            "pal cal: started ch {} ({}) sweeps {:?}",
-            snap.channel,
-            snap.pick_note,
-            g.cal.sweeps().iter().map(sweep_token).collect::<Vec<_>>()
-        );
-        Ok(())
+        let (linked, n_cards) = (g.linked(), g.cards.len());
+        g.cal.start(
+            sweeps,
+            linked,
+            g.chan.as_mut(),
+            n_cards,
+            self.channel,
+            now_ms,
+        )
     }
 
     fn set_channels(&mut self, chosen: &[u8]) -> Result<(), String> {
@@ -1022,26 +965,18 @@ impl GsCore for RustCore {
 
     fn cal_abort(&mut self) {
         if let Some(g) = self.gs.as_mut() {
-            if g.cal.running() || g.cal.picking() {
-                eprintln!("pal cal: aborted by the operator");
-            }
-            let picker = g.chan.as_mut().map(|c| c as &mut dyn CalPicker);
-            g.cal.abort("aborted by the operator", picker);
+            g.cal.abort(g.chan.as_mut());
         }
     }
 
     fn cal_json(&self) -> Option<String> {
         let g = self.gs.as_ref()?;
-        Some(cal_status_json(
-            &g.cal.snapshot(),
-            g.cal.sweeps(),
-            g.peer_can(rc::CAP_CALIBRATE),
-        ))
+        Some(g.cal.json(g.peer_can(rc::CAP_CALIBRATE)))
     }
 
     fn set_cal_log_dir(&mut self, dir: &std::path::Path) {
         if let Some(g) = self.gs.as_mut() {
-            g.cal.set_log(CalLog::open(dir));
+            g.cal.session.set_log(CalLog::open(dir));
         }
     }
 
@@ -1519,7 +1454,7 @@ mod tests {
         assert_eq!((cmd.kind, cmd.bw, cmd.seq), (cal::Kind::Power, 20, 0));
 
         // The drone accepts over the tunnel, tagged under the run's pair.
-        let ctx = core.gs.as_ref().unwrap().cal.tag_ctx();
+        let ctx = core.gs.as_ref().unwrap().cal.session.tag_ctx();
         let reply = cal::encode(
             &cal::CalMsg::Ack(cal::SweepAck {
                 nonce: cmd.nonce,
@@ -1541,7 +1476,7 @@ mod tests {
             &mut io,
         );
         assert_eq!(
-            core.gs.as_ref().unwrap().cal.state(),
+            core.gs.as_ref().unwrap().cal.session.state(),
             crate::cal::session::State::Sweep
         );
 
@@ -1567,7 +1502,10 @@ mod tests {
         core.on_rx(&body(p, &clk), &mut io);
         assert_eq!(core.c.cal_frames, 1);
         assert_eq!(core.c.bodies, bodies + 1);
-        assert_eq!(core.gs.as_ref().unwrap().cal.cell_received(0, 0, 0), 1);
+        assert_eq!(
+            core.gs.as_ref().unwrap().cal.session.cell_received(0, 0, 0),
+            1
+        );
         let j = core.cal_json().unwrap();
         assert!(j.contains("\"state\":\"sweep\""), "{j}");
 
