@@ -245,18 +245,36 @@ impl Gs {
         true
     }
 
-    /// The tunnel's send callback: slotted like an RCF, direct when the
-    /// slotter holds nothing.
+    /// Where a controller step goes, as (card, frame): a DISC follows the
+    /// scout (the channel core's targets) and proposes the channel of the
+    /// card it leaves on; an RCF goes to the TX card `tx`.
+    fn step_frames(&self, frame: &[u8], is_disc: bool, tx: usize) -> Vec<(usize, Vec<u8>)> {
+        match (&self.chan, is_disc) {
+            (Some(c), true) => c
+                .disc_targets(tx)
+                .into_iter()
+                .map(|t| (t, c.disc_for_card(frame, t)))
+                .collect(),
+            _ => vec![(tx, frame.to_vec())],
+        }
+    }
+
+    /// Slotted when the slotter takes it, else sent now.
+    fn offer_or_send(&mut self, mut sf: SlotFrame, now_us: u64, io: &mut dyn CoreIo) {
+        if !self.slot.offer(&mut sf, now_us / 1000, false) {
+            self.send(&sf, now_us, io);
+        }
+    }
+
+    /// The tunnel's send callback: slotted like an RCF.
     fn send_mav_frames(&mut self, frames: Vec<Vec<u8>>, now_us: u64, io: &mut dyn CoreIo) {
         for frame in frames {
-            let mut sf = SlotFrame {
+            let sf = SlotFrame {
                 frame,
                 card: self.sel.selected() as i32,
                 ..SlotFrame::default()
             };
-            if !self.slot.offer(&mut sf, now_us / 1000, false) {
-                self.send(&sf, now_us, io);
-            }
+            self.offer_or_send(sf, now_us, io);
         }
     }
 }
@@ -805,29 +823,17 @@ impl GsCore for RustCore {
                     self.lha.on_step_sent(&self.agg);
                 }
                 let tx = g.pick_tx(&self.agg, now_ms);
-                // A DISC follows the scout (the core's disc targets); an RCF
-                // goes to the TX selector's card. rcf_seq() IS this frame's
-                // seq; DISCs are not matchable RTT sends.
-                let targets = match (&g.chan, out.is_disc) {
-                    (Some(c), true) => c.disc_targets(tx),
-                    _ => vec![tx],
-                };
-                for t in targets {
-                    let frame = match (&g.chan, out.is_disc) {
-                        // A DISC proposes the channel it is sent on.
-                        (Some(c), true) => c.disc_for_card(&out.frame, t),
-                        _ => out.frame.clone(),
-                    };
-                    let mut sf = SlotFrame {
+                // rcf_seq() IS this frame's seq; DISCs are not matchable
+                // RTT sends.
+                for (card, frame) in g.step_frames(&out.frame, out.is_disc, tx) {
+                    let sf = SlotFrame {
                         frame,
                         seq: g.vrx.rcf_seq(),
-                        card: t as i32,
+                        card: card as i32,
                         stamp_rtt: !out.is_disc,
                         ..SlotFrame::default()
                     };
-                    if !g.slot.offer(&mut sf, now_ms, false) {
-                        g.send(&sf, now_us, io);
-                    }
+                    g.offer_or_send(sf, now_us, io);
                 }
             }
             for f in g.slot.take_due(now_ms) {
