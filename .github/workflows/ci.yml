@@ -7,7 +7,7 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Host packages
@@ -36,14 +36,14 @@ jobs:
         run: [a, b]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Host packages
         run: sudo apt-get update && sudo apt-get install -y pkg-config cmake bzip2
       - name: Build maburd (pinned OpenIPC toolchain, sha256-checked)
         run: PAL_FETCH_TOOLCHAIN=1 tools/build-maburd.sh "${GITHUB_SHA::8}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: maburd-${{ matrix.run }}
           path: dist/
@@ -52,7 +52,7 @@ jobs:
     needs: maburd
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
       - name: Compare the two builds
         run: |
           set -e
