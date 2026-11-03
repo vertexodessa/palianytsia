@@ -40,6 +40,7 @@ pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
     pal_core::config::LinkPick {
         bw: p.link_bw,
         channels: p.link_channels,
+        s3_demote: Some(p.s3_demote),
     }
 }
 

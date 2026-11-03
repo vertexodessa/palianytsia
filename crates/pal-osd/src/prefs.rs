@@ -28,6 +28,10 @@ pub struct HudPrefs {
     /// 1920 px video lands on fewer display pixels, so supersampling may
     /// beat sharpening; judged by eye. Other front ends ignore it.
     pub video_filter: VideoFilter,
+    /// Step the ladder down on any enhance-layer residual loss
+    /// (`link.s3_demote`), applied when the link starts. On the bench it
+    /// caused 15 of 24 demotes with the base layer clean (2026-11-03).
+    pub s3_demote: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +74,7 @@ impl Default for HudPrefs {
             link_bw: 20,
             link_channels: Vec::new(),
             video_filter: VideoFilter::Off,
+            s3_demote: true,
         }
     }
 }
@@ -81,7 +86,7 @@ impl HudPrefs {
             "nav": self.nav, "link": self.link, "messages": self.messages,
             "stats": self.stats, "scale": self.scale, "link_bw": self.link_bw,
             "link_channels": self.link_channels,
-            "video_filter": self.video_filter.key(),
+            "video_filter": self.video_filter.key(), "s3_demote": self.s3_demote,
         })
         .to_string()
     }
@@ -125,6 +130,7 @@ impl HudPrefs {
             video_filter: VideoFilter::parse(
                 v.get("video_filter").and_then(Value::as_str).unwrap_or(""),
             ),
+            s3_demote: b("s3_demote", d.s3_demote),
         }
     }
 
@@ -153,6 +159,7 @@ mod tests {
             link_bw: 40,
             link_channels: vec![144, 40],
             video_filter: super::VideoFilter::Supersample,
+            s3_demote: false,
             ..Default::default()
         };
         assert_eq!(HudPrefs::from_json(&p.to_json()), p);

@@ -769,6 +769,8 @@ pub struct LinkPick {
     /// The members the link may sit on (`with_channels`): one = that
     /// channel, fixed; several = auto among them; none = the config's own.
     pub channels: Vec<u8>,
+    /// `link.s3_demote`; None = the config's own.
+    pub s3_demote: Option<bool>,
 }
 
 /// `text` with `pick` applied, and one line per choice that could not be
@@ -787,6 +789,12 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
     match with_search_grid(&out) {
         Ok(t) => out = t,
         Err(e) => skipped.push(format!("search grid not applied: {e}")),
+    }
+    if let Some(on) = pick.s3_demote {
+        match with_link_key(&out, "s3_demote", Value::Boolean(on)) {
+            Ok(t) => out = t,
+            Err(e) => skipped.push(format!("s3_demote {on} not applied: {e}")),
+        }
     }
     // The choice was saved against a set and a width: what is no longer a
     // member, or has no pair at 40 MHz, drops out; nothing left = all.
@@ -922,6 +930,21 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     if link.contains_key("static_bw") {
         link.insert("static_bw".into(), Value::Integer(bw.into()));
     }
+    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
+    parse_config_str(&out)?;
+    Ok(out)
+}
+
+/// `link.<key>` set to `v`, checked by the config parser.
+fn with_link_key(text: &str, key: &str, v: Value) -> R<String> {
+    let mut j = text
+        .parse::<Table>()
+        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    j.entry("link")
+        .or_insert_with(|| Value::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError("config: link is not a table".into()))?
+        .insert(key.into(), v);
     let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
     parse_config_str(&out)?;
     Ok(out)
@@ -1604,6 +1627,7 @@ mod tests {
         let pick = |bw, chs: &[u8]| LinkPick {
             bw,
             channels: chs.to_vec(),
+            s3_demote: None,
         };
         let grid20 = with_search_grid(&with_link_bw(&auto, 20).unwrap()).unwrap();
         let (t, skipped) = with_link_pick(&auto, pick(20, &[161]));
@@ -1636,6 +1660,15 @@ mod tests {
         // At 20 MHz every channel is its own.
         let (t, _) = with_link_pick(&auto, pick(20, &[149, 153]));
         assert_eq!(parse_config_str(&t).unwrap().radio.use_, vec![149, 153]);
+        // s3_demote: None keeps the config's true, Some sets it.
+        assert!(parse_config_str(&t).unwrap().link.ladder_cfg.s3_demote);
+        let off = LinkPick {
+            s3_demote: Some(false),
+            ..pick(20, &[])
+        };
+        let (t, skipped) = with_link_pick(&auto, off);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(!parse_config_str(&t).unwrap().link.ladder_cfg.s3_demote);
     }
 
     #[test]

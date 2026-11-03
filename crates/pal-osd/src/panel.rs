@@ -389,6 +389,26 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                                     .small()
                                     .color(Color32::GRAY),
                                 );
+                                ui.separator();
+                                if ui
+                                    .checkbox(
+                                        &mut i.prefs.s3_demote,
+                                        "Step down on enhance-layer loss",
+                                    )
+                                    .changed()
+                                {
+                                    out.prefs_changed = true;
+                                    out.relink = true;
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "On: any lost droppable frame steps the ladder down (early, \
+                                         cautious). Off: only base-layer loss does, so the bitrate \
+                                         climbs higher. Restarts the link.",
+                                    )
+                                    .small()
+                                    .color(Color32::GRAY),
+                                );
                                 if !i.channels.is_empty() {
                                     ui.separator();
                                     if let Some(set) =
