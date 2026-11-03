@@ -8,7 +8,7 @@ status: `docs/spec.md`; read its M1/M2 status sections first).
 |---|---|
 | `crates/pal-wire` | wire formats: dot11, SBI, RC (RCF/DISC/Telem/NACK/MAV), MAVLink 2 framer |
 | `crates/pal-fec` | GF(256), sliding-window RLC decoder |
-| `crates/pal-core` | the Rust GS core (`rust_core.rs`, WebGs wiring), `GsCore` trait, ladder, LHA, NACK, MAV tunnel, refresh (IDR) |
+| `crates/pal-core` | the Rust GS core (`rust_core.rs`, WebGs wiring; its NACK, calibration and parameter lanes in `rust_core/`), `GsCore` trait, ladder, LHA, NACK, MAV tunnel, refresh (IDR) |
 | `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle (desktop/host only); `RefCard` (`cpp/pal_card.cpp`) lends the devourer-sys card to it as a `maburgs::LinkCard`, so it runs mabur's ChannelCore live; `tests/chan_trace.rs` checks the Rust ChannelCore against it record by record |
 | `crates/devourer-sys` | devourer through a C shim (USB cards) |
 | `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
