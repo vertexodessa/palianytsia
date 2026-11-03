@@ -113,6 +113,62 @@ pub fn card_rates(old: &[CardRx], new: &[CardRx], dt: f64) -> Vec<CardRate> {
         .collect()
 }
 
+/// A card going deaf or hearing again, for the flight log.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeafChange {
+    pub card: usize,
+    pub deaf: bool,
+    pub fps: f64,
+    pub best_fps: f64,
+}
+
+/// Watches the per-card counters for the flight log the way the cards
+/// chip does (same window, same rule), so a deaf card leaves an event
+/// behind and not only a red chip nobody was looking at.
+#[derive(Default)]
+pub struct DeafWatch {
+    rows: VecDeque<(f64, Vec<CardRx>)>,
+    deaf: Vec<bool>,
+}
+
+impl DeafWatch {
+    /// Feeds one snapshot; returns the cards whose state flipped. A
+    /// changed card count starts over with every card hearing.
+    pub fn push(&mut self, t_s: f64, cards: &[CardRx]) -> Vec<DeafChange> {
+        if self.deaf.len() != cards.len() {
+            self.rows.clear();
+            self.deaf = vec![false; cards.len()];
+        }
+        self.rows.push_back((t_s, cards.to_vec()));
+        while self
+            .rows
+            .front()
+            .is_some_and(|(t, _)| t_s - t > History::CARD_WINDOW_S)
+        {
+            self.rows.pop_front();
+        }
+        let (t0, old) = &self.rows[0];
+        if cards.len() < 2 || t_s <= *t0 {
+            return Vec::new();
+        }
+        let rates = card_rates(old, cards, t_s - t0);
+        let best = rates.iter().map(|r| r.fps).fold(0.0, f64::max);
+        let mut out = Vec::new();
+        for (i, r) in rates.iter().enumerate() {
+            if r.deaf != self.deaf[i] {
+                self.deaf[i] = r.deaf;
+                out.push(DeafChange {
+                    card: i,
+                    deaf: r.deaf,
+                    fps: r.fps,
+                    best_fps: best,
+                });
+            }
+        }
+        out
+    }
+}
+
 /// "c0 DEAF   0/s  c1 TX -45 dBm 230/s crc 6 %": each card's frames/s
 /// and CRC failures over the last seconds, its RSSI, and which one
 /// transmits. A deaf card's RSSI is left out: it is the last one heard.
@@ -371,10 +427,6 @@ impl History {
             })
             .collect()
     }
-    /// The newest (rssi, snr) pair no older than `hold_s` before the last
-    /// row. A stats window with no drone frame in it reports both as null,
-    /// so taking only the last row made the chip blink "no signal" on a
-    /// healthy link.
     /// Per-card rates over the last `CARD_WINDOW_S` (empty with fewer
     /// than two cards or one snapshot).
     pub fn card_rates(&self) -> Vec<CardRate> {
@@ -393,6 +445,10 @@ impl History {
         };
         card_rates(&old.cards, &new.cards, t1 - t0)
     }
+    /// The newest (rssi, snr) pair no older than `hold_s` before the last
+    /// row. A stats window with no drone frame in it reports both as null,
+    /// so taking only the last row made the chip blink "no signal" on a
+    /// healthy link.
     pub fn signal(&self, hold_s: f64) -> Option<(f64, f64)> {
         let t_last = self.rows.back()?.0;
         self.rows
@@ -806,6 +862,32 @@ mod tests {
             crc_fail,
             ..CardRx::default()
         }
+    }
+
+    #[test]
+    fn deaf_watch_reports_each_flip_once() {
+        let mut w = DeafWatch::default();
+        // 1 s apart; card 1 hears 230/s throughout, card 0 stops at t=3.
+        let at = |t: u64, c0: u64| [card(None, c0, 0), card(None, 230 * t, 0)];
+        assert!(w.push(0.0, &at(0, 0)).is_empty());
+        for t in 1..=3 {
+            assert!(w.push(t as f64, &at(t, 230 * t)).is_empty(), "t={t}");
+        }
+        let mut flips = Vec::new();
+        for t in 4..=9 {
+            flips.extend(w.push(t as f64, &at(t, 690)));
+        }
+        assert_eq!(flips.len(), 1);
+        assert_eq!((flips[0].card, flips[0].deaf), (0, true));
+        assert_eq!(flips[0].fps, 0.0);
+        // It hears again: one flip back.
+        let back: Vec<_> = (10..=13)
+            .flat_map(|t| w.push(t as f64, &at(t, 690 + 230 * (t - 9))))
+            .collect();
+        assert_eq!(back.len(), 1);
+        assert_eq!((back[0].card, back[0].deaf), (0, false));
+        // A card set change starts over without a flip.
+        assert!(w.push(14.0, &[card(None, 0, 0)]).is_empty());
     }
 
     #[test]

@@ -184,6 +184,8 @@ pub struct CoreLoop {
     last_log_us: u64,
     /// Calibration bookkeeping the core does not keep.
     cal: CalUi,
+    /// Per-card deaf/hearing flips for the flight log.
+    deaf: pal_osd::DeafWatch,
 }
 
 /// The loop's channels to the UI.
@@ -220,6 +222,7 @@ impl CoreLoop {
             last_stats_us: 0,
             last_log_us: 0,
             cal: CalUi::default(),
+            deaf: pal_osd::DeafWatch::default(),
         }
     }
 
@@ -370,6 +373,19 @@ impl CoreLoop {
                     // A killed app (Android swipe, OOM) skips Drop: at most
                     // one second of log is lost, a few writes a second.
                     let _ = l.flush();
+                }
+                let cards = pal_osd::Snapshot::parse(&line).map(|s| s.cards);
+                for c in self.deaf.push(now as f64 / 1e6, &cards.unwrap_or_default()) {
+                    let ev = if c.deaf { "card_deaf" } else { "card_hearing" };
+                    eprintln!(
+                        "pal: card {} {ev}: {:.1} frames/s, best card {:.0}",
+                        c.card, c.fps, c.best_fps
+                    );
+                    self.sink.shared.event(
+                        ev,
+                        serde_json::json!({"card": c.card, "fps": (c.fps * 10.0).round() / 10.0,
+                            "best_fps": c.best_fps.round()}),
+                    );
                 }
             }
             let stats = stats_line::parse(&line);
