@@ -20,7 +20,7 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
 - M0-M2 done. Desktop (`pal-desktop`, `pal`) flies the quad on the Rust core, 1..N cards; ref==rust
   byte parity on every capture (`tools/m1-replay.sh`, local only: captures never go to GitHub).
   NV12/I420 planes go to GL textures and convert in a shader (b7370f5); VA-API still untested.
-- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.7.1, signed APKs). The G2G and RCF-heard
+- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.8, signed APKs; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):
   one Perfetto trace with kernel USB/IRQ events (xhci/usb tracepoints, usbfs reap, kprobes) and

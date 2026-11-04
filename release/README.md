@@ -1,11 +1,11 @@
-# Palianytsia v0.7.1
+# Palianytsia v0.8
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.7.1.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.7.1.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.8.0.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.8.0.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,12 +14,13 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.sh` installs it on an imx415 drone. |
 
-## What changed since v0.7
+## What changed since v0.7.1
 
-A ground-station-only update: the drone daemon is the same as in v0.7, so a v0.7 drone needs nothing. Coming from v0.6, update the drone too (v0.7 renumbered the drone parameters).
+Update the drone: the change is in the drone daemon. The GS is the same as v0.7.1 apart from the Quest display rate; a v0.7 or v0.7.1 GS works with a v0.8 drone and the other way round.
 
-- **Movable OSD chips.** Each stats chip can be dragged anywhere; the position is saved, and a double click puts the chip back in its row. Chips keep a fixed width, so a number gaining a digit no longer pushes its neighbours around.
-- **Quest: room beside the picture.** The OSD layer is 1.5 times the size of the video and centred on it, so chips can be parked outside the picture. On the Quest, chips move while the settings panel is open.
+- **FEC repairs leave with their frame.** The drone builds a frame's repair packets when the frame ends and sends them right behind it, each covering the whole frame. A frame that lost a packet is repaired at once instead of waiting for the next frame's repairs, so it no longer reaches the headset late and paired with its neighbour (the display then drops one of the two). On the Quest under ~4 % loss this halves the frames replaced before display (14 % to 6 %) and the frames more than 16.7 ms late (30 % to 14 %), at 60, 90 and 120 fps. New drone config key `fec.repairs_with_frame` (default `true`; `false` restores the v0.7 behaviour).
+- **FEC window 64.** The bundled `mabur.toml` sets `fec.window = 64` (was 32), so a repair covers about two frames and survives longer loss bursts. An update keeps the drone's own `mabur.toml`: set `window = 64` in its `[fec]` section, or install with `--config`.
+- **Quest: highest display rate.** The headset runs at the highest refresh rate it offers (up to 120 Hz before).
 
 ## Ground station
 
@@ -28,7 +29,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.7.1.apk    # or the phone APK
+   adb install palianytsia-quest-0.8.0.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -108,11 +109,13 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 ./install.sh --remove 192.168.1.10
 ```
 
-maburd refuses config keys it does not know. v0.7 and v0.7.1 add no config keys, so a v0.4 to v0.6 drone config works unchanged (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
+maburd refuses config keys it does not know. v0.8 adds the optional key `fec.repairs_with_frame`; a v0.4 to v0.7.1 drone config works unchanged, but a v0.7.1 or older maburd refuses a config that has the new key (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
 
-## Known limits in v0.7.1
+## Known limits in v0.8
 
 - Pairing uses the default link key on both ends.
+- The new FEC placement costs drone CPU: the hot thread goes from about 12 % to 19 % of a core at 120 fps and 13 Mbps.
+- At 30-60 fps under steady random loss, a model of the link loses slightly more whole frames with `repairs_with_frame` than without (0.6 % against 0.2 % of frames at 4 % loss, before NACK). On the air the difference was within noise.
 - While disarmed, the drone runs low power: 30 fps at 1 Mbps. Full rate starts on arming.
 - Above 90 fps and every native mode need waybeam's six-mode driver (`install.sh` installs it); on any other sensor driver those modes are refused.
 - DFS channels (52-144) are marked in the channel menu but neither end detects radar. Whether you may use them is up to your local rules.
@@ -124,7 +127,7 @@ maburd refuses config keys it does not know. v0.7 and v0.7.1 add no config keys,
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.7` @ @MABUR_SHA@ (`release/MABUR_RELEASE`). This is upstream mabur master c8e2d20e plus Palianytsia's commits (`palianytsia/base-v2`) without the bench-only `/sim` debug route.
+- mabur: fork branch `release/v0.8` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.7` plus the FEC repair placement (`fec.repairs_with_frame`) from `palianytsia/base-v2`.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
