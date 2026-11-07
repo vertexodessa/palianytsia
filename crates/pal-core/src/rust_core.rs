@@ -408,6 +408,7 @@ impl RustCore {
         let mut gs = gs;
         if let (Some(g), Some(env)) = (gs.as_mut(), env) {
             let cc = ChannelCoreCfg {
+                width_mhz: cfg.rx_width(),
                 radio: cfg.radio.clone(),
                 hop: cfg.hop.clone(),
                 key: cfg.link.key,
@@ -467,7 +468,7 @@ impl RustCore {
             lha: LinkHealthAssembler::new(n_cards, 4, sw::HEADER_LEN + layers[1].symbol_size),
             last_health: LinkHealth::empty(),
             spotter_op: OpPoint {
-                bw: i32::from(cfg.radio.width),
+                bw: i32::from(cfg.rx_width()),
                 ..OpPoint::default()
             },
             telem_rx_us: 0,

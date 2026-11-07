@@ -18,7 +18,8 @@
 //! cards (sweeps, survey windows); Palianytsia has neither.
 
 use std::sync::atomic::{
-    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::Release,
+    AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::Relaxed,
+    Ordering::Release,
 };
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -27,15 +28,18 @@ use pal_wire::rc::{self, DiscAck, LinkKey};
 
 use super::boot::{BootPick, BootPickIn, BootPickOut};
 use super::cal_pick::{cal_round_pick, CalReading};
-use super::gate::{hop_active, hop_burst_due, tx_selection_frozen, MoveEdgeHold};
+use super::gate::{
+    hop_active, hop_burst_due, hop_burst_period_ms, hop_burst_wanted, tx_selection_frozen,
+    MoveEdgeHold,
+};
 use super::hop::{
-    hop_store_blank_until, hop_verdict_loss_blank_until, HopAction, HopActionKind, HopController,
-    HopEvent, HopState, HopTick, HOP_SETTLE_BLANK_MS,
+    hop_store_blank_until, hop_verdict_link_loss, hop_verdict_loss_blank_until, HopAction,
+    HopActionKind, HopController, HopEvent, HopState, HopTick, HOP_SETTLE_BLANK_MS,
 };
 use super::hop_ranker::{HopRanker, HopVisit};
 use super::inflight::{InflightScout, InflightScoutCfg};
 use super::op_scan::{self, OpScan, Reading};
-use super::pair::{any_pair_ranked, scan_half_set};
+use super::pair::any_pair_ranked;
 use super::plan::{ChannelPlan, ChannelPlanCfg, MoveEvent};
 use super::radio::{
     needs_width_fix, nhm_period_4us, width_resync_open, LinkCard, ScoutFrames, ScoutRadio,
@@ -71,12 +75,14 @@ pub fn hop_state_name(s: HopState) -> &'static str {
 
 #[derive(Clone, Debug)]
 pub struct ChannelCoreCfg {
-    /// Channels, pin, width, scan knobs.
+    /// Channels, pin, scan knobs (the width is `width_mhz`).
     pub radio: RadioCfg,
     /// [hop] + [hop.verdict]
     pub hop: HopCfg,
     /// disc_for_channel re-tags per channel.
     pub key: LinkKey,
+    /// The receiver width every card is opened at (`Config::rx_width`).
+    pub width_mhz: u8,
     /// The pin, else the remembered member, else channels[0].
     pub start_ch: u8,
     pub leak_per_frame: f64,
@@ -92,6 +98,7 @@ impl Default for ChannelCoreCfg {
             radio: RadioCfg::default(),
             hop: HopCfg::default(),
             key: LinkKey::default(),
+            width_mhz: 20,
             start_ch: 0,
             leak_per_frame: 1.0,
             threaded: true,
@@ -242,13 +249,31 @@ type DwellRec = (usize, ScoutDwell, Option<HopVisit>);
 
 /// What the in-flight thread shares with the core thread. Lock order:
 /// `inflight` then a card's `sampler.hold_card()` then `drained`.
+/// In-flight thread: how often its period wait checks for a posted burst.
+const SCOUT_POLL_MS: i32 = 5;
+/// How long the core waits for a posted burst before giving it up (a burst
+/// takes ~75 ms at the defaults).
+const BURST_LOST_MS: f64 = 2000.0;
+
+/// What the in-flight thread hands the core thread: its dwells, and whether
+/// a posted burst's results are among them.
+#[derive(Default)]
+struct Drained {
+    recs: Vec<DwellRec>,
+    burst_done: bool,
+}
+
 struct Live {
     cards: Vec<Arc<dyn LinkCard>>,
     gates: Arc<WindowGates>,
     sampler: Arc<WindowSampler>,
     /// mabur `inflight_mu_`: also taken by the core's burst and width resync.
     inflight: Mutex<Option<InflightScout>>,
-    drained: Mutex<Vec<DwellRec>>,
+    drained: Mutex<Drained>,
+    /// A spare card's freshness burst, posted by the core thread and run by
+    /// the in-flight thread (-1 = none).
+    burst_req_card: AtomicI32,
+    burst_req_op: AtomicU8,
     hopping: AtomicBool,
     tx_card_now: AtomicUsize,
     scout_working: AtomicBool,
@@ -258,6 +283,7 @@ struct Live {
     reactive: bool,
     threaded: bool,
     sleep: Sleeper,
+    now_ms: MsClock,
     dwell_period_ms: i32,
 }
 
@@ -299,13 +325,6 @@ impl Live {
 
     fn away(&self, card: usize) -> Away<'_> {
         self.away_locked(card, self.inflight.lock().unwrap())
-    }
-
-    /// `away`, only while the in-flight scout exists: otherwise nothing is
-    /// held and the generation does not move.
-    fn away_with_scout(&self, card: usize) -> Option<Away<'_>> {
-        let ilk = self.inflight.lock().unwrap();
-        ilk.is_some().then(|| self.away_locked(card, ilk))
     }
 
     fn dwelling(&self, card: usize) -> bool {
@@ -367,8 +386,98 @@ impl Live {
             self.gates.dwell_card.store(-1, Relaxed);
             r
         };
-        self.drained.lock().unwrap().push((card, d, v));
+        self.drained.lock().unwrap().recs.push((card, d, v));
         drop(ilk);
+    }
+
+    /// One freshness burst on `card`, back to `op`; the caller holds
+    /// `inflight` (the scout must exist). `dwell_busy`/`dwell_card` mark the
+    /// card mid-dwell for the verdict, the TX selector and the mechanical
+    /// retune loop, which run on while a posted burst is out.
+    fn burst_on_card(
+        &self,
+        ilk: MutexGuard<'_, Option<InflightScout>>,
+        card: usize,
+        op: u8,
+        recs: &mut Vec<ScoutDwell>,
+    ) -> Vec<HopVisit> {
+        let mut away = self.away_locked(card, ilk);
+        let sc = away
+            .inflight
+            .as_mut()
+            .expect("burst_on_card: scout present");
+        sc.set_radio(self.cards[card].clone() as Arc<dyn ScoutRadio>);
+        self.gates.dwell_card.store(card as i32, Relaxed);
+        self.gates.dwell_busy.store(true, Relaxed);
+        let visits = sc.burst(op, recs);
+        self.gates.dwell_busy.store(false, Relaxed);
+        self.gates.dwell_card.store(-1, Relaxed);
+        visits
+    }
+
+    /// The in-flight thread's side of a posted burst.
+    fn run_posted_burst(&self) {
+        let card = self.burst_req_card.load(Relaxed);
+        if card < 0 {
+            return;
+        }
+        let mut recs = Vec::new();
+        let mut visits = Vec::new();
+        {
+            let ilk = self.inflight.lock().unwrap();
+            // A calibration measure round may have taken the scout card
+            // since the post (step_cal starts the round under this lock):
+            // stand down, but still report done so the core stops holding
+            // the trigger.
+            if ilk.is_some() && !self.scout_working.load(Relaxed) {
+                visits = self.burst_on_card(
+                    ilk,
+                    card as usize,
+                    self.burst_req_op.load(Relaxed),
+                    &mut recs,
+                );
+            }
+        }
+        // Clear the request before the results become visible: once the
+        // core sees burst_done it may post the next burst, which this must
+        // not erase (nor one the core re-posted after giving this one up).
+        let _ = self
+            .burst_req_card
+            .compare_exchange(card, -1, Relaxed, Relaxed);
+        let mut dr = self.drained.lock().unwrap();
+        // Visits pair with records in order, as the drain expects; a burst
+        // record without its own visit (a failed retune) gets None.
+        let mut vi = visits.into_iter();
+        for d in recs {
+            let v = if d.flags & FLAG_RETUNE_FAILED == 0 {
+                vi.next()
+            } else {
+                None
+            };
+            dr.recs.push((card as usize, d, v));
+        }
+        dr.burst_done = true;
+    }
+
+    fn scout_loop(&self) {
+        while self.scout_run.load(Relaxed) {
+            // The periodic dwell's period, cut short by a posted burst.
+            let t0 = (self.now_ms)();
+            while self.scout_run.load(Relaxed)
+                && self.burst_req_card.load(Relaxed) < 0
+                && (self.now_ms)().saturating_sub(t0) < self.dwell_period_ms.max(0) as u64
+            {
+                (self.sleep)(SCOUT_POLL_MS);
+            }
+            if !self.scout_run.load(Relaxed) {
+                break;
+            }
+            if self.burst_req_card.load(Relaxed) >= 0 {
+                self.run_posted_burst();
+            } else {
+                self.inflight_body();
+            }
+        }
     }
 }
 
@@ -395,14 +504,23 @@ pub struct ChannelCore {
     verdict: HopVerdict,
     ranker: HopRanker,
     hopc: HopController,
+    /// The verdict's own pre-FEC loss windows, base and enhancement; the
+    /// verdict reads the worse (`hop_verdict_link_loss`).
     s1_hop_loss: S1LossWindow,
+    enh_hop_loss: S1LossWindow,
 
     cur_ch: Vec<u8>,
+    /// The receiver width (cfg.width_mhz).
+    width_mhz: u8,
     width_tried: Vec<bool>,
     energy_last: Vec<Option<StatsEnergyIn>>,
     dwell_stats: Vec<Option<StatsDwellIn>>,
     window_prev: Vec<ScoutFrames>,
     window_prev_crc: Vec<u64>,
+    /// The card's seq walk at the previous sample: the window's delivery
+    /// ratio scales its own airtime.
+    window_prev_seq_exp: Vec<u64>,
+    window_prev_seq_rcv: Vec<u64>,
     window_prev_ok: Vec<bool>,
     window_prev_ms: Vec<u64>,
 
@@ -425,8 +543,11 @@ pub struct ChannelCore {
 
     hop_lead_latched: Option<usize>,
     recovered_prev_window: u64,
-    au_seq_prev: u64,
     hop_was_active: bool,
+    /// A spare card's freshness burst posted to the in-flight thread and
+    /// not yet ranked: the trigger is held back meanwhile.
+    burst_inflight: bool,
+    burst_posted_ms: f64,
     move_hold: MoveEdgeHold,
     last_verdict: Verdict,
     last_verdict_out: VerdictOut,
@@ -529,9 +650,9 @@ impl ChannelCore {
                 op_window_ms: scan.op_window_ms,
                 beacon_period_ms: 20,
                 one_card_ms: scan.one_card_ms,
-                pick_margin: scan.pick_margin as u32,
+                pick_margin_pct: f64::from(scan.pick_margin_pct),
                 one_card,
-                link_width_mhz: cfg.radio.width,
+                link_width_mhz: cfg.width_mhz,
                 busy_dbm: scan.busy.busy_dbm,
                 blocked_pct: scan.busy.blocked_pct,
                 leak_per_frame: cfg.leak_per_frame,
@@ -552,7 +673,7 @@ impl ChannelCore {
                     observe_ms: cfg.hop.dwell_observe_ms,
                     period_ms: cfg.hop.dwell_period_ms,
                     candidates: cfg.radio.usable().to_vec(),
-                    width_mhz: cfg.radio.width,
+                    width_mhz: cfg.width_mhz,
                     busy_dbm: scan.busy.busy_dbm,
                 },
                 cards[sci].clone() as Arc<dyn ScoutRadio>,
@@ -579,7 +700,7 @@ impl ChannelCore {
                     observe_ms: op_scan::OBSERVE_MS,
                     period_ms: 0,
                     candidates: Vec::new(),
-                    width_mhz: cfg.radio.width,
+                    width_mhz: cfg.width_mhz,
                     busy_dbm: scan.busy.busy_dbm,
                 },
                 c.clone() as Arc<dyn ScoutRadio>,
@@ -592,7 +713,9 @@ impl ChannelCore {
             gates,
             sampler,
             inflight: Mutex::new(inflight),
-            drained: Mutex::new(Vec::new()),
+            drained: Mutex::new(Drained::default()),
+            burst_req_card: AtomicI32::new(-1),
+            burst_req_op: AtomicU8::new(0),
             hopping: AtomicBool::new(false),
             tx_card_now: AtomicUsize::new(0),
             scout_working: AtomicBool::new(false),
@@ -602,6 +725,7 @@ impl ChannelCore {
             reactive,
             threaded: cfg.threaded,
             sleep: sleep_ms,
+            now_ms: now_ms.clone(),
             dwell_period_ms: cfg.hop.dwell_period_ms,
         });
         let gs_start_ms = now_ms();
@@ -613,15 +737,18 @@ impl ChannelCore {
                 search_after_ms: scan.search_after_ms,
             }),
             boot_pick: BootPick::new(scout.is_some() && !pinned),
-            verdict: HopVerdict::new(cfg.hop.clone(), scan.busy.clone(), n),
+            verdict: HopVerdict::new(cfg.hop.clone(), scan.busy.clone()),
             ranker: HopRanker::new(
                 cfg.hop.clone(),
                 scan.busy.clone(),
                 cfg.radio.usable().to_vec(),
                 0,
+                cfg.width_mhz,
             ),
             hopc: HopController::new(cfg.hop.clone()),
             s1_hop_loss: S1LossWindow::default(),
+            enh_hop_loss: S1LossWindow::default(),
+            width_mhz: cfg.width_mhz,
             scout_search_req: scout.is_some(),
             scout,
             live,
@@ -642,6 +769,8 @@ impl ChannelCore {
             dwell_stats: vec![None; n],
             window_prev: vec![ScoutFrames::default(); n],
             window_prev_crc: vec![0; n],
+            window_prev_seq_exp: vec![0; n],
+            window_prev_seq_rcv: vec![0; n],
             window_prev_ok: vec![false; n],
             window_prev_ms: vec![0; n],
             scout_thread: None,
@@ -658,8 +787,9 @@ impl ChannelCore {
             last_bi: BootPickIn::default(),
             hop_lead_latched: None,
             recovered_prev_window: 0,
-            au_seq_prev: 0,
             hop_was_active: false,
+            burst_inflight: false,
+            burst_posted_ms: 0.0,
             move_hold: MoveEdgeHold::default(),
             last_verdict: Verdict::Healthy,
             last_verdict_out: VerdictOut::default(),
@@ -845,7 +975,7 @@ impl ChannelCore {
         self.scout_card_down = true;
         if s.working() {
             self.scout_card_died_seen = true;
-            let (rounds, w) = (s.rounds(), self.cfg.radio.width);
+            let (rounds, w) = (s.rounds(), self.width_mhz);
             self.log(format!(
                 "maburgs channel: scout card {card} died at {rounds} rounds; search held \
                  until it reopens, card rejoins at {w} MHz"
@@ -1006,6 +1136,9 @@ impl ChannelCore {
             let s1 = agg.decoder().stats(0);
             self.s1_hop_loss
                 .add(s1.arr_expected, s1.arr_arrived, inp.now_ms);
+            let enh = agg.decoder().stats(1);
+            self.enh_hop_loss
+                .add(enh.arr_expected, enh.arr_arrived, inp.now_ms);
         }
         let dwell_busy = self.dwell_busy();
         ChannelTickOut {
@@ -1036,7 +1169,8 @@ impl ChannelCore {
             min_rounds
         };
         let all = s.ranking();
-        let any = if self.cfg.radio.width == 40 {
+        // The ranking's width is the scout's: its dwells ran at its card's width.
+        let any = if s.link_width_mhz() == 40 {
             any_pair_ranked(&all, self.cfg.radio.usable(), mr)
         } else {
             all.iter().any(|e| e.visits >= mr as u32)
@@ -1066,7 +1200,10 @@ impl ChannelCore {
                 }
             }
             HopActionKind::OneCardRetune => self.plan.hop_order(now_ms, act.target, None),
-            HopActionKind::Confirm => self.plan.hop_confirmed(now_ms),
+            HopActionKind::Confirm => {
+                self.plan.hop_confirmed(now_ms);
+                self.verdict.landed(now_ms);
+            }
             HopActionKind::Withdraw => {
                 vrx.set_hop(act.target, act.epoch);
                 self.plan.hop_withdraw(now_ms);
@@ -1104,6 +1241,7 @@ impl ChannelCore {
         }
         if let Some(b) = hop_verdict_loss_blank_until(act, now_ms) {
             self.s1_hop_loss.blank_until(b);
+            self.enh_hop_loss.blank_until(b);
         }
         match act.kind {
             HopActionKind::Order => {
@@ -1428,7 +1566,6 @@ impl ChannelCore {
             self.last_verdict_out = VerdictOut::default();
             self.window_prev_ok.fill(false);
             self.recovered_prev_window = Self::recovered_total(inp.agg);
-            self.au_seq_prev = self.live.au_seq.load(Relaxed);
             self.verdict.new_session();
             self.live.sampler.reset(now_ms_u);
         }
@@ -1455,8 +1592,6 @@ impl ChannelCore {
         // The sample instant: every per-window span is measured to it.
         let t_ms = rec.t_ms;
         let mut vc = vec![VerdictCardIn::default(); self.n_cards];
-        let mut starved_valid = 0;
-        let mut starved_all_zero = true;
         // The worst valid card's reading of op this window.
         let mut op_read: Option<CalReading> = None;
         for (si, cs) in rec.cards.iter().enumerate().take(self.n_cards) {
@@ -1466,23 +1601,38 @@ impl ChannelCore {
             }
             let ct = inp.agg.map(|a| &a.cards()[si]);
             let crc_fail = ct.map_or(0, |c| c.crc_fail);
-            let rssi_raw = ct.map_or(0.0, |c| c.rf.rssi_a_ema);
+            let seq_exp = ct.map_or(0, |c| c.seq_expected);
+            let seq_rcv = ct.map_or(0, |c| c.seq_received);
+            // The pooled EMA: the per-frame best of the two receive chains,
+            // so a card still hearing the drone on one antenna is not weak.
+            let rssi_raw = ct.map_or(0.0, |c| c.rf.rssi_ema);
             let snr_raw = ct.map_or(0.0, |c| c.rf.snr_ema);
             if self.window_prev_ok[si] {
                 let prev = self.window_prev[si];
                 let own = cs.frames.own.wrapping_sub(prev.own);
                 let foreign = cs.frames.foreign.wrapping_sub(prev.foreign);
-                starved_valid += 1;
-                if own != 0 {
-                    starved_all_zero = false;
-                }
                 let win_us = t_ms.wrapping_sub(self.window_prev_ms[si]) as f64 * 1000.0;
+                // Own airtime is what the drone sent, not what this card
+                // decoded: scaled by the window's delivery (the drone's seq
+                // walk counts every frame it sent), floored at 1 (a stalled
+                // walk reads under 1). A window that decoded nothing has no
+                // ratio, so it gives no busy reading at all (mabur
+                // channel_core.cpp).
+                let d_exp = seq_exp.wrapping_sub(self.window_prev_seq_exp[si]);
+                let d_rcv = seq_rcv.wrapping_sub(self.window_prev_seq_rcv[si]);
+                let delivery = if d_rcv > 0 {
+                    (d_exp as f64 / d_rcv as f64).max(1.0)
+                } else {
+                    1.0
+                };
                 let own_pct = if win_us > 0.0 {
-                    (100.0 * cs.frames.own_air_us.wrapping_sub(prev.own_air_us) as f64 / win_us)
+                    (100.0 * delivery * cs.frames.own_air_us.wrapping_sub(prev.own_air_us) as f64
+                        / win_us)
                         .min(100.0)
                 } else {
                     0.0
                 };
+                let busy_pct = if d_rcv == 0 { None } else { cs.nhm_busy_pct };
                 let snr_ok = self.snr_ok[si];
                 vc[si] = VerdictCardIn {
                     valid: true,
@@ -1497,8 +1647,8 @@ impl ChannelCore {
                         f64::NAN
                     },
                     snr_valid: snr_ok,
-                    busy_valid: cs.nhm_busy_pct.is_some(),
-                    nhm_busy_pct: cs.nhm_busy_pct.unwrap_or(0.0),
+                    busy_valid: busy_pct.is_some(),
+                    nhm_busy_pct: busy_pct.unwrap_or(0.0),
                     own_air_pct: own_pct,
                 };
                 self.energy_last[si] = Some(StatsEnergyIn {
@@ -1507,14 +1657,14 @@ impl ChannelCore {
                     own,
                     foreign,
                     igi: None,
-                    busy_pct: cs.nhm_busy_pct,
+                    busy_pct,
                     own_air_pct: Some(own_pct),
                 });
                 // Op's reading for a calibration run's pick (the scout never
-                // dwells on op's halves while linked): foreign frames scaled
-                // from this window's span to one dwell_ms observe, and the
-                // foreign share of the NHM busy airtime. The worst card on
-                // each term, as the scout keeps a half's worst visit.
+                // dwells on op while linked): foreign frames scaled from this
+                // window's span to one dwell_ms observe, and the foreign
+                // share of the NHM busy airtime. The worst card on each term,
+                // as the scout keeps a member's worst visit.
                 if win_us > 0.0 {
                     let k = f64::from(self.cfg.radio.scan.dwell_ms) * 1000.0 / win_us;
                     let f = (foreign as f64 * k).round() as u32;
@@ -1523,7 +1673,7 @@ impl ChannelCore {
                         ..CalReading::default()
                     });
                     r.foreign = r.foreign.max(f);
-                    if let Some(b) = cs.nhm_busy_pct {
+                    if let Some(b) = busy_pct {
                         r.busy_valid = true;
                         r.busy_pct = r.busy_pct.max((b - own_pct).max(0.0));
                     }
@@ -1531,6 +1681,8 @@ impl ChannelCore {
             }
             self.window_prev[si] = cs.frames;
             self.window_prev_crc[si] = crc_fail;
+            self.window_prev_seq_exp[si] = seq_exp;
+            self.window_prev_seq_rcv[si] = seq_rcv;
             self.window_prev_ms[si] = t_ms;
             self.window_prev_ok[si] = true;
         }
@@ -1538,17 +1690,15 @@ impl ChannelCore {
             self.op_live = op_read;
             self.op_live_ms = now_ms;
         }
-        let s1 = self.s1_hop_loss.sample(now_ms);
         let recovered_now = Self::recovered_total(inp.agg);
-        let au_now = self.live.au_seq.load(Relaxed);
         let vl = VerdictLinkIn {
-            pre_fec_loss: if s1.valid { s1.loss } else { 0.0 },
+            pre_fec_loss: hop_verdict_link_loss(
+                self.s1_hop_loss.sample(now_ms),
+                self.enh_hop_loss.sample(now_ms),
+            ),
             recovered: recovered_now.wrapping_sub(self.recovered_prev_window) as u32,
-            starved: starved_valid > 0 && starved_all_zero,
-            au_count: au_now.wrapping_sub(self.au_seq_prev) as u32,
         };
         self.recovered_prev_window = recovered_now;
-        self.au_seq_prev = au_now;
         let vo = self.verdict.window(now_ms, &vc, &vl, vrx.ctl().rung());
         if vo.v != Verdict::Healthy || vo.v != self.last_verdict {
             self.sink.verdict(now_ms, &vo, &vc, &vl);
@@ -1580,27 +1730,45 @@ impl ChannelCore {
         }
     }
 
-    /// The freshness burst on `card`: every candidate once, back to op.
+    /// The freshness burst on `card`, here and synchronously: every
+    /// candidate once, back to op.
     fn burst(&mut self, card: usize, now_ms: f64) {
         let live = self.live.clone();
         let mut recs = Vec::new();
         {
-            let Some(mut away) = live.away_with_scout(card) else {
+            let ilk = live.inflight.lock().unwrap();
+            if ilk.is_none() {
                 return;
-            };
-            let sc = away
-                .inflight
-                .as_mut()
-                .expect("away_with_scout: scout present");
-            let fe = &live.cards[card];
-            sc.set_radio(fe.clone() as Arc<dyn ScoutRadio>);
-            for v in sc.burst(self.plan.op(), &mut recs) {
+            }
+            for v in live.burst_on_card(ilk, card, self.plan.op(), &mut recs) {
                 self.ranker.add(v);
             }
-            self.cur_ch[card] = fe.channel();
         }
+        self.cur_ch[card] = live.cards[card].channel();
         for d in &recs {
             self.sink.dwell(now_ms, card, d);
+        }
+    }
+
+    /// The in-flight thread: started once the boot pick is closed and the
+    /// boot scout owns no card. Two cards, auto mode only: pinned never
+    /// ranks (nothing to move to). Also checked before the freshness burst:
+    /// the tick the boot scout lets go of its card may burst, and that
+    /// burst belongs on this thread.
+    fn start_inflight_if_due(&mut self) {
+        if self.inflight_started
+            || !self.reactive
+            || self.scout_owns()
+            || self.boot_pick.open()
+            || self.n_cards < 2
+        {
+            return;
+        }
+        self.inflight_started = true;
+        if self.cfg.threaded {
+            self.live.scout_run.store(true, Relaxed);
+            let live = self.live.clone();
+            self.inflight_thread = Some(std::thread::spawn(move || live.scout_loop()));
         }
     }
 
@@ -1632,23 +1800,66 @@ impl ChannelCore {
         let relocation_owns = self.boot_pick.relocating()
             || self.pending_relocate.is_some()
             || self.boot_pick.relocation_pending(&self.last_bi);
+        // No relay sweeps here: a burst card is always a USB card.
         let burst_card = pick_burst_card(&self.live.can_scout, &[], inp.tx_card);
+        let op = self.plan.op();
+        let ranking_complete = self
+            .ranker
+            .ranking(now_ms)
+            .iter()
+            .all(|e| e.ch == op || e.ranked);
+        let burst_period =
+            hop_burst_period_ms(self.hopc.state(), false, ranking_complete, &self.cfg.hop);
+        let spare_usb_burst = burst_card.is_some_and(|c| c != inp.tx_card);
+        self.start_inflight_if_due();
         if self.reactive
             && !self.scout_owns()
             && !relocation_owns
+            && !self.burst_inflight
+            && hop_burst_wanted(spare_usb_burst, ranking_complete)
             && hop_burst_due(
                 self.hopc.state(),
                 self.last_verdict_out.trigger,
                 now_ms,
                 self.last_burst_ms,
-                self.cfg.hop.dwell_period_ms,
+                burst_period,
             )
         {
             self.last_burst_ms = now_ms;
-            if let Some(card) = burst_card {
-                self.burst(card, now_ms);
+            match burst_card {
+                Some(card) if spare_usb_burst && self.cfg.threaded && self.inflight_started => {
+                    // The spare card's burst runs on the in-flight thread,
+                    // which owns that card's dwells anyway: the core loop
+                    // keeps draining and publishing the TX card's video
+                    // while it runs. step_drains ranks the results; the
+                    // trigger is held back below until it has.
+                    self.live.burst_req_op.store(op, Relaxed);
+                    self.live.burst_req_card.store(card as i32, Relaxed);
+                    self.burst_inflight = true;
+                    self.burst_posted_ms = now_ms;
+                }
+                // A one-card GS (the burst card is the TX card, off op
+                // either way) and a core without threads run it here.
+                Some(card) => self.burst(card, now_ms),
+                None => {}
             }
             self.fill_hop_targets(&mut ht, now_ms);
+        }
+        // A posted burst that never came back (the in-flight thread
+        // stopped) must not hold the trigger forever.
+        if self.burst_inflight && now_ms - self.burst_posted_ms >= BURST_LOST_MS {
+            self.burst_inflight = false;
+            self.live.burst_req_card.store(-1, Relaxed);
+            let lost = now_ms - self.burst_posted_ms;
+            self.log(format!("maburgs hop: posted burst lost after {lost:.0} ms"));
+        }
+        // A posted burst in flight: the ranking is about to change; holding
+        // the trigger back keeps the controller out of hold_exhausted (and
+        // its order off the bursting card) until it lands.
+        if self.burst_inflight {
+            ht.verdict.trigger = false;
+            ht.best = None;
+            ht.escape = None;
         }
         // Pinned: the verdict is still measured (OSD/sideport read it) but
         // the controller never sees a reactive trigger. Relocation re-arms it
@@ -1884,14 +2095,10 @@ impl ChannelCore {
             }
             self.cal_meas.s = CalMeasureState::Running;
             self.cal_meas.t0 = now_ms;
-            // Twice a full round's dwell time (every dwell channel, op's
-            // included, at dwell_ms + settle_ms), never under a second.
-            let chans = &self.cfg.radio.channels;
-            let n = if self.cfg.radio.width == 40 {
-                scan_half_set(chans).len()
-            } else {
-                chans.len()
-            };
+            // Twice a full round's dwell time (every member, op's included,
+            // at dwell_ms + settle_ms; one dwell per pair at 40), never under
+            // a second.
+            let n = self.cfg.radio.channels.len();
             let scan = &self.cfg.radio.scan;
             self.cal_meas.bound_ms =
                 (2.0 * n as f64 * f64::from(scan.dwell_ms + scan.settle_ms)).max(1000.0);
@@ -1920,7 +2127,7 @@ impl ChannelCore {
         // without one op is unmeasured and a working link is not moved on a
         // one-sided comparison.
         let have_op = self.op_live.is_some() && self.op_live_ms >= self.cal_meas.t0;
-        let halves: Vec<CalReading> = scout
+        let members: Vec<CalReading> = scout
             .round_samples()
             .iter()
             .map(|s| CalReading {
@@ -1932,12 +2139,11 @@ impl ChannelCore {
             .collect();
         let scan = &self.cfg.radio.scan;
         let pick = cal_round_pick(
-            &halves,
+            &members,
             if have_op { self.op_live } else { None },
             op,
-            self.cfg.radio.usable(),
-            self.cfg.radio.width,
-            scan.pick_margin as u32,
+            &self.cfg.radio.channels,
+            f64::from(scan.pick_margin_pct),
             scan.busy.blocked_pct,
         );
         self.sink
@@ -1982,33 +2188,14 @@ impl ChannelCore {
                 self.sink.dwell(self.now_ms_cur, sci, &d);
             }
         }
-        // The in-flight thread starts once the boot pick is closed and the
-        // boot scout owns no card. Two cards, auto mode only: pinned never
-        // ranks (nothing to move to).
-        if !self.inflight_started
-            && self.reactive
-            && !self.scout_owns()
-            && !self.boot_pick.open()
-            && self.n_cards >= 2
-        {
-            self.inflight_started = true;
-            if self.cfg.threaded {
-                self.live.scout_run.store(true, Relaxed);
-                let live = self.live.clone();
-                self.inflight_thread = Some(std::thread::spawn(move || {
-                    while live.scout_run.load(Relaxed) {
-                        (live.sleep)(live.dwell_period_ms);
-                        if !live.scout_run.load(Relaxed) {
-                            break;
-                        }
-                        live.inflight_body();
-                    }
-                }));
-            }
-        }
+        self.start_inflight_if_due();
         let drained = std::mem::take(&mut *self.live.drained.lock().unwrap());
+        if drained.burst_done {
+            // Its visits are ranked below, before the next controller step.
+            self.burst_inflight = false;
+        }
         let mut visits = Vec::new();
-        for (card, d, v) in drained {
+        for (card, d, v) in drained.recs {
             self.cur_ch[card] = self.live.cards[card].channel();
             self.sink.dwell(self.now_ms_cur, card, &d);
             let ok = d.flags & FLAG_RETUNE_FAILED == 0;
@@ -2026,36 +2213,54 @@ impl ChannelCore {
         }
     }
 
-    fn step_width_resync(&mut self) {
-        if !width_resync_open(
-            !self.scout_owns(),
+    /// A boot pick or a calibration round in flight: the scout card's width
+    /// is the scan's, not the link's.
+    fn scan_holds_width(&self) -> bool {
+        !width_resync_open(
             self.scout.is_some(),
-            !self.boot_pick.open(),
-        ) {
+            self.boot_pick.open(),
+            self.scout.as_ref().is_some_and(|s| s.round_open()),
+        )
+    }
+
+    fn step_width_resync(&mut self) {
+        if self.scan_holds_width() {
             return;
         }
-        let w = self.cfg.radio.width;
+        // The scout thread drives only its own card, so while it searches
+        // every other card is fixed here and the scout card is left to it.
+        let scout_busy = self.scout_owns();
+        let w = self.width_mhz;
         let live = self.live.clone();
         for (i, fe) in live.cards.iter().enumerate() {
+            let scouting = scout_busy && self.is_scout_card(i);
             let wc = WidthCard {
                 ready: fe.ready(),
                 width: fe.width(),
                 tried: self.width_tried[i],
                 busy: live.dwelling(i),
+                scouting,
             };
-            if !needs_width_fix(&wc, w) {
-                continue;
+            if needs_width_fix(&wc, w) {
+                self.width_tried[i] = true;
+                let _ilk = live.inflight.lock().unwrap();
+                let ch = fe.channel();
+                if fe.set_width(ch, w) {
+                    self.cur_ch[i] = fe.channel();
+                    live.gates.tune_gen[i].fetch_add(1, std::sync::atomic::Ordering::Release);
+                } else {
+                    drop(_ilk);
+                    self.log(format!(
+                        "maburgs radio: card {i} width resync to {w} MHz on ch {ch} failed"
+                    ));
+                }
             }
-            self.width_tried[i] = true;
-            let _ilk = live.inflight.lock().unwrap();
-            let ch = fe.channel();
-            if fe.set_width(ch, w) {
-                self.cur_ch[i] = fe.channel();
-                live.gates.tune_gen[i].fetch_add(1, std::sync::atomic::Ordering::Release);
-            } else {
-                self.log(format!(
-                    "maburgs radio: card {i} width resync to {w} MHz on ch {ch} failed"
-                ));
+            // The scout's dwells, ranks and picks are as wide as its card.
+            // Told only while the scout has no work, so no dwell is in flight.
+            if self.is_scout_card(i) && !scouting && fe.ready() {
+                if let Some(s) = &self.scout {
+                    s.set_link_width_mhz(fe.width());
+                }
             }
         }
     }

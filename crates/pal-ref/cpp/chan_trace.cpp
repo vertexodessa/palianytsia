@@ -40,7 +40,6 @@ struct pal_tnhm {
 struct pal_tcard_vt {
   void* user;
   int (*retune)(void*, uint8_t);
-  int (*retune_width)(void*, uint8_t, uint8_t);
   void (*read_energy)(void*, int, pal_tenergy*);
   void (*read_energy_scout)(void*, pal_tenergy*);
   void (*frames)(void*, uint64_t*);   // own, foreign, own_air_us
@@ -103,7 +102,6 @@ class TraceCard final : public LinkCard {
  public:
   explicit TraceCard(const pal_tcard_vt& vt) : v_(vt) {}
   bool retune(uint8_t ch) override { return v_.retune(v_.user, ch) != 0; }
-  bool retune_width(uint8_t ch, uint8_t w) override { return v_.retune_width(v_.user, ch, w) != 0; }
   ScoutEnergy read_energy(bool with_nhm) override {
     pal_tenergy e{};
     v_.read_energy(v_.user, with_nhm ? 1 : 0, &e);
@@ -207,13 +205,11 @@ class TraceSink final : public ChannelSink {
   }
   void verdict(double t, const VerdictOut& o, const std::vector<VerdictCardIn>& cards,
                const VerdictLinkIn& l) override {
-    std::string s = fmt("V t=%s v=%s ev=%u rr=%d trig=%d rref=%s dr=%s ts=%s tw=%s frz=%d first=%d "
-                        "link=%s:%u:%d:%u cards=",
+    std::string s = fmt("V t=%s v=%s ev=%u rr=%d trig=%d ts=%s tw=%s frz=%d first=%d "
+                        "link=%s:%u cards=",
                         num(t).c_str(), to_string(o.v), o.evidence, o.ref_rung, o.trigger,
-                        num(o.ref_rssi_dbm).c_str(), num(o.d_rssi_db).c_str(),
                         num(o.t_start_ms).c_str(), num(o.t_ms).c_str(), o.ref_frozen,
-                        o.first_interfered, num(l.pre_fec_loss).c_str(), l.recovered, l.starved,
-                        l.au_count);
+                        o.first_blocked, num(l.pre_fec_loss).c_str(), l.recovered);
     for (const auto& c : cards)
       s += fmt("%d:%u:%u:%u:%u:%s:%s:%d:%d:%s:%s;", c.valid, c.foreign, c.crc_fail, c.fa, c.cca,
                num(c.rssi_dbm).c_str(), num(c.snr_db).c_str(), c.snr_valid, c.busy_valid,
@@ -255,7 +251,6 @@ pal_ctrace* pal_ctrace_new(const pal_tcfg* c, const pal_tcard_vt* cards, size_t 
     t->env = *env;
     t->cfg = load_config(c->config_path);
     t->cfg.radio.channels.assign(c->channels, c->channels + c->n_channels);
-    t->cfg.radio.width = c->width;
     if (c->pin) t->cfg.radio.pin = c->pin;
     if (c->max_ms >= 0) t->cfg.radio.scan.max_ms = c->max_ms;
     for (size_t i = 0; i < n; ++i) {
@@ -265,10 +260,12 @@ pal_ctrace* pal_ctrace_new(const pal_tcfg* c, const pal_tcard_vt* cards, size_t 
     t->sink = std::make_unique<TraceSink>(t->env);
     VrxCfg vc = vrx_cfg_from(t->cfg, c->start_ch);
     vc.rz_nonce = c->rz_nonce;
+    vc.width = c->width;
     t->vrx = std::make_unique<VrxController>(vc);
     t->agg = std::make_unique<Aggregator>(t->cfg.uep_layers(), 32, static_cast<int>(n), 0);
     ChannelCoreCfg cc;
     cc.radio = t->cfg.radio;
+    cc.width_mhz = c->width;
     cc.hop = t->cfg.hop;
     cc.key = t->cfg.link.key;
     cc.start_ch = c->start_ch;
@@ -338,6 +335,16 @@ void pal_ctrace_on_session_opened(pal_ctrace* t, const uint8_t* b, size_t n, dou
 void pal_ctrace_note_video(pal_ctrace* t, uint8_t ch) { t->core->note_video(ch); }
 void pal_ctrace_note_sent(pal_ctrace* t, int ok, int rcf) { t->core->note_sent(ok, rcf); }
 void pal_ctrace_note_au_end(pal_ctrace* t) { t->core->note_au_end(); }
+// One decoded frame on `card` with mac_seq `seq` into the aggregator: not
+// SBI, not RC (misroutes), still walks the card's seq.
+void pal_ctrace_junk_body(pal_ctrace* t, int card, uint16_t seq) {
+  mabur::node::RxBody m;
+  m.card_id = static_cast<uint8_t>(card); m.mac_seq = seq; m.crc_ok = true;
+  m.rssi[0] = 38; m.rssi[1] = 40; m.snr[0] = 10; m.snr[1] = 25;
+  m.mono_us = 1000u * seq;
+  m.body.assign(20, 0);
+  t->agg->on_rx_body(m);
+}
 void pal_ctrace_run_scout_step(pal_ctrace* t) { t->core->run_scout_step(); }
 void pal_ctrace_run_inflight_step(pal_ctrace* t) { t->core->run_inflight_step(); }
 void pal_ctrace_run_sampler_step(pal_ctrace* t) { t->core->run_sampler_step(); }

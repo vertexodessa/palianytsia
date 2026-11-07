@@ -196,7 +196,7 @@ impl VrxCfg {
             pin_overhead_enh: c.link.static_overhead_enh,
             probe_pin_mcs: c.link.ladder_cfg.probe.pin_mcs,
             rz_nonce,
-            width: c.radio.width,
+            width: c.rx_width(),
         }
     }
 }

@@ -181,7 +181,7 @@ fn parse() -> Opts {
                 .unwrap_or(0);
         }
         if o.width == 0 {
-            o.width = c.radio.width;
+            o.width = c.rx_width();
         }
     }
     o

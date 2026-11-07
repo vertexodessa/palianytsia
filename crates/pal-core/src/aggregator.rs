@@ -179,7 +179,18 @@ impl Aggregator {
             return Route::Dropped;
         };
         let rc_t = rc::frame_type(&m.body);
-        if m.crc_ok && matches!(rc_t, Some(rc::T_RCF | rc::T_DISC)) {
+        // Every type the GS sends, heard back on its own capture: RCF, DISC,
+        // NACK, and its own (tagged) T_MAV; the drone's T_MAV is untagged.
+        // A self frame carries the GS's seq counter: let into the walk, one
+        // landing ahead of the drone's mark stalls the card's expected count
+        // while received climbs.
+        let is_self = m.crc_ok
+            && match rc_t {
+                Some(rc::T_RCF | rc::T_DISC | rc::T_NACK) => true,
+                Some(rc::T_MAV) => rc::parse_mav(&m.body, true).is_some(),
+                _ => false,
+            };
+        if is_self {
             // Our own control frames heard back.
             c.self_frames += 1;
             c.rc_frames += 1;
@@ -249,5 +260,60 @@ impl Aggregator {
             self.dec
                 .add_body(&m.body, m.mono_us / 1000, m.mcs, m.mono_us, m.crc_ok),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! mabur `test_aggregator.cpp`: the GS's own uplink stays out of the seq walk.
+    use super::*;
+    use pal_wire::rc::{Mav, Nack, TagCtx, DEFAULT_LINK_KEY};
+
+    fn agg() -> Aggregator {
+        Aggregator::new(&crate::config::Config::default().uep_layers(), 512, 1, 0)
+    }
+    fn msg(seq: u16, body: Vec<u8>) -> RxBody {
+        RxBody {
+            crc_ok: true,
+            mac_seq: seq,
+            body,
+            ..Default::default()
+        }
+    }
+    fn walk(a: &Aggregator) -> (u64, u64, u64) {
+        let c = &a.cards()[0];
+        (c.self_frames, c.seq_received, c.seq_expected)
+    }
+
+    #[test]
+    fn gs_nack_kept_out_of_the_seq_walk() {
+        let mut a = agg();
+        let mut n = Nack {
+            counter: 3,
+            n: 1,
+            ..Default::default()
+        };
+        n.e[0].first_seq = 40;
+        let nack = rc::pack_nack(&n, &DEFAULT_LINK_KEY, &TagCtx::default());
+        a.on_rx_body(&msg(10, vec![0; 20]));
+        assert!(matches!(a.on_rx_body(&msg(1500, nack)), Route::Rc));
+        a.on_rx_body(&msg(11, vec![0; 20]));
+        a.on_rx_body(&msg(12, vec![0; 20]));
+        assert_eq!(walk(&a), (1, 3, 3));
+    }
+
+    #[test]
+    fn gs_tagged_mav_is_self_drone_mav_walks() {
+        let mut a = agg();
+        let m = Mav {
+            counter: 5,
+            payload: vec![0xFD, 1, 2, 3],
+        };
+        let k = (&DEFAULT_LINK_KEY, &TagCtx::default());
+        a.on_rx_body(&msg(10, vec![0; 20]));
+        a.on_rx_body(&msg(1500, rc::pack_mav(&m, true, k.0, k.1)));
+        a.on_rx_body(&msg(11, rc::pack_mav(&m, false, k.0, k.1)));
+        a.on_rx_body(&msg(12, vec![0; 20]));
+        assert_eq!(walk(&a), (1, 3, 3));
     }
 }

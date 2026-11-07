@@ -38,7 +38,7 @@ impl CalLane {
             // parks, and verify tallies by rate whatever the drone's own
             // margin parks at.
             session: CalSession::new(CalSessionCfg::default(), CalLog::none()),
-            radio_width: cfg.radio.width,
+            radio_width: cfg.rx_width(),
             ladder: cfg.link.ladder_cfg.ladder.clone(),
             peer_width: 0,
             mav_seq: 0,

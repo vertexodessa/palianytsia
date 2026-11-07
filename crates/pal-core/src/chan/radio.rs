@@ -78,10 +78,9 @@ impl Default for CardCaps {
 /// The scout's view of a card (mabur `ScoutRadio`). Implementations are
 /// shared between the core and the scout, hence `&self` and interior locking.
 pub trait ScoutRadio: Send + Sync {
+    /// Retune to `ch` at the card's current width. The scout never changes
+    /// a card's width: only the core does (a live width flip).
     fn retune(&self, ch: u8) -> bool;
-    fn retune_width(&self, ch: u8, _width_mhz: u8) -> bool {
-        self.retune(ch)
-    }
     fn read_energy(&self, with_nhm: bool) -> ScoutEnergy;
     fn read_energy_scout(&self) -> ScoutEnergy;
     fn frames(&self) -> ScoutFrames;
@@ -175,10 +174,12 @@ impl NhmWindowTracker {
     }
 }
 
-/// Width resync may run once the scout thread is joined and, if there is a
-/// scout, it has frozen.
-pub fn width_resync_open(scout_joined: bool, has_scout: bool, scout_frozen: bool) -> bool {
-    scout_joined && (!has_scout || scout_frozen)
+/// mabur `width_resync.h`: the fix-up is closed while a scan holds the
+/// scout card (the boot pick open, or a calibration round). No scout at
+/// all is open from the start; a scout that only searches keeps its own
+/// card (`WidthCard::scouting`) and every other card is fixed.
+pub fn width_resync_open(has_scout: bool, pick_open: bool, round_open: bool) -> bool {
+    !has_scout || (!pick_open && !round_open)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +190,8 @@ pub struct WidthCard {
     pub tried: bool,
     /// The in-flight scout has it off on a dwell.
     pub busy: bool,
+    /// The boot scout has it (searching): fixed once the search lets go.
+    pub scouting: bool,
 }
 
 impl Default for WidthCard {
@@ -198,12 +201,15 @@ impl Default for WidthCard {
             width: 20,
             tried: false,
             busy: false,
+            scouting: false,
         }
     }
 }
 
+/// Once per bring-up and width (tried resets on reopen, when the boot
+/// scout lets go of the card, or when the width flips).
 pub fn needs_width_fix(c: &WidthCard, want_mhz: u8) -> bool {
-    c.ready && !c.tried && !c.busy && c.width != want_mhz
+    c.ready && !c.tried && !c.busy && !c.scouting && c.width != want_mhz
 }
 
 #[cfg(test)]
@@ -280,10 +286,9 @@ mod tests {
 
     #[test]
     fn width_resync_gate() {
-        assert!(!width_resync_open(false, true, false));
-        assert!(!width_resync_open(false, true, true));
-        assert!(!width_resync_open(true, true, false));
-        assert!(width_resync_open(true, true, true));
+        assert!(width_resync_open(false, true, true), "no scout: open");
+        assert!(!width_resync_open(true, true, false), "boot pick open");
+        assert!(!width_resync_open(true, false, true), "calibration round");
         assert!(width_resync_open(true, false, false));
     }
 
@@ -294,12 +299,20 @@ mod tests {
             width: 20,
             tried: false,
             busy: false,
+            scouting: false,
         };
         assert!(needs_width_fix(&c, 40));
         assert!(!needs_width_fix(&c, 20));
         assert!(!needs_width_fix(&WidthCard { ready: false, ..c }, 40));
         assert!(!needs_width_fix(&WidthCard { tried: true, ..c }, 40));
         assert!(!needs_width_fix(&WidthCard { busy: true, ..c }, 40));
+        assert!(!needs_width_fix(
+            &WidthCard {
+                scouting: true,
+                ..c
+            },
+            40
+        ));
         assert!(!needs_width_fix(&WidthCard { width: 40, ..c }, 40));
     }
 }

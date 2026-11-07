@@ -1,8 +1,10 @@
 //! mabur `channel_ranker.{h,cpp}`: boot-time channel ranking from scout
-//! visits. The worst visit decides; ties go to a valid lower noise floor,
-//! then config order. A channel whose worst NHM busy % reaches
-//! `blocked_pct` ranks after every unblocked one. `proposal(current)` keeps
-//! the current channel unless the best is `margin` busy units cleaner.
+//! visits. Order: tier (a worst NHM busy % at `blocked_pct` ranks after
+//! every unblocked channel), a busy reading before none, lower busy %,
+//! lower frame score, a valid lower noise floor, config order.
+//! `proposal(current)` keeps the current channel unless the best is in a
+//! better tier, reads busy where current does not, or reads `margin_pct`
+//! busy-% points cleaner.
 
 /// One scout visit's worth of the scouting card's own counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -34,13 +36,13 @@ pub struct RankEntry {
 #[derive(Clone, Debug)]
 pub struct ChannelRanker {
     min_rounds: i32,
-    margin: u32,
+    margin_pct: f64,
     blocked_pct: f64,
     entries: Vec<RankEntry>, // config order, duplicates dropped
 }
 
 impl ChannelRanker {
-    pub fn new(channels: &[u8], min_rounds: i32, margin: u32, blocked_pct: f64) -> Self {
+    pub fn new(channels: &[u8], min_rounds: i32, margin_pct: f64, blocked_pct: f64) -> Self {
         let mut entries: Vec<RankEntry> = Vec::new();
         for &c in channels {
             if !entries.iter().any(|e| e.ch == c) {
@@ -52,7 +54,7 @@ impl ChannelRanker {
         }
         Self {
             min_rounds,
-            margin,
+            margin_pct,
             blocked_pct,
             entries,
         }
@@ -60,7 +62,7 @@ impl ChannelRanker {
 
     /// mabur's defaults: no margin, nothing blocked.
     pub fn plain(channels: &[u8], min_rounds: i32) -> Self {
-        Self::new(channels, min_rounds, 0, 1e9)
+        Self::new(channels, min_rounds, 0.0, 1e9)
     }
 
     pub fn busy(s: &RankSample) -> u32 {
@@ -110,7 +112,10 @@ impl ChannelRanker {
             if ab != bb {
                 return if ab { Greater } else { Less };
             }
-            if ab && a.worst_busy_pct != b.worst_busy_pct {
+            if a.busy_valid != b.busy_valid {
+                return if a.busy_valid { Less } else { Greater };
+            }
+            if a.busy_valid && a.worst_busy_pct != b.worst_busy_pct {
                 return a
                     .worst_busy_pct
                     .partial_cmp(&b.worst_busy_pct)
@@ -152,18 +157,20 @@ impl ChannelRanker {
         let Some(best) = k.first() else {
             return current;
         };
-        if best.ch == current || self.margin == 0 {
+        if best.ch == current || self.margin_pct == 0.0 {
             return best.ch;
         }
         if let Some(e) = k.iter().find(|e| e.ch == current) {
             if self.is_blocked(e) && !self.is_blocked(best) {
-                return best.ch; // the margin applies within a tier
+                return best.ch; // a better tier moves at once
             }
-            return if best.worst_busy as u64 + self.margin as u64 <= e.worst_busy as u64 {
-                best.ch
-            } else {
-                current
-            };
+            if best.busy_valid != e.busy_valid {
+                return if best.busy_valid { best.ch } else { current };
+            }
+            if best.busy_valid && e.worst_busy_pct - best.worst_busy_pct >= self.margin_pct {
+                return best.ch;
+            }
+            return current; // an exact busy tie, or neither side read: stay
         }
         best.ch // current not ranked yet
     }
@@ -289,36 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn home_margin_keeps_home_unless_a_candidate_is_clearly_cleaner() {
-        let mk = |rounds, margin, v: &[(u8, u32)]| {
-            let set: Vec<u8> = v.iter().map(|x| x.0).collect();
-            let mut r = ChannelRanker::new(&set, rounds, margin, 1e9);
-            for &(c, b) in v {
-                r.add(&s(c, b, 0, 0, 0));
-            }
-            r
-        };
-        assert_eq!(
-            mk(1, 20, &[(136, 6), (149, 2), (165, 0)]).proposal(136),
-            136
-        );
-        assert_eq!(
-            mk(1, 20, &[(136, 30), (149, 8), (165, 12)]).proposal(136),
-            149
-        );
-        assert_eq!(mk(1, 20, &[(136, 25), (149, 5)]).proposal(136), 149);
-        assert_eq!(mk(1, 20, &[(136, 24), (149, 5)]).proposal(136), 136);
-        let mut r5 = ChannelRanker::new(&[136, 149], 2, 20, 1e9);
-        r5.add(&s(149, 0, 0, 0, 0));
-        r5.add(&s(149, 0, 0, 0, 0));
-        r5.add(&s(136, 300, 0, 0, 0));
-        assert_eq!(r5.proposal(136), 149);
-        assert_eq!(mk(1, 0, &[(136, 6), (149, 2)]).proposal(136), 149);
-    }
-
-    #[test]
     fn worst_busy_visit_blocks_the_channel() {
-        let mut r = ChannelRanker::new(&[136, 144], 1, 0, 30.0);
+        let mut r = ChannelRanker::new(&[136, 144], 1, 0.0, 30.0);
         r.add(&rsb(144, 0, 5.0));
         r.add(&rsb(144, 0, 80.0));
         let e = *r.all().iter().find(|e| e.ch == 144).unwrap();
@@ -327,7 +306,7 @@ mod tests {
 
     #[test]
     fn blocked_home_loses_despite_margin() {
-        let mut r = ChannelRanker::new(&[136, 144], 1, 20, 30.0);
+        let mut r = ChannelRanker::new(&[136, 144], 1, 20.0, 30.0);
         r.add(&rsb(136, 0, 100.0));
         r.add(&rsb(144, 15, 0.0));
         assert_eq!(r.proposal(136), 144);
@@ -335,7 +314,7 @@ mod tests {
 
     #[test]
     fn unblocked_candidate_still_needs_the_margin() {
-        let mut r = ChannelRanker::new(&[136, 144], 1, 20, 30.0);
+        let mut r = ChannelRanker::new(&[136, 144], 1, 20.0, 30.0);
         r.add(&rsb(136, 10, 0.0));
         r.add(&rsb(144, 0, 0.0));
         assert_eq!(r.proposal(136), 136);
@@ -351,17 +330,6 @@ mod tests {
     }
 
     #[test]
-    fn margin_is_against_the_current_channel_not_a_fixed_home() {
-        let mut r = ChannelRanker::new(&[136, 149], 1, 20, 1e9);
-        r.add(&s(136, 30, 0, 0, 0));
-        r.add(&s(149, 15, 0, 0, 0));
-        assert_eq!(r.proposal(136), 136);
-        assert_eq!(r.proposal(149), 149);
-        r.add(&s(136, 60, 0, 0, 0));
-        assert_eq!(r.proposal(136), 149);
-    }
-
-    #[test]
     fn ranked_with_an_explicit_visit_bar_overrides_min_rounds() {
         let mut r = ChannelRanker::plain(&[136, 149], 3);
         r.add(&s(136, 100, 0, 0, 0));
@@ -373,11 +341,57 @@ mod tests {
 
     #[test]
     fn proposal_with_an_explicit_visit_bar_overrides_min_rounds() {
-        let mut r = ChannelRanker::new(&[136, 149], 3, 20, 1e9);
-        r.add(&s(136, 100, 0, 0, 0));
-        r.add(&s(149, 0, 0, 0, 0));
+        let mut r = ChannelRanker::new(&[136, 149], 3, 20.0, 1e9);
+        r.add(&rsb(136, 0, 100.0));
+        r.add(&rsb(149, 0, 0.0));
         assert_eq!(r.proposal(136), 136);
         assert_eq!(r.proposal_at(136, 1), 149);
         assert_eq!(r.proposal_at(136, 2), 136);
+    }
+
+    #[test]
+    fn busy_margin_keeps_home_unless_a_candidate_is_clearly_cleaner() {
+        let mk = |rounds, margin, v: &[(u8, f64)]| {
+            let set: Vec<u8> = v.iter().map(|x| x.0).collect();
+            let mut r = ChannelRanker::new(&set, rounds, margin, 1e9);
+            for &(c, b) in v {
+                r.add(&rsb(c, 0, b));
+            }
+            r
+        };
+        let p = |r: ChannelRanker| r.proposal(136);
+        assert_eq!(
+            p(mk(1, 10.0, &[(136, 20.0), (149, 11.0), (165, 30.0)])),
+            136
+        );
+        assert_eq!(
+            p(mk(1, 10.0, &[(136, 20.0), (149, 10.0), (165, 30.0)])),
+            149
+        );
+        assert_eq!(p(mk(1, 0.0, &[(136, 20.0), (149, 19.0)])), 149);
+        let mut r4 = ChannelRanker::new(&[136, 149], 2, 10.0, 1e9);
+        r4.add(&rsb(149, 0, 5.0));
+        r4.add(&rsb(149, 0, 5.0));
+        r4.add(&rsb(136, 0, 80.0));
+        assert_eq!(r4.proposal(136), 149, "home unranked: the best ranked wins");
+    }
+
+    #[test]
+    fn ranked_sorts_by_busy_before_frame_score_in_the_unblocked_tier() {
+        let mut r = ChannelRanker::plain(&[136, 149], 1);
+        r.add(&rsb(136, 500, 5.0));
+        r.add(&rsb(149, 0, 20.0));
+        assert_eq!(chs(&r.ranked()), vec![136, 149]);
+    }
+
+    #[test]
+    fn margin_is_against_the_current_channel_not_a_fixed_home() {
+        let mut r = ChannelRanker::new(&[136, 149], 1, 20.0, 1e9);
+        r.add(&rsb(136, 0, 30.0));
+        r.add(&rsb(149, 0, 15.0));
+        assert_eq!(r.proposal(136), 136);
+        assert_eq!(r.proposal(149), 149);
+        r.add(&rsb(136, 0, 60.0));
+        assert_eq!(r.proposal(136), 149);
     }
 }

@@ -35,7 +35,6 @@ type U = *mut c_void;
 struct TCardVt {
     user: U,
     retune: extern "C" fn(U, u8) -> c_int,
-    retune_width: extern "C" fn(U, u8, u8) -> c_int,
     read_energy: extern "C" fn(U, c_int, *mut TEnergy),
     read_energy_scout: extern "C" fn(U, *mut TEnergy),
     frames: extern "C" fn(U, *mut u64),
@@ -118,6 +117,7 @@ extern "C" {
     fn pal_ctrace_note_video(t: *mut Raw, ch: u8);
     fn pal_ctrace_note_sent(t: *mut Raw, ok: c_int, rcf: c_int);
     fn pal_ctrace_note_au_end(t: *mut Raw);
+    fn pal_ctrace_junk_body(t: *mut Raw, card: c_int, seq: u16);
     fn pal_ctrace_run_scout_step(t: *mut Raw);
     fn pal_ctrace_run_inflight_step(t: *mut Raw);
     fn pal_ctrace_run_sampler_step(t: *mut Raw);
@@ -152,9 +152,6 @@ fn card(u: U) -> &'static dyn LinkCard {
 
 extern "C" fn c_retune(u: U, ch: u8) -> c_int {
     guard(|| card(u).retune(ch) as c_int)
-}
-extern "C" fn c_retune_width(u: U, ch: u8, w: u8) -> c_int {
-    guard(|| card(u).retune_width(ch, w) as c_int)
 }
 fn put_energy(e: pal_core::chan::radio::ScoutEnergy, o: *mut TEnergy) {
     // SAFETY: the C++ side passes a valid out pointer.
@@ -312,7 +309,6 @@ impl CppTrace {
             .map(|b| TCardVt {
                 user: b as *const Arc<dyn LinkCard> as U,
                 retune: c_retune,
-                retune_width: c_retune_width,
                 read_energy: c_read_energy,
                 read_energy_scout: c_read_energy_scout,
                 frames: c_frames,
@@ -446,6 +442,10 @@ impl CppTrace {
     }
     pub fn note_au_end(&mut self) {
         unsafe { pal_ctrace_note_au_end(self.raw) }
+    }
+    /// One decoded frame on `card` with mac_seq `seq` (not SBI, not RC).
+    pub fn junk_body(&mut self, card: usize, seq: u16) {
+        unsafe { pal_ctrace_junk_body(self.raw, card as c_int, seq) }
     }
     pub fn run_scout_step(&mut self) {
         unsafe { pal_ctrace_run_scout_step(self.raw) }

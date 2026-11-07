@@ -19,7 +19,7 @@ pub struct InflightScoutCfg {
     pub period_ms: i32,
     /// The dwell set: radio.channels; the card's own channel is skipped.
     pub candidates: Vec<u8>,
-    /// radio.width: the dwell keeps the card's tuning; recorded.
+    /// The link width: the dwell keeps the card's tuning; recorded.
     pub width_mhz: u8,
     pub busy_dbm: i32,
 }
@@ -66,6 +66,11 @@ impl InflightScout {
     }
 
     /// The core picks the dwell card per cycle.
+    /// The link width moved (a live width flip): later dwells record it.
+    pub fn set_width_mhz(&mut self, w: u8) {
+        self.cfg.width_mhz = w;
+    }
+
     pub fn set_radio(&mut self, radio: Arc<dyn ScoutRadio>) {
         self.radio = radio;
     }
@@ -445,6 +450,7 @@ mod tests {
             BusyCfg::default(),
             vec![120, 149, 165, 136],
             0,
+            20,
         );
         for _ in 0..6 {
             let ch = s.next_candidate(149).unwrap();

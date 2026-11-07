@@ -110,7 +110,7 @@ pal_ref* pal_ref_new(const char* config_path, int mode, int adaptive_gap, uint32
     o.rz_nonce = rz_nonce;
     const uint8_t ch = channel ? channel : r->cfg.radio.channels.front();
     r->gs = std::make_unique<webgs::WebGs>(r->cfg, m, ch,
-                                           r->cfg.radio.width,
+                                           maburgs::derived_width(r->cfg.link),
                                            std::vector<maburgs::LinkCard*>{}, 0, std::move(io), o);
     return r.release();
   } catch (const std::exception& e) {

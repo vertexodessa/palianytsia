@@ -24,7 +24,7 @@ impl Default for BusyCfg {
     fn default() -> Self {
         Self {
             busy_dbm: -83,
-            blocked_pct: 50.0,
+            blocked_pct: 30.0,
         }
     }
 }
@@ -37,7 +37,8 @@ pub struct ScanCfg {
     pub search_ms: i32,
     pub op_window_ms: i32,
     pub search_after_ms: i32,
-    pub pick_margin: i32,
+    /// Busy-% points a candidate must beat the current channel by (every pick).
+    pub pick_margin_pct: i32,
     pub one_card_ms: i32,
     pub max_ms: i32,
     pub busy: BusyCfg,
@@ -52,7 +53,7 @@ impl Default for ScanCfg {
             search_ms: 100,
             op_window_ms: 300,
             search_after_ms: 5000,
-            pick_margin: 20,
+            pick_margin_pct: 10,
             one_card_ms: 5000,
             max_ms: 30000,
             busy: BusyCfg::default(),
@@ -67,10 +68,12 @@ pub struct HopVerdictCfg {
     pub recovered_min: i32,
     pub weak_rssi_dbm: i32,
     pub weak_snr_db: i32,
-    pub fading_drop_db: i32,
-    pub foreign_pps: i32,
-    pub fa_pps: i32,
-    pub starved_frac: f64,
+    /// Consecutive blocked windows that read `occupied` (impaired on their own).
+    pub occupied_windows: i32,
+    /// Detect route: median foreign busy % over a detect run.
+    pub detect_pct: f64,
+    pub detect_windows: i32,
+    pub detect_impaired: i32,
 }
 
 impl Default for HopVerdictCfg {
@@ -81,10 +84,10 @@ impl Default for HopVerdictCfg {
             recovered_min: 8,
             weak_rssi_dbm: -78,
             weak_snr_db: 12,
-            fading_drop_db: 6,
-            foreign_pps: 50,
-            fa_pps: 100,
-            starved_frac: 0.25,
+            occupied_windows: 5,
+            detect_pct: 8.0,
+            detect_windows: 5,
+            detect_impaired: 1,
         }
     }
 }
@@ -95,6 +98,8 @@ pub struct HopCfg {
     pub persist: i32,
     pub dwell_observe_ms: i32,
     pub dwell_period_ms: i32,
+    /// USB freshness-burst pacing while a hop trigger is live.
+    pub burst_period_ms: i32,
     pub rank_visits: i32,
     pub rank_max_age_ms: i32,
     pub confirm_ms: i32,
@@ -113,8 +118,9 @@ impl Default for HopCfg {
         Self {
             window_ms: 150,
             persist: 2,
-            dwell_observe_ms: 5,
-            dwell_period_ms: 333,
+            dwell_observe_ms: 20,
+            dwell_period_ms: 1000,
+            burst_period_ms: 333,
             rank_visits: 5,
             rank_max_age_ms: 10000,
             confirm_ms: 500,
@@ -140,7 +146,6 @@ pub struct RadioCfg {
     pub use_: Vec<u8>,
     /// None = "auto".
     pub pin: Option<u8>,
-    pub width: u8,
     pub cards: Vec<CardCfg>,
     pub auto_scan: bool,
     pub tx_card: i32,
@@ -165,7 +170,6 @@ impl Default for RadioCfg {
             channels: vec![40, 64, 112, 144],
             use_: Vec::new(),
             pin: None,
-            width: 20,
             cards: Vec::new(),
             auto_scan: true,
             tx_card: -1,
@@ -708,38 +712,54 @@ fn channel_set_issue(set: &[u8], width: u8, field: &str) -> R<()> {
     Ok(())
 }
 
+/// Per-channel width check (mabur `radio_width_issue`): 20 or 40, and 40
+/// only on a channel with a standard 5 GHz pair. The loader runs it on
+/// `radio.channels` at the derived receiver width.
 pub fn radio_width_issue(channel: u8, width: i32) -> Option<(String, String)> {
     if width != 20 && width != 40 {
         return Some((
-            "radio.width".into(),
-            "must be 20 or 40 (HT20 / HT40)".into(),
+            "radio.channels".into(),
+            "width must be 20 or 40 (HT20 / HT40)".into(),
         ));
     }
     if width == 40 && ht40_offset(channel) == 0 {
         return Some((
-            "radio.width".into(),
+            "radio.channels".into(),
             format!("40 MHz needs a standard 5 GHz pair and channel {channel} has none (common/include/mabur/ht40.h)"),
         ));
     }
     None
 }
 
-pub fn link_width_issue(link: &LinkCfg, width: i32) -> Option<(String, String)> {
-    for (i, r) in link.ladder_cfg.ladder.iter().enumerate() {
-        if r.bw == 40 && width != 40 {
-            return Some((
-                format!("link.ladder[{i}].bw"),
-                "40 MHz rung but radio.width is 20: the GS could not receive it".into(),
-            ));
-        }
+/// The receiver width the link settings imply (mabur `derived_width`): a
+/// static pin flies `static_bw`; a ladder needs 40 when any rung is 40.
+pub fn derived_width(link: &LinkCfg) -> u8 {
+    if link.static_mcs >= 0 {
+        return if link.static_bw == 40 { 40 } else { 20 };
     }
-    if link.static_bw == 40 && width != 40 {
-        return Some((
-            "link.static_bw".into(),
-            "40 MHz pin but radio.width is 20".into(),
-        ));
+    if link.ladder_cfg.ladder.iter().any(|r| r.bw == 40) {
+        40
+    } else {
+        20
     }
-    None
+}
+
+/// Why `derived_width` says what it says (mabur `derived_width_reason`).
+pub fn derived_width_reason(link: &LinkCfg) -> String {
+    if link.static_mcs >= 0 {
+        return format!("static_bw {}", link.static_bw);
+    }
+    match link.ladder_cfg.ladder.iter().position(|r| r.bw == 40) {
+        Some(i) => format!("ladder: rung {i} bw 40"),
+        None => "ladder: no 40 rung".into(),
+    }
+}
+
+impl Config {
+    /// The receiver width every card opens at (`derived_width`).
+    pub fn rx_width(&self) -> u8 {
+        derived_width(&self.link)
+    }
 }
 
 fn is_ipv4(s: &str) -> bool {
@@ -808,9 +828,9 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
                 .iter()
                 .copied()
                 .filter(|ch| c.radio.channels.contains(ch))
-                .filter(|&ch| c.radio.width != 40 || ht40_offset(ch) != 0)
+                .filter(|&ch| c.rx_width() != 40 || ht40_offset(ch) != 0)
                 .filter(|&ch| {
-                    if c.radio.width != 40 {
+                    if c.rx_width() != 40 {
                         return true;
                     }
                     let low = if ht40_offset(ch) == 1 { ch } else { ch - 4 };
@@ -840,7 +860,7 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
 /// `radio.channels` = every 5 GHz grid channel the config's width can use
 /// (`grid_5g`); a `radio.use` and a pin stay as they are.
 pub fn with_search_grid(text: &str) -> R<String> {
-    let width = parse_config_str(text)?.radio.width;
+    let width = parse_config_str(text)?.rx_width();
     let mut j = text
         .parse::<Table>()
         .map_err(|e| ConfigError(format!("config: {e}")))?;
@@ -899,11 +919,11 @@ pub fn with_channels(text: &str, chosen: &[u8]) -> R<String> {
     Ok(out)
 }
 
-/// `text` with the GS card (`radio.width`), every `[[link.ladder]]` rung and
-/// `link.static_bw` at `bw` MHz: the drone airs each rung at the width the
-/// RCF names, and a 20 MHz link wants a 20 MHz receiver too (tuned 40 it
-/// would take the pair's other half, its noise and interference, into the
-/// same filter). Comments are not kept (the result is a generated copy);
+/// `text` with every `[[link.ladder]]` rung and `link.static_bw` at `bw`
+/// MHz: the drone airs each rung at the width the RCF names, and the GS's
+/// receiver width follows from them (`derived_width`), so a 20 MHz link
+/// gets a 20 MHz receiver too (tuned 40 it would take the pair's other
+/// half, its noise and interference, into the same filter). Comments are not kept (the result is a generated copy);
 /// the result is validated as a whole.
 pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     if bw != 20 && bw != 40 {
@@ -912,11 +932,9 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     let mut j = text
         .parse::<Table>()
         .map_err(|e| ConfigError(format!("config: {e}")))?;
-    j.entry("radio")
-        .or_insert_with(|| Value::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| ConfigError("config: radio is not a table".into()))?
-        .insert("width".into(), Value::Integer(bw.into()));
+    if let Some(r) = j.get_mut("radio").and_then(Value::as_table_mut) {
+        r.remove("width");
+    }
     let link = j
         .entry("link")
         .or_insert_with(|| Value::Table(Table::new()))
@@ -927,9 +945,9 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
             r.insert("bw".into(), Value::Integer(bw.into()));
         }
     }
-    if link.contains_key("static_bw") {
-        link.insert("static_bw".into(), Value::Integer(bw.into()));
-    }
+    // Always: a static pin flies static_bw (default 20), and the adaptive
+    // ladder ignores it.
+    link.insert("static_bw".into(), Value::Integer(bw.into()));
     let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
     parse_config_str(&out)?;
     Ok(out)
@@ -1004,10 +1022,9 @@ fn parse_config(j: &Table) -> R<Config> {
             r,
             "radio",
             &[
-                "channel", "channels", "use", "width", "cards", "tx_card", "scan", "relays",
+                "channel", "channels", "use", "cards", "tx_card", "scan", "relays",
             ],
         )?;
-        c.radio.width = get_int(r, "width", 20, 20, 40, "radio")? as u8;
         if let Some(v) = r.get("channels") {
             let Value::Array(a) = v else {
                 return fail("radio.channels", "not an array");
@@ -1023,12 +1040,8 @@ fn parse_config(j: &Table) -> R<Config> {
                 c.radio.channels.push(*ch as u8);
             }
         }
-        channel_set_issue(&c.radio.channels, c.radio.width, "radio.channels")?;
-        for &ch in &c.radio.channels {
-            if let Some((f, w)) = radio_width_issue(ch, i32::from(c.radio.width)) {
-                return fail(&f, &w);
-            }
-        }
+        // The channel-set rule and the per-channel pair check need the
+        // receiver width, derived from [link]: they run after it is read.
         match r.get("channel") {
             None => {}
             Some(Value::String(s)) => {
@@ -1149,7 +1162,7 @@ fn parse_config(j: &Table) -> R<Config> {
                     "search_ms",
                     "op_window_ms",
                     "search_after_ms",
-                    "pick_margin",
+                    "pick_margin_pct",
                     "one_card_ms",
                     "max_ms",
                     "busy_dbm",
@@ -1163,7 +1176,7 @@ fn parse_config(j: &Table) -> R<Config> {
             sc.search_ms = get_i32(s, "search_ms", 100, 40, 2000, w)?;
             sc.op_window_ms = get_i32(s, "op_window_ms", 300, 40, 10000, w)?;
             sc.search_after_ms = get_i32(s, "search_after_ms", 5000, 0, 600000, w)?;
-            sc.pick_margin = get_i32(s, "pick_margin", 20, 0, 100000, w)?;
+            sc.pick_margin_pct = get_i32(s, "pick_margin_pct", 10, 0, 100, w)?;
             sc.one_card_ms = get_i32(s, "one_card_ms", 5000, 0, 60000, w)?;
             sc.max_ms = get_i32(s, "max_ms", 30000, 1000, 600000, w)?;
             sc.busy.busy_dbm = get_i32(s, "busy_dbm", -83, -104, -70, w)?;
@@ -1173,7 +1186,7 @@ fn parse_config(j: &Table) -> R<Config> {
                     "must be an NHM bucket edge: -104 -101 -98 -95 -92 -89 -86 -83 -80 -75 -70",
                 );
             }
-            sc.busy.blocked_pct = get_num(s, "blocked_pct", 50.0, 1.0, 100.0, w)?;
+            sc.busy.blocked_pct = get_num(s, "blocked_pct", 30.0, 1.0, 100.0, w)?;
         }
     }
     let _ = cards_absent;
@@ -1191,6 +1204,7 @@ fn parse_config(j: &Table) -> R<Config> {
                 "persist",
                 "dwell_observe_ms",
                 "dwell_period_ms",
+                "burst_period_ms",
                 "rank_visits",
                 "rank_max_age_ms",
                 "confirm_ms",
@@ -1207,8 +1221,9 @@ fn parse_config(j: &Table) -> R<Config> {
         let hc = &mut c.hop;
         hc.window_ms = get_i32(h, "window_ms", 150, 50, 2000, "hop")?;
         hc.persist = get_i32(h, "persist", 2, 1, 3, "hop")?;
-        hc.dwell_observe_ms = get_i32(h, "dwell_observe_ms", 5, 1, 250, "hop")?;
-        hc.dwell_period_ms = get_i32(h, "dwell_period_ms", 333, 20, 60000, "hop")?;
+        hc.dwell_observe_ms = get_i32(h, "dwell_observe_ms", 20, 1, 250, "hop")?;
+        hc.dwell_period_ms = get_i32(h, "dwell_period_ms", 1000, 20, 60000, "hop")?;
+        hc.burst_period_ms = get_i32(h, "burst_period_ms", 333, 100, 60000, "hop")?;
         hc.rank_visits = get_i32(h, "rank_visits", 5, 1, 100, "hop")?;
         hc.rank_max_age_ms = get_i32(h, "rank_max_age_ms", 10000, 1000, 600000, "hop")?;
         hc.confirm_ms = get_i32(h, "confirm_ms", 500, 100, 5000, "hop")?;
@@ -1229,11 +1244,11 @@ fn parse_config(j: &Table) -> R<Config> {
                     "recovered_x",
                     "weak_rssi_dbm",
                     "weak_snr_db",
-                    "fading_drop_db",
-                    "foreign_pps",
-                    "fa_pps",
                     "recovered_min",
-                    "starved_frac",
+                    "occupied_windows",
+                    "detect_pct",
+                    "detect_windows",
+                    "detect_impaired",
                 ],
             )?;
             let vc = &mut hc.verdict;
@@ -1242,11 +1257,24 @@ fn parse_config(j: &Table) -> R<Config> {
             vc.recovered_min = get_i32(v, "recovered_min", 8, 0, 1000, w)?;
             vc.weak_rssi_dbm = get_i32(v, "weak_rssi_dbm", -78, -110, -20, w)?;
             vc.weak_snr_db = get_i32(v, "weak_snr_db", 12, 0, 40, w)?;
-            vc.fading_drop_db = get_i32(v, "fading_drop_db", 6, 1, 40, w)?;
-            vc.foreign_pps = get_i32(v, "foreign_pps", 50, 1, 100000, w)?;
-            vc.fa_pps = get_i32(v, "fa_pps", 100, 1, 100000, w)?;
-            vc.starved_frac = get_num(v, "starved_frac", 0.25, 0.0, 1.0, w)?;
+            vc.occupied_windows = get_i32(v, "occupied_windows", 5, 1, 100, w)?;
+            vc.detect_pct = get_num(v, "detect_pct", 8.0, 1.0, 100.0, w)?;
+            vc.detect_windows = get_i32(v, "detect_windows", 5, 2, 100, w)?;
+            vc.detect_impaired = get_i32(v, "detect_impaired", 1, 1, 100, w)?;
         }
+    }
+    // Cross-key checks outside the sections: either side may be the one set.
+    if c.hop.verdict.detect_pct > c.radio.scan.busy.blocked_pct {
+        return fail(
+            "hop.verdict.detect_pct",
+            "must not exceed radio.scan.blocked_pct",
+        );
+    }
+    if c.hop.verdict.detect_impaired > c.hop.verdict.detect_windows {
+        return fail(
+            "hop.verdict.detect_impaired",
+            "must not exceed detect_windows",
+        );
     }
     if let Some(r) = section(j, "fec")? {
         check_keys(r, "fec", &["symbol_size", "seq_horizon"])?;
@@ -1498,8 +1526,17 @@ fn parse_config(j: &Table) -> R<Config> {
             Err(e) => return fail("link.key_file", &e),
         }
     }
-    if let Some((f, w)) = link_width_issue(&c.link, i32::from(c.radio.width)) {
-        return fail(&f, &w);
+    // The receiver width is derived from the link section (derived_width),
+    // so the channel-set rule and the per-channel pair check run here, after
+    // both sections are settled.
+    {
+        let rx_width = derived_width(&c.link);
+        channel_set_issue(&c.radio.channels, rx_width, "radio.channels")?;
+        for &ch in &c.radio.channels {
+            if let Some((f, w)) = radio_width_issue(ch, i32::from(rx_width)) {
+                return fail(&f, &w);
+            }
+        }
     }
     if let Some(r) = section(j, "video")? {
         check_keys(
@@ -1650,7 +1687,7 @@ mod tests {
         let (t, skipped) = with_link_pick(&auto, pick(40, &[36, 40, 165]));
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         let c = parse_config_str(&t).unwrap();
-        assert_eq!(c.radio.width, 40);
+        assert_eq!(c.rx_width(), 40);
         assert_eq!(c.radio.channels, grid_5g(40));
         assert_eq!(c.radio.use_, vec![36], "36 and 40 are one 40 MHz block");
         // The Quest's pick on 2026-11-03: six channels, four blocks.
@@ -1683,12 +1720,12 @@ mod tests {
             c.link.ladder_cfg.ladder.len(),
             orig.link.ladder_cfg.ladder.len()
         );
-        assert_eq!(c.radio.width, 20);
+        assert_eq!(c.rx_width(), 20);
         assert_eq!(c.radio.channels, orig.radio.channels);
         let t40 = with_link_bw(&t20, 40).unwrap();
         let c = parse_config_str(&t40).unwrap();
         assert!(c.link.ladder_cfg.ladder.iter().all(|r| r.bw == 40));
-        assert_eq!(c.radio.width, 40);
+        assert_eq!(c.rx_width(), 40);
         assert!(with_link_bw(&text, 30).is_err());
     }
 
@@ -1751,7 +1788,7 @@ mod tests {
     fn bundled_configs_load() {
         let c = load_config(&repo("configs/gs.toml"), None).unwrap();
         assert_eq!(c.radio.pin, Some(144));
-        assert_eq!(c.radio.width, 40);
+        assert_eq!(c.rx_width(), 40);
         let m = load_config(
             &repo("third_party/mabur/gs/bundle/maburgs.default.toml"),
             None,
@@ -1767,8 +1804,44 @@ mod tests {
         assert_eq!(e.0, "config: video.frame_gap_timeout_ms: out of range");
         let e = parse_config_str("[video]\nbogus = 1\n").unwrap_err();
         assert_eq!(e.0, "config: video.bogus: unknown key");
-        let e = parse_config_str("[radio]\nwidth = 40\nchannels = [40, 165]\n").unwrap_err();
+        let e = parse_config_str("[radio]\nwidth = 40\n").unwrap_err();
+        assert_eq!(e.0, "config: radio.width: unknown key");
+        let e = parse_config_str(
+            "[radio]\nchannels = [40, 165]\n[link]\nstatic_mcs = 1\nstatic_bw = 40\n",
+        )
+        .unwrap_err();
         assert!(e.0.contains("has no 40 MHz pair"), "{}", e.0);
+    }
+
+    #[test]
+    fn receiver_width_is_derived_from_the_link() {
+        let c = parse_config_str("[link]\nstatic_mcs = 1\nstatic_bw = 40\n").unwrap();
+        assert_eq!(
+            (c.rx_width(), derived_width_reason(&c.link).as_str()),
+            (40, "static_bw 40")
+        );
+        let c = parse_config_str("[link]\nstatic_mcs = 1\n").unwrap();
+        assert_eq!(c.rx_width(), 20);
+    }
+
+    #[test]
+    fn detect_keys_cross_check() {
+        let e = parse_config_str("[hop.verdict]\ndetect_pct = 40\n").unwrap_err();
+        assert_eq!(
+            e.0,
+            "config: hop.verdict.detect_pct: must not exceed radio.scan.blocked_pct"
+        );
+        let e = parse_config_str("[radio.scan]\nblocked_pct = 5\n").unwrap_err();
+        assert_eq!(
+            e.0,
+            "config: hop.verdict.detect_pct: must not exceed radio.scan.blocked_pct"
+        );
+        let e = parse_config_str("[hop.verdict]\ndetect_windows = 3\ndetect_impaired = 4\n")
+            .unwrap_err();
+        assert_eq!(
+            e.0,
+            "config: hop.verdict.detect_impaired: must not exceed detect_windows"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! has a test.
 
 use super::hop::HopState;
+use crate::config::HopCfg;
 
 /// The in-session hop block (verdict window, burst, controller tick) runs
 /// only in SESSION: during the boot rendezvous the loss window reads 80-90 %
@@ -37,18 +38,53 @@ pub fn verdict_card_usable(ready: bool, mid_dwell: bool, card_ch: u8, op_ch: u8)
 }
 
 /// The freshness burst: no hop in flight (Idle or Hold), a live trigger,
-/// at most one per dwell period (the caller's last_burst_ms starts at
-/// -1e18 so the first is not delayed).
+/// at most one per burst period (`hop_burst_period_ms`; the caller's
+/// last_burst_ms starts at -1e18 so the first is not delayed).
 pub fn hop_burst_due(
     state: HopState,
     trigger: bool,
     now_ms: f64,
     last_burst_ms: f64,
-    dwell_period_ms: i32,
+    burst_period_ms: i32,
 ) -> bool {
     matches!(state, HopState::Idle | HopState::Hold)
         && trigger
-        && now_ms - last_burst_ms >= dwell_period_ms as f64
+        && now_ms - last_burst_ms >= burst_period_ms as f64
+}
+
+/// A relay burst paces on `relay_burst_period_ms` in any state. A USB burst
+/// takes its card off op for every candidate dwell, so it paces on
+/// `burst_period_ms` while it is what stands between the trigger and an
+/// order: in Idle, and in a Hold entered because some non-op candidate is
+/// not ranked yet. Once every non-op candidate is ranked and the controller
+/// still holds, the trigger can stay live indefinitely on a link that still
+/// carries video (an occupied op): re-bursting at the Idle cadence would
+/// make the burst itself the outage, so that Hold paces on
+/// `dwell_period_ms`, the spare card's own periodic cadence.
+pub fn hop_burst_period_ms(
+    state: HopState,
+    relay_burst: bool,
+    ranking_complete: bool,
+    hop: &HopCfg,
+) -> i32 {
+    if relay_burst {
+        hop.relay_burst_period_ms
+    } else if state == HopState::Hold && ranking_complete {
+        hop.dwell_period_ms
+    } else {
+        hop.burst_period_ms
+    }
+}
+
+/// Whether a due burst is worth running. A burst on a spare USB card (not
+/// the TX card) re-measures what the periodic dwell thread already keeps
+/// ranked on that card, and takes it off diversity for every candidate
+/// dwell, so once every non-op candidate is ranked it is skipped and the
+/// hop acts on the periodic dwells' ranking. A one-card GS's burst is its
+/// only ranking source and runs regardless; an incomplete ranking still
+/// bursts, which brings a stalled periodic dwell's ranking back.
+pub fn hop_burst_wanted(spare_usb_burst: bool, ranking_complete: bool) -> bool {
+    !(spare_usb_burst && ranking_complete)
 }
 
 /// mabur `CalMoveEdgeHold`: holds the link-pairing move edge while `hold`
@@ -72,6 +108,25 @@ impl MoveEdgeHold {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn burst_period_follows_state_relay_and_ranking() {
+        let h = HopCfg::default();
+        let p = |st, relay, done| hop_burst_period_ms(st, relay, done, &h);
+        assert_eq!(p(HopState::Idle, true, false), h.relay_burst_period_ms);
+        assert_eq!(p(HopState::Hold, true, true), h.relay_burst_period_ms);
+        assert_eq!(p(HopState::Idle, false, true), h.burst_period_ms);
+        assert_eq!(p(HopState::Hold, false, false), h.burst_period_ms);
+        assert_eq!(p(HopState::Hold, false, true), h.dwell_period_ms);
+    }
+
+    #[test]
+    fn spare_card_burst_skipped_once_ranked() {
+        assert!(hop_burst_wanted(true, false));
+        assert!(!hop_burst_wanted(true, true));
+        assert!(hop_burst_wanted(false, true));
+        assert!(hop_burst_wanted(false, false));
+    }
 
     #[test]
     fn idle_and_hold_with_trigger_and_no_prior_burst_are_due() {

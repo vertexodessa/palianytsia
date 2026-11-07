@@ -43,6 +43,14 @@ pub struct FakeState {
     pub fa_next: u32,
     pub nhm_arm_ok: bool,
     pub nhm_read: NhmBusyRead,
+    /// Air that reads nhm_read's buckets under whatever period was last
+    /// armed (the op-window sampler and a scout dwell both read it). Off,
+    /// nhm_read.period decides which of them it is valid for.
+    pub nhm_any_period: bool,
+    pub nhm_armed_period: u16,
+    /// Per-channel NHM busy %, read at whatever channel the card is tuned
+    /// to: -1 falls back to nhm_arm_ok/nhm_read.
+    pub nhm_busy_pct_on: Vec<i32>,
     // the blocking read
     pub block_next_read: bool,
     pub in_read: bool,
@@ -80,6 +88,9 @@ impl FakeCard {
                 fa_next: 0,
                 nhm_arm_ok: false,
                 nhm_read: NhmBusyRead::default(),
+                nhm_any_period: false,
+                nhm_armed_period: 0,
+                nhm_busy_pct_on: vec![-1; 256],
                 block_next_read: false,
                 in_read: false,
                 release: false,
@@ -108,13 +119,6 @@ impl ScoutRadio for FakeCard {
             return false;
         }
         s.ch = c;
-        true
-    }
-    fn retune_width(&self, c: u8, w: u8) -> bool {
-        let mut s = self.s();
-        s.calls.push(format!("retune_width {c}/{w}"));
-        s.ch = c;
-        s.width_mhz = w;
         true
     }
     fn read_energy(&self, with_nhm: bool) -> ScoutEnergy {
@@ -149,7 +153,8 @@ impl ScoutRadio for FakeCard {
     fn arm_nhm_busy(&self, period_4us: u16) -> bool {
         let mut s = self.s();
         s.calls.push(format!("arm_nhm {period_4us}"));
-        s.nhm_arm_ok
+        s.nhm_armed_period = period_4us;
+        s.nhm_busy_pct_on[s.ch as usize] >= 0 || s.nhm_arm_ok
     }
     fn read_nhm_busy(&self) -> NhmBusyRead {
         let mut s = self.s();
@@ -161,7 +166,22 @@ impl ScoutRadio for FakeCard {
             s = self.cv.wait_while(s, |s| !s.release).unwrap();
             s.in_read = false;
         }
-        s.nhm_read
+        let pct = s.nhm_busy_pct_on[s.ch as usize];
+        if pct >= 0 {
+            let mut r = NhmBusyRead {
+                valid: true,
+                period: s.nhm_armed_period,
+                ..Default::default()
+            };
+            r.buckets[11] = pct as u8;
+            r.buckets[0] = (100 - pct) as u8;
+            return r;
+        }
+        let mut r = s.nhm_read;
+        if s.nhm_any_period {
+            r.period = s.nhm_armed_period;
+        }
+        r
     }
 }
 

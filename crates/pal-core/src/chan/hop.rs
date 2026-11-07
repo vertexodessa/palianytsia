@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use super::verdict::{Verdict, VerdictOut, EV_BLOCKED};
+use super::verdict::{trigger_evidence, Verdict, VerdictOut};
 use crate::config::HopCfg;
+use crate::link_health::LossSample;
 
 /// LadderController's post-transition settle-blank, shared by both hop
 /// call sites.
@@ -43,7 +44,8 @@ pub struct HopTick {
     /// confirm lands it with no verify window.
     pub no_verify: bool,
     /// The best unblocked candidate that has not failed a verify, used only
-    /// with no `best` while the verdict carries `EV_BLOCKED`.
+    /// with no `best` while the verdict carries a hop-route reading
+    /// (`trigger_evidence`: blocked or detected).
     pub escape: Option<u8>,
     pub escape_score: u32,
 }
@@ -275,7 +277,7 @@ impl HopController {
             // jams the uplink too, so the order keeps riding RCFs until
             // confirm_extend_ms; once engaged it holds whatever later
             // windows say.
-            let engage = self.confirm_extended || k.verdict.evidence & EV_BLOCKED != 0;
+            let engage = self.confirm_extended || trigger_evidence(k.verdict.evidence);
             if self.cfg.confirm_extend_ms > self.cfg.confirm_ms
                 && engage
                 && elapsed < self.cfg.confirm_extend_ms as f64
@@ -447,7 +449,7 @@ impl HopController {
     /// target has not failed a verify.
     fn escape_allowed(&self, k: &HopTick) -> Option<u8> {
         let esc = k.escape?;
-        if k.verdict.evidence & EV_BLOCKED == 0 {
+        if !trigger_evidence(k.verdict.evidence) {
             return None;
         }
         let failed = self
@@ -540,12 +542,29 @@ impl HopController {
     }
 }
 
-/// How far ahead to blank the ladder's rung store: from the first
-/// interfered window of a frozen episode (once per episode, which bounds
-/// it) for confirm_ms plus the settle. Never in pinned mode (`reactive`
-/// false), never for fades or unknown windows.
+/// How far ahead to blank the ladder's rung store (mabur `hop_blank.h`):
+/// from the lead-in window of either route to `interfered`
+/// (`VerdictOut::first_blocked`, once per frozen episode, which bounds it)
+/// for confirm_ms plus the settle. The first `interfered` window is too
+/// late: the lossy lead-in windows before it are where the ladder demotes.
+/// Never in pinned mode (`reactive` false), never for fades.
 pub fn hop_store_blank_until(vo: &VerdictOut, reactive: bool, confirm_ms: i32) -> Option<f64> {
-    (reactive && vo.first_interfered).then_some(vo.t_ms + confirm_ms as f64 + HOP_SETTLE_BLANK_MS)
+    (reactive && vo.first_blocked).then_some(vo.t_ms + confirm_ms as f64 + HOP_SETTLE_BLANK_MS)
+}
+
+/// The pre-FEC loss the verdict confirms on: the worse of the base and
+/// enhancement layers' windows (UEP gives the enhancement layer the thinner
+/// FEC, so a jam often shows there first). An invalid window contributes
+/// nothing.
+pub fn hop_verdict_link_loss(base: LossSample, enh: LossSample) -> f64 {
+    let mut loss: f64 = 0.0;
+    if base.valid {
+        loss = loss.max(base.loss);
+    }
+    if enh.valid {
+        loss = loss.max(enh.loss);
+    }
+    loss
 }
 
 /// When the verdict's own loss window must be blanked: at Confirm plus the
@@ -557,7 +576,9 @@ pub fn hop_verdict_loss_blank_until(act: &HopAction, now_ms: f64) -> Option<f64>
 #[cfg(test)]
 mod tests {
     use super::super::plan::{ChannelPlan, ChannelPlanCfg};
-    use super::super::verdict::{HopVerdict, VerdictCardIn, VerdictLinkIn, EV_IMPAIRED, EV_RAISED};
+    use super::super::verdict::{
+        HopVerdict, VerdictCardIn, VerdictLinkIn, EV_BLOCKED, EV_DETECTED, EV_IMPAIRED, EV_WEAK,
+    };
     use super::HopActionKind as K;
     use super::*;
     use crate::config::BusyCfg;
@@ -583,9 +604,18 @@ mod tests {
             ..interfered()
         }
     }
-    fn raised_here() -> VerdictOut {
+    fn unknown_here() -> VerdictOut {
         VerdictOut {
-            evidence: EV_IMPAIRED | EV_RAISED,
+            v: Verdict::Unknown,
+            evidence: EV_IMPAIRED,
+            ..interfered()
+        }
+    }
+    /// The detect route's per-window reading: same shape as blocked_here(),
+    /// the other bit trigger_evidence() treats alike.
+    fn detected_here() -> VerdictOut {
+        VerdictOut {
+            evidence: EV_IMPAIRED | EV_DETECTED,
             ..interfered()
         }
     }
@@ -1000,9 +1030,29 @@ mod tests {
     }
 
     #[test]
+    fn escape_from_detected_op_into_fled_channel() {
+        let mut h = hc();
+        let mut k = t(1000.0, detected_here(), None, 136);
+        k.escape = Some(112);
+        k.escape_score = 7;
+        let a = h.tick(&k);
+        assert!(a.kind == K::Order && a.target == 112 && a.restore_rung == 5);
+        assert_eq!(h.state(), HopState::Ordered);
+        let ev = h.take_events();
+        assert!(ev.len() == 1 && ev[0].kind == "escape" && ev[0].target == 112 && ev[0].score == 7);
+        assert!(backed(&h, 136, 1001.0));
+        assert!(!h.backed_off_failed(1001.0).contains(&136));
+        assert_eq!(
+            h.tick(&tv(1080.0, detected_here(), None, 136)).kind,
+            K::Confirm
+        );
+        assert_eq!(h.state(), HopState::Verifying);
+    }
+
+    #[test]
     fn no_escape_when_op_not_blocked() {
         let mut h = hc();
-        let mut k = t(1000.0, raised_here(), None, 136);
+        let mut k = t(1000.0, unknown_here(), None, 136);
         k.escape = Some(112);
         assert_eq!(h.tick(&k).kind, K::Hold);
         assert_eq!(kinds(&h.take_events()), vec!["hold_exhausted"]);
@@ -1065,7 +1115,7 @@ mod tests {
         let mut g = hc();
         g.tick(&t(1000.0, interfered(), Some(149), 136));
         g.tick(&tv(1080.0, interfered(), Some(149), 136));
-        let mut m = t(1400.0, measured(raised_here(), 1250.0, 1400.0), None, 149);
+        let mut m = t(1400.0, measured(interfered(), 1250.0, 1400.0), None, 149);
         m.escape = Some(112);
         assert_eq!(g.tick(&m).kind, K::Hold);
     }
@@ -1084,6 +1134,27 @@ mod tests {
         h.take_events();
         for x in [1500.0, 2000.0, 3900.0] {
             assert_eq!(h.tick(&t(x, blocked_here(), Some(112), 144)).kind, K::None);
+        }
+        assert!(h.state() == HopState::Ordered && h.hop_ch() == 112);
+        let ev = h.take_events();
+        assert!(
+            ev.len() == 1
+                && ev[0].kind == "confirm_extend"
+                && ev[0].target == 112
+                && ev[0].elapsed_ms == 500.0
+        );
+    }
+
+    #[test]
+    fn confirm_extend_engages_on_a_detected_verdict() {
+        let mut h = hc();
+        assert_eq!(
+            h.tick(&t(1000.0, detected_here(), Some(112), 144)).kind,
+            K::Order
+        );
+        h.take_events();
+        for x in [1500.0, 2000.0, 3900.0] {
+            assert_eq!(h.tick(&t(x, detected_here(), Some(112), 144)).kind, K::None);
         }
         assert!(h.state() == HopState::Ordered && h.hop_ch() == 112);
         let ev = h.take_events();
@@ -1118,10 +1189,10 @@ mod tests {
     #[test]
     fn unblocked_op_withdraws_at_confirm_ms() {
         let mut h = hc();
-        h.tick(&t(1000.0, raised_here(), Some(112), 144));
+        h.tick(&t(1000.0, interfered(), Some(112), 144));
         h.take_events();
         assert_eq!(
-            h.tick(&t(1500.0, raised_here(), Some(112), 144)).kind,
+            h.tick(&t(1500.0, interfered(), Some(112), 144)).kind,
             K::Withdraw
         );
         assert_eq!(kinds(&h.take_events()), vec!["withdraw"]);
@@ -1146,7 +1217,7 @@ mod tests {
         h.tick(&t(1500.0, blocked_here(), Some(112), 144));
         h.take_events();
         assert_eq!(
-            h.tick(&t(1800.0, raised_here(), Some(112), 144)).kind,
+            h.tick(&t(1800.0, interfered(), Some(112), 144)).kind,
             K::None
         );
         assert_eq!(h.tick(&t(2500.0, healthy(), Some(112), 144)).kind, K::None);
@@ -1359,11 +1430,10 @@ mod tests {
         VerdictLinkIn {
             pre_fec_loss: loss,
             recovered: rec,
-            ..Default::default()
         }
     }
     fn hv() -> HopVerdict {
-        HopVerdict::new(cfg(), BusyCfg::default(), 2)
+        HopVerdict::new(cfg(), BusyCfg::default())
     }
     fn warm(v: &mut HopVerdict) -> f64 {
         let mut x = 0.0;
@@ -1373,8 +1443,50 @@ mod tests {
         }
         x
     }
+    fn occ_n() -> i32 {
+        cfg().verdict.occupied_windows
+    }
+    fn det_n() -> i32 {
+        cfg().verdict.detect_windows
+    }
+    /// The detect ring's tail after a lossy run: windows it still reads
+    /// the run's majority for.
+    fn tail() -> i32 {
+        det_n() - (det_n() + 1) / 2
+    }
+    fn busy(mut c: VerdictCardIn, nhm: f64, own: f64) -> VerdictCardIn {
+        c.busy_valid = true;
+        c.nhm_busy_pct = nhm;
+        c.own_air_pct = own;
+        c
+    }
+    /// One blocked window: NHM foreign busy 92 % on both cards, lossy.
+    /// Interfered once the detect ring holds a majority of such readings or
+    /// the blocked streak reaches occupied_windows; unknown before that.
     fn jam(v: &mut HopVerdict, x: f64) -> VerdictOut {
-        v.window(x, &[card(-55.0, 33.0, 237.0, 2.0); 2], &link(0.06, 80), 5)
+        let c = busy(card(-55.0, 33.0, 237.0, 2.0), 95.0, 3.0);
+        v.window(x, &[c, c], &link(0.06, 80), 5)
+    }
+    /// occupied_windows blocked windows from x (x advances past them).
+    /// Returns how many of them armed the blank.
+    fn occupy(v: &mut HopVerdict, x: &mut f64) -> usize {
+        let mut armed = 0;
+        for _ in 0..occ_n() {
+            if hop_store_blank_until(&jam(v, *x), true, 500).is_some() {
+                armed += 1;
+            }
+            *x += 150.0;
+        }
+        armed
+    }
+    /// A healthy window with a clean NHM reading (resets the blocked streak).
+    fn quiet(v: &mut HopVerdict, x: f64) -> VerdictOut {
+        let c = busy(card(-61.0, 30.0, 0.0, 4.0), 10.0, 3.0);
+        v.window(x, &[c, c], &link(0.0, 20), 5)
+    }
+    /// Strong signal, NHM busy `nhm` over our own 35 % airtime.
+    fn low_busy(nhm: f64) -> [VerdictCardIn; 2] {
+        [busy(card(-55.0, 33.0, 0.0, 2.0), nhm, 35.0); 2]
     }
     fn fade(v: &mut HopVerdict, x: f64) -> VerdictOut {
         v.window(
@@ -1397,16 +1509,93 @@ mod tests {
         assert!(hop_store_blank_until(&o, true, 500).is_none());
     }
 
+    /// The blank opens on the jam's first blocked window, windows before it
+    /// classifies interfered: the lossy lead-in is where the ladder demotes.
     #[test]
-    fn blank_opens_at_the_first_interfered_window() {
+    fn blank_opens_at_the_first_blocked_window() {
+        let mut v = hv();
+        let mut x = warm(&mut v);
+        let onset = x;
+        let first = jam(&mut v, x);
+        x += 150.0;
+        assert_eq!(first.v, Verdict::Unknown);
+        assert_eq!(
+            hop_store_blank_until(&first, true, 500),
+            Some(onset + 500.0 + HOP_SETTLE_BLANK_MS)
+        );
+        let mut o = first;
+        for _ in 1..occ_n() {
+            o = jam(&mut v, x);
+            assert!(hop_store_blank_until(&o, true, 500).is_none());
+            x += 150.0;
+        }
+        assert_eq!(o.v, Verdict::Interfered);
+    }
+
+    /// A lossy window whose foreign reading clears detect_pct but not
+    /// blocked_pct is a detect run's earliest window: the blank arms there.
+    #[test]
+    fn blank_opens_at_the_first_lossy_low_foreign_window() {
         let mut v = hv();
         let x = warm(&mut v);
-        let o = jam(&mut v, x);
-        assert_eq!(o.v, Verdict::Interfered);
+        let first = v.window(x, &low_busy(45.0), &link(0.04, 80), 5);
+        assert_eq!(first.evidence & EV_BLOCKED, 0);
         assert_eq!(
-            hop_store_blank_until(&o, true, 500),
+            hop_store_blank_until(&first, true, 500),
             Some(x + 500.0 + HOP_SETTLE_BLANK_MS)
         );
+        let second = v.window(x + 150.0, &low_busy(45.0), &link(0.04, 80), 5);
+        assert!(hop_store_blank_until(&second, true, 500).is_none());
+    }
+
+    /// Loss in clean air (foreign under detect_pct) is the ladder's.
+    #[test]
+    fn a_lossy_window_with_low_foreign_never_blanks() {
+        let mut v = hv();
+        let mut x = warm(&mut v);
+        for _ in 0..3 {
+            let o = v.window(x, &low_busy(40.0), &link(0.04, 80), 5);
+            assert_eq!(o.v, Verdict::Unknown);
+            assert!(hop_store_blank_until(&o, true, 500).is_none());
+            x += 150.0;
+        }
+    }
+
+    /// A detect run with no lossy lead-in arms on its first detected window.
+    #[test]
+    fn blank_opens_at_the_first_detected_window_when_the_loss_window_read_low() {
+        let mut v = hv();
+        let mut x = warm(&mut v);
+        let lossy = v.window(x, &low_busy(40.0), &link(0.04, 80), 5);
+        x += 150.0;
+        assert!(lossy.ref_frozen);
+        assert!(hop_store_blank_until(&lossy, true, 500).is_none());
+        let mut o = VerdictOut::default();
+        for _ in 0..2 * det_n() {
+            o = v.window(x, &low_busy(45.0), &link(0.0, 20), 4);
+            x += 150.0;
+            if o.evidence & EV_DETECTED != 0 {
+                break;
+            }
+            assert!(hop_store_blank_until(&o, true, 500).is_none());
+        }
+        assert_ne!(o.evidence & EV_DETECTED, 0);
+        assert_eq!(o.evidence & EV_WEAK, 0);
+        assert_eq!(
+            hop_store_blank_until(&o, true, 500),
+            Some(o.t_ms + 500.0 + HOP_SETTLE_BLANK_MS)
+        );
+    }
+
+    /// A weak blocked window is a fade: the ladder owns it.
+    #[test]
+    fn a_weak_blocked_window_never_blanks() {
+        let mut v = hv();
+        let x = warm(&mut v);
+        let c = busy(card(-90.0, 8.0, 237.0, 2.0), 95.0, 3.0);
+        let o = v.window(x, &[c, c], &link(0.06, 80), 5);
+        assert_eq!(o.v, Verdict::Fade);
+        assert!(hop_store_blank_until(&o, true, 500).is_none());
     }
 
     #[test]
@@ -1435,10 +1624,15 @@ mod tests {
     #[test]
     fn pinned_never_blanks() {
         let mut v = hv();
-        let x = warm(&mut v);
-        let o = jam(&mut v, x);
-        assert_eq!(o.v, Verdict::Interfered);
-        assert!(hop_store_blank_until(&o, false, 500).is_none());
+        let mut x = warm(&mut v);
+        for i in 0..occ_n() {
+            let o = jam(&mut v, x);
+            assert!(hop_store_blank_until(&o, false, 500).is_none());
+            if i == occ_n() - 1 {
+                assert_eq!(o.v, Verdict::Interfered);
+            }
+            x += 150.0;
+        }
     }
 
     #[test]
@@ -1453,41 +1647,60 @@ mod tests {
         assert_eq!(armed, 1);
     }
 
+    /// Blocked stretches alternating with healthy windows short of a thaw
+    /// stay one episode: each stretch re-earns interfered, nothing re-arms.
     #[test]
     fn interfered_healthy_alternation_inside_one_episode_does_not_rearm() {
         let mut v = hv();
         let mut x = warm(&mut v);
-        let mut armed = 0;
-        for _ in 0..20 {
-            if hop_store_blank_until(&jam(&mut v, x), true, 500).is_some() {
-                armed += 1;
+        let (mut armed, mut interfered) = (0, 0);
+        for _ in 0..10 {
+            for k in 0..occ_n() {
+                let o = jam(&mut v, x);
+                if k == occ_n() - 1 && o.v == Verdict::Interfered {
+                    interfered += 1;
+                }
+                if hop_store_blank_until(&o, true, 500).is_some() {
+                    armed += 1;
+                }
+                x += 150.0;
             }
-            x += 150.0;
-            calm(&mut v, x);
-            x += 150.0;
+            for _ in 0..tail() {
+                assert_ne!(quiet(&mut v, x).evidence & EV_DETECTED, 0);
+                x += 150.0;
+            }
+            for _ in 0..2 {
+                assert_eq!(quiet(&mut v, x).v, Verdict::Healthy);
+                x += 150.0;
+            }
         }
+        assert_eq!(interfered, 10);
         assert_eq!(armed, 1);
     }
 
     #[test]
     fn rearms_after_three_healthy_windows() {
         let mut v = hv();
-        let x = warm(&mut v);
-        assert!(hop_store_blank_until(&jam(&mut v, x), true, 500).is_some());
-        for i in 1..=3 {
-            calm(&mut v, x + 150.0 * i as f64);
+        let mut x = warm(&mut v);
+        assert_eq!(occupy(&mut v, &mut x), 1);
+        for _ in 0..tail() + 3 {
+            quiet(&mut v, x);
+            x += 150.0;
         }
-        assert!(hop_store_blank_until(&jam(&mut v, x + 600.0), true, 500).is_some());
+        assert!(!quiet(&mut v, x).ref_frozen);
+        x += 150.0;
+        assert_eq!(occupy(&mut v, &mut x), 1);
     }
 
     #[test]
     fn rearms_after_reset_ends_a_verify_window() {
         let mut v = hv();
-        let x = warm(&mut v);
-        assert!(hop_store_blank_until(&jam(&mut v, x), true, 500).is_some());
-        assert!(hop_store_blank_until(&jam(&mut v, x + 150.0), true, 500).is_none());
+        let mut x = warm(&mut v);
+        assert_eq!(occupy(&mut v, &mut x), 1);
+        assert!(hop_store_blank_until(&jam(&mut v, x), true, 500).is_none());
+        x += 150.0;
         v.reset();
-        assert!(hop_store_blank_until(&jam(&mut v, x + 300.0), true, 500).is_some());
+        assert!(hop_store_blank_until(&jam(&mut v, x), true, 500).is_some());
     }
 
     #[test]
@@ -1498,6 +1711,24 @@ mod tests {
             hop_store_blank_until(&jam(&mut v, x), true, 2000),
             Some(x + 2000.0 + HOP_SETTLE_BLANK_MS)
         );
+    }
+
+    /// The ladder demotes on loss in either layer, so the verdict confirms
+    /// on either.
+    #[test]
+    fn verdict_link_loss_is_the_worse_layer() {
+        let s = |valid, loss| LossSample { valid, loss };
+        assert_eq!(hop_verdict_link_loss(s(true, 0.0), s(true, 0.04)), 0.04);
+        assert_eq!(hop_verdict_link_loss(s(true, 0.05), s(true, 0.01)), 0.05);
+    }
+
+    /// A layer with no window contributes nothing; neither valid reads 0.
+    #[test]
+    fn verdict_link_loss_ignores_an_invalid_layer() {
+        let s = |valid, loss| LossSample { valid, loss };
+        assert_eq!(hop_verdict_link_loss(s(false, 0.9), s(true, 0.02)), 0.02);
+        assert_eq!(hop_verdict_link_loss(s(true, 0.03), s(false, 0.9)), 0.03);
+        assert_eq!(hop_verdict_link_loss(s(false, 0.9), s(false, 0.9)), 0.0);
     }
 
     #[test]

@@ -3,12 +3,14 @@
 //!
 //! - search (link down): sweep the set, bursting DISC (`beaconing()`) for
 //!   search_ms on every member dwell so the drone is found wherever it is.
-//! - measure (auto mode, pick open): observe every dwell channel (both
-//!   20 MHz halves of each member's pair at width 40) and rank it.
-//!   Unlinked, the observe is `quiet()` (the TX card holds its DISC);
-//!   linked, the TX card's leak is subtracted instead, and op's own halves
-//!   are skipped (they carry the drone's video).
-//! - no work: park on op at the link width, once.
+//! - measure (auto mode, pick open): observe every member at the card's
+//!   width (at 40 one dwell on the primary reads the whole pair) and rank
+//!   it. Unlinked, the observe is `quiet()` (the TX card holds its DISC);
+//!   linked, the TX card's leak is subtracted instead, and op is skipped
+//!   (its pair carries the drone's video).
+//! - no work: park on op, once. The scout never changes the card's width:
+//!   the core retunes it (a live width flip) while the scout has no work
+//!   and then tells it (`set_link_width_mhz`).
 //!
 //! One card + measure: a silent prelude of one_card_ms first; afterwards
 //! every step is an op window then one dwell. The clock and sleep are
@@ -18,10 +20,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
 use std::sync::Mutex;
 
-use super::pair::{all_pairs_ranked, any_pair_ranked, pair_proposal, pair_ranking, scan_half_set};
+use super::pair::{all_pairs_ranked, any_pair_ranked, pair_proposal, pair_ranking};
 use super::radio::{nhm_busy_pct, nhm_period_4us, NhmBusyRead, ScoutRadio};
 use super::ranker::{ChannelRanker, RankEntry, RankSample};
-use crate::config::ht40_pair_other;
+use crate::config::ht40_offset;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScoutCfg {
@@ -41,9 +43,11 @@ pub struct ScoutCfg {
     pub beacon_period_ms: i32,
     /// One card + measure: the silent prelude before the first DISC.
     pub one_card_ms: i32,
-    pub pick_margin: u32,
+    /// Busy-% points a candidate must beat the current channel by.
+    pub pick_margin_pct: f64,
     pub one_card: bool,
-    /// 40: dwell every half at 20, pick a pair, park at 40.
+    /// The card's width at construction (`set_link_width_mhz` moves it);
+    /// 40 = one dwell per pair, pick a pair.
     pub link_width_mhz: u8,
     pub busy_dbm: i32,
     pub blocked_pct: f64,
@@ -64,7 +68,7 @@ impl Default for ScoutCfg {
             op_window_ms: 300,
             beacon_period_ms: 20,
             one_card_ms: 5000,
-            pick_margin: 20,
+            pick_margin_pct: 10.0,
             one_card: false,
             link_width_mhz: 20,
             busy_dbm: -83,
@@ -192,8 +196,6 @@ const ROUND_MEASURED: u8 = 2;
 struct RunState {
     sched: FlatScheduler,
     seq: u64,
-    /// The next tune switches the card to 20 MHz.
-    need_width: bool,
     /// First run_once() (the one-card prelude start).
     t0: Option<i64>,
 }
@@ -222,21 +224,13 @@ pub struct ChannelScout<R: ScoutRadio + ?Sized> {
     done: AtomicBool,
     rounds: AtomicU64,
     round: AtomicU8,
-}
-
-/// Pinned or width 20: the members; measuring at 40: both halves of every
-/// member's pair. Also the ranker's row order.
-fn dwell_channels(c: &ScoutCfg) -> Vec<u8> {
-    if c.measure && c.link_width_mhz == 40 {
-        scan_half_set(&c.channels)
-    } else {
-        c.channels.clone()
-    }
+    /// The card's width (`cfg.link_width_mhz` at construction).
+    link_width: AtomicU8,
 }
 
 impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     pub fn new(cfg: ScoutCfg, radio: std::sync::Arc<R>, now: NowFn, sleep: SleepFn) -> Self {
-        let dc = dwell_channels(&cfg);
+        let dc = cfg.channels.clone();
         // The first pick: the first usable member (radio.use narrows it).
         let first = cfg
             .usable
@@ -248,7 +242,12 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         Self {
             usable: Mutex::new(cfg.usable.clone()),
             sh: Mutex::new(Shared {
-                ranker: ChannelRanker::new(&dc, cfg.min_rounds, cfg.pick_margin, cfg.blocked_pct),
+                ranker: ChannelRanker::new(
+                    &dc,
+                    cfg.min_rounds,
+                    cfg.pick_margin_pct,
+                    cfg.blocked_pct,
+                ),
                 dwells: Vec::new(),
                 round_dwells: 0,
                 round_samples: Vec::new(),
@@ -256,7 +255,6 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             run: Mutex::new(RunState {
                 sched: FlatScheduler::new(&dc),
                 seq: 0,
-                need_width: true,
                 t0: None,
             }),
             proposal: AtomicU8::new(first),
@@ -273,6 +271,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             done: AtomicBool::new(false),
             rounds: AtomicU64::new(0),
             round: AtomicU8::new(ROUND_IDLE),
+            link_width: AtomicU8::new(cfg.link_width_mhz),
             cfg,
             radio,
             now,
@@ -298,6 +297,15 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     }
     pub fn stop(&self) {
         self.stop.store(true, Release);
+    }
+    /// The width the card is tuned to, set by the core after it retuned
+    /// the card while the scout had no work: dwells record it, and at 40
+    /// the ranking, maturity and proposal go by pair.
+    pub fn set_link_width_mhz(&self, w: u8) {
+        self.link_width.store(w, Release);
+    }
+    pub fn link_width_mhz(&self) -> u8 {
+        self.link_width.load(Acquire)
     }
     /// One card + measure: the core committed the prelude pick (op = the
     /// committed channel); op windows may run.
@@ -357,9 +365,9 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         {
             let mut sh = self.sh.lock().unwrap();
             sh.ranker = ChannelRanker::new(
-                &dwell_channels(&self.cfg),
+                &self.cfg.channels,
                 self.cfg.min_rounds,
-                self.cfg.pick_margin,
+                self.cfg.pick_margin_pct,
                 self.cfg.blocked_pct,
             );
             sh.round_dwells = 0;
@@ -397,14 +405,14 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             .compare_exchange(ROUND_MEASURING, ROUND_MEASURED, AcqRel, Acquire);
     }
 
-    /// The round is over once every dwell channel it does not skip has a
-    /// visit, or after two passes' worth of dwells (a half whose retune or
-    /// read keeps failing must not hold the run's pick forever).
+    /// The round is over once every member it does not skip has a visit,
+    /// or after two passes' worth of dwells (a member whose retune or read
+    /// keeps failing must not hold the run's pick forever).
     fn note_round_dwell(&self) {
         if !self.round_measuring() {
             return;
         }
-        let cap = 2 * dwell_channels(&self.cfg).len();
+        let cap = 2 * self.cfg.channels.len();
         let (all, taken) = {
             let mut sh = self.sh.lock().unwrap();
             sh.round_dwells += 1;
@@ -412,7 +420,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
                 .ranker
                 .all()
                 .iter()
-                .all(|e| self.skip_op_half(e.ch) || e.visits != 0);
+                .all(|e| self.skip_op(e.ch) || e.visits != 0);
             (all, sh.round_dwells)
         };
         if all || taken >= cap {
@@ -454,33 +462,11 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         }
     }
 
-    fn park(&self, rs: &mut RunState) {
-        let op = self.op.load(Acquire);
-        if self.cfg.link_width_mhz == 40 {
-            // Not retried here: the core loop's width resync fixes the card
-            // once it is ready again.
-            if !self.radio.retune_width(op, 40) {
-                eprintln!("pal chan: scout card width switch to 40 MHz on ch {op} failed; the core loop retries");
-            }
-        } else {
-            self.radio.retune(op);
-        }
+    fn park(&self) {
+        self.radio.retune(self.op.load(Acquire));
         self.beaconing.store(false, Release);
         self.quiet.store(false, Release);
         self.working.store(false, Release);
-        rs.need_width = true;
-    }
-
-    fn tune(&self, rs: &mut RunState, ch: u8) -> bool {
-        let ok = if rs.need_width {
-            self.radio.retune_width(ch, 20)
-        } else {
-            self.radio.retune(ch)
-        };
-        if ok {
-            rs.need_width = false;
-        }
-        ok
     }
 
     /// Thread body: loops run_once() until stop(), parks the card on exit.
@@ -491,33 +477,28 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             }
         }
         if self.working.load(Acquire) {
-            self.park(&mut self.run.lock().unwrap());
+            self.park();
         }
         self.done.store(true, Release);
     }
 
-    /// While the search is off op's own pair carries the drone's video,
-    /// which a 20 MHz observe at width 40 counts as busy and NHM counts
-    /// either way: those halves are skipped and op keeps its pre-link
-    /// visits.
-    fn is_op_half(&self, ch: u8) -> bool {
-        let op = self.op.load(Acquire);
-        ch == op || (self.cfg.measure && self.cfg.link_width_mhz == 40 && ch == ht40_pair_other(op))
-    }
-    fn skip_op_half(&self, ch: u8) -> bool {
-        !self.search.load(Acquire) && self.measuring() && self.is_op_half(ch)
+    /// While the search is off op's pair carries the drone's video (NHM
+    /// counts its airtime, the frame counts see it): op is skipped and keeps
+    /// its pre-link visits.
+    fn skip_op(&self, ch: u8) -> bool {
+        !self.search.load(Acquire) && self.measuring() && ch == self.op.load(Acquire)
     }
 
-    /// One scheduler dwell. A skipped op half completes in the scheduler
-    /// without touching the card and the next bin is taken; false when
-    /// every bin is one of op's.
+    /// One scheduler dwell. A skipped op completes in the scheduler without
+    /// touching the card and the next bin is taken; false when op is the
+    /// only bin.
     fn step_dwell(&self, rs: &mut RunState, burst_ok: bool, observe: bool) -> bool {
         let bins = rs.sched.bins.len();
         for _ in 0..=bins {
             let Some((i, ch, round)) = rs.sched.next() else {
                 return true;
             };
-            if self.skip_op_half(ch) {
+            if self.skip_op(ch) {
                 // Stamped one dwell ahead, or a tie with the dwell that just
                 // finished could win by plan order forever.
                 rs.sched
@@ -545,7 +526,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         let t0 = *rs.t0.get_or_insert_with(|| (self.now)());
         if !self.has_work() {
             if self.working.load(Acquire) {
-                self.park(&mut rs);
+                self.park();
             }
             // A round that just ended is over once parked.
             let _ = self
@@ -569,7 +550,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
                 return false;
             }
             let op = self.op.load(Acquire);
-            if !self.tune(&mut rs, op) {
+            if !self.radio.retune(op) {
                 return true;
             }
             self.beaconing.store(true, Release);
@@ -594,14 +575,19 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         let mut d = ScoutDwell {
             seq: rs.seq,
             ch,
-            width_mhz: 20,
+            width_mhz: self.link_width_mhz(),
+            offset: if self.link_width_mhz() == 40 {
+                ht40_offset(ch)
+            } else {
+                0
+            },
             round,
             t_start_ms: (self.now)(),
             settle_ms: self.cfg.settle_ms,
             ..Default::default()
         };
         rs.seq += 1;
-        if !self.tune(rs, ch) {
+        if !self.radio.retune(ch) {
             d.flags |= FLAG_RETUNE_FAILED;
             d.t_end_ms = (self.now)();
             self.push_dwell(d);
@@ -706,13 +692,13 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         let sh = self.sh.lock().unwrap();
         let op = self.op.load(Acquire);
         let mr = self.eff_min_rounds();
-        let p = if self.cfg.link_width_mhz == 40 {
+        let p = if self.link_width_mhz() == 40 {
             pair_proposal(
                 sh.ranker.all(),
                 op,
                 &self.usable(),
                 mr,
-                self.cfg.pick_margin,
+                self.cfg.pick_margin_pct,
                 self.cfg.blocked_pct,
             )
         } else {
@@ -735,7 +721,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     fn op_ranked_locked(&self, sh: &Shared, mr: i32) -> bool {
         let op = self.op.load(Acquire);
         let all = sh.ranker.all();
-        if self.cfg.link_width_mhz == 40 {
+        if self.link_width_mhz() == 40 {
             return any_pair_ranked(all, &[op], mr);
         }
         all.iter()
@@ -760,7 +746,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         if all.is_empty() {
             return false;
         }
-        if self.cfg.link_width_mhz == 40 {
+        if self.link_width_mhz() == 40 {
             let others: Vec<u8> = self
                 .cfg
                 .channels
@@ -783,7 +769,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     pub fn pick_ranking(&self) -> Vec<u8> {
         let sh = self.sh.lock().unwrap();
         let mr = self.eff_min_rounds();
-        if self.cfg.link_width_mhz == 40 {
+        if self.link_width_mhz() == 40 {
             return pair_ranking(sh.ranker.all(), &self.usable(), mr, self.cfg.blocked_pct);
         }
         let usable = self.usable();
@@ -798,7 +784,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::radio::{ScoutEnergy, ScoutFrames};
+    use super::super::radio::{NhmBusyRead, ScoutEnergy, ScoutFrames};
     use super::*;
     use std::sync::{Arc, OnceLock, Weak};
 
@@ -807,19 +793,23 @@ mod tests {
         now: i64,
         calls: Vec<String>,
         ch: u8,
-        width: u8,
         cca_per_ms_on: Vec<u32>,
+        /// NHM busy % per channel; -1: no NHM window.
+        busy_pct_on: Vec<i32>,
+        armed: u16,
         last_read: i64,
     }
 
     /// Fake radio + clock: sleep advances `now`, every call is recorded.
+    /// The radio has no width switch: the card stays at whatever width it
+    /// was opened with, so every tune is a plain retune.
     struct FakeRadio(Mutex<FakeState>);
 
     impl FakeRadio {
         fn new() -> Arc<Self> {
             Arc::new(Self(Mutex::new(FakeState {
-                width: 20,
                 cca_per_ms_on: vec![0; 256],
+                busy_pct_on: vec![-1; 256],
                 ..Default::default()
             })))
         }
@@ -835,6 +825,9 @@ mod tests {
         fn busy(&self, ch: u8, per_ms: u32) {
             self.st().cca_per_ms_on[ch as usize] = per_ms;
         }
+        fn nhm(&self, ch: u8, pct: i32) {
+            self.st().busy_pct_on[ch as usize] = pct;
+        }
     }
 
     impl ScoutRadio for FakeRadio {
@@ -844,12 +837,22 @@ mod tests {
             s.calls.push(format!("retune {c}"));
             true
         }
-        fn retune_width(&self, c: u8, w: u8) -> bool {
+        fn arm_nhm_busy(&self, p: u16) -> bool {
             let mut s = self.st();
-            s.ch = c;
-            s.width = w;
-            s.calls.push(format!("retune_width {c}/{w}"));
-            true
+            s.armed = p;
+            s.busy_pct_on[s.ch as usize] >= 0
+        }
+        fn read_nhm_busy(&self) -> NhmBusyRead {
+            let s = self.st();
+            let b = s.busy_pct_on[s.ch as usize].max(0) as u8;
+            let mut r = NhmBusyRead {
+                valid: true,
+                period: s.armed,
+                ..Default::default()
+            };
+            r.buckets[0] = 100 - b; // below every edge
+            r.buckets[11] = b; // above every edge
+            r
         }
         fn read_energy(&self, with_nhm: bool) -> ScoutEnergy {
             let mut s = self.st();
@@ -941,7 +944,7 @@ mod tests {
             search_ms: 100,
             op_window_ms: 300,
             beacon_period_ms: 20,
-            pick_margin: 20,
+            pick_margin_pct: 10.0,
             link_width_mhz: 40,
             ..Default::default()
         }
@@ -954,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_until_search_or_measure_then_first_dwell_switches_to_20() {
+    fn idle_until_search_or_measure_then_dwells_retune_the_card_as_opened() {
         let g = Rig::new(two(false));
         g.s.set_op(136);
         g.s.set_search(false);
@@ -962,10 +965,49 @@ mod tests {
         assert!(g.r.calls().is_empty());
         g.s.set_search(true);
         assert!(g.s.run_once() && g.s.working());
-        assert_eq!(g.r.calls()[0], "retune_width 136/20");
-        assert_eq!(g.r.st().width, 20);
+        assert_eq!(g.r.calls()[0], "retune 136");
         g.s.run_once();
         assert_eq!(g.r.calls().last().unwrap(), "retune 144");
+    }
+
+    /// Width 40: one dwell per pair, on its primary, in config order; the
+    /// dwell is recorded at 40 with the primary's offset.
+    #[test]
+    fn at_40_the_dwell_set_is_the_primaries_and_the_card_never_switches_width() {
+        let g = Rig::new(ScoutCfg {
+            channels: vec![136, 144, 40],
+            ..two(true)
+        });
+        g.s.set_op(136);
+        g.s.set_search(true);
+        g.steps(3);
+        assert_eq!(g.s.rounds(), 1);
+        let tunes: Vec<String> =
+            g.r.calls()
+                .into_iter()
+                .filter(|c| c.starts_with("retune"))
+                .collect();
+        assert_eq!(tunes, vec!["retune 136", "retune 144", "retune 40"]);
+        let d = g.s.take_dwells();
+        assert_eq!(d.len(), 3);
+        for x in &d {
+            assert_eq!(x.width_mhz, 40);
+            assert_eq!(x.offset, pal_wire::ht40::ht40_offset(x.ch));
+        }
+        let k: Vec<u8> = g.s.ranking().iter().map(|e| e.ch).collect();
+        assert_eq!(k, vec![136, 144, 40]);
+    }
+
+    #[test]
+    fn park_at_40_is_a_plain_retune_to_op() {
+        let g = Rig::new(two(true));
+        g.s.set_op(136);
+        g.s.set_search(true);
+        g.steps(2);
+        g.s.set_search(false);
+        g.s.freeze();
+        assert!(!g.s.run_once());
+        assert_eq!(g.r.calls().last().unwrap(), "retune 136");
     }
 
     #[test]
@@ -988,26 +1030,31 @@ mod tests {
     }
 
     #[test]
-    fn auto_unlinked_dwell_is_burst_then_quiet_observe_on_primaries_observe_only_on_secondaries() {
+    fn auto_unlinked_dwell_is_burst_then_quiet_observe_on_every_member() {
         let g = Rig::new(two(true));
         g.s.set_op(136);
         g.s.set_search(true);
         g.s.run_once();
         let p = g.phases();
-        assert_eq!(p.len(), 2);
-        assert!(ph(&p[0], "W", 30) && ph(&p[1], "QW", 250));
-        assert_eq!(g.r.st().ch, 132);
+        assert_eq!(p.len(), 4);
+        assert!(
+            ph(&p[0], "W", 30)
+                && ph(&p[1], "BW", 100)
+                && ph(&p[2], "W", 20)
+                && ph(&p[3], "QW", 250)
+        );
+        assert_eq!(g.r.st().ch, 136);
+        assert!(!g.s.quiet() && !g.s.beaconing());
         g.clear();
         g.s.run_once();
         let p = g.phases();
         assert_eq!(p.len(), 4);
-        assert!(ph(&p[1], "BW", 100) && ph(&p[2], "W", 20) && ph(&p[3], "QW", 250));
-        assert!(!g.s.quiet() && !g.s.beaconing());
+        assert!(p[1].0 == "BW" && p[3].0 == "QW");
         let d = g.s.take_dwells();
         assert_eq!(d.len(), 2);
-        assert!(d[1].ch == 136 && d[1].observe_ms == 250);
+        assert!(d[0].ch == 136 && d[0].observe_ms == 250 && d[1].ch == 144);
         let k: Vec<u8> = g.s.ranking().iter().map(|e| e.ch).collect();
-        assert_eq!(k, vec![132, 136, 140, 144]);
+        assert_eq!(k, vec![136, 144]);
     }
 
     #[test]
@@ -1058,23 +1105,53 @@ mod tests {
         assert_eq!(entry(&g.s, 144).worst_busy, 250);
     }
 
+    /// Unlinked (searching): op is measured like every other channel.
     #[test]
-    fn two_card_proposal_matures_after_min_rounds_and_moves_only_past_the_margin() {
+    fn two_card_proposal_matures_after_min_rounds_and_moves_only_past_the_busy_margin() {
         let g = Rig::new(two(true));
         g.s.set_op(136);
         g.s.set_search(true);
-        g.steps(4);
+        g.steps(2);
         assert!(!g.s.mature() && g.s.proposal() == 136 && g.s.pick_ranking().is_empty());
-        g.steps(4);
+        g.steps(2);
         assert!(g.s.mature() && g.s.rounds() == 2 && g.s.proposal() == 136);
         let h = Rig::new(two(true));
         h.s.set_op(136);
         h.s.set_search(true);
-        h.r.busy(132, 1);
-        h.steps(8);
+        h.r.nhm(136, 30);
+        h.r.nhm(144, 0);
+        h.steps(4);
         assert_eq!(h.s.proposal(), 144);
         assert_eq!(h.s.pick_ranking(), vec![144, 136]);
         h.s.set_op(144);
+        assert_eq!(h.s.proposal(), 144);
+    }
+
+    /// Width 40 ranks NHM busy first, and op keeps the pick until a
+    /// candidate beats its busy by pick_margin_pct points.
+    #[test]
+    fn at_40_proposal_ranks_busy_first_and_holds_op_by_pick_margin_pct() {
+        let c = ScoutCfg {
+            pick_margin_pct: 15.0,
+            ..two(true)
+        };
+        let g = Rig::new(c.clone());
+        g.s.set_op(136);
+        g.s.set_search(true);
+        g.r.nhm(136, 30);
+        g.r.nhm(144, 18);
+        g.r.busy(144, 1);
+        g.steps(4);
+        assert!(g.s.mature());
+        assert_eq!(g.s.pick_ranking(), vec![144, 136]);
+        assert_eq!(g.s.proposal(), 136);
+        let h = Rig::new(c);
+        h.s.set_op(136);
+        h.s.set_search(true);
+        h.r.nhm(136, 40);
+        h.r.nhm(144, 18);
+        h.r.busy(144, 1);
+        h.steps(4);
         assert_eq!(h.s.proposal(), 144);
     }
 
@@ -1085,14 +1162,14 @@ mod tests {
         let g = Rig::with(
             two(true),
             Some(Box::new(move |s, ms| {
-                if ms == 250 && o2.fetch_add(1, SeqCst) + 1 == 8 {
+                if ms == 250 && o2.fetch_add(1, SeqCst) + 1 == 4 {
                     s.set_op(144);
                 }
             })),
         );
         g.s.set_op(144);
         g.s.set_search(true);
-        g.steps(7);
+        g.steps(3);
         g.s.set_op(136);
         assert_eq!(g.s.proposal(), 136);
         g.s.run_once();
@@ -1101,14 +1178,15 @@ mod tests {
     }
 
     #[test]
-    fn two_card_width_20_ranks_the_members_and_proposes_past_the_margin() {
+    fn two_card_width_20_ranks_the_members_and_proposes_past_the_busy_margin() {
         let g = Rig::new(ScoutCfg {
             link_width_mhz: 20,
             ..two(true)
         });
         g.s.set_op(136);
         g.s.set_search(true);
-        g.r.busy(136, 1);
+        g.r.nhm(136, 30);
+        g.r.nhm(144, 0);
         g.steps(4);
         assert!(g.s.mature() && g.s.rounds() == 2 && g.s.proposal() == 144);
         assert_eq!(g.s.pick_ranking(), vec![144, 136]);
@@ -1118,19 +1196,21 @@ mod tests {
         assert_eq!(g.r.calls().last().unwrap(), "retune 136");
     }
 
+    /// Linked, op carries the drone's video: the scout never tunes to op
+    /// and op keeps only its pre-link visits.
     #[test]
-    fn linked_dwells_never_tune_to_op_halves() {
+    fn linked_dwells_never_tune_to_op() {
         let g = Rig::new(two(true));
         g.s.set_op(136);
         g.s.set_search(false);
-        for _ in 0..8 {
+        for _ in 0..4 {
             assert!(g.s.run_once());
         }
         for c in g.r.calls() {
             assert!(!c.contains("132") && !c.contains("136"));
         }
         for e in g.s.ranking() {
-            assert_eq!(e.visits, if e.ch == 132 || e.ch == 136 { 0 } else { 4 });
+            assert_eq!(e.visits, if e.ch == 136 { 0 } else { 4 });
         }
         assert_eq!(g.s.rounds(), 4);
     }
@@ -1155,17 +1235,17 @@ mod tests {
         let g = Rig::new(two(true));
         g.s.set_op(136);
         g.s.set_search(true);
-        g.steps(2);
+        g.s.run_once();
         g.s.set_search(false);
-        g.steps(4);
+        g.steps(2);
         assert!(g.s.mature() && !g.s.op_ranked());
         let h = Rig::new(two(true));
         h.s.set_op(136);
         h.s.set_search(true);
-        h.steps(6);
+        h.steps(3);
         h.s.set_search(false);
         assert!(!h.s.mature());
-        h.steps(2);
+        h.s.run_once();
         assert!(h.s.mature() && h.s.op_ranked());
     }
 
@@ -1174,14 +1254,14 @@ mod tests {
         let g = Rig::new(two(true));
         g.s.set_op(144);
         g.s.set_search(true);
-        g.steps(7);
+        g.steps(3);
         assert!(!g.s.op_ranked() && !g.s.mature());
         g.s.run_once();
         assert!(g.s.op_ranked() && g.s.mature());
     }
 
     #[test]
-    fn freeze_stops_measuring_and_parks_at_link_width_on_op() {
+    fn freeze_stops_measuring_and_parks_on_op() {
         let g = Rig::new(two(true));
         g.s.set_op(144);
         g.s.set_search(false);
@@ -1191,7 +1271,7 @@ mod tests {
         assert!(!g.s.pick_open());
         assert!(!g.s.run_once());
         assert!(!g.s.working() && !g.s.quiet() && !g.s.beaconing());
-        assert_eq!(g.r.calls().last().unwrap(), "retune_width 144/40");
+        assert_eq!(g.r.calls().last().unwrap(), "retune 144");
         let n = g.r.calls().len();
         assert!(!g.s.run_once());
         assert_eq!(g.r.calls().len(), n);
@@ -1201,7 +1281,7 @@ mod tests {
         assert!(g.phases().iter().all(|p| !p.0.contains('Q')));
         let calls = g.r.calls();
         assert!(calls[n..].iter().all(|c| !c.starts_with("read")));
-        assert!(calls[n].starts_with("retune_width ") && g.r.st().width == 20);
+        assert_eq!(calls[n], "retune 144");
         assert!(g.s.working());
     }
 
@@ -1269,7 +1349,6 @@ mod tests {
         let calls = g.r.calls();
         assert_eq!(calls[n], "retune 144");
         assert!(ph(&g.phases()[0], "BW", 300));
-        assert!(calls[n..].iter().all(|c| c != "retune 136"));
     }
 
     #[test]
@@ -1306,7 +1385,7 @@ mod tests {
         g.s.stop();
         g.s.run();
         assert!(g.s.done() && !g.s.working());
-        assert_eq!(g.r.calls().last().unwrap(), "retune_width 136/40");
+        assert_eq!(g.r.calls().last().unwrap(), "retune 136");
     }
 
     #[test]

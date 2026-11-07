@@ -148,7 +148,6 @@ class PalCard final : public maburgs::LinkCard {
     rx_channel_.store(ch, std::memory_order_release);
     return true;
   }
-  bool retune_width(uint8_t ch, uint8_t w) override { return set_width(ch, w); }
   maburgs::ScoutEnergy read_energy(bool with_nhm) override {
     if (!ready()) return {};
     std::lock_guard<std::mutex> g(ctl_);

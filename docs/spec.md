@@ -1,6 +1,6 @@
 # Palianytsia: a Rust ground-station client for mabur
 
-Status: Draft 2 of 2026-10-31, kept as written except for dated notes; the current state is "Status (2026-11-03)" below (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
+Status: Draft 2 of 2026-10-31, kept as written except for dated notes; the current state is "Status (2026-11-07)" below (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
 The name is a choice, not decoration: the word is the 2022 shibboleth used to tell a Russian speaker from a Ukrainian one, and no Russian military unit will want it on a ground station.
 Paths like `exp-orig-backport/...`, `exp-mabur-fluke-pxp/...` and `devourer_stack/...` are on the author's machine, relative to `/mnt/sdb2/moved_from_ssd/home/ihor/build/drone/BUILD/devourer_stack/` (`devourer_stack/...` relative to its parent `BUILD/`); palianytsia itself is the sibling `BUILD/palianytsia`. Verified 2026-11-01: `exp-mabur-fluke-pxp/pixelpilot` is at e2d0c90, `exp-orig-backport/pixelpilot` at 33978f8, `devourer_stack/openipc-rs` at v0.1.40+1.
 Home: `vertexodessa/palianytsia`, a **private** GitHub repo (not OpenIPC, not this workspace). The mabur and devourer forks it pins stay public.
@@ -12,7 +12,7 @@ Sources read for this draft:
 
 The unify tree (RC 21, `T_CFG_SET`/`T_LOG`, `phone_wall_us`) is a reference only. This app does not speak it.
 
-## Status (2026-11-03)
+## Status (2026-11-07)
 
 The dated milestone notes in sections 10 and 14 are history: each says what was true that day, and
 their "not ported" / "still owed" lines are superseded by later ones. The current state:
@@ -37,10 +37,22 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   calibration with the channel pick. Not done: GS-side DVR, VTX recording control beyond the
   REC_* parameters, preflight.
 - M5: the parameter client is done; MSP OSD and Quest hand tracking are not.
+- 2026-11-07: mabur `palianytsia/base-v2` rebased onto upstream master with #114 (hop verdict
+  reads NHM airtime only: occupied route = blocked streak of `hop.verdict.occupied_windows`, detect
+  route = a ring of `detect_windows` with median foreign % >= `detect_pct` and lossy slots; the
+  store blank opens on the first blocked window; verdict loss = the worse video layer; own airtime
+  scaled by seq delivery, best-chain RSSI) and #116 (no GS `radio.width`: the receiver width is
+  derived from `[link]`; 40 MHz scans dwell once per pair on the primary, the scout never switches
+  width; rankers order busy % first with `pick_margin_pct`; spare-card freshness bursts run on
+  the in-flight thread, paced by `hop.burst_period_ms`). Ported to the Rust core; ref==rust holds
+  (`chan_trace.rs` random scripts now jam op through NHM and decode frames;
+  `pal-ref/tests/verdict_diff.rs` checks the verdict against mabur's on both routes). Not ported:
+  mabur's live ChannelCore `set_width` (a Palianytsia width change restarts the link).
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).
-- Owed on hardware (none run on air yet): TxSelector switching, field calibration at distance,
+- Owed on hardware (none run on air yet): the NHM-only hop verdict and the posted spare-card burst
+  (2026-11-07 port), TxSelector switching, field calibration at distance,
   the Quest relink with the cards kept open, card_deaf on a real deaf card.
 - Deferred (would change original mabur): the calibration measure card chosen by role at request
   time, a hop right after a rung climb.

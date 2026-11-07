@@ -17,7 +17,7 @@ use pal_core::chan::core::{
 use pal_core::chan::fake::{FakeCard, FakeClock};
 use pal_core::chan::hop::HopEvent;
 use pal_core::chan::plan::MoveEvent;
-use pal_core::chan::radio::LinkCard;
+use pal_core::chan::radio::{nhm_period_4us, LinkCard, NhmBusyRead};
 use pal_core::chan::ranker::RankEntry;
 use pal_core::chan::scout::ScoutDwell;
 use pal_core::chan::verdict::{VerdictCardIn, VerdictLinkIn, VerdictOut};
@@ -124,23 +124,18 @@ impl ChannelSink for TSink {
     }
     fn verdict(&mut self, t: f64, o: &VerdictOut, cards: &[VerdictCardIn], l: &VerdictLinkIn) {
         let mut s = format!(
-            "V t={} v={} ev={} rr={} trig={} rref={} dr={} ts={} tw={} frz={} first={} \
-             link={}:{}:{}:{} cards=",
+            "V t={} v={} ev={} rr={} trig={} ts={} tw={} frz={} first={} link={}:{} cards=",
             num(t),
             o.v.as_str(),
             o.evidence,
             o.ref_rung,
             b(o.trigger),
-            num(o.ref_rssi_dbm),
-            num(o.d_rssi_db),
             num(o.t_start_ms),
             num(o.t_ms),
             b(o.ref_frozen),
-            b(o.first_interfered),
+            b(o.first_blocked),
             num(l.pre_fec_loss),
-            l.recovered,
-            b(l.starved),
-            l.au_count
+            l.recovered
         );
         for c in cards {
             s += &format!(
@@ -238,13 +233,29 @@ struct Duo {
     cpp: CppTrace,
     tr: Vec<String>,
     tc: Vec<String>,
+    /// decode_one(): the next mac_seq, every card.
+    seq_next: u16,
+}
+
+fn junk_body(card: u8, seq: u16) -> pal_core::RxBody {
+    pal_core::RxBody {
+        card_id: card,
+        mac_seq: seq,
+        crc_ok: true,
+        phy_valid: true,
+        rssi: [38, 40],
+        snr: [10, 25],
+        mono_us: 1000 * u64::from(seq),
+        body: vec![0; 20],
+        ..Default::default()
+    }
 }
 
 fn fakes(clk: &FakeClock, n: usize, start: u8, width: u8) -> Vec<Arc<FakeCard>> {
     (0..n)
         .map(|i| {
             let c = FakeCard::new(clk.clone(), start);
-            // The boot scout card opens at 20, every other at radio.width.
+            // The boot scout card opens at 20, every other at the link width.
             c.s().width_mhz = if i == n - 1 { 20 } else { width };
             c
         })
@@ -259,19 +270,19 @@ impl Duo {
     fn with(n: usize, pin: Option<u8>, start: u8, channels: &[u8], max_ms: Option<i32>) -> Self {
         let mut cfg = load_config(Path::new(CONFIG), None).unwrap();
         cfg.radio.channels = channels.to_vec();
-        cfg.radio.width = 40;
         cfg.radio.pin = pin;
         if let Some(m) = max_ms {
             cfg.radio.scan.max_ms = m;
         }
         let (clk_r, clk_c) = (FakeClock::default(), FakeClock::default());
-        let cr = fakes(&clk_r, n, start, cfg.radio.width);
-        let cc = fakes(&clk_c, n, start, cfg.radio.width);
+        let cr = fakes(&clk_r, n, start, 40);
+        let cc = fakes(&clk_c, n, start, 40);
         let lines_r = Arc::new(Mutex::new(Vec::new()));
         let (st, k1, k2, k3) = (lines_r.clone(), clk_r.clone(), clk_r.clone(), clk_r.clone());
         let core = ChannelCore::new(
             ChannelCoreCfg {
                 radio: cfg.radio.clone(),
+                width_mhz: 40,
                 hop: cfg.hop.clone(),
                 key: cfg.link.key,
                 start_ch: start,
@@ -307,7 +318,12 @@ impl Duo {
         )
         .unwrap();
         Duo {
-            vrx: VrxController::new(VrxCfg::from_config(&cfg, start, NONCE)),
+            // The link width both sides run at (TraceCfg width 40), not the
+            // bundle's derived one.
+            vrx: VrxController::new(VrxCfg {
+                width: 40,
+                ..VrxCfg::from_config(&cfg, start, NONCE)
+            }),
             agg: Aggregator::new(&cfg.uep_layers(), 32, n, 0),
             cfg,
             clk_r,
@@ -319,6 +335,7 @@ impl Duo {
             cpp,
             tr: Vec::new(),
             tc: Vec::new(),
+            seq_next: 100,
         }
     }
     fn new(n: usize, pin: Option<u8>, start: u8) -> Self {
@@ -492,15 +509,59 @@ impl Duo {
         }
         None
     }
+    /// One decoded frame per card on both sides, walking its seq.
+    fn decode_one(&mut self) {
+        for i in 0..self.cr.len() {
+            let seq = self.seq_next;
+            self.agg.on_rx_body(&junk_body(i as u8, seq));
+            self.cpp.junk_body(i, seq);
+        }
+        self.seq_next = self.seq_next.wrapping_add(1);
+    }
+    /// Op's NHM window at the sampler's period: every sample busy when
+    /// `jammed`, every sample clean otherwise.
+    fn op_air(&self, jammed: bool) -> NhmBusyRead {
+        let mut r = NhmBusyRead {
+            valid: true,
+            period: nhm_period_4us(self.cfg.hop.window_ms - 10),
+            ..Default::default()
+        };
+        r.buckets[if jammed { 11 } else { 0 }] = 100;
+        r
+    }
+    fn occ_lead(&self) -> usize {
+        (self.cfg.hop.verdict.occupied_windows - 1).max(0) as usize
+    }
+    /// Interfered windows: op jammed on every card, each tick decoding one
+    /// frame per card (no FEC loss: occupancy is the only route).
     fn interfere(&mut self, windows: usize) {
+        let jam = self.op_air(true);
+        self.cards(|_, s| {
+            s.nhm_arm_ok = true;
+            s.nhm_read = jam;
+        });
         for _ in 0..windows {
             self.cards(|_, s| s.fr.foreign += 40);
             for _ in 0..self.cfg.hop.window_ms / 10 + 1 {
                 self.vrx_video();
+                self.decode_one();
                 self.tick_tx(true, 0);
                 self.advance(10);
             }
         }
+        self.cards(|_, s| {
+            s.nhm_arm_ok = false;
+            s.nhm_read = NhmBusyRead::default();
+        });
+    }
+    fn interfere_until_order(&mut self) {
+        for _ in 0..self.occ_lead() + 12 {
+            if self.has(" order epoch") {
+                break;
+            }
+            self.interfere(1);
+        }
+        assert!(self.has(" order epoch"));
     }
     fn freeze_auto(&mut self) {
         let n = self.cr.len();
@@ -628,7 +689,8 @@ fn pinned_relocation_confirm_and_dirty_pin() {
     d.note_video(40);
     d.tick(true);
     d.cards(|_, s| s.cca_per_ms_on[40] = 50);
-    d.interfere(8);
+    let lead = d.occ_lead();
+    d.interfere(lead + 8);
     d.snapshot(0);
     assert!(d.has("verify_pass"));
 }
@@ -643,8 +705,7 @@ fn order_duo(n: usize) -> Duo {
         d.tick(true);
     }
     d.cards(|_, s| s.cca_per_ms_on[40] = 50);
-    d.interfere(4);
-    assert!(d.has(" order epoch"));
+    d.interfere_until_order();
     d
 }
 
@@ -710,8 +771,7 @@ fn auto_boot_hop_relocates_to_the_pick() {
     let mut d = Duo::new(2, None, 40);
     d.cards(|i, s| {
         if i == 1 {
-            s.cca_per_ms_on[60] = 5;
-            s.cca_per_ms_on[64] = 5;
+            s.nhm_busy_pct_on[64] = 100; // 64's pair is blocked
         }
     });
     let visits = |d: &Duo, ch: u8| {
@@ -828,6 +888,10 @@ impl Rng {
 #[test]
 fn random_scripts() {
     let set = [40u8, 64, 112, 144];
+    // Lines that show the occupied route and the bursts' orders were
+    // compared. The detect route needs FEC loss, which these junk bodies
+    // never carry: tests/verdict_diff.rs walks it against the C++ verdict.
+    let (mut occupied, mut orders) = (0usize, 0usize);
     for seed in 1..=200u64 {
         let mut r = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let n = 1 + r.below(2) as usize;
@@ -841,10 +905,25 @@ fn random_scripts() {
                 0..=54 => {
                     if session {
                         d.vrx_video();
+                        // Most windows decode something; a window that
+                        // decodes nothing gives no busy reading.
+                        if r.below(4) != 0 {
+                            d.decode_one();
+                        }
                     }
                     d.tick(session);
                 }
-                55..=59 => {
+                55..=56 => {
+                    let ch = set[r.below(4) as usize];
+                    let v = [-1i32, 5, 25, 100][r.below(4) as usize];
+                    let card = r.below(n as u64) as usize;
+                    d.cards(|i, s| {
+                        if i == card {
+                            s.nhm_busy_pct_on[ch as usize] = v;
+                        }
+                    });
+                }
+                57..=59 => {
                     let ch = set[r.below(4) as usize];
                     let v = [0u32, 5, 50][r.below(3) as usize];
                     let card = r.below(n as u64) as usize;
@@ -920,11 +999,35 @@ fn random_scripts() {
                     d.cpp.note_au_end();
                 }
                 90..=91 => d.snapshot(r.below(n as u64) as usize),
+                92..=93 => {
+                    // Op's own air: jammed (every NHM sample busy) or clean.
+                    let on = r.below(2) == 0;
+                    let jam = d.op_air(on);
+                    d.cards(|_, s| {
+                        s.nhm_arm_ok = on;
+                        s.nhm_read = jam;
+                    });
+                }
                 _ => d.send_path(),
             }
         }
         d.snapshot(0);
+        let ev = |l: &String, bit: u32| {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix("ev="))
+                .and_then(|v| v.parse::<u32>().ok())
+                .is_some_and(|e| e & bit != 0)
+        };
+        occupied +=
+            d.tr.iter()
+                .filter(|l| l.starts_with("V ") && ev(l, 128))
+                .count();
+        orders += d.tr.iter().filter(|l| l.contains(" order epoch")).count();
     }
+    assert!(
+        occupied > 0 && orders > 0,
+        "occupied {occupied} orders {orders}"
+    );
 }
 
 /// Deterministic per step, the same for both sides.

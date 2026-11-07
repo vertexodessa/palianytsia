@@ -40,6 +40,10 @@ pub struct HopRankEntry {
     /// `blocked_pct`.
     pub blocked: bool,
     pub busy_pct: f64,
+    /// At least one fresh visit carried an NHM busy reading. At 40 MHz it
+    /// orders entries with a reading ahead within a tier (NHM busy % reads
+    /// the whole pair; a 20 MHz dwell's frame terms see the primary only).
+    pub busy_valid: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -48,17 +52,25 @@ pub struct HopRanker {
     busy: BusyCfg,
     candidates: Vec<u8>,
     boot_pick: u8,
+    width_mhz: u8,
     visits: Vec<VecDeque<HopVisit>>,
 }
 
 impl HopRanker {
-    pub fn new(cfg: HopCfg, busy: BusyCfg, channels: Vec<u8>, boot_pick: u8) -> Self {
+    pub fn new(
+        cfg: HopCfg,
+        busy: BusyCfg,
+        channels: Vec<u8>,
+        boot_pick: u8,
+        width_mhz: u8,
+    ) -> Self {
         let n = channels.len();
         Self {
             cfg,
             busy,
             candidates: channels,
             boot_pick,
+            width_mhz,
             visits: vec![VecDeque::new(); n],
         }
     }
@@ -95,6 +107,15 @@ impl HopRanker {
     /// ties fall through to config order.
     pub fn set_boot_pick(&mut self, ch: u8) {
         self.boot_pick = ch;
+    }
+
+    /// The receiver width the ranking orders for; a live width flip moves
+    /// it. Visits held are kept and age out as usual.
+    pub fn set_width_mhz(&mut self, w: u8) {
+        self.width_mhz = w;
+    }
+    pub fn width_mhz(&self) -> u8 {
+        self.width_mhz
     }
 
     /// fa + max(cca - own, 0) + 4 * foreign, wrapping like mabur's uint32.
@@ -144,10 +165,12 @@ impl HopRanker {
                     ranked: fresh >= 2,
                     blocked: busy_n > 0 && busy_pct >= self.busy.blocked_pct,
                     busy_pct,
+                    busy_valid: busy_n > 0,
                 }
             })
             .collect();
         let boot = self.boot_pick;
+        let w40 = self.width_mhz == 40;
         entries.sort_by(|a, b| {
             use std::cmp::Ordering::*;
             if a.ranked != b.ranked {
@@ -161,6 +184,14 @@ impl HopRanker {
             }
             if a.blocked && a.busy_pct != b.busy_pct {
                 return a.busy_pct.partial_cmp(&b.busy_pct).unwrap_or(Equal);
+            }
+            if w40 {
+                if a.busy_valid != b.busy_valid {
+                    return if a.busy_valid { Less } else { Greater };
+                }
+                if a.busy_valid && a.busy_pct != b.busy_pct {
+                    return a.busy_pct.partial_cmp(&b.busy_pct).unwrap_or(Equal);
+                }
             }
             if a.score != b.score {
                 return a.score.cmp(&b.score);
@@ -225,7 +256,7 @@ mod tests {
         }
     }
     fn r3(boot: u8) -> HopRanker {
-        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149, 165], boot);
+        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149, 165], boot, 20);
         for i in 0..3 {
             for ch in [120, 149, 165] {
                 r.add(f(ch, i as f64 * 100.0, 2));
@@ -242,7 +273,7 @@ mod tests {
 
     #[test]
     fn unranked_below_two_fresh_visits() {
-        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149, 165], 136);
+        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149, 165], 136, 20);
         r.add(f(120, 0.0, 0));
         assert!(!r.ranking(100.0)[0].ranked);
         assert_eq!(r.best(100.0, 136, &[], false), None);
@@ -250,7 +281,7 @@ mod tests {
 
     #[test]
     fn sum_of_last_five_visits_lowest_wins() {
-        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149, 165], 136);
+        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149, 165], 136, 20);
         for i in 0..8 {
             let t = i as f64 * 300.0;
             r.add(f(120, t, if i < 3 { 30 } else { 0 }));
@@ -266,7 +297,7 @@ mod tests {
 
     #[test]
     fn stale_visits_are_dropped() {
-        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120], 136);
+        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120], 136, 20);
         r.add(f(120, 0.0, 0));
         r.add(f(120, 100.0, 0));
         assert!(r.best(5000.0, 136, &[], false).is_some());
@@ -301,7 +332,7 @@ mod tests {
     }
 
     fn pair(b: BusyCfg, a: (f64, u32, f64), c: (f64, u32, f64)) -> HopRanker {
-        let mut r = HopRanker::new(HopCfg::default(), b, vec![144, 64], 0);
+        let mut r = HopRanker::new(HopCfg::default(), b, vec![144, 64], 0, 20);
         for i in 0..3 {
             let t = i as f64;
             r.add(bv(144, t + a.0, a.1, a.2));
@@ -326,13 +357,17 @@ mod tests {
             pair(low, (0.0, 0, 40.0), (0.0, 40, 0.0)).best(10.0, 136, &[], false),
             Some(64)
         );
-        let d = pair(BusyCfg::default(), (0.0, 0, 40.0), (0.0, 40, 0.0));
+        let hi = BusyCfg {
+            blocked_pct: 50.0,
+            ..Default::default()
+        };
+        let d = pair(hi, (0.0, 0, 40.0), (0.0, 40, 0.0));
         assert_eq!(d.best(10.0, 136, &[], false), Some(144));
     }
 
     #[test]
     fn busy_is_the_mean_over_fresh_visits() {
-        let mut r = HopRanker::new(HopCfg::default(), BusyCfg::default(), vec![144], 0);
+        let mut r = HopRanker::new(HopCfg::default(), BusyCfg::default(), vec![144], 0, 20);
         for (t, b) in [(1.0, 100.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0)] {
             r.add(bv(144, t, 0, b));
         }
@@ -349,7 +384,7 @@ mod tests {
 
     #[test]
     fn visits_without_busy_rank_as_today() {
-        let mut r = HopRanker::new(HopCfg::default(), BusyCfg::default(), vec![144, 64], 0);
+        let mut r = HopRanker::new(HopCfg::default(), BusyCfg::default(), vec![144, 64], 0, 20);
         for i in 0..3 {
             r.add(f(144, i as f64, 5));
             r.add(f(64, i as f64, 1));
@@ -359,7 +394,7 @@ mod tests {
 
     #[test]
     fn best_require_unblocked_skips_blocked() {
-        let mut r = HopRanker::new(HopCfg::default(), BusyCfg::default(), vec![144, 112], 0);
+        let mut r = HopRanker::new(HopCfg::default(), BusyCfg::default(), vec![144, 112], 0, 20);
         for i in 0..3 {
             r.add(bv(144, i as f64, 0, 95.0));
             r.add(bv(112, i as f64, 40, 0.0));
@@ -373,7 +408,13 @@ mod tests {
 
     #[test]
     fn ranking_uses_only_the_newest_visit_source() {
-        let mut r = HopRanker::new(HopCfg::default(), BusyCfg::default(), vec![40, 64, 112], 0);
+        let mut r = HopRanker::new(
+            HopCfg::default(),
+            BusyCfg::default(),
+            vec![40, 64, 112],
+            0,
+            20,
+        );
         let usb = |ch, t, cca| v(ch, t, 0, cca, 0, 0);
         let rel = |ch, t, fa| HopVisit {
             src: VisitSrc::Relay,
@@ -390,5 +431,52 @@ mod tests {
         assert_eq!(r.best(300.0, 40, &[], false), Some(64));
         let e = r.ranking(300.0).into_iter().find(|e| e.ch == 112).unwrap();
         assert!(e.visits == 2 && e.score == 180);
+    }
+
+    fn mixed(width: u8) -> HopRanker {
+        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149, 165], 0, width);
+        for i in 0..3 {
+            let t = i as f64 * 300.0;
+            r.add(bv(120, t, 0, 25.0));
+            r.add(bv(149, t, 30, 5.0));
+            r.add(bv(165, t, 5, 15.0));
+        }
+        r
+    }
+    fn order(r: &HopRanker) -> Vec<u8> {
+        r.ranking(1000.0).iter().map(|e| e.ch).collect()
+    }
+
+    #[test]
+    fn at_40_lower_busy_mean_beats_lower_frame_score() {
+        let r = mixed(40);
+        assert_eq!(order(&r), vec![149, 165, 120]);
+        assert_eq!(r.best(1000.0, 0, &[], false), Some(149));
+        assert_eq!(order(&mixed(20)), vec![120, 165, 149], "score order at 20");
+    }
+
+    #[test]
+    fn set_width_mhz_switches_the_busy_first_order() {
+        let mut r = mixed(20);
+        r.set_width_mhz(40);
+        assert_eq!((r.width_mhz(), order(&r)[0]), (40, 149));
+        r.set_width_mhz(20);
+        assert_eq!(order(&r)[0], 120);
+    }
+
+    #[test]
+    fn at_40_entries_without_a_reading_sort_last_and_blocked_stays_last() {
+        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149], 0, 40);
+        for i in 0..3 {
+            r.add(f(120, i as f64 * 300.0, 0));
+            r.add(bv(149, i as f64 * 300.0, 50, 20.0));
+        }
+        assert_eq!(order(&r), vec![149, 120]);
+        let mut r = HopRanker::new(cfg(), BusyCfg::default(), vec![120, 149], 0, 40);
+        for i in 0..3 {
+            r.add(bv(120, i as f64 * 300.0, 0, 60.0));
+            r.add(bv(149, i as f64 * 300.0, 90, 25.0));
+        }
+        assert_eq!(r.best(1000.0, 0, &[], true), Some(149));
     }
 }

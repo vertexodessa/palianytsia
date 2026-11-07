@@ -212,9 +212,6 @@ impl ScoutRadio for DevCard {
         })
         .unwrap_or(false)
     }
-    fn retune_width(&self, ch: u8, width_mhz: u8) -> bool {
-        self.set_width(ch, width_mhz)
-    }
     fn read_energy(&self, with_nhm: bool) -> ScoutEnergy {
         self.with_ctl(|c| to_scout(c.rx_energy(with_nhm)))
             .unwrap_or_default()

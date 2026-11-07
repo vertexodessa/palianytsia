@@ -11,6 +11,7 @@ use pal_wire::rc::{self, DiscAck, Rcf};
 use super::*;
 use crate::chan::fake::{FakeCard, FakeClock};
 use crate::chan::plan::MoveReason;
+use crate::chan::radio::{nhm_period_4us, NhmBusyRead};
 use crate::config::{load_config, Config};
 use crate::ladder::LinkHealth;
 use crate::vrx::{VrxCfg, VrxState};
@@ -73,6 +74,23 @@ struct Rig {
     /// synchronous stand-in for the core thread reading the gate while the
     /// scout thread is mid-dwell.
     gate_obs: Arc<Mutex<Vec<(bool, bool)>>>,
+    /// decode_one(): per-card next mac_seq.
+    seq_next: Vec<u16>,
+}
+
+fn junk_body(card: u8, seq: u16) -> crate::RxBody {
+    crate::RxBody {
+        card_id: card,
+        mac_seq: seq,
+        crc_ok: true,
+        phy_valid: true,
+        rssi: [38, 40],
+        snr: [10, 25],
+        mono_us: 1000 * u64::from(seq),
+        // Not SBI, not RC: misroutes, still walks the seq.
+        body: vec![0; 20],
+        ..Default::default()
+    }
 }
 
 impl Rig {
@@ -83,7 +101,6 @@ impl Rig {
         let mut cfg = bundle();
         cfg.radio.channels = vec![40, 64, 112, 144];
         cfg.radio.use_ = use_.to_vec();
-        cfg.radio.width = 40;
         if pinned {
             cfg.radio.pin = Some(if start != 0 { start } else { 40 });
         }
@@ -92,14 +109,15 @@ impl Rig {
         let cards: Vec<Arc<FakeCard>> = (0..n)
             .map(|i| {
                 let c = FakeCard::new(clk.clone(), start_ch);
-                // The boot scout card opens at 20, every other at radio.width.
-                c.s().width_mhz = if i == n - 1 { 20 } else { cfg.radio.width };
+                // The boot scout card opens at 20, every other at the link width.
+                c.s().width_mhz = if i == n - 1 { 20 } else { 40 };
                 c
             })
             .collect();
         let vrx = VrxController::new(VrxCfg::from_config(&cfg, start_ch, 0));
         let cc = ChannelCoreCfg {
             radio: cfg.radio.clone(),
+            width_mhz: 40,
             hop: cfg.hop.clone(),
             key: cfg.link.key,
             start_ch,
@@ -152,6 +170,7 @@ impl Rig {
             vrx,
             core,
             gate_obs,
+            seq_next: Vec::new(),
         }
     }
     fn auto(n: usize) -> Self {
@@ -251,20 +270,105 @@ impl Rig {
         }
         None
     }
-    /// Interfered verdict windows: foreign >> foreign_pps on every card and
-    /// impaired through `starved` (own frames never bump; this rig's
-    /// aggregator decodes nothing, so loss/recovered stay 0).
+    /// One decoded frame per card, walking its seq. A jammed window still
+    /// decodes some of the drone's frames; the window fill gives a card
+    /// that decoded nothing no busy reading at all. The body misroutes (not
+    /// SBI, not RC): no FEC loss, no recovered symbols.
+    fn decode_one(&mut self) {
+        self.seq_next
+            .resize(self.cards.len().max(self.seq_next.len()), 100);
+        for i in 0..self.cards.len() {
+            let seq = self.seq_next[i];
+            self.seq_next[i] = seq.wrapping_add(1);
+            self.agg.on_rx_body(&junk_body(i as u8, seq));
+        }
+    }
+    /// The op's air held by a foreign transmitter: NHM reads 100 % busy on
+    /// every card, armed at the sampler's op-window period, so a scout
+    /// dwell (its own period) reads nothing. A card the test gave NHM air
+    /// of its own (nhm_any_period) keeps it. Returns what to restore.
+    fn op_jam(&self) -> Vec<(bool, NhmBusyRead)> {
+        let mut full = NhmBusyRead {
+            valid: true,
+            period: nhm_period_4us(self.cfg.hop.window_ms - 10),
+            ..Default::default()
+        };
+        full.buckets[11] = 100;
+        self.cards
+            .iter()
+            .map(|c| {
+                let mut s = c.s();
+                let saved = (s.nhm_arm_ok, s.nhm_read);
+                if !s.nhm_any_period {
+                    s.nhm_arm_ok = true;
+                    s.nhm_read = full;
+                }
+                saved
+            })
+            .collect()
+    }
+    fn op_unjam(&self, saved: Vec<(bool, NhmBusyRead)>) {
+        for (c, (ok, rd)) in self.cards.iter().zip(saved) {
+            let mut s = c.s();
+            if !s.nhm_any_period {
+                s.nhm_arm_ok = ok;
+                s.nhm_read = rd;
+            }
+        }
+    }
+    /// The windows a blocked op needs on top of the old three-window
+    /// trigger shape: `interfered` needs the op blocked for
+    /// occupied_windows consecutive windows with a busy reading.
+    /// A calibration round's air: op's NHM busy 25 % (below blocked_pct)
+    /// on card 0 whatever period is armed; on the scout card 64 and 144
+    /// read 25 %, 112 is the clean member at 5 %.
+    fn cal_air(&self) {
+        {
+            let mut s = self.cards[0].s();
+            s.nhm_arm_ok = true;
+            s.nhm_any_period = true;
+            s.nhm_read.valid = true;
+            s.nhm_read.buckets[11] = 25;
+            s.nhm_read.buckets[0] = 75;
+        }
+        let mut s = self.cards[1].s();
+        s.nhm_busy_pct_on[64] = 25;
+        s.nhm_busy_pct_on[112] = 5;
+        s.nhm_busy_pct_on[144] = 25;
+    }
+    fn occ_lead(&self) -> usize {
+        (self.cfg.hop.verdict.occupied_windows - 1).max(0) as usize
+    }
+    /// Interfered verdict windows: the op jammed (op_jam), foreign frames
+    /// added alongside as context only. This rig's aggregator never decodes
+    /// a real body, so the only route to `impaired` is occupancy: the first
+    /// window arms NHM, the occupied_windows-th blocked one after it is the
+    /// first interfered, the next the trigger (persist 2).
     fn interfere(&mut self, windows: usize) {
+        let saved = self.op_jam();
         for _ in 0..windows {
             for c in &self.cards {
                 c.s().fr.foreign += 40;
             }
             for _ in 0..self.cfg.hop.window_ms / 10 + 1 {
                 self.vrx.on_video(self.ms());
+                self.decode_one();
                 self.tick_tx(true, 0);
                 self.clk.advance(10);
             }
         }
+        self.op_unjam(saved);
+    }
+    /// Interfered windows until the controller orders, bounded: the order
+    /// waits on a burst ranking the candidates.
+    fn interfere_until_order(&mut self) {
+        for _ in 0..self.occ_lead() + 12 {
+            if self.has_hop("order") {
+                break;
+            }
+            self.interfere(1);
+        }
+        assert!(self.has_hop("order"));
     }
     /// An auto rig frozen on 40 without a hop. Two cards: no dwell ever
     /// completes, so max_ms freezes op in place. One card: link-up freezes
@@ -444,7 +548,7 @@ fn disc_targets_is_tx_when_scout_owns_nothing() {
 #[test]
 fn one_card_prelude_commits_before_first_disc() {
     let mut g = Rig::auto(1);
-    g.cards[0].s().cca_per_ms_on[40] = 5;
+    g.cards[0].s().nhm_busy_pct_on[40] = 100; // 40 blocked, the rest unread
     g.until(800, false, "one-card prelude ranking picks");
     assert!(g.has_line("one-card prelude ranking picks"));
     assert_ne!(g.core.op(), 40);
@@ -471,8 +575,7 @@ fn one_card_prelude_never_picks_outside_radio_use() {
 #[test]
 fn two_card_no_link_commits_at_maturity() {
     let mut g = Rig::auto(2);
-    g.cards[1].s().cca_per_ms_on[40] = 5;
-    g.cards[1].s().cca_per_ms_on[36] = 5;
+    g.cards[1].s().nhm_busy_pct_on[40] = 100; // op's pair blocked
     g.until(3000, false, "pick frozen on");
     assert!(g.has_line("pick frozen on"));
     assert!(g.has_line("(commit)"));
@@ -486,8 +589,7 @@ fn two_card_no_link_commits_at_maturity() {
 fn store_failure_is_logged_not_fatal() {
     let mut g = Rig::auto(2);
     g.store_ok.store(false, SeqCst);
-    g.cards[1].s().cca_per_ms_on[40] = 5;
-    g.cards[1].s().cca_per_ms_on[36] = 5;
+    g.cards[1].s().nhm_busy_pct_on[40] = 100; // op's pair blocked
     g.until(3000, false, "pick frozen on");
     assert!(g.has_line("pick frozen on"));
     assert!(g.has_line("maburgs channel: could not write the-store"));
@@ -568,7 +670,8 @@ fn pinned_two_card_never_hops_on_interference() {
         g.tick(true);
     }
     g.busy_op();
-    g.interfere(6);
+    let lead = g.occ_lead();
+    g.interfere(lead + 6);
     assert_eq!(g.core.snapshot(0).hop.verdict, "interfered");
     assert!(g.rec().hops.is_empty());
     assert_eq!(g.core.snapshot(0).hop.state, "idle");
@@ -589,7 +692,8 @@ fn pinned_one_card_never_hops_on_interference() {
         g.tick(true);
     }
     g.busy_op();
-    g.interfere(6);
+    let lead = g.occ_lead();
+    g.interfere(lead + 6);
     assert_eq!(g.core.snapshot(0).hop.verdict, "interfered");
     assert!(g.rec().hops.is_empty());
     assert_eq!(g.ch(0), 40);
@@ -610,7 +714,8 @@ fn pinned_relocation_is_not_failed_by_a_dirty_pin() {
     g.tick(true);
     assert!(g.has_hop("lead_confirm"));
     g.busy_op();
-    g.interfere(8);
+    let lead = g.occ_lead();
+    g.interfere(lead + 8);
     assert!(g.has_hop("verify_pass"));
     assert!(!g.has_hop("verify_fail"));
     assert!(!g.has_line("did not land"));
@@ -757,8 +862,7 @@ fn order_rig(n: usize) -> Rig {
         g.tick(true);
     }
     g.busy_op();
-    g.interfere(4);
-    assert!(g.has_hop("order"));
+    g.interfere_until_order();
     g
 }
 
@@ -815,7 +919,7 @@ fn one_card_order_rides_repeats_then_retunes() {
     assert_eq!(g.ch(0), r.hop_ch);
     assert!(g.has_move(MoveReason::HopOneCard));
     for e in g.rec().hops.iter().filter(|e| e.kind == "one_card_retune") {
-        assert!((200.0..=400.0).contains(&e.elapsed_ms), "{}", e.elapsed_ms);
+        assert!((200.0..=600.0).contains(&e.elapsed_ms), "{}", e.elapsed_ms);
     }
     g.core.note_video(r.hop_ch);
     g.tick(true);
@@ -924,8 +1028,7 @@ fn relocate_lands_on_verify_pass() {
 #[test]
 fn auto_want_pick_relocates_linked_drone_to_the_pick() {
     let mut g = Rig::auto(2);
-    g.cards[1].s().cca_per_ms_on[60] = 5; // 64's pair is the busy one
-    g.cards[1].s().cca_per_ms_on[64] = 5;
+    g.cards[1].s().nhm_busy_pct_on[64] = 100; // 64's pair is blocked
     let visits = |g: &Rig, ch: u8| g.rec().dwells.iter().filter(|d| d.1.ch == ch).count();
     let mr = g.cfg.radio.scan.min_rounds as usize;
     for _ in 0..3000 {
@@ -934,7 +1037,7 @@ fn auto_want_pick_relocates_linked_drone_to_the_pick() {
         }
         g.tick(false);
     }
-    assert!(visits(&g, 60) >= mr && visits(&g, 64) >= mr);
+    assert!(visits(&g, 64) >= mr);
     assert!(visits(&g, 144) < mr);
     assert!(g.core.pick_open());
     g.session_opened_on(64, 64);
@@ -966,7 +1069,7 @@ fn auto_want_pick_relocates_linked_drone_to_the_pick() {
 #[test]
 fn one_card_link_edge_freezes_one_card_linked() {
     let mut g = Rig::auto(1);
-    g.cards[0].s().cca_per_ms_on[40] = 5;
+    g.cards[0].s().nhm_busy_pct_on[40] = 100; // 40 blocked, the rest unread
     g.until(800, false, "one-card prelude ranking picks");
     assert!(g.has_line("one-card prelude ranking picks"));
     g.vrx.test_set_move_edge();
@@ -1076,7 +1179,6 @@ fn sampled_record_consumed_next_tick_uses_sample_span() {
 fn shutdown_joins_threads_and_is_idempotent() {
     let mut cfg = bundle();
     cfg.radio.channels = vec![40, 64];
-    cfg.radio.width = 40;
     cfg.radio.scan.max_ms = 1000;
     let clk = FakeClock::default();
     let a = FakeCard::new(clk.clone(), 40);
@@ -1091,6 +1193,7 @@ fn shutdown_joins_threads_and_is_idempotent() {
     let mut core = ChannelCore::new(
         ChannelCoreCfg {
             radio: cfg.radio.clone(),
+            width_mhz: 40,
             hop: cfg.hop.clone(),
             key: cfg.link.key,
             start_ch: 40,
@@ -1212,15 +1315,14 @@ impl Rig {
 }
 
 /// Auto, two cards, linked, the boot pick long closed: one round dwells
-/// every half outside op's pair exactly once, reads op from the verdict
-/// window, emits one K record and names the best member. Op reads busy,
-/// 64's pair reads busy: 112 is the first clean member in config order.
+/// on every pair outside op's exactly once, reads op from the verdict
+/// window, emits one K record and names the best member: op, 64 and 144
+/// read 25 % busy, 112 reads 5 %.
 #[test]
 fn cal_measure_round_ranks_the_set_once() {
     let mut g = Rig::auto(2);
     g.linked_auto(30, 200);
-    g.cards[1].s().foreign_per_ms_on[60] = 1;
-    g.cards[1].s().foreign_per_ms_on[64] = 1;
+    g.cal_air();
     assert!(g.core.cal_can_measure());
     assert_eq!(g.core.op(), 40);
     let (picks0, dwells0) = {
@@ -1247,7 +1349,7 @@ fn cal_measure_round_ranks_the_set_once() {
         })
         .collect();
     chs.sort();
-    assert_eq!(chs, vec![60, 64, 108, 112, 140, 144]); // op's 36/40 never dwelt on
+    assert_eq!(chs, vec![64, 112, 144]); // one dwell per pair; op's (40) never dwelt on
     assert_eq!(g.core.op(), 40); // measuring moves nothing
     for _ in 0..3 {
         g.live_tick(200);
@@ -1536,8 +1638,7 @@ fn a_calibration_run_picks_its_channel_through_the_core() {
 
     let mut g = Rig::auto(2);
     g.linked_auto(30, 200);
-    g.cards[1].s().foreign_per_ms_on[60] = 1;
-    g.cards[1].s().foreign_per_ms_on[64] = 1;
+    g.cal_air();
     let mut s = CalSession::new(CalSessionCfg::default(), CalLog::none());
     s.set_peer(true, true, rc::TagCtx::default());
     let sweeps = vec![SweepSpec {

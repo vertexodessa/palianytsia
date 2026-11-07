@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Palianytsia: a Rust ground station for the mabur FPV link (spec and milestone
-status: `docs/spec.md`; read its "Status (2026-11-03)" section first; the dated M-notes are history).
+status: `docs/spec.md`; read its "Status (2026-11-07)" section first; the dated M-notes are history).
 
 ## Layout
 | Path | Role |
@@ -19,7 +19,7 @@ status: `docs/spec.md`; read its "Status (2026-11-03)" section first; the dated 
 | `apps/quest` | Quest 3 app (M3): `rust/` = `pal-quest` NativeActivity (OpenXR: video via surface swapchain quad, egui OSD quad, controller ray + panel, USB supervisor with 3 s retry; up to 2 cards: card 0 = link/TX, all receive, the channel core scouts on the other; a card added or detached restarts the link), `android/` = manifest only. `tools/quest-apk.sh [cfg]` builds the APK (OpenXR loader pulled from Maven Central) |
 | `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
 | `third_party/libusb` | upstream libusb v1.0.27, Android only (`tools/android-libusb.sh`; `tools/android-build.sh build -p <crate>` cross-builds for aarch64) |
-| `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (mabur: branch `palianytsia/base-v2` = upstream master plus our commits (rebased 2026-11-03), `palianytsia/base` is the pre-rebase line; devourer: `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
+| `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (mabur: branch `palianytsia/base-v2` = upstream master plus our commits (rebased 2026-11-07; the 2026-11-03 line is kept as branch `palianytsia/base-v2-pre-2026-11-07` and tags `palianytsia/v0.8`, `palianytsia/v0.8.1`), `palianytsia/base` is the pre-2026-11-03 line; devourer: `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
 
 ## Gates (run all before a commit)
 ```sh
