@@ -69,7 +69,6 @@ categories = ["com.oculus.intent.category.VR", "android.intent.category.LAUNCHER
 name = "com.oculus.supportedDevices"
 value = "quest3|quest2|questpro"
 
-# Spike only: the Android debug key. Release builds of the real app sign with their own key.
-[package.metadata.android.signing.release]
-path = "/home/ihor/.android/debug.keystore"
-keystore_password = "android"
+# Spike only: a release build signs with the Android debug key, passed in the environment
+# (CARGO_APK_RELEASE_KEYSTORE=~/.android/debug.keystore CARGO_APK_RELEASE_KEYSTORE_PASSWORD=android).
+# Release builds of the real app sign with their own key.

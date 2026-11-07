@@ -63,7 +63,7 @@ Run this from a Linux or macOS PC that can reach the drone over ssh. The drone n
 
 ```
 cd drone
-./install.sh 192.168.1.10          # or root@<drone-ip>
+./install.sh <drone-ip>            # or root@<drone-ip>; a stock OpenIPC image answers on 192.168.1.10
 ```
 
 It asks for the drone's root password once. The drone must be a SigmaStar ssc338q camera with an RTL8812EU or RTL8822E card (tested with the imx415 sensor). The script checks the SoC, the card and the free flash first and stops on a mismatch before changing anything.
@@ -98,13 +98,13 @@ Both ways it asks for confirmation (`-y` skips it), uploads to `/tmp` and checks
 To roll back, run the same script with the backup folder it printed:
 
 ```
-./install.sh 192.168.1.10 ./drone-backup-20261101-181614
+./install.sh <drone-ip> ./drone-backup-20261101-181614
 ```
 
 To go back to the stock image (majestic + wifibroadcast, the original `load_sigmastar` and sensor driver), with a reboot:
 
 ```
-./install.sh --remove 192.168.1.10
+./install.sh --remove <drone-ip>
 ```
 
 maburd refuses config keys it does not know. v0.8 added the optional key `fec.repairs_with_frame`; a v0.4 to v0.8 drone config works unchanged, but a v0.7.1 or older maburd refuses a config that has the new key (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
