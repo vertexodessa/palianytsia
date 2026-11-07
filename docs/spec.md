@@ -3,7 +3,7 @@
 Status: Draft 2 of 2026-10-31, kept as written except for dated notes; the current state is "Status (2026-11-07)" below (Draft 1 reviewed: stale text after the desktop-first and strategy-C decisions fixed; capture format, maburd chip set and GS radio config corrected against the pinned tree). Name: **Palianytsia** (repo `palianytsia`, crate prefix `pal-`, CLI `pal`).
 The name is a choice, not decoration: the word is the 2022 shibboleth used to tell a Russian speaker from a Ukrainian one, and no Russian military unit will want it on a ground station.
 Paths like `exp-orig-backport/...`, `exp-mabur-fluke-pxp/...` and `devourer_stack/...` are on the author's machine, relative to a sibling checkout `../devourer_stack/` of palianytsia (`devourer_stack/...` relative to their common parent). Verified 2026-11-01: `exp-mabur-fluke-pxp/pixelpilot` is at e2d0c90, `exp-orig-backport/pixelpilot` at 33978f8, `devourer_stack/openipc-rs` at v0.1.40+1.
-Home: `vertexodessa/palianytsia`, a **private** GitHub repo (not OpenIPC, not this workspace). The mabur and devourer forks it pins stay public.
+Home: `vertexodessa/palianytsia`, a public GitHub repo (not OpenIPC, not this workspace), as are the mabur and devourer forks it pins.
 
 Sources read for this draft:
 - mabur, original tree with backports, now pinned as `third_party/mabur` @ `51cea32f` (`RC_VERSION = 18`, `common/include/mabur/rc_proto.h:68`). This is the wire the quad flies today. Draft 1 read the same tree at its child 7bab3194, which only adds a bench debug endpoint.
