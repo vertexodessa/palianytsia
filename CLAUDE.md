@@ -42,7 +42,7 @@ pairing key.
 - Host card: RTL8812AU 0bda:881a on USB 5-2. If sends fail with
   `error -4` and dmesg shows `USB disconnect` ~2 s after open, the card dropped
   off the bus; `authorized` toggling does not fix it, a physical replug did.
-- Drone `ld` (address in Claude memory, `mabur-drone-address`): RTL8822E quad, maburd RC 18, default key, parked on
+- Drone `ld` (192.168.1.10): RTL8822E quad, maburd RC 18, default key, parked on
   ch 40 / 40 MHz. `configs/gs.toml` pins ch 144, so live runs use a copy with
   `channel = 40` and `pal live --ch 40 --width 40 --mode gs`; the phone/Quest APKs
   (`gs-auto.toml`) find it on their own.
