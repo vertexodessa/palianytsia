@@ -78,7 +78,7 @@ fn link_radio(
         .pin
         .or(cfg.radio.channels.first().copied())
         .ok_or("config: no channel")?;
-    let width = cfg.radio.width;
+    let width = cfg.rx_width();
     Ok((toml, cfg, ch, width))
 }
 
