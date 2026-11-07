@@ -18,7 +18,7 @@ OUT=$ROOT/target/ffmpeg-static
 SRC=$ROOT/target/ffmpeg-src
 mkdir -p "$SRC"
 TAR=$SRC/ffmpeg-$VER.tar.xz
-[[ -f $TAR ]] || curl -fL -o "$TAR" "https://ffmpeg.org/releases/ffmpeg-$VER.tar.xz"
+[[ -f $TAR ]] || curl -fL --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 -o "$TAR" "https://ffmpeg.org/releases/ffmpeg-$VER.tar.xz"
 echo "$SHA  $TAR" | sha256sum -c -
 rm -rf "$SRC/ffmpeg-$VER"
 tar -C "$SRC" -xf "$TAR"
