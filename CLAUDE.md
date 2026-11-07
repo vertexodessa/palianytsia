@@ -83,6 +83,7 @@ pairing key.
   v0.7.1 = GS only (movable OSD chips, Quest OSD quad 1.5x the video), same maburd as v0.7, APKs 0.7.1.
   v0.8 = maburd from mabur `release/v0.8` (`release/v0.7` + FEC repairs at frame end, `fec.repairs_with_frame`), bundle
   `fec.window = 64`, APKs 0.8.0; GS and drone stay compatible with v0.7.x.
+  v0.8.1 = `release/v0.8` + a config without `repairs_with_frame` gets the mode with window raised to 64 (a drone config kept on update), APKs 0.8.1.
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
   `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally (CI has no captures and never will: no recordings on GitHub), bump both APK `versionName`, head `release/README.md` with `# Palianytsia <tag>`, write the

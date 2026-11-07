@@ -1,11 +1,11 @@
-# Palianytsia v0.8
+# Palianytsia v0.8.1
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.8.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.8.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.8.1.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.8.1.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,13 +14,11 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.sh` installs it on an imx415 drone. |
 
-## What changed since v0.7.1
+## What changed since v0.8
 
-Update the drone: the change is in the drone daemon. The GS is the same as v0.7.1 apart from the Quest display rate; a v0.7 or v0.7.1 GS works with a v0.8 drone and the other way round.
+- **An updated drone gets the new FEC placement at the tested window.** `install.sh` keeps the drone's own `mabur.toml` on an update. A config from before v0.8 has `window = 32` and no `repairs_with_frame` key; v0.8 then ran the new placement at window 32, a pair never tested. v0.8.1 still turns the placement on for such a config, and raises its window to 64 (the log lists it among the defaulted keys: `fec.window=64 (raised from 32 for repairs_with_frame)`). A config that sets `repairs_with_frame` explicitly keeps its own window; `repairs_with_frame = false` restores the v0.7 behaviour.
 
-- **FEC repairs leave with their frame.** The drone builds a frame's repair packets when the frame ends and sends them right behind it, each covering the whole frame. A frame that lost a packet is repaired at once instead of waiting for the next frame's repairs, so it no longer reaches the headset late and paired with its neighbour (the display then drops one of the two). On the Quest under ~4 % loss this halves the frames replaced before display (14 % to 6 %) and the frames more than 16.7 ms late (30 % to 14 %), at 60, 90 and 120 fps. New drone config key `fec.repairs_with_frame` (default `true`; `false` restores the v0.7 behaviour).
-- **FEC window 64.** The bundled `mabur.toml` sets `fec.window = 64` (was 32), so a repair covers about two frames and survives longer loss bursts. An update keeps the drone's own `mabur.toml`: set `window = 64` in its `[fec]` section, or install with `--config`.
-- **Quest: highest display rate.** The headset runs at the highest refresh rate it offers (up to 120 Hz before).
+v0.8 notes: FEC repairs leave with their frame (on the Quest under ~4 % loss, frames replaced before display 14 % to 6 %, frames more than 16.7 ms late 30 % to 14 %, at 60, 90 and 120 fps); bundle window 64; the Quest runs at its highest display rate. A v0.7.x GS works with a v0.8.1 drone and the other way round.
 
 ## Ground station
 
@@ -29,7 +27,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.8.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.8.1.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -109,9 +107,9 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 ./install.sh --remove 192.168.1.10
 ```
 
-maburd refuses config keys it does not know. v0.8 adds the optional key `fec.repairs_with_frame`; a v0.4 to v0.7.1 drone config works unchanged, but a v0.7.1 or older maburd refuses a config that has the new key (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
+maburd refuses config keys it does not know. v0.8 added the optional key `fec.repairs_with_frame`; a v0.4 to v0.8 drone config works unchanged, but a v0.7.1 or older maburd refuses a config that has the new key (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
 
-## Known limits in v0.8
+## Known limits in v0.8.1
 
 - Pairing uses the default link key on both ends.
 - The new FEC placement costs drone CPU: the hot thread goes from about 12 % to 19 % of a core at 120 fps and 13 Mbps.
