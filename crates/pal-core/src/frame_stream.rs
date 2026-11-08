@@ -114,9 +114,35 @@ pub struct FrameStreamStats {
     pub slice_fallback: [u64; SLICE_FB_COUNT],
 }
 
+/// A frame's repairs can all leave after its last symbol, so a hole near its
+/// head waits for the rest of the frame to serialize, and the window-based
+/// timeout only knows frames already seen. us_per_sym 0 turns this off.
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameSpan {
+    us_per_sym: [u32; 2],
+    margin_ms: u32,
+    cap_ms: u64,
+}
+
+impl FrameSpan {
+    /// The wait for a hole in a frame with `left` symbols still to emit: a
+    /// slot still missing its header counts the whole frame. Never shorter
+    /// than the window-based timeout.
+    fn wait_ms(&self, gap_ms: &[u64; 2], sid: u8, left: u16) -> u64 {
+        let sid = if sid <= 1 { usize::from(sid) } else { 0 };
+        let us = self.us_per_sym[sid];
+        if us == 0 {
+            return gap_ms[sid];
+        }
+        let span = u64::from(left) * u64::from(us) / 1000 + u64::from(self.margin_ms);
+        gap_ms[sid].max(span.min(self.cap_ms))
+    }
+}
+
 pub struct FrameStream {
     cfg: FrameStreamCfg,
     gap_ms: [u64; 2],
+    span: FrameSpan,
     slots: BTreeMap<u32, Slot>,
     have_id_base: bool,
     last_id64: u64,
@@ -136,6 +162,7 @@ impl FrameStream {
         Self {
             cfg,
             gap_ms: [cfg.gap_timeout_ms; 2],
+            span: FrameSpan::default(),
             slots: BTreeMap::new(),
             have_id_base: false,
             last_id64: 0,
@@ -157,6 +184,13 @@ impl FrameStream {
     pub fn set_gap_timeout(&mut self, sid: usize, ms: u64) {
         if sid <= 1 {
             self.gap_ms[sid] = ms;
+        }
+    }
+    pub fn set_gap_frame_span(&mut self, sid: usize, us_per_sym: u32, margin_ms: u32, cap_ms: u64) {
+        if sid <= 1 {
+            self.span.us_per_sym[sid] = us_per_sym;
+            self.span.margin_ms = margin_ms;
+            self.span.cap_ms = cap_ms;
         }
     }
     pub fn gap_ms(&self, sid: u8) -> u64 {
@@ -356,7 +390,8 @@ impl FrameStream {
                 self.finish(h, true, out);
                 continue;
             }
-            let stale = now_ms >= h.last_progress_ms + self.gap_ms(h.sid);
+            let left = h.count.saturating_sub(h.emitted_upto);
+            let stale = now_ms >= h.last_progress_ms + self.span.wait_ms(&self.gap_ms, h.sid, left);
             let ahead = max_known >= h.id64 + self.cfg.lookahead;
             if stale || ahead {
                 self.finish(h, false, out);
@@ -449,9 +484,11 @@ impl FrameStream {
     /// Drives timeouts; call every tick.
     pub fn poll(&mut self, now_ms: u64, out: &mut dyn FrameOut) {
         let gap = self.gap_ms;
+        let span = self.span;
         let before = self.slots.len();
         self.slots.retain(|_, s| {
-            s.have_hdr || now_ms < s.first_ms + gap[if s.sid <= 1 { usize::from(s.sid) } else { 0 }]
+            let left = s.count.saturating_sub(s.emitted_upto);
+            s.have_hdr || now_ms < s.first_ms + span.wait_ms(&gap, s.sid, left)
         });
         self.st.dropped += (before - self.slots.len()) as u64;
         self.try_emit(now_ms, out);
@@ -491,5 +528,28 @@ impl FrameStream {
         self.stall_armed = false;
         self.discont_seen_since_emit = false;
         self.params.reset();
+    }
+}
+
+#[cfg(test)]
+mod frame_span_tests {
+    use super::FrameSpan;
+
+    fn span(us_per_sym: u32, cap_ms: u64) -> FrameSpan {
+        FrameSpan {
+            us_per_sym: [us_per_sym, 0],
+            margin_ms: 15,
+            cap_ms,
+        }
+    }
+
+    #[test]
+    fn a_big_frame_waits_for_its_own_send_time() {
+        let gap = [50, 50];
+        assert_eq!(span(1000, 1000).wait_ms(&gap, 0, 90), 105); // the time left to send it
+        assert_eq!(span(1000, 80).wait_ms(&gap, 0, 90), 80); // capped
+        assert_eq!(span(100, 1000).wait_ms(&gap, 0, 90), 50); // never below the timeout
+        assert_eq!(span(0, 1000).wait_ms(&gap, 0, 90), 50); // off
+        assert_eq!(span(1000, 1000).wait_ms(&gap, 1, 90), 50); // sids are independent
     }
 }

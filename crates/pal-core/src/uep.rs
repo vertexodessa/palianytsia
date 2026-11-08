@@ -184,6 +184,11 @@ impl UepDecoder {
     pub fn repair_window(&self, sid: usize) -> usize {
         self.layers.get(sid).map_or(0, |l| l.sw.repair_window())
     }
+    pub fn repair_window_recent(&self, sid: usize) -> usize {
+        self.layers
+            .get(sid)
+            .map_or(0, |l| l.sw.repair_window_recent())
+    }
     pub fn missing_sources(&self, sid: usize, lookback: u32) -> Vec<u32> {
         self.layers
             .get(sid)

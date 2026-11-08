@@ -1,11 +1,11 @@
-# Palianytsia v0.9
+# Palianytsia v0.10
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.9.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.9.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.10.0.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.10.0.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,15 +14,18 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
 
-## What changed since v0.8.1
+## What changed since v0.9
 
-Update both ends, in either order: the radio protocol is unchanged, so a v0.8.x GS works with a v0.9 drone and the other way round. The FEC change is in the drone daemon, the channel changes are in the GS.
+Update both ends. The radio protocol is unchanged, so either end still works with a v0.9 peer, but the two halves of the FEC change belong together: a v0.9 GS can give up on a hole in a big frame before its repairs arrive.
 
-- **FEC repairs for big frames.** A frame that fits the FEC window (64 symbols, about 21 KB) still holds all its repairs to its end. A bigger frame now spends its repairs as it goes and holds only the last ones, enough for about one radio packet, instead of spending them a window at a time and leaving its end nearly unprotected. Upstream's bench at 24 Mbps (two runs each, before and after): truncated frames under 5 % burst loss 4.29 / 3.88 % to 1.64 / 1.39 %; enhance frames truncated at 2 % loss 0.37 / 0.44 % to 0. Continuous placement, the old `repairs_with_frame = false`, still truncates fewer frames under bursts (1.06 / 1.11 %), but it delivers about three times more late frames at 2 % loss.
-- **`fec.repairs_with_frame` is gone.** maburd refuses a config that has it. `install.py` removes it from the config it installs, and a drone coming from an older build with `window` below 64 and no such key gets the window raised to 64 (that build did it at boot; this one no longer does). The original config stays in the backup.
-- **Channel hops read channel airtime.** The GS decides a hop from the radio's airtime measurement (NHM) alone, and channel picks order by busy time first and hold the current channel by a margin. The GS receiver width now comes from the `[link]` ladder, so `radio.width` is gone from the GS config. The GS refuses an older `gs.toml` that still has it; use the one in this package.
-- **The installer is a Python script.** `drone/install.py` replaces `drone/install.sh` and needs python3 on the PC; the drone still needs ssh only.
+- **Each frame picks its own FEC repair window.** The window is now `min(128, max(fec.window, n + 32))` for a frame of `n` symbols, so up to 128 symbols every repair covers the whole frame and all of them leave at its end. The repair count, the airtime and the wire do not change. Real codec with simulated loss, no NACK, 88 symbols per frame, 5 % loss in bursts of 3: frames lost 3.20 to 1.09 %, frames more than 10 ms late 10.97 to 3.40 %.
+- **The GS waits for the rest of a big frame.** A hole in a frame now waits for the time left to send that frame, up to the existing cap, and the gap timeout follows the window of the last seconds instead of the largest one ever seen. In the desktop, phone and Quest apps.
 
+On one bench (SSC338Q, 8822E, MCS 3, 60 fps, 60 s per arm), against the v0.8 placement rather than v0.9: delivery gaps over 100 ms 12 and 8 down to 0, longest gap 345 and 331 ms down to 34 ms. It is one arm; an earlier run of the same build had 2 such gaps.
+
+It costs drone CPU: the `mbr-hot` thread went from about 14 % to 23 % of a core in that bench run, part of it the extra video delivered.
+
+v0.9 notes: frame-tail FEC rule from upstream PR #119, `fec.repairs_with_frame` removed, channel hops read channel airtime, `drone/install.py` replaces `install.sh`.
 
 ## Ground station
 
@@ -31,7 +34,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.9.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.10.0.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -113,11 +116,11 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 
 maburd refuses config keys it does not know, so `install.py` fits the config to the maburd it installs: it removes `fec.repairs_with_frame` when that maburd does not have the key (the original stays in the backup). A v0.8.x maburd takes that key as optional; a v0.7.1 or older one and v0.9 refuse a config that has it (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
 
-## Known limits in v0.9
+## Known limits in v0.10
 
 - Pairing uses the default link key on both ends.
 - The new FEC placement costs drone CPU: the hot thread goes from about 12 % to 19 % of a core at 120 fps and 13 Mbps.
-- The frame-tail FEC rule of v0.9 is measured on upstream's bench only, with loss bursts of 3 packets. It has not been flown, and longer bursts are not measured.
+- The per-frame FEC window of v0.10 has not been flown: host simulation and one bench run only. The worst inline repair batch at high rates is not measured.
 - At 30-60 fps under steady random loss, a model of the link loses slightly more whole frames with repairs held to the frame end than without (0.6 % against 0.2 % of frames at 4 % loss, before NACK). On the air the difference was within noise.
 - While disarmed, the drone runs low power: 30 fps at 1 Mbps. Full rate starts on arming.
 - Above 90 fps and every native mode need waybeam's six-mode driver (`install.py` installs it); on any other sensor driver those modes are refused.
@@ -130,7 +133,7 @@ maburd refuses config keys it does not know, so `install.py` fits the config to 
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.9` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): upstream master plus its PR #119 (frame-tail FEC rule) and `palianytsia/base-v2`, without the bench-only `/sim` route.
+- mabur: fork branch `release/v0.10` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.9` plus the per-frame FEC repair window from `palianytsia/base-v2`.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
