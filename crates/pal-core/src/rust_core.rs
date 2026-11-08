@@ -736,8 +736,14 @@ impl GsCore for RustCore {
             for s in 0..2 {
                 let d = self.agg.decoder();
                 self.gap
-                    .update(s, d.newest_seq(s), d.repair_window(s), now_ms);
+                    .update(s, d.newest_seq(s), d.repair_window_recent(s), now_ms);
                 self.fs.set_gap_timeout(s, self.gap.timeout_ms(s));
+                self.fs.set_gap_frame_span(
+                    s,
+                    self.gap.us_per_symbol(s),
+                    GapTimeoutPolicy::margin_ms(),
+                    self.gap.cap_ms(),
+                );
             }
         }
         if let Some(g) = self.gs.as_mut() {

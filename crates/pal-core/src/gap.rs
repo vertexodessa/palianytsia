@@ -65,6 +65,24 @@ impl GapTimeoutPolicy {
         s.last_ms = now_ms;
     }
 
+    /// Microseconds one symbol takes at the estimated send rate; 0 while the
+    /// rate is unknown or near silence, or with the stretch disabled, where
+    /// `timeout_ms` already decides alone.
+    pub fn us_per_symbol(&self, sid: usize) -> u32 {
+        match self.s.get(sid) {
+            Some(s) if self.cap_ms != 0 && s.have_rate && s.rate >= MIN_RATE => {
+                (1e6 / s.rate) as u32
+            }
+            _ => 0,
+        }
+    }
+    pub fn cap_ms(&self) -> u64 {
+        self.cap_ms
+    }
+    pub const fn margin_ms() -> u32 {
+        MARGIN_MS as u32
+    }
+
     pub fn timeout_ms(&self, sid: usize) -> u64 {
         let Some(s) = self.s.get(sid) else {
             return self.floor_ms;
@@ -145,5 +163,24 @@ mod tests {
         assert_eq!(g.timeout_ms(0), 124);
         g.update(0, 1000, 32, 30000);
         assert_eq!(g.timeout_ms(0), 150);
+    }
+
+    #[test]
+    fn us_per_symbol_follows_the_send_rate() {
+        let mut g = GapTimeoutPolicy::new(50, 150);
+        assert_eq!(g.us_per_symbol(0), 0); // no rate yet
+        g.update(0, 0, 64, 0);
+        g.update(0, 1000, 64, 1000);
+        // 292.9 syms/s, the rate of the gap_policy test above
+        assert_eq!(g.us_per_symbol(0), 3414);
+        assert_eq!(g.us_per_symbol(1), 0); // sids are independent
+        assert_eq!(g.us_per_symbol(2), 0); // out of range
+        g.update(0, 1000, 64, 30000); // silence: the rate falls under MIN_RATE
+        assert_eq!(g.us_per_symbol(0), 0);
+
+        let mut off = GapTimeoutPolicy::new(50, 0);
+        off.update(0, 0, 64, 0);
+        off.update(0, 1000, 64, 1000);
+        assert_eq!(off.us_per_symbol(0), 0); // stretch disabled
     }
 }

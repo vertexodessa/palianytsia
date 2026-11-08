@@ -118,6 +118,7 @@ pub struct SwDecoder {
     last_out_seqs: Vec<u32>,
     st: DecoderStats,
     repair_window_hwm: usize,
+    repair_window_recent: RecentWindow,
     wm_open: bool,
     wm_valid: bool,
     wm: u64,
@@ -128,6 +129,45 @@ pub struct SwDecoder {
     episodes: Vec<LossEpisode>,
     arr_guard: u32,
     arr: ArrivalTracker,
+}
+
+const RECENT_WINDOW_EPOCH_MS: u64 = 1000;
+
+/// Largest repair window of the last one to two seconds. The drone picks the
+/// span per frame, so one big frame must not stretch the gap timeout for the
+/// rest of the session the way the high-water mark would.
+#[derive(Clone, Copy, Debug, Default)]
+struct RecentWindow {
+    cur: usize,
+    prev: usize,
+    epoch_ms: u64,
+    started: bool,
+}
+
+impl RecentWindow {
+    fn note(&mut self, window: usize, now_ms: u64) {
+        // Stamps come per card through one queue and can step back a little;
+        // an older one simply belongs to the current epoch.
+        if !self.started
+            || (now_ms >= self.epoch_ms && now_ms - self.epoch_ms >= RECENT_WINDOW_EPOCH_MS)
+        {
+            // Two epochs of silence: the last epoch's window no longer
+            // describes the stream either.
+            self.prev = if self.started && now_ms - self.epoch_ms < 2 * RECENT_WINDOW_EPOCH_MS {
+                self.cur
+            } else {
+                0
+            };
+            self.cur = 0;
+            self.epoch_ms = now_ms;
+            self.started = true;
+        }
+        self.cur = self.cur.max(window);
+    }
+
+    fn get(&self) -> usize {
+        self.cur.max(self.prev)
+    }
 }
 
 impl SwDecoder {
@@ -156,6 +196,7 @@ impl SwDecoder {
             last_out_seqs: Vec::new(),
             st: DecoderStats::default(),
             repair_window_hwm: 0,
+            repair_window_recent: RecentWindow::default(),
             wm_open: false,
             wm_valid: false,
             wm: 0,
@@ -192,9 +233,14 @@ impl SwDecoder {
             0
         }
     }
-    /// Largest repair window seen: the TX window as flown.
+    /// Largest repair window seen: sizes the loss episodes.
     pub fn repair_window(&self) -> usize {
         self.repair_window_hwm
+    }
+    /// Largest repair window of the last one to two seconds, 0 until the
+    /// first repair; holds its value while no repair arrives.
+    pub fn repair_window_recent(&self) -> usize {
+        self.repair_window_recent.get()
     }
     pub fn rows_in_flight(&self) -> usize {
         self.rows.len()
@@ -534,6 +580,7 @@ impl SwDecoder {
         let ws = self.unwrap(h.seq);
         let wl = usize::from(h.window_len);
         self.repair_window_hwm = self.repair_window_hwm.max(wl);
+        self.repair_window_recent.note(wl, now_ms);
         let wend = ws.wrapping_add(wl as u64);
         if wend > self.newest_v.wrapping_add(RESET_SPAN)
             || wend.wrapping_add(RESET_SPAN) < self.newest_v
@@ -664,5 +711,27 @@ impl SwDecoder {
         self.rows
             .retain(|_, r| !(now_ms > r.first_seen_ms && now_ms - r.first_seen_ms > deadline_ms));
         before - self.rows.len()
+    }
+}
+
+#[cfg(test)]
+mod recent_window_tests {
+    use super::RecentWindow;
+
+    #[test]
+    fn a_big_window_ages_out_and_a_stamp_stepping_back_keeps_it() {
+        let mut w = RecentWindow::default();
+        assert_eq!(w.get(), 0);
+        w.note(128, 1000);
+        w.note(64, 1500);
+        assert_eq!(w.get(), 128);
+        w.note(64, 2000); // next epoch: 128 is still the previous one
+        assert_eq!(w.get(), 128);
+        w.note(64, 1990); // a card's older stamp stays in this epoch
+        assert_eq!(w.get(), 128);
+        w.note(64, 3000); // one more epoch: 128 is gone
+        assert_eq!(w.get(), 64);
+        w.note(40, 6000); // silence longer than two epochs drops the last one
+        assert_eq!(w.get(), 40);
     }
 }

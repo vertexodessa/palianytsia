@@ -1,11 +1,11 @@
 [submodule "third_party/mabur"]
 	path = third_party/mabur
 	url = https://github.com/vertexodessa/mabur.git
-	branch = palianytsia/base-v2
+	branch = palianytsia/hisi-cv610
 [submodule "third_party/devourer"]
 	path = third_party/devourer
 	url = https://github.com/vertexodessa/devourer.git
-	branch = palianytsia/base
+	branch = palianytsia/hisi-cv610
 [submodule "third_party/libusb"]
 	path = third_party/libusb
 	url = https://github.com/libusb/libusb.git
