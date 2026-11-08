@@ -4,14 +4,20 @@
 //!   every 3 s when the card leaves or the core gives up; it ignores XR
 //!   session state, so lifting the headset keeps the link up;
 //! - `xr`: the OpenXR frame loop: MediaCodec renders straight into an
-//!   XR_KHR_android_surface_swapchain shown as a head-locked quad, and
+//!   XR_KHR_android_surface_swapchain shown as a head-locked quad (goggle
+//!   mode) or as a window hanging in the room over passthrough, and
 //!   `osd` draws pal-osd's HUD into a second, transparent quad above it.
+#[cfg(target_os = "android")]
+mod background;
 #[cfg(target_os = "android")]
 mod input;
 #[cfg(target_os = "android")]
 mod osd;
 #[cfg(target_os = "android")]
 mod perf;
+// Called from xr (Android); host builds run its tests.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod placement;
 // Called from xr (Android); host builds run its tests.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod rate;

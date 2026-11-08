@@ -6,6 +6,8 @@
          app while the headset is in hand mode ("Switch to Controllers"). -->
     <uses-feature android:name="oculus.software.handtracking" android:required="false" />
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+    <!-- The window mode's background; goggle mode works without it. -->
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
     <application
         android:label="Palianytsia"
         android:hasCode="false">

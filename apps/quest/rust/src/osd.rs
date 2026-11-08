@@ -66,6 +66,15 @@ impl Osd {
     pub fn video_filter(&self) -> pal_osd::prefs::VideoFilter {
         self.console.prefs.video_filter
     }
+
+    /// The operator's view mode, read every frame by xr.
+    pub fn view_mode(&self) -> pal_osd::prefs::QuestView {
+        self.console.prefs.quest_view
+    }
+
+    pub fn panel_open(&self) -> bool {
+        self.console.panel.open
+    }
 }
 
 impl Osd {

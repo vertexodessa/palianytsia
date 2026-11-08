@@ -592,6 +592,12 @@ fn osd_ui(ui: &mut Ui, p: &mut HudPrefs) -> bool {
         ui.radio_value(&mut p.video_filter, F::Sharpen, "sharpen");
         ui.radio_value(&mut p.video_filter, F::Supersample, "supersample");
     });
+    ui.horizontal(|ui| {
+        use crate::prefs::QuestView as V;
+        ui.label("View (Quest)");
+        ui.radio_value(&mut p.quest_view, V::Goggle, "goggle");
+        ui.radio_value(&mut p.quest_view, V::Window, "window in the room");
+    });
     *p != before
 }
 

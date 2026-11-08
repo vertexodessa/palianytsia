@@ -298,7 +298,7 @@ Frame rate:
 
 Placement:
 - Goggle mode (default): the quad sits in `XR_REFERENCE_SPACE_TYPE_VIEW`, head-locked like real FPV goggles, size and distance adjustable (PixelPilot's margin and distance sliders, made into quad size and z).
-- Screen mode: world-locked in `LOCAL` space, a large screen for spotters.
+- Window mode (OSD tab, `View (Quest)`): world-locked in `LOCAL` space over `XR_FB_passthrough`, for flying with the room in view. It starts ahead of the pilot at eye height on every launch and every switch into the mode; size and distance are kept in `screen.json`, the place in the room is not. Right grip with the ray on the window carries it, the thumbsticks resize it and change its distance only while the ray is on it. The passthrough objects exist only in this mode, so goggle mode does not run the cameras. G2G against goggle mode is not measured yet.
 
 OSD and menus:
 - A second quad layer from a small GL swapchain. egui draws it at 30 Hz or on change, never at the video rate. The same widgets as the phone.

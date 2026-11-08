@@ -1,9 +1,10 @@
 //! The OpenXR side, grown from spikes/quest-xr-probe (whose findings it
 //! keeps: the ndk_context Activity swap, the zero fields of the surface
-//! swapchain, the vertical flip). Two quad layers in VIEW space (goggle
-//! mode, head-locked like real FPV goggles): the video, decoded by
+//! swapchain, the vertical flip). Two quad layers: the video, decoded by
 //! MediaCodec straight into an XR_KHR_android_surface_swapchain, and the
-//! OSD above it. The frame loop never waits for video.
+//! OSD above it. In goggle mode they sit in VIEW space, head-locked like
+//! real FPV goggles; in window mode they hang in LOCAL space over
+//! passthrough. The frame loop never waits for video.
 use std::ffi::CString;
 use std::io::Read;
 use std::ptr;
@@ -16,19 +17,35 @@ use glow::HasContext;
 use openxr as xr;
 use openxr::sys;
 
+use crate::background::Background;
 use crate::input::Input;
 use crate::osd::Osd;
+use crate::placement::{self, Grab, Placement, Pose, MAX_DIST_M, MIN_DIST_M};
 use crate::supervisor::Hub;
+use pal_osd::prefs::QuestView;
 
 /// Video swapchain size: the decoder scales into it.
 const VW: u32 = 1920;
 const VH: u32 = 1080;
-/// Goggle mode screen: where the video and OSD quads sit in VIEW space.
-/// Default 2.0 m wide at 1.5 m, about 67 degrees across; the thumbsticks
-/// change it and screen.json in the files dir keeps it.
-struct Screen {
+/// While the menu is open in window mode, the video part of the OSD quad
+/// is at least this wide per metre of distance (50 degrees across): the
+/// panel is drawn at a fixed share of the quad, unreadable on a small window.
+const MENU_MIN_WIDTH_PER_M: f32 = 0.93;
+
+#[derive(Clone, Copy)]
+struct Extent {
     dist_m: f32,
     width_m: f32,
+}
+
+/// How big the video is and how far away, per view mode. The goggle
+/// default is 2.0 m wide at 1.5 m, about 67 degrees across, the window's
+/// 1.2 m, about 44. The thumbsticks change them and screen.json in the
+/// files dir keeps them; the window's place in the room is not kept, it
+/// starts in front of the pilot every launch.
+struct Screen {
+    goggle: Extent,
+    window: Extent,
     path: std::path::PathBuf,
     /// Changed and not saved yet.
     dirty: bool,
@@ -37,8 +54,14 @@ struct Screen {
 impl Screen {
     fn load(path: std::path::PathBuf) -> Self {
         let mut s = Self {
-            dist_m: 1.5,
-            width_m: 2.0,
+            goggle: Extent {
+                dist_m: 1.5,
+                width_m: 2.0,
+            },
+            window: Extent {
+                dist_m: 1.5,
+                width_m: 1.2,
+            },
             path,
             dirty: false,
         };
@@ -49,25 +72,39 @@ impl Screen {
                     .and_then(|r| r.split([',', '}']).next())
                     .and_then(|v| v.trim().parse::<f32>().ok())
             };
-            if let Some(d) = num("dist_m") {
-                s.dist_m = d.clamp(0.6, 5.0);
-            }
-            if let Some(w) = num("width_m") {
-                s.width_m = w.clamp(0.5, 6.0);
-            }
+            let read = |e: &mut Extent, dist: &str, width: &str| {
+                if let Some(d) = num(dist) {
+                    e.dist_m = d.clamp(MIN_DIST_M, MAX_DIST_M);
+                }
+                if let Some(w) = num(width) {
+                    e.width_m = w.clamp(0.5, 6.0);
+                }
+            };
+            read(&mut s.goggle, "dist_m", "width_m");
+            read(&mut s.window, "window_dist_m", "window_width_m");
         }
         s
     }
 
+    fn extent(&self, view: QuestView) -> Extent {
+        match view {
+            QuestView::Goggle => self.goggle,
+            QuestView::Window => self.window,
+        }
+    }
+
     /// Stick Y per second: full deflection changes size or distance by
     /// about 60 % a second, proportional so it feels the same near and far.
-    fn steer(&mut self, size: f32, dist: f32, dt: f32) {
+    fn steer(&mut self, view: QuestView, size: f32, dist: f32, dt: f32) {
         if size == 0.0 && dist == 0.0 {
             if self.dirty {
                 self.dirty = false;
                 let j = format!(
-                    "{{\"dist_m\":{:.3},\"width_m\":{:.3}}}",
-                    self.dist_m, self.width_m
+                    "{{\"dist_m\":{:.3},\"width_m\":{:.3},\"window_dist_m\":{:.3},\"window_width_m\":{:.3}}}",
+                    self.goggle.dist_m,
+                    self.goggle.width_m,
+                    self.window.dist_m,
+                    self.window.width_m
                 );
                 if let Err(e) = std::fs::write(&self.path, j) {
                     log::warn!("screen.json: {e}");
@@ -75,10 +112,51 @@ impl Screen {
             }
             return;
         }
-        self.width_m = (self.width_m * (1.0 + 0.6 * size * dt)).clamp(0.5, 6.0);
-        self.dist_m = (self.dist_m * (1.0 - 0.6 * dist * dt)).clamp(0.6, 5.0);
+        let e = match view {
+            QuestView::Goggle => &mut self.goggle,
+            QuestView::Window => &mut self.window,
+        };
+        e.width_m = (e.width_m * (1.0 + 0.6 * size * dt)).clamp(0.5, 6.0);
+        e.dist_m = (e.dist_m * (1.0 - 0.6 * dist * dt)).clamp(MIN_DIST_M, MAX_DIST_M);
         self.dirty = true;
     }
+}
+
+/// `space` located in `base` at `t`, when the tracker knows it.
+fn locate(space: &xr::Space, base: &xr::Space, t: xr::Time) -> Option<Pose> {
+    let loc = space.locate(base, t).ok()?;
+    let ok = xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
+    if !loc.location_flags.contains(ok) {
+        return None;
+    }
+    let (p, q) = (loc.pose.position, loc.pose.orientation);
+    Some(Pose {
+        pos: [p.x, p.y, p.z],
+        rot: [q.x, q.y, q.z, q.w],
+    })
+}
+
+/// Where the video hangs now and whether that is in LOCAL space (else
+/// VIEW). A window not placed yet shows head-locked: no tracked head at the
+/// first frames must not mean no video.
+fn video_placement(view: QuestView, window: Option<Placement>, scr: &Screen) -> (bool, Placement) {
+    match window.filter(|_| view == QuestView::Window) {
+        Some(w) => (true, w),
+        None => {
+            let e = scr.extent(view);
+            (false, Placement::in_view(e.dist_m, e.width_m))
+        }
+    }
+}
+
+/// The OSD quad, centred on the video.
+fn osd_placement(video: &Placement, view: QuestView, menu: bool, scr: &Screen) -> Placement {
+    let min = if view == QuestView::Window && menu {
+        MENU_MIN_WIDTH_PER_M * scr.window.dist_m / video.width_m
+    } else {
+        1.0
+    };
+    video.scaled(crate::osd::SPAN * min.max(1.0))
 }
 
 struct Egl {
@@ -186,11 +264,8 @@ fn video_swapchain(
     Ok((sc, win))
 }
 
-/// `span`: the quad's size as a multiple of the video screen's.
-#[allow(clippy::too_many_arguments)]
 fn quad(
-    scr: &Screen,
-    span: f32,
+    at: &Placement,
     space: sys::Space,
     sc: sys::Swapchain,
     w: u32,
@@ -198,6 +273,7 @@ fn quad(
     flags: sys::CompositionLayerFlags,
     next: *const std::ffi::c_void,
 ) -> sys::CompositionLayerQuad {
+    let ([px, py, pz], [qx, qy, qz, qw]) = (at.pose.pos, at.pose.rot);
     sys::CompositionLayerQuad {
         ty: sys::CompositionLayerQuad::TYPE,
         next,
@@ -217,20 +293,20 @@ fn quad(
         },
         pose: sys::Posef {
             orientation: sys::Quaternionf {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-                w: 1.0,
+                x: qx,
+                y: qy,
+                z: qz,
+                w: qw,
             },
             position: sys::Vector3f {
-                x: 0.0,
-                y: 0.0,
-                z: -scr.dist_m,
+                x: px,
+                y: py,
+                z: pz,
             },
         },
         size: sys::Extent2Df {
-            width: scr.width_m * span,
-            height: scr.width_m * span * 9.0 / 16.0,
+            width: at.width_m,
+            height: at.height_m(),
         },
     }
 }
@@ -359,6 +435,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     want.fb_composition_layer_image_layout = exts.fb_composition_layer_image_layout;
     want.meta_performance_metrics = exts.meta_performance_metrics;
     want.fb_composition_layer_settings = exts.fb_composition_layer_settings;
+    want.fb_passthrough = exts.fb_passthrough;
+    log::info!("XR_FB_passthrough: {}", exts.fb_passthrough);
     let inst = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -436,6 +514,9 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let space = session
         .create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)
         .map_err(|e| format!("space: {e}"))?;
+    let local = session
+        .create_reference_space(xr::ReferenceSpaceType::LOCAL, xr::Posef::IDENTITY)
+        .map_err(|e| format!("local space: {e}"))?;
 
     let input = match Input::new(&inst, &session) {
         Ok(i) => Some(i),
@@ -446,6 +527,12 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     };
     let perf = crate::perf::PerfMetrics::new(&inst, &session);
     let mut scr = Screen::load(int_dir.join("screen.json"));
+    let mut view = QuestView::Goggle;
+    let mut background: Option<Background> = None;
+    // None until placed: on launch and on every switch into the window mode.
+    let mut window: Option<Placement> = None;
+    let mut grab: Option<Grab> = None;
+    let mut grip_was = false;
     let mut t_frame = Instant::now();
     let mut video: Option<sys::Swapchain> = None;
     let mut osd: Option<Osd> = None;
@@ -542,21 +629,76 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         unsafe {
             (fp.wait_frame)(session.as_raw(), &wi, &mut fs);
         }
+        let wanted = osd.as_ref().map_or(view, |o| o.view_mode());
+        if wanted != view {
+            view = wanted;
+            window = None;
+            grab = None;
+            background = None;
+            if view == QuestView::Window && exts.fb_passthrough {
+                match Background::new(&session) {
+                    Ok(b) => background = Some(b),
+                    Err(e) => log::error!("passthrough: {e}"),
+                }
+            }
+            log::info!(
+                "view {view:?}, passthrough {}",
+                if background.is_some() { "on" } else { "off" }
+            );
+        }
+        let t = fs.predicted_display_time;
+        let head = (view == QuestView::Window)
+            .then(|| locate(&space, &local, t))
+            .flatten();
+        if view == QuestView::Window && window.is_none() {
+            window = head.map(|h| Placement::in_front_of(h, scr.window.dist_m, scr.window.width_m));
+        }
+        let menu = osd.as_ref().is_some_and(Osd::panel_open);
+        let (in_local, video_at) = video_placement(view, window, &scr);
+        let xr_space = if in_local { &local } else { &space };
         // Input at the predicted display time, so the ray matches the
         // frame it is drawn into.
         let frame = input.as_ref().map_or_else(Default::default, |i| {
             i.poll(
                 &session,
-                &space,
-                fs.predicted_display_time,
-                scr.dist_m,
-                scr.width_m * crate::osd::SPAN,
+                xr_space,
+                t,
+                &osd_placement(&video_at, view, menu, &scr),
                 crate::osd::points(),
             )
         });
         let dt = t_frame.elapsed().as_secs_f32().min(0.1);
         t_frame = Instant::now();
-        scr.steer(frame.size, frame.dist, dt);
+        let (mut size, mut dist) = (frame.size, frame.dist);
+        if view == QuestView::Window {
+            if let (Some(w), Some(h)) = (window.as_mut(), head) {
+                if frame.grip && !grip_was {
+                    grab = frame.aim.and_then(|r| Grab::start(&r, w));
+                }
+                if let (Some(g), Some(r)) = (&grab, &frame.aim) {
+                    w.pose = g.moved(r, h.pos);
+                }
+                if !frame.grip && grab.take().is_some() {
+                    scr.window.dist_m = placement::distance(w.pose.pos, h.pos);
+                    scr.dirty = true;
+                }
+            }
+            // Only the window under the ray listens: a thumb resting on
+            // a stick must not change it unasked in flight.
+            let aimed = frame.aim.is_some_and(|r| video_at.hit(&r).is_some());
+            if !aimed || grab.is_some() {
+                (size, dist) = (0.0, 0.0);
+            }
+        }
+        grip_was = frame.grip;
+        let before = scr.extent(view).dist_m;
+        scr.steer(view, size, dist, dt);
+        if view == QuestView::Window {
+            if let Some(w) = window.as_mut() {
+                w.width_m = scr.window.width_m;
+                w.pushed(before - scr.window.dist_m);
+            }
+        }
         if let Some(o) = osd.as_mut() {
             o.tick(&hub, frame);
         }
@@ -594,12 +736,18 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         } else {
             settings_ptr
         };
+        // After this frame's grab and sticks.
+        let (in_local, video_at) = video_placement(view, window, &scr);
+        let layer_space = if in_local {
+            local.as_raw()
+        } else {
+            space.as_raw()
+        };
         let mut quads = Vec::with_capacity(2);
         if let Some(sc) = video {
             quads.push(quad(
-                &scr,
-                1.0,
-                space.as_raw(),
+                &video_at,
+                layer_space,
                 sc,
                 VW,
                 VH,
@@ -609,9 +757,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         }
         if let Some(o) = osd.as_ref().filter(|o| o.ready) {
             quads.push(quad(
-                &scr,
-                crate::osd::SPAN,
-                space.as_raw(),
+                &osd_placement(&video_at, view, o.panel_open(), &scr),
+                layer_space,
                 o.sc.as_raw(),
                 crate::osd::W,
                 crate::osd::H,
@@ -619,9 +766,16 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 ptr::null(),
             ));
         }
-        let layers: Vec<*const sys::CompositionLayerBaseHeader> = quads
+        let room = background.as_ref().map(Background::layer);
+        // The room first: layers are composited in order.
+        let layers: Vec<*const sys::CompositionLayerBaseHeader> = room
             .iter()
-            .map(|q| q as *const _ as *const sys::CompositionLayerBaseHeader)
+            .map(|r| r as *const _ as *const sys::CompositionLayerBaseHeader)
+            .chain(
+                quads
+                    .iter()
+                    .map(|q| q as *const _ as *const sys::CompositionLayerBaseHeader),
+            )
             .collect();
         let render = fs.should_render != sys::FALSE;
         let ei = sys::FrameEndInfo {

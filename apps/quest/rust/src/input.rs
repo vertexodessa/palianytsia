@@ -2,8 +2,10 @@
 //! controller's aim ray is a pointer on the OSD quad, the trigger clicks,
 //! B or Y opens the settings panel, A or X toggles link statistics; the
 //! right thumbstick resizes the screen and the left one moves it nearer or
-//! farther.
+//! farther; the right grip carries the window in window mode.
 use openxr as xr;
+
+use crate::placement::{rotate, Placement, Ray};
 
 pub struct Input {
     set: xr::ActionSet,
@@ -13,6 +15,7 @@ pub struct Input {
     stats: xr::Action<bool>,
     size: xr::Action<xr::Vector2f>,
     dist: xr::Action<xr::Vector2f>,
+    grip: xr::Action<bool>,
     aim_space: xr::Space,
 }
 
@@ -28,6 +31,10 @@ pub struct Frame {
     /// Thumbstick Y, -1..1: right = screen size, left = distance.
     pub size: f32,
     pub dist: f32,
+    /// The right controller's aim, in the space given to `poll`.
+    pub aim: Option<Ray>,
+    /// The right grip is held.
+    pub grip: bool,
 }
 
 impl Input {
@@ -39,6 +46,7 @@ impl Input {
         let stats = set.create_action::<bool>("stats", "Link statistics", &[])?;
         let size = set.create_action::<xr::Vector2f>("size", "Screen size", &[])?;
         let dist = set.create_action::<xr::Vector2f>("dist", "Screen distance", &[])?;
+        let grip = set.create_action::<bool>("grip", "Carry the window", &[])?;
         let p = |s: &str| inst.string_to_path(s);
         inst.suggest_interaction_profile_bindings(
             p("/interaction_profiles/oculus/touch_controller")?,
@@ -51,6 +59,7 @@ impl Input {
                 xr::Binding::new(&stats, p("/user/hand/left/input/x/click")?),
                 xr::Binding::new(&size, p("/user/hand/right/input/thumbstick")?),
                 xr::Binding::new(&dist, p("/user/hand/left/input/thumbstick")?),
+                xr::Binding::new(&grip, p("/user/hand/right/input/squeeze/value")?),
             ],
         )?;
         session.attach_action_sets(&[&set])?;
@@ -63,19 +72,19 @@ impl Input {
             stats,
             size,
             dist,
+            grip,
             aim_space,
         })
     }
 
-    /// `view`: the VIEW space both quads live in; the quad is `w_m` wide,
-    /// 16:9, centred `dist_m` ahead; `pts` is the OSD's size in points.
+    /// `space`: the one both quads live in; `osd` is where the OSD quad
+    /// hangs in it; `pts` is the OSD's size in points.
     pub fn poll(
         &self,
         session: &xr::Session<xr::OpenGlEs>,
-        view: &xr::Space,
+        space: &xr::Space,
         t: xr::Time,
-        dist_m: f32,
-        w_m: f32,
+        osd: &Placement,
         pts: egui::Vec2,
     ) -> Frame {
         let mut f = Frame::default();
@@ -109,11 +118,15 @@ impl Input {
         };
         f.size = stick(&self.size);
         f.dist = stick(&self.dist);
+        f.grip = self
+            .grip
+            .state(session, xr::Path::NULL)
+            .is_ok_and(|s| s.is_active && s.current_state);
         let active = self.aim.is_active(session, xr::Path::NULL).unwrap_or(false);
         if !active {
             return f;
         }
-        let Ok(loc) = self.aim_space.locate(view, t) else {
+        let Ok(loc) = self.aim_space.locate(space, t) else {
             return f;
         };
         let ok = xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
@@ -121,59 +134,15 @@ impl Input {
             return f;
         }
         let (p, q) = (loc.pose.position, loc.pose.orientation);
-        // Forward is -Z rotated by q.
-        let d = rotate(q, [0.0, 0.0, -1.0]);
-        if d[2] >= -1e-3 {
-            return f;
-        }
-        let t = (-dist_m - p.z) / d[2];
-        let (hx, hy) = (p.x + t * d[0], p.y + t * d[1]);
-        let h_m = w_m * 9.0 / 16.0;
-        let u = (hx + w_m / 2.0) / w_m;
-        let v = (h_m / 2.0 - hy) / h_m;
-        if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+        let ray = Ray {
+            origin: [p.x, p.y, p.z],
+            // Forward is -Z rotated by q.
+            dir: rotate([q.x, q.y, q.z, q.w], [0.0, 0.0, -1.0]),
+        };
+        f.aim = Some(ray);
+        if let Some((_, [u, v])) = osd.hit(&ray) {
             f.pointer = Some(egui::pos2(u * pts.x, v * pts.y));
         }
         f
-    }
-}
-
-/// v rotated by the unit quaternion q.
-fn rotate(q: xr::Quaternionf, v: [f32; 3]) -> [f32; 3] {
-    let (x, y, z, w) = (q.x, q.y, q.z, q.w);
-    // t = 2 * cross(q.xyz, v); v' = v + w * t + cross(q.xyz, t)
-    let t = [
-        2.0 * (y * v[2] - z * v[1]),
-        2.0 * (z * v[0] - x * v[2]),
-        2.0 * (x * v[1] - y * v[0]),
-    ];
-    [
-        v[0] + w * t[0] + (y * t[2] - z * t[1]),
-        v[1] + w * t[1] + (z * t[0] - x * t[2]),
-        v[2] + w * t[2] + (x * t[1] - y * t[0]),
-    ]
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn identity_and_yaw() {
-        let id = openxr::Quaternionf {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            w: 1.0,
-        };
-        assert_eq!(super::rotate(id, [0.0, 0.0, -1.0]), [0.0, 0.0, -1.0]);
-        // 90 degrees about +Y turns -Z into -X.
-        let s = std::f32::consts::FRAC_1_SQRT_2;
-        let yaw = openxr::Quaternionf {
-            x: 0.0,
-            y: s,
-            z: 0.0,
-            w: s,
-        };
-        let r = super::rotate(yaw, [0.0, 0.0, -1.0]);
-        assert!((r[0] + 1.0).abs() < 1e-5 && r[1].abs() < 1e-5 && r[2].abs() < 1e-5);
     }
 }

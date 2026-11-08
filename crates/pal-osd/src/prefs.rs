@@ -28,6 +28,9 @@ pub struct HudPrefs {
     /// 1920 px video lands on fewer display pixels, so supersampling may
     /// beat sharpening; judged by eye. Other front ends ignore it.
     pub video_filter: VideoFilter,
+    /// Quest: the video head-locked on black, or a window hanging in the
+    /// room over passthrough. Other front ends ignore it.
+    pub quest_view: QuestView,
     /// Step the ladder down on any enhance-layer residual loss
     /// (`link.s3_demote`), applied when the link starts. On the bench it
     /// caused 15 of 24 demotes with the base layer clean (2026-11-03).
@@ -64,6 +67,29 @@ impl VideoFilter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuestView {
+    #[default]
+    Goggle,
+    Window,
+}
+
+impl QuestView {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Goggle => "goggle",
+            Self::Window => "window",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "window" => Self::Window,
+            _ => Self::Goggle,
+        }
+    }
+}
+
 impl Default for HudPrefs {
     fn default() -> Self {
         Self {
@@ -78,6 +104,7 @@ impl Default for HudPrefs {
             link_bw: 20,
             link_channels: Vec::new(),
             video_filter: VideoFilter::Off,
+            quest_view: QuestView::Goggle,
             s3_demote: true,
             chip_pos: Default::default(),
         }
@@ -91,7 +118,8 @@ impl HudPrefs {
             "nav": self.nav, "link": self.link, "messages": self.messages,
             "stats": self.stats, "scale": self.scale, "link_bw": self.link_bw,
             "link_channels": self.link_channels,
-            "video_filter": self.video_filter.key(), "s3_demote": self.s3_demote,
+            "video_filter": self.video_filter.key(), "quest_view": self.quest_view.key(),
+            "s3_demote": self.s3_demote,
             "chip_pos": self.chip_pos,
         })
         .to_string()
@@ -136,6 +164,7 @@ impl HudPrefs {
             video_filter: VideoFilter::parse(
                 v.get("video_filter").and_then(Value::as_str).unwrap_or(""),
             ),
+            quest_view: QuestView::parse(v.get("quest_view").and_then(Value::as_str).unwrap_or("")),
             s3_demote: b("s3_demote", d.s3_demote),
             chip_pos: v
                 .get("chip_pos")
@@ -179,6 +208,7 @@ mod tests {
             link_bw: 40,
             link_channels: vec![144, 40],
             video_filter: super::VideoFilter::Supersample,
+            quest_view: super::QuestView::Window,
             s3_demote: false,
             chip_pos: [("loss".to_string(), [-120.5, 40.0])].into(),
             ..Default::default()
