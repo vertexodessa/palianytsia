@@ -11,7 +11,10 @@
 //! whole AUs skipped before this one (reason lost), or an explicit request.
 //! Never on enhance damage: nothing references an enhance frame.
 //! Clears on a complete, unsalvaged base AU whose first slice NAL is an
-//! IRAP (16..21). While armed the byte is bumped again every `RETRY_MS`.
+//! IRAP (16..21). While armed the byte is bumped again, at least `RETRY_MS`
+//! apart and further apart with each try: see `retry_wait_ms`. The C++
+//! requester keeps the fixed `RETRY_MS`; the parity gate is unaffected
+//! because both cores here are driven by this one.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
@@ -66,6 +69,12 @@ pub struct Event {
 }
 
 pub const RETRY_MS: u64 = 300;
+/// The longest wait between two tries of one request.
+pub const RETRY_MAX_MS: u64 = 1000;
+/// Tries after which the wait stops doubling.
+const RETRY_DOUBLINGS: u64 = 1;
+/// Base-layer repairs an IDR carries on top of its bytes, as a share.
+const IDR_FEC_OVERHEAD: f64 = 0.5;
 
 #[derive(Debug)]
 pub struct RefreshRequester {
@@ -75,6 +84,12 @@ pub struct RefreshRequester {
     armed_since_ms: u64,
     last_bump_ms: u64,
     retries_this: u64,
+    /// Armed too soon after the last bump: the request's own bump is owed.
+    first_owed: bool,
+    /// Bytes of the last clean IRAP; 0 until one is seen.
+    irap_bytes: u64,
+    /// PHY rate of the current rung; 0 until known.
+    link_mbps: f64,
     c: Counters,
     events: Vec<Event>,
 }
@@ -88,6 +103,9 @@ impl Default for RefreshRequester {
             armed_since_ms: 0,
             last_bump_ms: 0,
             retries_this: 0,
+            first_owed: false,
+            irap_bytes: 0,
+            link_mbps: 0.0,
             c: Counters::default(),
             events: Vec::new(),
         }
@@ -131,9 +149,47 @@ impl RefreshRequester {
         self.arm(r, now_ms);
     }
 
+    /// The size of the last clean IRAP, the best guess at the next one.
+    pub fn set_irap_bytes(&mut self, bytes: u64) {
+        self.irap_bytes = bytes;
+    }
+
+    /// The PHY rate of the current rung; 0 = unknown.
+    pub fn set_link_mbps(&mut self, mbps: f64) {
+        self.link_mbps = mbps;
+    }
+
+    /// Twice the air time of an IDR at the current rung: the span a request
+    /// needs for its IDR to be sent and the P frames behind it to drain. An
+    /// IDR requested sooner lands in the queue behind the previous one, and
+    /// at MCS0 that is what keeps the queue full and every IDR damaged.
+    fn idr_span_ms(&self) -> u64 {
+        if self.link_mbps <= 0.0 {
+            return 0;
+        }
+        let bits = self.irap_bytes as f64 * 8.0 * (1.0 + IDR_FEC_OVERHEAD);
+        ((2.0 * bits / (self.link_mbps * 1000.0)) as u64).min(RETRY_MAX_MS)
+    }
+
+    fn retry_wait_ms(&self) -> u64 {
+        let base = RETRY_MS.max(self.idr_span_ms());
+        (base << self.retries_this.min(RETRY_DOUBLINGS)).min(RETRY_MAX_MS)
+    }
+
     /// Retry cadence; call once per loop iteration while in a session.
     pub fn poll(&mut self, now_ms: u64) {
-        if !self.armed || now_ms < self.last_bump_ms + RETRY_MS {
+        if !self.armed {
+            return;
+        }
+        if self.first_owed {
+            if now_ms >= self.last_bump_ms + self.idr_span_ms() {
+                self.first_owed = false;
+                self.c.requests += 1;
+                self.bump(now_ms);
+            }
+            return;
+        }
+        if now_ms < self.last_bump_ms + self.retry_wait_ms() {
             return;
         }
         self.c.retries += 1;
@@ -163,6 +219,12 @@ impl RefreshRequester {
         self.reason = r;
         self.armed_since_ms = now_ms;
         self.retries_this = 0;
+        // A heal followed by a new hole must not start an IDR on top of the
+        // one just asked for either.
+        if now_ms < self.last_bump_ms + self.idr_span_ms() {
+            self.first_owed = true;
+            return;
+        }
         self.c.requests += 1;
         self.bump(now_ms);
     }
@@ -183,6 +245,7 @@ impl RefreshRequester {
             return;
         }
         self.armed = false;
+        self.first_owed = false;
         // Stamps come from two clocks (body RX time, tick time), so an IRAP
         // body can carry a stamp older than the arming tick.
         let heal = now_ms.saturating_sub(self.armed_since_ms);
@@ -240,6 +303,9 @@ impl IdrDriver {
             self.r.request(r, now_us / 1000);
         }
         self.started = true;
+        if irap {
+            self.r.set_irap_bytes(a.data.len() as u64);
+        }
         let was_armed = self.r.armed();
         self.r.note_au(
             a.sid,
@@ -280,14 +346,122 @@ impl IdrDriver {
         if total != self.applied {
             self.applied = total;
             core.set_idr_requests(total as u32);
+            // Once per bump, not per tick: stats_json builds the whole line.
+            self.r.set_link_mbps(link_mbps(&core.stats_json()));
         }
         self.r.take_events()
+    }
+}
+
+/// The first `"key":<digits>` of a stats line.
+fn stats_uint(json: &str, key: &str) -> Option<u8> {
+    let at = json.find(&format!("\"{key}\":"))? + key.len() + 3;
+    let rest = &json[at..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// The rung's PHY rate from a stats line; 0 when it carries none.
+fn link_mbps(stats: &str) -> f64 {
+    match (stats_uint(stats, "mcs"), stats_uint(stats, "bw")) {
+        (Some(mcs), Some(bw)) => {
+            pal_wire::profile::phy_rate_mbps(pal_wire::profile::PhyMode::Ht, mcs, bw)
+        }
+        _ => 0.0,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_space_out_and_cap() {
+        let mut r = RefreshRequester::default();
+        r.request(Reason::Hole, 1000);
+        r.poll(1299);
+        assert_eq!(r.epoch(), 1);
+        r.poll(1300);
+        assert_eq!(r.epoch(), 2);
+        r.poll(1899);
+        assert_eq!(r.epoch(), 2);
+        r.poll(1900);
+        assert_eq!(r.epoch(), 3);
+        // One doubling only, and a slow link is capped.
+        r.poll(2499);
+        assert_eq!(r.epoch(), 3);
+        r.poll(2500);
+        assert_eq!(r.epoch(), 4);
+        r.set_irap_bytes(400_000);
+        r.set_link_mbps(6.5);
+        r.poll(3499);
+        assert_eq!(r.epoch(), 4);
+        r.poll(3500);
+        assert_eq!(r.epoch(), 5);
+    }
+
+    #[test]
+    fn retry_waits_for_a_big_idr_on_a_slow_rung() {
+        let mut r = RefreshRequester::default();
+        // 102 KB at MCS0 20 MHz: 2 x 188 ms of air.
+        r.set_irap_bytes(102_000);
+        r.set_link_mbps(6.5);
+        r.request(Reason::Hole, 10_000);
+        r.poll(10_375);
+        assert_eq!(r.epoch(), 1);
+        r.poll(10_376);
+        assert_eq!(r.epoch(), 2);
+        // The same IDR on a fast rung keeps the RETRY_MS floor.
+        let mut f = RefreshRequester::default();
+        f.set_irap_bytes(102_000);
+        f.set_link_mbps(26.0);
+        f.request(Reason::Hole, 10_000);
+        f.poll(10_300);
+        assert_eq!(f.epoch(), 2);
+    }
+
+    #[test]
+    fn new_hole_right_after_a_request_waits_for_the_idr_in_flight() {
+        let mut r = RefreshRequester::default();
+        r.set_irap_bytes(102_000);
+        r.set_link_mbps(6.5);
+        r.request(Reason::Hole, 10_000);
+        r.note_au(0, true, false, 19, 0, 10_100);
+        assert!(!r.armed());
+        r.note_au(0, false, false, 1, 0, 10_200);
+        assert!(r.armed());
+        assert_eq!(r.epoch(), 1);
+        assert_eq!(r.counters().requests, 1);
+        r.poll(10_375);
+        assert_eq!(r.epoch(), 1);
+        r.poll(10_376);
+        assert_eq!(r.epoch(), 2);
+        assert_eq!((r.counters().requests, r.counters().retries), (2, 0));
+    }
+
+    #[test]
+    fn owed_request_heals_without_a_bump() {
+        let mut r = RefreshRequester::default();
+        r.set_irap_bytes(102_000);
+        r.set_link_mbps(6.5);
+        r.request(Reason::Hole, 10_000);
+        r.note_au(0, true, false, 19, 0, 10_100);
+        r.note_au(0, false, false, 1, 0, 10_200);
+        r.note_au(0, true, false, 19, 0, 10_300);
+        r.poll(11_000);
+        assert_eq!(r.epoch(), 1);
+        assert_eq!(r.counters().requests, 1);
+    }
+
+    #[test]
+    fn link_rate_comes_from_the_stats_line() {
+        assert_eq!(link_mbps(r#"{"bw":20,"cards":[],"mcs":0}"#), 6.5);
+        assert_eq!(link_mbps(r#"{"mcs":3,"bw":40}"#), 54.0);
+        assert_eq!(link_mbps(r#"{"bw":20}"#), 0.0);
+        assert_eq!(link_mbps(r#"{"bw":null,"mcs":1}"#), 0.0);
+    }
 
     #[test]
     fn hole_arms_retries_and_irap_heals() {
@@ -349,7 +523,7 @@ mod tests {
         let mut r = RefreshRequester::default();
         r.request(Reason::Decoder, 0);
         for i in 1..=255u64 {
-            r.poll(i * RETRY_MS);
+            r.poll(i * RETRY_MAX_MS);
         }
         assert_eq!(r.epoch(), 0);
         // IdrDriver hands the core the cumulative count, which keeps going.

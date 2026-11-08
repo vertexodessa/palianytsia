@@ -365,6 +365,12 @@ pub struct LadderController {
 }
 
 const NEVER: f64 = -1e18;
+/// A rung change retunes the encoder's bitrate, and on Star6E that emits a
+/// keyframe several times a P frame's size, which can take hundreds of ms of air.
+/// The frames queued behind it arrive late and read as residual loss. Demoting on
+/// that loss changes the bitrate again, so each step pays for the next one. For
+/// this long after a change, residual loss does not demote; util demotes still do.
+const RUNG_CHANGE_RESIDUAL_HOLD_MS: f64 = 1200.0;
 
 impl LadderController {
     pub fn new(cfg: LadderCfg) -> Self {
@@ -728,7 +734,8 @@ impl LadderController {
                 self.store.observe_evm(r, h.rf_evm_db);
             }
         }
-        if h.residual_loss > 0.0 && self.idx > 0 {
+        let idr_settling = now - self.last_change_ms < RUNG_CHANGE_RESIDUAL_HOLD_MS;
+        if h.residual_loss > 0.0 && self.idx > 0 && !idr_settling {
             self.fail_probation_if_on_it(now);
             self.counters.demotes_residual += 1;
             self.demote(now, CtlReason::Residual, self.u, true);
@@ -788,7 +795,12 @@ impl LadderController {
                     .observe_s3(self.idx as usize, self.u3, h.s3_residual_loss > 0.0, now);
             }
         }
-        if self.cfg.s3_demote && s3_live && h.s3_residual_loss > 0.0 && self.idx > 0 {
+        if self.cfg.s3_demote
+            && s3_live
+            && h.s3_residual_loss > 0.0
+            && self.idx > 0
+            && !idr_settling
+        {
             self.fail_probation_if_on_it(now);
             self.counters.demotes_s3_residual += 1;
             self.demote(now, CtlReason::S3Residual, self.u3, true);

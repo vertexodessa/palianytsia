@@ -867,6 +867,19 @@ fn order_rig(n: usize) -> Rig {
 }
 
 #[test]
+fn hop_restore_without_a_reference_keeps_the_rung() {
+    let mut g = order_rig(2);
+    g.vrx.restore_rung(2, 0.0);
+    let mcs = g.vrx.cur_op().mcs;
+    g.vrx.restore_rung(0, 0.0);
+    assert_ne!(g.vrx.cur_op().mcs, mcs);
+    g.vrx.restore_rung(2, 0.0);
+    g.vrx.restore_rung(-1, 0.0);
+    assert_eq!(g.vrx.cur_op().mcs, mcs);
+    assert_eq!(g.vrx.ctl().last_event().reason.as_str(), "hop_restore");
+}
+
+#[test]
 fn two_card_order_rcf_carries_hop_and_plan_leads_then_follows() {
     let mut g = order_rig(2);
     let r = g.pump_rcf().unwrap();

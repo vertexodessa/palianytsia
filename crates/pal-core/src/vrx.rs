@@ -420,7 +420,11 @@ impl VrxController {
         r
     }
 
+    /// `rung < 0`: the verdict froze no reference, as on a move off a healthy
+    /// link. Stay on the current rung; rung 0 would cut the link's capacity
+    /// to its floor while the encoder and the queue still run at this rate.
     pub fn restore_rung(&mut self, rung: i32, now: f64) {
+        let rung = if rung < 0 { self.ctrl.rung() } else { rung };
         self.ctrl.restore(rung, now);
         self.sync_op();
     }
