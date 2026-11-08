@@ -84,11 +84,12 @@ const WARN: Color32 = Color32::from_rgb(240, 190, 60);
 const BAD: Color32 = Color32::from_rgb(240, 80, 70);
 
 /// Rows per tab, by F18 id.
-const VIDEO: [&str; 7] = [
+const VIDEO: [&str; 8] = [
     "VENC_MODE",
     "ENC_BITRATE_MAX",
     "ENC_AIRTIME",
     "VENC_SLICES",
+    "VENC_MIN_IQP",
     "LOWPWR_ENABLE",
     "VENC_MIRROR",
     "VENC_FLIP",
@@ -102,6 +103,7 @@ fn step(id: &str) -> f64 {
         "ENC_BITRATE_MAX" | "REC_BITRATE" => 1000.0,
         "ENC_AIRTIME" => 0.05,
         "RADIO_WALL_MARGN" => 0.5,
+        "VENC_MIN_IQP" => 2.0,
         _ => 1.0,
     }
 }

@@ -61,8 +61,9 @@ pub const TABLE: &[Row] = &[
     Row { id: "VENC_FLIP", section: "venc", key: "flip", ty: PType::Bool, apply: Apply::Rebuild, help: "Flip the picture upside down, for a camera mounted upside down" },
     Row { id: "RADIO_PWR_MODE", section: "radio", key: "power_mode", ty: PType::Str, apply: Apply::Reprogram, help: "TX power table: offset flies the calibrated walls, none the chip's own; none undoes a calibration" },
     Row { id: "VENC_MODES", section: "venc", key: "driver_modes", ty: PType::Str, apply: Apply::ReadOnly, help: "The camera driver's modes as VENC_MODE values at each mode's full size and top rate, comma-separated; empty until the camera starts" },
+    Row { id: "VENC_MIN_IQP", section: "venc", key: "min_iqp", ty: PType::Int32, apply: Apply::Reprogram, help: "Keyframe quality floor, 0 to 51 (0 = the firmware's own); higher makes keyframes smaller and the moment after each one coarser" },
 ];
-pub const COUNT: usize = 16;
+pub const COUNT: usize = 17;
 const _: () = assert!(TABLE.len() == COUNT);
 const MAX_ID_LEN: usize = 16;
 const VENC_MODE_ROW: usize = 2;
