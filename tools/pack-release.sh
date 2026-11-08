@@ -42,7 +42,7 @@ OUT=$ROOT/dist/palianytsia-$TAG
 rm -rf "$OUT" "$OUT.tar.gz"
 mkdir -p "$OUT/drone" "$OUT/gs"
 install -m755 "$MABURD" "$OUT/drone/maburd"
-install -m755 "$ROOT/tools/drone-install.sh" "$OUT/drone/install.sh"
+install -m755 "$ROOT/tools/drone-install.py" "$OUT/drone/install.py"
 install -m644 "$REL/drone/mabur.toml" "$REL/drone/S96mabur" "$OUT/drone/"
 install -m644 "$KO" "$OUT/drone/sensor_imx415_star6e.ko"
 install -m644 "$QUEST" "$OUT/gs/palianytsia-quest-$VER.apk"

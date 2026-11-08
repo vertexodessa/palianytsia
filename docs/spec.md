@@ -20,7 +20,8 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
 - M0-M2 done. Desktop (`pal-desktop`, `pal`) flies the quad on the Rust core, 1..N cards; ref==rust
   byte parity on every capture (`tools/m1-replay.sh`, local only: captures never go to GitHub).
   NV12/I420 planes go to GL textures and convert in a shader (b7370f5); VA-API still untested.
-- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.8.1, signed APKs; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
+- mabur pin (2026-11-08): `palianytsia/base-v2` rebased onto upstream master plus PR #119 (frame-tail FEC repair rule, `fec.repairs_with_frame` removed), the old line kept as branch `palianytsia/base-v2-pre-2026-11-08`. `tools/drone-install.py` replaces the shell installer and fits the config to the new maburd: it removes the key a maburd does not know and makes the one-time window raise to 64 that the removed key's build did at boot.
+- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.9, signed APKs; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):
   one Perfetto trace with kernel USB/IRQ events (xhci/usb tracepoints, usbfs reap, kprobes) and
@@ -358,7 +359,7 @@ third_party/devourer   -> vertexodessa/devourer (fork of OpenIPC/devourer; the p
 Every release tag builds both ends from the same gitlinks and ships them together, so "which maburd goes with this app" never has an answer other than "the one in the same release".
 
 Release assets for tag `vX.Y.Z` (the plan; as built, `tools/pack-release.sh` packs `gs/` with both APKs, the
-static desktop binary and `gs.toml`, `drone/` with `maburd`, `install.sh` (from `tools/drone-install.sh`),
+static desktop binary and `gs.toml`, `drone/` with `maburd`, `install.py` (from `tools/drone-install.py`),
 `S96mabur`, `mabur.toml` and the IMX415 driver, plus `README.md` and `SHA256SUMS`; no CLI and no `PAIR.txt`,
 the shas are in the README's Sources section):
 

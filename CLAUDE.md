@@ -19,7 +19,7 @@ status: `docs/spec.md`; read its "Status (2026-11-07)" section first; the dated 
 | `apps/quest` | Quest 3 app (M3): `rust/` = `pal-quest` NativeActivity (OpenXR: video via surface swapchain quad, egui OSD quad, controller ray + panel, USB supervisor with 3 s retry; up to 2 cards: card 0 = link/TX, all receive, the channel core scouts on the other; a card added or detached restarts the link), `android/` = manifest only. `tools/quest-apk.sh [cfg]` builds the APK (OpenXR loader pulled from Maven Central) |
 | `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
 | `third_party/libusb` | upstream libusb v1.0.27, Android only (`tools/android-libusb.sh`; `tools/android-build.sh build -p <crate>` cross-builds for aarch64) |
-| `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (mabur: branch `palianytsia/base-v2` = upstream master plus our commits (rebased 2026-11-07; the 2026-11-03 line is kept as branch `palianytsia/base-v2-pre-2026-11-07` and tags `palianytsia/v0.8`, `palianytsia/v0.8.1`), `palianytsia/base` is the pre-2026-11-03 line; devourer: `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
+| `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (mabur: branch `palianytsia/base-v2` = upstream master plus our commits (rebased 2026-11-08 onto master + upstream PR #119, the frame-tail FEC rule; the earlier lines are kept as branches `palianytsia/base-v2-pre-2026-11-08` and `palianytsia/base-v2-pre-2026-11-07`, and tags `palianytsia/v0.8`, `palianytsia/v0.8.1`), `palianytsia/base` is the pre-2026-11-03 line; devourer: `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
 
 ## Gates (run all before a commit)
 ```sh
@@ -71,7 +71,7 @@ pairing key.
 - Release desktop: `tools/ffmpeg-static.sh` once, then `PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release -p pal-desktop`
   (HEVC + swscale linked in, no hwaccel; the system-FFmpeg build did not start on QA's machine). v0.2 package:
   `dist/palianytsia-v0.2/` (maburd from mabur `release/v0.2` = `release/v0.1` + DISC width agreement 7c3e2cf9);
-  v0.3 = same maburd, `tools/drone-install.sh` that also does a first install on a stock OpenIPC FPV image
+  v0.3 = same maburd, `tools/drone-install.py` (a shell script until 2026-11-08) that also does a first install on a stock OpenIPC FPV image
   (`--fresh` forces those steps, `--remove` undoes them; an update keeps the drone's mabur.toml), GPU decode in the desktop;
   v0.4 = maburd from mabur `release/v0.4` (24e9d368 = `release/v0.2` + native readout), `sensor_imx415_star6e.ko`
   installed by `drone-install.sh` (patches the drone's `load_sigmastar`, original kept as `.palianytsia`), APKs 0.4.0.
@@ -84,6 +84,7 @@ pairing key.
   v0.8 = maburd from mabur `release/v0.8` (`release/v0.7` + FEC repairs at frame end, `fec.repairs_with_frame`), bundle
   `fec.window = 64`, APKs 0.8.0; GS and drone stay compatible with v0.7.x.
   v0.8.1 = `release/v0.8` + a config without `repairs_with_frame` gets the mode with window raised to 64 (a drone config kept on update), APKs 0.8.1.
+  v0.9 = maburd from mabur `release/v0.9` (upstream master + PR #119, the frame-tail FEC rule, + `palianytsia/base-v2` minus `/sim`), `fec.repairs_with_frame` removed from the drone toml, `drone/install.py` replaces `install.sh`, APKs 0.9.0; GS and drone stay compatible with v0.8.x.
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
   `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally (CI has no captures and never will: no recordings on GitHub), bump both APK `versionName`, head `release/README.md` with `# Palianytsia <tag>`, write the
