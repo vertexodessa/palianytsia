@@ -397,13 +397,16 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let int_dir = app.internal_data_path().ok_or("no files dir")?;
     let hub = Arc::new(Hub::default());
     let act = app.activity_as_ptr() as usize;
+    // Read here: the supervisor must not touch ndk_context, which this
+    // thread swaps below.
+    let vm = ndk_context::android_context().vm() as usize;
     let sup = {
         let hub = hub.clone();
         let log_dir = ext_dir.join("logs");
         let prefs = int_dir.join("hud.json");
         std::thread::Builder::new()
             .name("pal-supervisor".into())
-            .spawn(move || crate::supervisor::run(hub, act, toml, log_dir, prefs))
+            .spawn(move || crate::supervisor::run(hub, act, vm, toml, log_dir, prefs))
             .map_err(|e| e.to_string())?
     };
 

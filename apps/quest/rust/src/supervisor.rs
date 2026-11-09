@@ -77,10 +77,10 @@ fn ids(opens: &[Open]) -> String {
         .join(" + ")
 }
 
-pub fn run(hub: Arc<Hub>, act: usize, toml: String, log_dir: PathBuf, prefs: PathBuf) {
-    let ctx = ndk_context::android_context();
-    // SAFETY: the VM pointer ndk_context holds is the process's JavaVM.
-    let vm = match unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) } {
+pub fn run(hub: Arc<Hub>, act: usize, vm: usize, toml: String, log_dir: PathBuf, prefs: PathBuf) {
+    // SAFETY: `vm` is the process's JavaVM, read on the XR thread before
+    // that thread swaps ndk_context.
+    let vm = match unsafe { jni::JavaVM::from_raw(vm as *mut _) } {
         Ok(v) => v,
         Err(e) => return log::error!("supervisor: VM: {e}"),
     };
