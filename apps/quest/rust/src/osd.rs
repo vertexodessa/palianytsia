@@ -328,7 +328,6 @@ impl Osd {
                 tex,
                 0,
             );
-            self.gl.viewport(0, 0, W as i32, H as i32);
         }
         self.painter.clear([W, H], [0.0, 0.0, 0.0, 0.0]);
         self.painter.paint_and_update_textures(

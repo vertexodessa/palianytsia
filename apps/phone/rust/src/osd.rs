@@ -255,9 +255,6 @@ pub fn run(o: OsdIn) {
             o.shared.quit.store(true, Ordering::Relaxed);
         }
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        unsafe {
-            gl.viewport(0, 0, w as i32, h as i32);
-        }
         painter.clear([w, h], [0.0, 0.0, 0.0, 0.0]);
         painter.paint_and_update_textures(
             [w, h],
