@@ -22,6 +22,20 @@ pub struct Feeds<'a> {
     pub set_res: &'a Receiver<(usize, Result<(), String>)>,
 }
 
+/// What a front end hands the flight overlay for one frame.
+pub struct OverlayIn {
+    /// Where the video is on the surface.
+    pub video: egui::Rect,
+    /// Anchor the chips in the HUD's rect; false: in the video's.
+    pub chips_in_hud: bool,
+    pub top_offset: f32,
+    /// A line above the chips, styled by the front end.
+    pub status: Option<egui::RichText>,
+    pub fps: f64,
+    pub kbps: f64,
+    pub dec: (u64, u64),
+}
+
 pub struct Console {
     pub hist: History,
     pub telem: Telemetry,
@@ -121,6 +135,44 @@ impl Console {
             );
         }
         self.fps.0
+    }
+
+    /// The flight overlay: HUD, status line, stats chips and the key
+    /// banner. True when the operator moved a chip.
+    pub fn overlay(&mut self, ui: &mut egui::Ui, now: f64, o: OverlayIn) -> bool {
+        let r = crate::panel::hud_rect(ui.ctx(), &self.panel, o.video);
+        crate::hud::hud(
+            ui,
+            r,
+            o.video.center(),
+            &self.telem,
+            &self.hist,
+            now,
+            &self.prefs,
+        );
+        let mismatch = self.hist.last().is_some_and(|s| s.key_mismatch);
+        let mut moved = false;
+        if self.prefs.stats || mismatch || o.status.is_some() {
+            let base = if o.chips_in_hud { r } else { o.video };
+            let top = base.shrink(8.0).translate(egui::vec2(0.0, o.top_offset));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
+                if let Some(s) = o.status {
+                    ui.label(s);
+                }
+                if self.prefs.stats {
+                    moved = crate::chips(
+                        ui,
+                        &mut self.prefs.chip_pos,
+                        &self.hist,
+                        o.fps,
+                        o.kbps,
+                        o.dec,
+                    );
+                }
+                crate::key_banner(ui, &self.hist);
+            });
+        }
+        moved
     }
 
     pub fn save_prefs(&self) {

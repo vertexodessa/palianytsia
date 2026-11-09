@@ -600,34 +600,19 @@ impl eframe::App for App {
                     let scale = (area.width() / w).min(area.height() / h);
                     egui::Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale))
                 });
-                let hr = pal_osd::panel::hud_rect(ctx, &self.console.panel, vr);
-                pal_osd::hud::hud(
+                chips_moved = self.console.overlay(
                     ui,
-                    hr,
-                    vr.center(),
-                    &self.console.telem,
-                    &self.console.hist,
                     now,
-                    &self.console.prefs,
+                    pal_osd::console::OverlayIn {
+                        video: vr,
+                        chips_in_hud: false,
+                        top_offset: 40.0,
+                        status: None,
+                        fps: self.fps,
+                        kbps: self.shared.rx_kbps(),
+                        dec: (frames, self.shared.dec_errors.load(Ordering::Relaxed)),
+                    },
                 );
-                let mismatch = self.console.hist.last().is_some_and(|s| s.key_mismatch);
-                if self.console.prefs.stats || mismatch {
-                    let decode = (frames, self.shared.dec_errors.load(Ordering::Relaxed));
-                    let top = vr.shrink(8.0).translate(egui::vec2(0.0, 40.0));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
-                        if self.console.prefs.stats {
-                            chips_moved = pal_osd::chips(
-                                ui,
-                                &mut self.console.prefs.chip_pos,
-                                &self.console.hist,
-                                self.fps,
-                                self.shared.rx_kbps(),
-                                decode,
-                            );
-                        }
-                        pal_osd::key_banner(ui, &self.console.hist);
-                    });
-                }
             });
         if chips_moved {
             self.console.save_prefs();

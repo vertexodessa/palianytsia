@@ -265,32 +265,28 @@ impl Osd {
         let out = self.ctx.run(input, |ctx| {
             pout = console.show_panel(ctx, link_info.clone(), log_info.clone(), channels);
             let c = &mut *console;
-            let (hist, telem, prefs, panel) = (&c.hist, &c.telem, &mut c.prefs, &c.panel);
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
-                    let vr = video_rect();
-                    let r = pal_osd::panel::hud_rect(ctx, panel, vr);
-                    pal_osd::hud::hud(ui, r, vr.center(), telem, hist, now, prefs);
-                    let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
-                    if prefs.stats || mismatch || !status.is_empty() {
-                        let top = r.shrink(8.0).translate(egui::vec2(0.0, 36.0));
-                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
-                            if !status.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(status)
-                                        .size(20.0)
-                                        .color(egui::Color32::from_rgb(240, 190, 60))
-                                        .background_color(egui::Color32::from_black_alpha(160)),
-                                );
-                            }
-                            if prefs.stats {
-                                chips_moved =
-                                    pal_osd::chips(ui, &mut prefs.chip_pos, hist, fps, kbps, dec);
-                            }
-                            pal_osd::key_banner(ui, hist);
-                        });
-                    }
+                    let status = (!status.is_empty()).then(|| {
+                        egui::RichText::new(status)
+                            .size(20.0)
+                            .color(egui::Color32::from_rgb(240, 190, 60))
+                            .background_color(egui::Color32::from_black_alpha(160))
+                    });
+                    chips_moved = c.overlay(
+                        ui,
+                        now,
+                        pal_osd::console::OverlayIn {
+                            video: video_rect(),
+                            chips_in_hud: true,
+                            top_offset: 36.0,
+                            status,
+                            fps,
+                            kbps,
+                            dec,
+                        },
+                    );
                 });
             // The controller ray's end: no controller model is drawn, so
             // this dot is the only sign of where it points.

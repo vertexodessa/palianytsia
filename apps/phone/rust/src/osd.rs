@@ -221,36 +221,25 @@ pub fn run(o: OsdIn) {
                         stats_flip = true;
                     }
                     let c = &mut console;
-                    let hist = &c.hist;
-                    let r = pal_osd::panel::hud_rect(ctx, &c.panel, ui.max_rect());
-                    pal_osd::hud::hud(ui, r, ui.max_rect().center(), &c.telem, hist, now, &c.prefs);
-                    let stats = c.prefs.stats;
-                    let chip_pos = &mut c.prefs.chip_pos;
-                    let mismatch = hist.last().is_some_and(|s| s.key_mismatch);
                     let searching = o.shared.searching.load(Ordering::Relaxed);
-                    if stats || mismatch || searching {
-                        let top = r.shrink(8.0).translate(egui::vec2(0.0, 36.0));
-                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
-                            if searching {
-                                ui.label(
-                                    egui::RichText::new(o.shared.radio_label(o.info.width))
-                                        .size(20.0)
-                                        .color(egui::Color32::YELLOW),
-                                );
-                            }
-                            if stats {
-                                chips_moved = pal_osd::chips(
-                                    ui,
-                                    chip_pos,
-                                    hist,
-                                    fps,
-                                    o.shared.rx_kbps(),
-                                    dec,
-                                );
-                            }
-                            pal_osd::key_banner(ui, hist);
-                        });
-                    }
+                    let status = searching.then(|| {
+                        egui::RichText::new(o.shared.radio_label(o.info.width))
+                            .size(20.0)
+                            .color(egui::Color32::YELLOW)
+                    });
+                    chips_moved = c.overlay(
+                        ui,
+                        now,
+                        pal_osd::console::OverlayIn {
+                            video: ui.max_rect(),
+                            chips_in_hud: true,
+                            top_offset: 36.0,
+                            status,
+                            fps,
+                            kbps: o.shared.rx_kbps(),
+                            dec,
+                        },
+                    );
                 });
         });
         console.settle(&mut pout, Some(&o.cmd_tx));
