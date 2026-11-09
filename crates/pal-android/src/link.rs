@@ -11,7 +11,7 @@ use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::{RustCore, RustOpts};
 use pal_core::Mode;
 use pal_osd::params::Cmd;
-use runtime::{CoreLoop, LiveCfg, Shared, Sink};
+use runtime::{CoreLoop, Shared, Sink};
 
 /// Same rendezvous nonce as the desktop: replays stay comparable.
 const RZ_NONCE: u32 = 0x5041_4c31;
@@ -46,16 +46,14 @@ pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
 
 /// The cards a link runs on.
 pub enum Cards {
-    /// usbfs fds from UsbDeviceConnection.getFileDescriptor(), one per
-    /// card; the first is the link card, the rest receive (and scout) with
-    /// it under the channel core. Opened by the link, closed when it ends.
-    Fds(Vec<i32>),
     /// Cards the caller opened (`open_cards`) and keeps across links: a
     /// restart for new settings skips the card bring-up.
     Open(Arc<runtime::CardSet>),
-    /// Like `Fds`, but the link that finds `slot` empty opens the cards on
-    /// its core thread and leaves them there; the next link on the same
-    /// slot runs on them. The caller's thread never waits for a bring-up.
+    /// usbfs fds from UsbDeviceConnection.getFileDescriptor(), one per
+    /// card; the first is the link card, the rest receive (and scout) with
+    /// it. The link that finds `slot` empty opens the cards on its core
+    /// thread and leaves them there; the next link on the same slot runs on
+    /// them. The caller's thread never waits for a bring-up.
     Kept {
         fds: Vec<i32>,
         slot: Arc<Mutex<Option<Arc<runtime::CardSet>>>>,
@@ -139,6 +137,9 @@ impl Link {
         c: LinkCfg,
         win: ndk::native_window::NativeWindow,
     ) -> Result<(Link, Ports), String> {
+        if let Cards::Kept { fds, .. } = &c.cards {
+            fds.first().ok_or("no card fd")?;
+        }
         let (_, cfg, ch, width) = link_radio(&c.toml, c.pick.clone())?;
         let channels = cfg.radio.channels.clone();
         let dec = MediaCodecDecoder::new(win, 1920, 1080)?;
@@ -212,9 +213,6 @@ impl Link {
             .name("pal-decode".into())
             .spawn(move || decode_loop(dec, au_rx, &sh))
             .map_err(|e| e.to_string())?;
-        if let Cards::Fds(f) | Cards::Kept { fds: f, .. } = &c.cards {
-            f.first().ok_or("no card fd")?;
-        }
         let cards = c.cards;
         let core_t = std::thread::Builder::new()
             .name("pal-core".into())
@@ -236,53 +234,29 @@ impl Link {
                 // channel it last used) and relocates it onto the pin; the
                 // runtime's fixed drive would wait on the pin forever.
                 let attach = runtime::dev_card::rust_channel_core(cfg.clone(), opts, width);
-                let r = match cards {
-                    Cards::Fds(fds) => {
-                        let lc = LiveCfg {
-                            select: devourer_sys::Select::Fd(fds[0]),
-                            ch,
-                            width,
-                            drive: runtime::Drive::Core {
-                                attach,
-                                extra: fds[1..]
-                                    .iter()
-                                    .map(|&f| devourer_sys::Select::Fd(f))
-                                    .collect(),
-                            },
-                        };
-                        runtime::run_live(cl, lc, |chip| {
-                            log::info!("card {chip} on ch {ch} / {width} MHz")
-                        })
-                    }
-                    Cards::Open(set) => {
-                        log::info!("card {} (kept open) on ch {ch} / {width} MHz", set.chips());
-                        runtime::run_core_on(cl, &set, ch, width, attach)
-                    }
+                let set = match cards {
+                    Cards::Open(set) => Ok(set),
                     Cards::Kept { fds, slot } => {
                         let kept = slot.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                        let set = match kept {
-                            Some(set) => {
-                                log::info!(
-                                    "card {} (kept open) on ch {ch} / {width} MHz",
-                                    set.chips()
-                                );
-                                Ok(set)
-                            }
+                        match kept {
+                            Some(set) => Ok(set),
                             None => {
                                 let selects =
                                     fds.iter().map(|&f| devourer_sys::Select::Fd(f)).collect();
                                 runtime::CardSet::open(selects, ch, width).map(|set| {
-                                    log::info!("card {} on ch {ch} / {width} MHz", set.chips());
                                     let set = Arc::new(set);
                                     *slot.lock().unwrap_or_else(|p| p.into_inner()) =
                                         Some(set.clone());
                                     set
                                 })
                             }
-                        };
-                        set.and_then(|set| runtime::run_core_on(cl, &set, ch, width, attach))
+                        }
                     }
                 };
+                let r = set.and_then(|set| {
+                    log::info!("card {} on ch {ch} / {width} MHz", set.chips());
+                    runtime::run_core_on(cl, &set, ch, width, attach)
+                });
                 match r {
                     Ok(()) => log::info!("core loop ended"),
                     Err(e) => set_err(e),
