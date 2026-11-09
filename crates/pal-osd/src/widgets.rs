@@ -208,7 +208,8 @@ const OK: Color32 = Color32::from_rgb(90, 200, 120);
 const WARN: Color32 = Color32::from_rgb(230, 180, 60);
 const BAD: Color32 = Color32::from_rgb(230, 80, 70);
 
-/// Per-second history for the 60 s monitor plots.
+/// The UI stats lines (10 Hz from the core loop) of the last 60 s, for the
+/// monitor plots.
 #[derive(Default)]
 pub struct History {
     rows: VecDeque<(f64, Snapshot)>,
@@ -217,6 +218,12 @@ pub struct History {
 impl History {
     pub const SPAN_S: f64 = 60.0;
     pub fn push(&mut self, t_s: f64, s: Snapshot) {
+        // Only the newest row's views are read; about 600 rows are kept.
+        if let Some((_, prev)) = self.rows.back_mut() {
+            prev.ladder = None;
+            prev.cal = None;
+            prev.chscan = None;
+        }
         self.rows.push_back((t_s, s));
         while self
             .rows
@@ -249,7 +256,8 @@ impl History {
         if new.cards.len() < 2 {
             return Vec::new();
         }
-        let Some((t0, old)) = self.rows.iter().find(|(t, _)| t1 - t <= CARD_WINDOW_S) else {
+        let start = self.rows.partition_point(|(t, _)| t1 - t > CARD_WINDOW_S);
+        let Some((t0, old)) = self.rows.get(start) else {
             return Vec::new();
         };
         card_rates(&old.cards, &new.cards, t1 - t0)
