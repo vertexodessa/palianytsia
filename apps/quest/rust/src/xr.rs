@@ -391,6 +391,202 @@ fn log_extensions(entry: &xr::Entry) {
     log::info!("openxr extensions ({}): {}", names.len(), names.join(" "));
 }
 
+/// Until the activity is resumed, focused and has a window; false when it
+/// is destroyed first.
+fn wait_for_activity(app: &AndroidApp) -> bool {
+    let (mut resumed, mut window, mut focused) = (false, false, false);
+    while !(resumed && window && focused) {
+        let mut destroy = false;
+        drain_input(app);
+        app.poll_events(Some(Duration::from_millis(100)), |e| {
+            if let PollEvent::Main(m) = &e {
+                match m {
+                    MainEvent::Resume { .. } => resumed = true,
+                    MainEvent::InitWindow { .. } => window = true,
+                    MainEvent::Pause => resumed = false,
+                    MainEvent::TerminateWindow { .. } => window = false,
+                    MainEvent::GainedFocus => focused = true,
+                    MainEvent::LostFocus => focused = false,
+                    MainEvent::Destroy => destroy = true,
+                    _ => {}
+                }
+            }
+        });
+        if destroy {
+            return false;
+        }
+    }
+    true
+}
+
+/// The window mode's placement and grab.
+#[derive(Default)]
+struct WindowCtl {
+    /// None until placed: on launch and on every switch into the mode.
+    window: Option<Placement>,
+    grab: Option<Grab>,
+    grip_was: bool,
+}
+
+impl WindowCtl {
+    fn reset(&mut self) {
+        self.window = None;
+        self.grab = None;
+    }
+
+    fn place(&mut self, head: Option<Pose>, scr: &Screen) {
+        if self.window.is_none() {
+            self.window =
+                head.map(|h| Placement::in_front_of(h, scr.window.dist_m, scr.window.width_m));
+        }
+    }
+
+    /// Grip moves the window; returns the stick input it lets through.
+    fn step(
+        &mut self,
+        frame: &crate::input::Frame,
+        head: Option<Pose>,
+        video_at: &Placement,
+        scr: &mut Screen,
+    ) -> (f32, f32) {
+        if let (Some(w), Some(h)) = (self.window.as_mut(), head) {
+            if frame.grip && !self.grip_was {
+                self.grab = frame.aim.and_then(|r| Grab::start(&r, w));
+            }
+            if let (Some(g), Some(r)) = (&self.grab, &frame.aim) {
+                w.pose = g.moved(r, h.pos);
+            }
+            if !frame.grip && self.grab.take().is_some() {
+                scr.window.dist_m = placement::distance(w.pose.pos, h.pos);
+                scr.dirty = true;
+            }
+        }
+        // Only the window under the ray listens: a thumb resting on
+        // a stick must not change it unasked in flight.
+        let aimed = frame.aim.is_some_and(|r| video_at.hit(&r).is_some());
+        if !aimed || self.grab.is_some() {
+            (0.0, 0.0)
+        } else {
+            (frame.size, frame.dist)
+        }
+    }
+
+    /// After the sticks moved the screen's extent.
+    fn follow(&mut self, before: f32, scr: &Screen) {
+        if let Some(w) = self.window.as_mut() {
+            w.width_m = scr.window.width_m;
+            w.pushed(before - scr.window.dist_m);
+        }
+    }
+}
+
+/// One frame's layers: the structs and their chains must stay alive
+/// across xrEndFrame, so one function builds them and makes the call.
+struct Submit<'a> {
+    fp: &'a xr::raw::Instance,
+    session: sys::Session,
+    exts: &'a xr::ExtensionSet,
+    space: &'a xr::Space,
+    local: &'a xr::Space,
+    video: Option<sys::Swapchain>,
+    osd: Option<&'a Osd>,
+    background: Option<&'a Background>,
+    view: QuestView,
+    window: Option<Placement>,
+    scr: &'a Screen,
+}
+
+impl Submit<'_> {
+    fn end_frame(&self, fs: &sys::FrameState) {
+        // The operator's filter for the video quad (OSD tab), chained
+        // after the flip.
+        use pal_osd::prefs::VideoFilter;
+        use sys::CompositionLayerSettingsFlagsFB as LF;
+        let filter = self.osd.map_or(VideoFilter::Off, |o| o.video_filter());
+        let settings = sys::CompositionLayerSettingsFB {
+            ty: sys::CompositionLayerSettingsFB::TYPE,
+            next: ptr::null(),
+            layer_flags: match filter {
+                VideoFilter::Off => LF::EMPTY,
+                VideoFilter::Sharpen => LF::QUALITY_SHARPENING,
+                VideoFilter::Supersample => LF::QUALITY_SUPER_SAMPLING,
+            },
+        };
+        let settings_ptr = if self.exts.fb_composition_layer_settings && filter != VideoFilter::Off
+        {
+            &settings as *const _ as *const std::ffi::c_void
+        } else {
+            ptr::null()
+        };
+        // A decoder Surface stores rows top-down; OpenXR samples bottom-up.
+        let flip = sys::CompositionLayerImageLayoutFB {
+            ty: sys::CompositionLayerImageLayoutFB::TYPE,
+            next: settings_ptr as *mut _,
+            flags: sys::CompositionLayerImageLayoutFlagsFB::VERTICAL_FLIP,
+        };
+        let flip_ptr = if self.exts.fb_composition_layer_image_layout {
+            &flip as *const _ as *const std::ffi::c_void
+        } else {
+            settings_ptr
+        };
+        // After this frame's grab and sticks.
+        let (in_local, video_at) = video_placement(self.view, self.window, self.scr);
+        let layer_space = if in_local {
+            self.local.as_raw()
+        } else {
+            self.space.as_raw()
+        };
+        let mut quads = Vec::with_capacity(2);
+        if let Some(sc) = self.video {
+            quads.push(quad(
+                &video_at,
+                layer_space,
+                sc,
+                VW,
+                VH,
+                sys::CompositionLayerFlags::EMPTY,
+                flip_ptr,
+            ));
+        }
+        if let Some(o) = self.osd.filter(|o| o.ready) {
+            quads.push(quad(
+                &osd_placement(&video_at, self.view, o.panel_open(), self.scr),
+                layer_space,
+                o.sc.as_raw(),
+                crate::osd::W,
+                crate::osd::H,
+                sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA,
+                ptr::null(),
+            ));
+        }
+        let room = self.background.map(Background::layer);
+        // The room first: layers are composited in order.
+        let layers: Vec<*const sys::CompositionLayerBaseHeader> = room
+            .iter()
+            .map(|r| r as *const _ as *const sys::CompositionLayerBaseHeader)
+            .chain(
+                quads
+                    .iter()
+                    .map(|q| q as *const _ as *const sys::CompositionLayerBaseHeader),
+            )
+            .collect();
+        let render = fs.should_render != sys::FALSE;
+        let ei = sys::FrameEndInfo {
+            ty: sys::FrameEndInfo::TYPE,
+            next: ptr::null(),
+            display_time: fs.predicted_display_time,
+            environment_blend_mode: sys::EnvironmentBlendMode::OPAQUE,
+            layer_count: if render { layers.len() as u32 } else { 0 },
+            layers: layers.as_ptr(),
+        };
+        // SAFETY: the layers and their chained structs outlive the call.
+        let r = unsafe { (self.fp.end_frame)(self.session, &ei) };
+        if r != sys::Result::SUCCESS {
+            log::warn!("xr end_frame {r:?}");
+        }
+    }
+}
+
 pub fn run(app: &AndroidApp) -> Result<(), String> {
     let toml = asset(app, "gs.toml")?;
     let ext_dir = app.external_data_path().ok_or("no external files dir")?;
@@ -460,29 +656,10 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         .map_err(|e| format!("gles requirements: {e}"))?;
     // xrCreateSession checks the activity is resumed, focused and has a
     // window; created earlier, the session never leaves IDLE.
-    let (mut resumed, mut window, mut focused) = (false, false, false);
-    while !(resumed && window && focused) {
-        let mut destroy = false;
-        drain_input(app);
-        app.poll_events(Some(Duration::from_millis(100)), |e| {
-            if let PollEvent::Main(m) = &e {
-                match m {
-                    MainEvent::Resume { .. } => resumed = true,
-                    MainEvent::InitWindow { .. } => window = true,
-                    MainEvent::Pause => resumed = false,
-                    MainEvent::TerminateWindow { .. } => window = false,
-                    MainEvent::GainedFocus => focused = true,
-                    MainEvent::LostFocus => focused = false,
-                    MainEvent::Destroy => destroy = true,
-                    _ => {}
-                }
-            }
-        });
-        if destroy {
-            hub.quit.store(true, Ordering::Relaxed);
-            let _ = sup.join();
-            return Ok(());
-        }
+    if !wait_for_activity(app) {
+        hub.quit.store(true, Ordering::Relaxed);
+        let _ = sup.join();
+        return Ok(());
     }
     let egl = make_egl()?;
     let (session, _waiter, _stream) = unsafe {
@@ -532,10 +709,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let mut scr = Screen::load(int_dir.join("screen.json"));
     let mut view = QuestView::Goggle;
     let mut background: Option<Background> = None;
-    // None until placed: on launch and on every switch into the window mode.
-    let mut window: Option<Placement> = None;
-    let mut grab: Option<Grab> = None;
-    let mut grip_was = false;
+    let mut win = WindowCtl::default();
     let mut t_frame = Instant::now();
     let mut video: Option<sys::Swapchain> = None;
     let mut osd: Option<Osd> = None;
@@ -624,8 +798,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         let wanted = osd.as_ref().map_or(view, |o| o.view_mode());
         if wanted != view {
             view = wanted;
-            window = None;
-            grab = None;
+            win.reset();
             background = None;
             if view == QuestView::Window && exts.fb_passthrough {
                 match Background::new(&session) {
@@ -642,11 +815,11 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         let head = (view == QuestView::Window)
             .then(|| locate(&space, &local, t))
             .flatten();
-        if view == QuestView::Window && window.is_none() {
-            window = head.map(|h| Placement::in_front_of(h, scr.window.dist_m, scr.window.width_m));
+        if view == QuestView::Window {
+            win.place(head, &scr);
         }
         let menu = osd.as_ref().is_some_and(Osd::panel_open);
-        let (in_local, video_at) = video_placement(view, window, &scr);
+        let (in_local, video_at) = video_placement(view, win.window, &scr);
         let xr_space = if in_local { &local } else { &space };
         // Input at the predicted display time, so the ray matches the
         // frame it is drawn into.
@@ -661,35 +834,16 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         });
         let dt = t_frame.elapsed().as_secs_f32().min(0.1);
         t_frame = Instant::now();
-        let (mut size, mut dist) = (frame.size, frame.dist);
-        if view == QuestView::Window {
-            if let (Some(w), Some(h)) = (window.as_mut(), head) {
-                if frame.grip && !grip_was {
-                    grab = frame.aim.and_then(|r| Grab::start(&r, w));
-                }
-                if let (Some(g), Some(r)) = (&grab, &frame.aim) {
-                    w.pose = g.moved(r, h.pos);
-                }
-                if !frame.grip && grab.take().is_some() {
-                    scr.window.dist_m = placement::distance(w.pose.pos, h.pos);
-                    scr.dirty = true;
-                }
-            }
-            // Only the window under the ray listens: a thumb resting on
-            // a stick must not change it unasked in flight.
-            let aimed = frame.aim.is_some_and(|r| video_at.hit(&r).is_some());
-            if !aimed || grab.is_some() {
-                (size, dist) = (0.0, 0.0);
-            }
-        }
-        grip_was = frame.grip;
+        let (size, dist) = if view == QuestView::Window {
+            win.step(&frame, head, &video_at, &mut scr)
+        } else {
+            (frame.size, frame.dist)
+        };
+        win.grip_was = frame.grip;
         let before = scr.extent(view).dist_m;
         scr.steer(view, size, dist, dt);
         if view == QuestView::Window {
-            if let Some(w) = window.as_mut() {
-                w.width_m = scr.window.width_m;
-                w.pushed(before - scr.window.dist_m);
-            }
+            win.follow(before, &scr);
         }
         if let Some(o) = osd.as_mut() {
             o.tick(&hub, frame);
@@ -698,91 +852,20 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         unsafe {
             (fp.begin_frame)(session.as_raw(), &bi);
         }
-        // The operator's filter for the video quad (OSD tab), chained
-        // after the flip.
-        use pal_osd::prefs::VideoFilter;
-        use sys::CompositionLayerSettingsFlagsFB as LF;
-        let filter = osd.as_ref().map_or(VideoFilter::Off, |o| o.video_filter());
-        let settings = sys::CompositionLayerSettingsFB {
-            ty: sys::CompositionLayerSettingsFB::TYPE,
-            next: ptr::null(),
-            layer_flags: match filter {
-                VideoFilter::Off => LF::EMPTY,
-                VideoFilter::Sharpen => LF::QUALITY_SHARPENING,
-                VideoFilter::Supersample => LF::QUALITY_SUPER_SAMPLING,
-            },
-        };
-        let settings_ptr = if exts.fb_composition_layer_settings && filter != VideoFilter::Off {
-            &settings as *const _ as *const std::ffi::c_void
-        } else {
-            ptr::null()
-        };
-        // A decoder Surface stores rows top-down; OpenXR samples bottom-up.
-        let flip = sys::CompositionLayerImageLayoutFB {
-            ty: sys::CompositionLayerImageLayoutFB::TYPE,
-            next: settings_ptr as *mut _,
-            flags: sys::CompositionLayerImageLayoutFlagsFB::VERTICAL_FLIP,
-        };
-        let flip_ptr = if exts.fb_composition_layer_image_layout {
-            &flip as *const _ as *const std::ffi::c_void
-        } else {
-            settings_ptr
-        };
-        // After this frame's grab and sticks.
-        let (in_local, video_at) = video_placement(view, window, &scr);
-        let layer_space = if in_local {
-            local.as_raw()
-        } else {
-            space.as_raw()
-        };
-        let mut quads = Vec::with_capacity(2);
-        if let Some(sc) = video {
-            quads.push(quad(
-                &video_at,
-                layer_space,
-                sc,
-                VW,
-                VH,
-                sys::CompositionLayerFlags::EMPTY,
-                flip_ptr,
-            ));
+        Submit {
+            fp,
+            session: session.as_raw(),
+            exts: &exts,
+            space: &space,
+            local: &local,
+            video,
+            osd: osd.as_ref(),
+            background: background.as_ref(),
+            view,
+            window: win.window,
+            scr: &scr,
         }
-        if let Some(o) = osd.as_ref().filter(|o| o.ready) {
-            quads.push(quad(
-                &osd_placement(&video_at, view, o.panel_open(), &scr),
-                layer_space,
-                o.sc.as_raw(),
-                crate::osd::W,
-                crate::osd::H,
-                sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA,
-                ptr::null(),
-            ));
-        }
-        let room = background.as_ref().map(Background::layer);
-        // The room first: layers are composited in order.
-        let layers: Vec<*const sys::CompositionLayerBaseHeader> = room
-            .iter()
-            .map(|r| r as *const _ as *const sys::CompositionLayerBaseHeader)
-            .chain(
-                quads
-                    .iter()
-                    .map(|q| q as *const _ as *const sys::CompositionLayerBaseHeader),
-            )
-            .collect();
-        let render = fs.should_render != sys::FALSE;
-        let ei = sys::FrameEndInfo {
-            ty: sys::FrameEndInfo::TYPE,
-            next: ptr::null(),
-            display_time: fs.predicted_display_time,
-            environment_blend_mode: sys::EnvironmentBlendMode::OPAQUE,
-            layer_count: if render { layers.len() as u32 } else { 0 },
-            layers: layers.as_ptr(),
-        };
-        // SAFETY: the layers and their chained structs outlive the call.
-        let r = unsafe { (fp.end_frame)(session.as_raw(), &ei) };
-        if r != sys::Result::SUCCESS {
-            log::warn!("xr end_frame {r:?}");
-        }
+        .end_frame(&fs);
         frames += 1;
         if t_log.elapsed() >= Duration::from_secs(10) {
             log::info!(
