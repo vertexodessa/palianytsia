@@ -69,16 +69,12 @@ impl Phone {
         )?;
         let (touch_tx, touch_rx) = mpsc::channel();
         let osd_in = crate::osd::OsdIn {
-            mav_rx: ports.mav_rx,
+            ports,
             touch_rx,
-            params_rx: ports.params_rx,
-            cmd_tx: ports.cmd_tx,
-            set_res_rx: ports.set_res_rx,
             prefs_path: a.prefs_path.clone(),
             info: link.info.clone(),
             win: a.osd_win.clone(),
             density: a.density,
-            stats_rx: ports.stats_rx,
             shared: link.shared.clone(),
             relink: self.relink.clone(),
             reopen: self.reopen.clone(),

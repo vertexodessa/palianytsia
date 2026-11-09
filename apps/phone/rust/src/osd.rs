@@ -20,16 +20,10 @@ pub struct OsdIn {
     pub win: NativeWindow,
     /// Android DisplayMetrics.density: egui points to pixels.
     pub density: f32,
-    pub stats_rx: Receiver<String>,
+    pub ports: pal_android::Ports,
     pub shared: Arc<Shared>,
-    /// The drone's MAVLink packets (CoreIo::on_mav) for the flight HUD.
-    pub mav_rx: Receiver<Vec<u8>>,
     /// Touches from the Activity, in Surface pixels.
     pub touch_rx: Receiver<Touch>,
-    /// F18 drone settings: table snapshots in, commands out, answers in.
-    pub params_rx: Receiver<String>,
-    pub cmd_tx: Sender<Cmd>,
-    pub set_res_rx: Receiver<(usize, Result<(), String>)>,
     /// Width, channel set and flight log place, for the Link and Logs tabs.
     pub info: pal_android::LinkInfo,
     /// HUD prefs file in the app's files dir.
@@ -161,7 +155,7 @@ pub fn run(o: OsdIn) {
         // Stats lines pace the redraw at 10 Hz; with the panel open, 30 Hz
         // keeps scrolling and steppers responsive.
         let wait = if console.panel.open { 33 } else { 100 };
-        match o.stats_rx.recv_timeout(Duration::from_millis(wait)) {
+        match o.ports.stats_rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(s) => {
                 console.on_stats(t0.elapsed().as_secs_f64(), &s);
             }
@@ -172,9 +166,9 @@ pub fn run(o: OsdIn) {
         console.drain(
             now,
             Feeds {
-                mav: &o.mav_rx,
-                params: &o.params_rx,
-                set_res: &o.set_res_rx,
+                mav: &o.ports.mav_rx,
+                params: &o.ports.params_rx,
+                set_res: &o.ports.set_res_rx,
             },
         );
         let frames = o.shared.frames.load(Ordering::Relaxed);
@@ -240,7 +234,7 @@ pub fn run(o: OsdIn) {
                     );
                 });
         });
-        console.settle(&mut pout, Some(&o.cmd_tx));
+        console.settle(&mut pout, Some(&o.ports.cmd_tx));
         if chips_moved && !pout.prefs_changed {
             console.save_prefs();
         }
