@@ -200,6 +200,7 @@ impl GlVideo {
                 let fr = frame.lock().unwrap_or_else(|p| p.into_inner());
                 let Some(f) = fr.as_ref() else { return };
                 let p = &f.p;
+                let (bt709, full_range, nv12) = (p.bt709, p.full_range, p.nv12);
                 unsafe {
                     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
                     if g.loaded.0 != f.seq {
@@ -215,14 +216,16 @@ impl GlVideo {
                         g.loaded = (f.seq, p.w, p.h, p.nv12);
                         on_upload(f.t_dec);
                     }
+                    // The decode thread publishes through this lock.
+                    drop(fr);
                     let vp = info.viewport_in_pixels();
                     gl.viewport(vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px);
                     gl.disable(glow::BLEND);
                     gl.use_program(Some(g.prog));
-                    let (m, off) = matrix(p.bt709, p.full_range);
+                    let (m, off) = matrix(bt709, full_range);
                     gl.uniform_matrix_3_f32_slice(g.u_m.as_ref(), false, &m);
                     gl.uniform_3_f32_slice(g.u_off.as_ref(), &off);
-                    gl.uniform_1_i32(g.u_nv12.as_ref(), i32::from(p.nv12));
+                    gl.uniform_1_i32(g.u_nv12.as_ref(), i32::from(nv12));
                     for (i, t) in g.tex.iter().enumerate() {
                         gl.active_texture(glow::TEXTURE0 + i as u32);
                         gl.bind_texture(glow::TEXTURE_2D, Some(*t));
