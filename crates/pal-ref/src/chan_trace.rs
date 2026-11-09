@@ -3,9 +3,10 @@
 //! Every card call goes back into the given `LinkCard`; every sink record
 //! comes back as one text line (`take_lines`).
 
+use crate::ffi::{self, err_text, guard};
 use pal_core::chan::core::{MsClock, Sleeper, UsClock};
 use pal_core::chan::radio::LinkCard;
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::{Arc, Mutex};
 
 #[repr(C)]
@@ -138,11 +139,6 @@ extern "C" {
     fn pal_ctrace_snapshot(t: *mut Raw, tx: c_int);
 }
 
-fn guard<R>(f: impl FnOnce() -> R) -> R {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
-        .unwrap_or_else(|_| std::process::abort())
-}
-
 fn card(u: U) -> &'static dyn LinkCard {
     // SAFETY: `u` points at an Arc<dyn LinkCard> in CppTrace::cards (a Vec
     // never grown after construction, so its elements do not move),
@@ -215,13 +211,8 @@ extern "C" fn c_foreign(u: U) -> u64 {
 }
 extern "C" fn c_send(u: U, b: *const u8, n: usize) -> c_int {
     guard(|| {
-        let s = if n == 0 {
-            &[][..]
-        } else {
-            // SAFETY: n bytes at b.
-            unsafe { std::slice::from_raw_parts(b, n) }
-        };
-        card(u).send_control(s) as c_int
+        // SAFETY: n bytes at b.
+        card(u).send_control(unsafe { ffi::slice(b, n) }) as c_int
     })
 }
 extern "C" fn c_tx_frames(u: U) -> u64 {
@@ -269,7 +260,7 @@ extern "C" fn e_sleep(u: U, ms: c_int) {
 extern "C" fn e_line(u: U, s: *const c_char, n: usize) {
     guard(|| {
         // SAFETY: n bytes at s.
-        let b = unsafe { std::slice::from_raw_parts(s as *const u8, n) };
+        let b = unsafe { ffi::slice(s as *const u8, n) };
         env(u)
             .lines
             .lock()
@@ -367,10 +358,7 @@ impl CppTrace {
             )
         };
         if raw.is_null() {
-            // SAFETY: NUL-terminated by snprintf.
-            return Err(unsafe { CStr::from_ptr(err.as_ptr()) }
-                .to_string_lossy()
-                .into_owned());
+            return Err(err_text(&err));
         }
         Ok(Self {
             raw,

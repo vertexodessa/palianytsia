@@ -6,12 +6,14 @@
 //! files) as the M0 replay input, until live captures exist.
 
 pub mod chan_trace;
+mod ffi;
 #[cfg(feature = "live")]
 pub mod live;
 
+use ffi::{err_text, guard, read_json};
 use pal_core::CoreOpts;
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CString};
 use std::path::Path;
 
 #[repr(C)]
@@ -39,17 +41,11 @@ type CardSendCb = extern "C" fn(*mut c_void, *const u8, usize) -> c_int;
 pub type CardSend = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 extern "C" fn card_send_tramp(user: *mut c_void, data: *const u8, len: usize) -> c_int {
-    let r = std::panic::catch_unwind(|| {
-        // SAFETY: `user` is the boxed CardSend owned by the RefCard.
+    guard(|| {
+        // SAFETY: `user` is the boxed CardSend owned by the RefCard; len bytes at data.
         let f = unsafe { &*(user as *const CardSend) };
-        let bytes = if len == 0 {
-            &[][..]
-        } else {
-            unsafe { std::slice::from_raw_parts(data, len) }
-        };
-        c_int::from(f(bytes))
-    });
-    r.unwrap_or_else(|_| std::process::abort())
+        c_int::from(f(unsafe { ffi::slice(data, len) }))
+    })
 }
 
 #[repr(C)]
@@ -162,18 +158,14 @@ extern "C" fn on_au_tramp(
     data: *const u8,
     len: usize,
 ) {
-    let r = std::panic::catch_unwind(|| {
+    guard(|| {
         // SAFETY: `user` is the boxed Ctx owned by the RefCore making this
-        // call; `io` points at the caller's &mut dyn CoreIo for this call.
+        // call; `io` points at the caller's &mut dyn CoreIo for this call;
+        // len bytes at data.
         let ctx = unsafe { &mut *(user as *mut Ctx) };
         let io = unsafe { &mut *ctx.io.expect("C++ called back outside on_rx/tick") };
-        let bytes = if len == 0 {
-            &[][..]
-        } else {
-            unsafe { std::slice::from_raw_parts(data, len) }
-        };
         io.on_au(Au {
-            data: bytes.to_vec(),
+            data: unsafe { ffi::slice(data, len) }.to_vec(),
             pts_us,
             sid,
             flags,
@@ -182,33 +174,16 @@ extern "C" fn on_au_tramp(
             vcl_nal,
             salvaged: salvaged != 0,
         });
-    });
-    if r.is_err() {
-        std::process::abort(); // never unwind into C++
-    }
+    })
 }
 
 extern "C" fn send_tramp(user: *mut c_void, data: *const u8, len: usize) {
-    let r = std::panic::catch_unwind(|| {
+    guard(|| {
         // SAFETY: as in on_au_tramp.
         let ctx = unsafe { &mut *(user as *mut Ctx) };
         let io = unsafe { &mut *ctx.io.expect("C++ called back outside on_rx/tick") };
-        let bytes = if len == 0 {
-            &[][..]
-        } else {
-            unsafe { std::slice::from_raw_parts(data, len) }
-        };
-        io.send(bytes);
-    });
-    if r.is_err() {
-        std::process::abort();
-    }
-}
-
-fn err_text(err: &[c_char]) -> String {
-    unsafe { CStr::from_ptr(err.as_ptr()) }
-        .to_string_lossy()
-        .into_owned()
+        io.send(unsafe { ffi::slice(data, len) });
+    })
 }
 
 /// A card devourer opened, lent to the C++ core as its LinkCard: with it
@@ -285,64 +260,56 @@ pub struct RefCore {
 }
 
 impl RefCore {
-    pub fn new(config: &Path, opts: CoreOpts) -> Result<Self, String> {
+    /// What both constructors share around the C++ call. `c_new` gets the
+    /// config path, the callback user pointer and the error buffer + capacity.
+    fn open(
+        config: &Path,
+        card: Option<std::sync::Arc<RefCard>>,
+        c_new: impl FnOnce(*const c_char, *mut c_void, *mut c_char, usize) -> *mut PalRefRaw,
+    ) -> Result<Self, String> {
         let path =
             CString::new(config.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
         let mut ctx = Box::new(Ctx { io: None });
         let mut err = vec![0 as c_char; 512];
-        // SAFETY: all pointers are valid for the call; ctx outlives raw (Drop order below).
-        let raw = unsafe {
-            pal_ref_new(
-                path.as_ptr(),
-                if opts.mode == Mode::Gs { 0 } else { 1 },
-                c_int::from(opts.adaptive_gap),
-                opts.rz_nonce,
-                opts.channel,
-                &mut *ctx as *mut Ctx as *mut c_void,
-                on_au_tramp,
-                send_tramp,
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        };
-        if raw.is_null() {
-            let msg = unsafe { CStr::from_ptr(err.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
-            return Err(msg);
-        }
-        Ok(Self {
-            raw,
-            ctx,
-            _card: None,
-        })
-    }
-
-    /// Gs mode with `card` as the roster: mabur's whole GS, channel core
-    /// included. Stamp on_rx and tick with [`now_us`].
-    pub fn new_with_card(config: &Path, card: std::sync::Arc<RefCard>) -> Result<Self, String> {
-        let path =
-            CString::new(config.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-        let mut ctx = Box::new(Ctx { io: None });
-        let mut err = vec![0 as c_char; 512];
-        // SAFETY: as in new; the card outlives raw (field order + Drop).
-        let raw = unsafe {
-            pal_ref_new_with_card(
-                path.as_ptr(),
-                card.raw,
-                &mut *ctx as *mut Ctx as *mut c_void,
-                on_au_tramp,
-                err.as_mut_ptr(),
-                err.len(),
-            )
-        };
+        let user = &mut *ctx as *mut Ctx as *mut c_void;
+        let raw = c_new(path.as_ptr(), user, err.as_mut_ptr(), err.len());
         if raw.is_null() {
             return Err(err_text(&err));
         }
         Ok(Self {
             raw,
             ctx,
-            _card: Some(card),
+            _card: card,
+        })
+    }
+
+    pub fn new(config: &Path, opts: CoreOpts) -> Result<Self, String> {
+        Self::open(config, None, |path, user, err, cap| {
+            // SAFETY: all pointers are valid for the call; ctx outlives raw (Drop order below).
+            unsafe {
+                pal_ref_new(
+                    path,
+                    if opts.mode == Mode::Gs { 0 } else { 1 },
+                    c_int::from(opts.adaptive_gap),
+                    opts.rz_nonce,
+                    opts.channel,
+                    user,
+                    on_au_tramp,
+                    send_tramp,
+                    err,
+                    cap,
+                )
+            }
+        })
+    }
+
+    /// Gs mode with `card` as the roster: mabur's whole GS, channel core
+    /// included. Stamp on_rx and tick with [`now_us`].
+    pub fn new_with_card(config: &Path, card: std::sync::Arc<RefCard>) -> Result<Self, String> {
+        let card_raw = card.raw;
+        Self::open(config, Some(card), |path, user, err, cap| {
+            // SAFETY: as in new; the card outlives raw (field order + Drop).
+            unsafe { pal_ref_new_with_card(path, card_raw, user, on_au_tramp, err, cap) }
         })
     }
 
@@ -411,12 +378,7 @@ impl GsCore for RefCore {
     }
 
     fn params_json(&self, now_us: u64) -> String {
-        let n = unsafe { pal_ref_params_json(self.raw, now_us, std::ptr::null_mut(), 0) };
-        let mut buf = vec![0 as c_char; n + 1];
-        unsafe { pal_ref_params_json(self.raw, now_us, buf.as_mut_ptr(), buf.len()) };
-        unsafe { CStr::from_ptr(buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
+        read_json(|buf, cap| unsafe { pal_ref_params_json(self.raw, now_us, buf, cap) })
     }
 
     fn param_set(&mut self, row: usize, text: &str) -> Result<(), String> {
@@ -427,9 +389,7 @@ impl GsCore for RefCore {
         if ok == 1 {
             Ok(())
         } else {
-            Err(unsafe { CStr::from_ptr(why.as_ptr()) }
-                .to_string_lossy()
-                .into_owned())
+            Err(err_text(&why))
         }
     }
 
@@ -444,12 +404,7 @@ impl GsCore for RefCore {
     }
 
     fn stats_json(&self) -> String {
-        let n = unsafe { pal_ref_stats_json(self.raw, std::ptr::null_mut(), 0) };
-        let mut buf = vec![0 as c_char; n + 1];
-        unsafe { pal_ref_stats_json(self.raw, buf.as_mut_ptr(), buf.len()) };
-        unsafe { CStr::from_ptr(buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
+        read_json(|buf, cap| unsafe { pal_ref_stats_json(self.raw, buf, cap) })
     }
 }
 
@@ -493,11 +448,8 @@ impl Iterator for FrameFile {
             return None;
         }
         let b = unsafe { b.assume_init() };
-        let body = if b.body_len == 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(b.body, b.body_len) }.to_vec()
-        };
+        // SAFETY: body_len bytes at body, until the next pal_ffs_next.
+        let body = unsafe { ffi::slice(b.body, b.body_len) }.to_vec();
         Some(RxBody {
             card_id: b.card_id,
             mono_us: b.mono_us,
