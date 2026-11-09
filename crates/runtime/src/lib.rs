@@ -568,10 +568,6 @@ fn result_text(r: &Result<(), String>, ok: &str) -> String {
     }
 }
 
-pub fn mono_us(t0: Instant) -> u64 {
-    1_000_000 + t0.elapsed().as_micros() as u64
-}
-
 /// Builds a core for the channel the drone was found on.
 pub type Remake = Box<dyn FnMut(u8) -> Result<Box<dyn GsCore>, String>>;
 
@@ -635,7 +631,7 @@ pub struct Search {
 
 type TapClock = (Vec<Arc<dyn RxTap>>, fn() -> u64);
 
-fn mono_default() -> u64 {
+pub fn mono_default() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     1_000_000 + START.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
@@ -743,7 +739,7 @@ pub fn run_live(cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<
 /// Says what a received frame's body is stamped with: Some((rx_channel,
 /// mono_us)) forwards it to the core, None drops it. Called on the card's
 /// RX thread with the card's roster index.
-type Stamp =
+pub type Stamp =
     Arc<dyn Fn(u8, &devourer_sys::RxFrame, &dot11::Verdict) -> Option<(u8, u64)> + Send + Sync>;
 
 /// The core's view of one received frame: `f` as the card delivered it,
@@ -846,6 +842,10 @@ impl CardSet {
     }
 
     /// "8822e + 8812a": the chips that opened, in roster order.
+    pub fn cards(&self) -> &[Arc<devourer_sys::Card>] {
+        &self.cards
+    }
+
     pub fn chips(&self) -> &str {
         &self.chips
     }
@@ -853,7 +853,7 @@ impl CardSet {
     /// Starts a session: its skipped-card events, the cards on (`ch`,
     /// `width`) when an earlier session left them elsewhere, and the RX
     /// threads delivering to `tx` as `stamp` says until the guard drops.
-    fn begin(
+    pub fn begin(
         &self,
         ch: u8,
         width: u8,
@@ -882,7 +882,7 @@ impl CardSet {
 
 /// A session's hold on the cards' RX: dropped, frames drop until the next
 /// session begins.
-struct SessionRoute<'a>(&'a CardSet);
+pub struct SessionRoute<'a>(&'a CardSet);
 
 impl Drop for SessionRoute<'_> {
     fn drop(&mut self) {
@@ -923,6 +923,7 @@ pub fn run_core_on(
         &mut cl,
         &rx,
         clock,
+        &shared,
         |_, _| {
             if let Some(t) = &link {
                 shared.channel.store(t.channel(), Ordering::Relaxed);
@@ -1000,6 +1001,7 @@ fn run_runtime_owned(
         &mut cl,
         &rx,
         clock,
+        &shared,
         |_, _| {},
         |cl, now| {
             let h = hits.load(Ordering::Relaxed);
@@ -1025,40 +1027,57 @@ fn run_runtime_owned(
     r
 }
 
-/// Bodies into the core and its ticks on `clock` until `shared.quit`.
+/// What `pump` drives: the bodies off the queue and the 2 ms ticks.
+pub trait BodyLoop {
+    fn rx(&mut self, b: &RxBody);
+    fn tick(&mut self, now: u64);
+}
+
+impl BodyLoop for CoreLoop {
+    fn rx(&mut self, b: &RxBody) {
+        CoreLoop::rx(self, b);
+    }
+    fn tick(&mut self, now: u64) {
+        CoreLoop::tick(self, now);
+    }
+}
+
+/// Bodies into `l` and its ticks on `clock` until `shared.quit`.
 /// `on_tick` runs right after each tick; `after` once per wake past the
 /// quit check, and ends the loop by returning false.
-fn pump(
-    cl: &mut CoreLoop,
+pub fn pump<L: BodyLoop>(
+    l: &mut L,
     rx: &Receiver<RxBody>,
     clock: fn() -> u64,
-    mut on_tick: impl FnMut(&mut CoreLoop, u64),
-    mut after: impl FnMut(&mut CoreLoop, u64) -> Result<bool, String>,
+    shared: &Shared,
+    mut on_tick: impl FnMut(&mut L, u64),
+    mut after: impl FnMut(&mut L, u64) -> Result<bool, String>,
 ) -> Result<(), String> {
     let mut next_tick = clock();
     loop {
         let wait = Duration::from_micros(next_tick.saturating_sub(clock()));
         match rx.recv_timeout(wait) {
             Ok(b) => {
-                let l = &cl.sink.shared.lat;
-                l.rx_recv.fetch_add(1, Ordering::Relaxed);
-                l.body_lag_max
+                shared.lat.rx_recv.fetch_add(1, Ordering::Relaxed);
+                shared
+                    .lat
+                    .body_lag_max
                     .fetch_max(clock().saturating_sub(b.mono_us), Ordering::Relaxed);
-                cl.rx(&b)
+                l.rx(&b)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err("RX thread ended".into()),
         }
         let now = clock();
         if now >= next_tick {
-            cl.tick(now);
+            l.tick(now);
             next_tick = now + TICK_US;
-            on_tick(cl, now);
+            on_tick(l, now);
         }
-        if cl.sink.shared.quit.load(Ordering::Relaxed) {
+        if shared.quit.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if !after(cl, now)? {
+        if !after(l, now)? {
             return Ok(());
         }
     }

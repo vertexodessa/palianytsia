@@ -31,7 +31,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const TICK_US: u64 = 2000;
 const RZ_NONCE: u32 = 0x5041_4c31; // "PAL1"
 
 #[derive(Default)]
@@ -320,183 +319,182 @@ fn core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
     )
 }
 
-/// Monotonic microseconds, the one clock for RX stamps and ticks.
-fn mono_us(t0: Instant) -> u64 {
-    // Offset keeps 0 out of the range: the core treats 0 as "never".
-    1_000_000 + t0.elapsed().as_micros() as u64
+/// `pal live`'s side of the runtime's pump: capture and flight log around
+/// the core, and the per-second figures.
+struct Live {
+    core: Box<dyn GsCore>,
+    sink: Sink,
+    cap: Option<capture::Writer<BufWriter<std::fs::File>>>,
+    t0: Instant,
+    sets: std::iter::Peekable<std::vec::IntoIter<(f64, usize, String)>>,
+    print_params: bool,
+    last_params: String,
+    last_stats: u64,
+    bodies: u64,
+    rssi_sum: f64,
+    rssi_n: u64,
+    mcs: u8,
 }
 
-/// One received body: capture, flight log, the count, then the core.
-fn ingest(
-    b: &RxBody,
-    cap: &mut Option<capture::Writer<BufWriter<std::fs::File>>>,
-    bodies: &mut u64,
-    sink: &mut Sink,
-    core: &mut dyn GsCore,
-) {
-    if let Some(c) = cap.as_mut() {
-        c.body(b).unwrap();
+impl runtime::BodyLoop for Live {
+    fn rx(&mut self, b: &RxBody) {
+        if b.phy_valid && b.crc_ok {
+            self.rssi_sum += f64::from(b.rssi[0]) - 110.0;
+            self.rssi_n += 1;
+        }
+        if b.mcs != 255 {
+            self.mcs = b.mcs;
+        }
+        if let Some(c) = self.cap.as_mut() {
+            c.body(b).unwrap();
+        }
+        self.bodies += 1;
+        self.sink.now_us = b.mono_us;
+        if let Some(l) = self.sink.log.as_mut() {
+            l.body(b).unwrap();
+        }
+        self.core.on_rx(b, &mut self.sink);
     }
-    *bodies += 1;
-    sink.now_us = b.mono_us;
-    if let Some(l) = sink.log.as_mut() {
-        l.body(b).unwrap();
+
+    fn tick(&mut self, now: u64) {
+        if let Some(c) = self.cap.as_mut() {
+            c.tick(now).unwrap();
+        }
+        self.sink.now_us = now;
+        if let Some(l) = self.sink.log.as_mut() {
+            l.tick(now).unwrap();
+        }
+        let el = self.t0.elapsed().as_secs_f64();
+        while let Some((ts, row, text)) = self.sets.next_if(|(ts, _, _)| el >= *ts) {
+            let r = self.core.param_set(row, &text);
+            println!("param t={ts} row={row} text={text} -> {r:?}");
+        }
+        self.core.tick(now, &mut self.sink);
+        if self.print_params {
+            // Live: print each change of a row's state as it happens.
+            let p = self.core.params_json(now);
+            if p != self.last_params {
+                print_param_changes(&self.last_params, &p, el);
+                self.last_params = p;
+            }
+        }
+        self.sink.idr_step(now, &mut *self.core);
+        self.sink.log_stats(now, &mut self.last_stats, &*self.core);
     }
-    core.on_rx(b, sink);
 }
 
 fn live(o: Opts) {
-    let mut core = core(&o, o.ch);
+    let core = core(&o, o.ch);
     let mut sink = Sink::new(&o);
-    let mut cap = o.capture.as_ref().map(|p| {
+    let cap = o.capture.as_ref().map(|p| {
         capture::Writer::new(BufWriter::with_capacity(
             1 << 20,
             std::fs::File::create(p).unwrap(),
         ))
         .unwrap()
     });
-
-    let mut card = devourer_sys::Card::open(&devourer_sys::Config {
-        select: devourer_sys::Select::Scan { index: o.card },
-        channel: o.ch,
-        width_mhz: o.width,
-    })
-    .unwrap_or_else(|e| die(&format!("card: {e}")));
-    eprintln!(
-        "pal: card {} on ch {} / {} MHz",
-        card.chip().unwrap_or("?".into()),
+    let set = runtime::CardSet::open(
+        vec![devourer_sys::Select::Scan { index: o.card }],
         o.ch,
-        o.width
-    );
+        o.width,
+    )
+    .unwrap_or_else(|e| die(&e));
+    eprintln!("pal: card {} on ch {} / {} MHz", set.chips(), o.ch, o.width);
 
     let t0 = Instant::now();
+    let clock = runtime::mono_default;
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
-    let (dropped, foreign, rx_frames) = (
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-    );
-    {
-        let (dropped, foreign, rx_frames) = (dropped.clone(), foreign.clone(), rx_frames.clone());
-        let ch = o.ch;
-        card.start_rx(move |f| {
+    let (foreign, rx_frames) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let shared = Arc::new(runtime::Shared::default());
+    let stamp: runtime::Stamp = {
+        let (foreign, rx_frames, ch) = (foreign.clone(), rx_frames.clone(), o.ch);
+        Arc::new(move |_, _, v| {
             rx_frames.fetch_add(1, Ordering::Relaxed);
-            match dot11::parse(f.frame, f.crc_err, f.data_rate) {
-                dot11::Verdict::Short => {}
-                dot11::Verdict::Foreign => {
-                    foreign.fetch_add(1, Ordering::Relaxed);
-                }
-                dot11::Verdict::Body(p) => {
-                    let b = runtime::rx_body(0, f, &p, mono_us(t0), ch);
-                    if tx.try_send(b).is_err() {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+            if matches!(v, dot11::Verdict::Foreign) {
+                foreign.fetch_add(1, Ordering::Relaxed);
             }
+            Some((ch, clock()))
         })
+    };
+    let route = set
+        .begin(o.ch, o.width, stamp, tx, &shared)
         .unwrap_or_else(|e| die(&e));
-    }
-    let card = Arc::new(card);
     if o.mode == Some(Mode::Gs) {
-        sink.card = Some(card.clone());
+        sink.card = set.cards().first().cloned();
         if o.idr != Some(false) {
             sink.idr = Some(IdrDriver::default());
         }
     }
 
-    let end = Duration::from_secs(o.secs);
-    let mut last_stats = 0u64;
-    let mut next_tick = mono_us(t0);
-    let mut next_report = t0 + Duration::from_secs(1);
     let mut sets = o.param_sets.clone();
     sets.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut sets = sets.into_iter().peekable();
-    let mut last_params = String::new();
-    let (mut bodies, mut last_aus, mut rssi_sum, mut rssi_n, mut mcs) =
-        (0u64, 0u64, 0f64, 0u64, 255u8);
-    while t0.elapsed() < end {
-        let now = mono_us(t0);
-        let wait = Duration::from_micros(next_tick.saturating_sub(now));
-        match rx.recv_timeout(wait) {
-            Ok(b) => {
-                if b.phy_valid && b.crc_ok {
-                    rssi_sum += f64::from(b.rssi[0]) - 110.0;
-                    rssi_n += 1;
-                }
-                if b.mcs != 255 {
-                    mcs = b.mcs;
-                }
-                ingest(&b, &mut cap, &mut bodies, &mut sink, &mut *core);
+    let mut live = Live {
+        core,
+        sink,
+        cap,
+        t0,
+        sets: sets.into_iter().peekable(),
+        print_params: !o.param_sets.is_empty(),
+        last_params: String::new(),
+        last_stats: 0,
+        bodies: 0,
+        rssi_sum: 0.0,
+        rssi_n: 0,
+        mcs: 255,
+    };
+    let end = Duration::from_secs(o.secs);
+    let mut next_report = t0 + Duration::from_secs(1);
+    let mut last_aus = 0u64;
+    runtime::pump(
+        &mut live,
+        &rx,
+        clock,
+        &shared,
+        |_, _| {},
+        |l, _| {
+            if Instant::now() >= next_report {
+                next_report += Duration::from_secs(1);
+                eprintln!(
+                    "pal: t={:>3}s bodies={} aus/s={} truncated={} rssi={:.1} mcs={} rx_frames={} foreign={} dropped={} sends={} send_fail={}",
+                    l.t0.elapsed().as_secs(),
+                    l.bodies,
+                    l.sink.aus - last_aus,
+                    l.sink.truncated,
+                    if l.rssi_n > 0 { l.rssi_sum / l.rssi_n as f64 } else { f64::NAN },
+                    l.mcs,
+                    rx_frames.load(Ordering::Relaxed),
+                    foreign.load(Ordering::Relaxed),
+                    shared.lat.rx_full.load(Ordering::Relaxed),
+                    l.sink.sends,
+                    l.sink.send_fail
+                );
+                last_aus = l.sink.aus;
+                l.rssi_sum = 0.0;
+                l.rssi_n = 0;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => die("RX thread ended"),
-        }
-        let now = mono_us(t0);
-        if now >= next_tick {
-            if let Some(c) = cap.as_mut() {
-                c.tick(now).unwrap();
-            }
-            sink.now_us = now;
-            if let Some(l) = sink.log.as_mut() {
-                l.tick(now).unwrap();
-            }
-            let el = t0.elapsed().as_secs_f64();
-            while let Some((ts, row, text)) = sets.next_if(|(ts, _, _)| el >= *ts) {
-                let r = core.param_set(row, &text);
-                println!("param t={ts} row={row} text={text} -> {r:?}");
-            }
-            core.tick(now, &mut sink);
-            if !o.param_sets.is_empty() {
-                // Live: print each change of a row's state as it happens.
-                let p = core.params_json(now);
-                if p != last_params {
-                    print_param_changes(&last_params, &p, el);
-                    last_params = p;
-                }
-            }
-            sink.idr_step(now, &mut *core);
-            sink.log_stats(now, &mut last_stats, &*core);
-            next_tick = now + TICK_US;
-        }
-        if Instant::now() >= next_report {
-            next_report += Duration::from_secs(1);
-            eprintln!(
-                "pal: t={:>3}s bodies={} aus/s={} truncated={} rssi={:.1} mcs={} rx_frames={} foreign={} dropped={} sends={} send_fail={}",
-                t0.elapsed().as_secs(),
-                bodies,
-                sink.aus - last_aus,
-                sink.truncated,
-                if rssi_n > 0 { rssi_sum / rssi_n as f64 } else { f64::NAN },
-                mcs,
-                rx_frames.load(Ordering::Relaxed),
-                foreign.load(Ordering::Relaxed),
-                dropped.load(Ordering::Relaxed),
-                sink.sends,
-                sink.send_fail
-            );
-            last_aus = sink.aus;
-            rssi_sum = 0.0;
-            rssi_n = 0;
-        }
-    }
-    sink.card = None;
-    drop(card); // last Arc: stops RX before the queue is drained
+            Ok(l.t0.elapsed() < end)
+        },
+    )
+    .unwrap_or_else(|e| die(&e));
+    live.sink.card = None;
+    drop(route); // no more bodies join the queue; what is in it still counts
     while let Ok(b) = rx.try_recv() {
-        ingest(&b, &mut cap, &mut bodies, &mut sink, &mut *core);
+        runtime::BodyLoop::rx(&mut live, &b);
     }
-    if let Some(c) = cap.as_mut() {
+    if let Some(c) = live.cap.as_mut() {
         c.flush().unwrap();
     }
-    sink.finish();
+    let bodies = live.bodies;
+    live.sink.finish();
     println!(
         "live bodies={bodies} aus={} truncated={} au_bytes={} dropped={} sends={} send_fail={} stats={}",
-        sink.aus,
-        sink.truncated,
-        sink.bytes,
-        dropped.load(Ordering::Relaxed),
-        sink.sends,
-        sink.send_fail,
-        core.stats_json()
+        live.sink.aus,
+        live.sink.truncated,
+        live.sink.bytes,
+        shared.lat.rx_full.load(Ordering::Relaxed),
+        live.sink.sends,
+        live.sink.send_fail,
+        live.core.stats_json()
     );
 }
 
