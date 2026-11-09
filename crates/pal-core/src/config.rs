@@ -544,8 +544,6 @@ impl Config {
 
 pub use pal_wire::ht40::{grid_5g, ht40_offset, ht40_pair_other};
 
-const NHM_EDGES: [i32; 11] = [-104, -101, -98, -95, -92, -89, -86, -83, -80, -75, -70];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(pub String);
 
@@ -1185,7 +1183,7 @@ fn parse_config(j: &Table) -> R<Config> {
             sc.one_card_ms = get_i32(s, "one_card_ms", 5000, 0, 60000, w)?;
             sc.max_ms = get_i32(s, "max_ms", 30000, 1000, 600000, w)?;
             sc.busy.busy_dbm = get_i32(s, "busy_dbm", -83, -104, -70, w)?;
-            if !NHM_EDGES.contains(&sc.busy.busy_dbm) {
+            if !crate::chan::radio::busy_dbm_is_edge(sc.busy.busy_dbm) {
                 return fail(
                     "radio.scan.busy_dbm",
                     "must be an NHM bucket edge: -104 -101 -98 -95 -92 -89 -86 -83 -80 -75 -70",

@@ -11,8 +11,7 @@ use pal_wire::profile::{self, PhyMode, Profile};
 use pal_wire::rc::NO_PROBE_PROFILE;
 use std::collections::VecDeque;
 
-pub const SNR_RAW_TO_DB: f64 = 0.5;
-pub const EVM_RAW_TO_DB: f64 = 0.5;
+pub use crate::chan::radio::{EVM_RAW_TO_DB, SNR_RAW_TO_DB};
 
 /// The commanded operating point (power is constant, not part of it).
 #[derive(Clone, Copy, Debug, PartialEq)]
