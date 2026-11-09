@@ -128,8 +128,8 @@ pub struct LinkInfo {
 pub struct Link {
     pub shared: Arc<Shared>,
     pub info: LinkInfo,
-    core: Option<JoinHandle<()>>,
-    dec: Option<JoinHandle<()>>,
+    core: JoinHandle<()>,
+    dec: JoinHandle<()>,
 }
 
 impl Link {
@@ -271,8 +271,8 @@ impl Link {
                     channels,
                     log_info,
                 },
-                core: Some(core_t),
-                dec: Some(dec_t),
+                core: core_t,
+                dec: dec_t,
             },
             Ports {
                 stats_rx,
@@ -286,7 +286,7 @@ impl Link {
 
     /// False once the core thread has returned (card gone, USB error).
     pub fn running(&self) -> bool {
-        self.core.as_ref().is_some_and(|c| !c.is_finished())
+        !self.core.is_finished()
     }
 
     /// Asks every thread to quit (UI threads that watch `shared.quit` too).
@@ -299,27 +299,19 @@ impl Link {
     /// which only ends when the core loop drops the AU sender.
     /// True when the core thread ended (its cards are free again); false
     /// when it was left behind wedged.
-    pub fn stop(mut self) -> bool {
+    pub fn stop(self) -> bool {
         self.request_quit();
         let t0 = Instant::now();
-        let mut core_done = true;
-        if let Some(c) = self.core.take() {
-            while !c.is_finished() && t0.elapsed() < Duration::from_secs(3) {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            core_done = c.is_finished();
-            if core_done {
-                let _ = c.join();
-            } else {
-                log::warn!("core thread did not stop in 3 s; leaving it");
-            }
+        while !self.core.is_finished() && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
         }
-        if let Some(d) = self.dec.take() {
-            if core_done {
-                let _ = d.join();
-            } else {
-                log::warn!("decoder left with the wedged core thread");
-            }
+        let core_done = self.core.is_finished();
+        if core_done {
+            let _ = self.core.join();
+            let _ = self.dec.join();
+        } else {
+            log::warn!("core thread did not stop in 3 s; leaving it");
+            log::warn!("decoder left with the wedged core thread");
         }
         core_done
     }
