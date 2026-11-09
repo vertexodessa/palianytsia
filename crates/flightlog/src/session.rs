@@ -23,6 +23,14 @@ pub const EVENTS_FORMAT: &str = "pal-events";
 pub const AULOG_MARKER: &str = "aulog 1";
 pub const VERSION: u32 = 1;
 
+pub(crate) const CAPTURE_FILE: &str = "bodies.bin";
+pub(crate) const AU_FILE: &str = "au.log";
+pub(crate) const EVENTS_FILE: &str = "events.jsonl";
+pub(crate) const STATS_FILE: &str = "stats.jsonl";
+/// Lines `Session::create` writes before any data.
+pub(crate) const AU_HEADER_LINES: usize = 2;
+pub(crate) const EVENTS_HEADER_LINES: usize = 1;
+
 /// Stats keys whose change is an event, in the order they are reported.
 const WATCHED: &[&str] = &[
     "session",
@@ -99,17 +107,17 @@ impl Session {
         fs::create_dir_all(root)?;
         let dir = root.join(format!("fl-{:04}_{}", next_index(root), stamp(now)));
         fs::create_dir(&dir)?;
-        let mut stats = create(&dir, "stats.jsonl")?;
+        let mut stats = create(&dir, STATS_FILE)?;
         writeln!(stats, "{}", json!({"format": STATS_FORMAT, "v": VERSION}))?;
-        let mut events = create(&dir, "events.jsonl")?;
+        let mut events = create(&dir, EVENTS_FILE)?;
         writeln!(events, "{}", json!({"format": EVENTS_FORMAT, "v": VERSION}))?;
-        let mut au = create(&dir, "au.log")?;
+        let mut au = create(&dir, AU_FILE)?;
         writeln!(au, "{AULOG_MARKER}")?;
         writeln!(au, "# t_us sid bytes flags complete salvaged pts_us")?;
         let capture = if capture_cap > 0 {
             Some(capture::Writer::new(BufWriter::with_capacity(
                 1 << 20,
-                File::create(dir.join("bodies.bin"))?,
+                File::create(dir.join(CAPTURE_FILE))?,
             ))?)
         } else {
             None
@@ -288,12 +296,12 @@ fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io
 
 pub fn summarize(dir: &Path) -> io::Result<Summary> {
     let mut s = Summary {
-        has_capture: dir.join("bodies.bin").exists(),
+        has_capture: dir.join(CAPTURE_FILE).exists(),
         ..Summary::default()
     };
     let (mut t_min, mut t_max) = (u64::MAX, 0u64);
 
-    let mut lines = BufReader::new(File::open(dir.join("au.log"))?).lines();
+    let mut lines = BufReader::new(File::open(dir.join(AU_FILE))?).lines();
     if lines.next().transpose()?.as_deref() != Some(AULOG_MARKER) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -321,8 +329,8 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
         s.salvaged += salvaged;
     }
 
-    let mut lines = BufReader::new(File::open(dir.join("stats.jsonl"))?).lines();
-    check_marker(lines.next(), STATS_FORMAT, "stats.jsonl")?;
+    let mut lines = BufReader::new(File::open(dir.join(STATS_FILE))?).lines();
+    check_marker(lines.next(), STATS_FORMAT, STATS_FILE)?;
     for l in lines {
         if let Ok(v) = serde_json::from_str::<Value>(&l?) {
             if let Some(t) = v.get("t_us").and_then(Value::as_u64) {
@@ -335,8 +343,8 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
     }
 
     let mut counts: Vec<(String, u64)> = Vec::new();
-    let mut lines = BufReader::new(File::open(dir.join("events.jsonl"))?).lines();
-    check_marker(lines.next(), EVENTS_FORMAT, "events.jsonl")?;
+    let mut lines = BufReader::new(File::open(dir.join(EVENTS_FILE))?).lines();
+    check_marker(lines.next(), EVENTS_FORMAT, EVENTS_FILE)?;
     for l in lines {
         let Ok(v) = serde_json::from_str::<Value>(&l?) else {
             continue;
@@ -447,7 +455,7 @@ mod tests {
             }
             s.dir().to_path_buf()
         };
-        let ev = fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        let ev = fs::read_to_string(dir.join(EVENTS_FILE)).expect("events");
         let hops: Vec<&str> = ev.lines().filter(|l| l.contains(r#""channel""#)).collect();
         assert_eq!(hops.len(), 1, "{ev}");
         assert!(hops[0].contains(r#""from":36"#) && hops[0].contains(r#""to":149"#));

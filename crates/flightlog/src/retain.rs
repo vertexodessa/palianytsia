@@ -12,8 +12,11 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
+use crate::session::{
+    AU_FILE, AU_HEADER_LINES, CAPTURE_FILE, EVENTS_FILE, EVENTS_HEADER_LINES, STATS_FILE,
+};
+
 pub const KEEP_FILE: &str = "keep";
-const CAPTURE: &str = "bodies.bin";
 
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
@@ -48,7 +51,7 @@ fn sessions(root: &Path) -> io::Result<Vec<Dir>> {
             path.is_dir().then(|| Dir {
                 index,
                 keep: path.join(KEEP_FILE).exists(),
-                capture: fs::metadata(path.join(CAPTURE)).map_or(0, |m| m.len()),
+                capture: fs::metadata(path.join(CAPTURE_FILE)).map_or(0, |m| m.len()),
                 path,
             })
         })
@@ -69,8 +72,8 @@ fn is_empty(dir: &Path) -> bool {
     // Each file's header: au.log marker + column comment, one format line in
     // the others; stats come at 1 Hz.
     matches!(
-        (lines("au.log", 2), lines("events.jsonl", 1), lines("stats.jsonl", 6)),
-        (Ok(a), Ok(e), Ok(s)) if a <= 2 && e <= 1 && s <= 6
+        (lines(AU_FILE, AU_HEADER_LINES), lines(EVENTS_FILE, EVENTS_HEADER_LINES), lines(STATS_FILE, 6)),
+        (Ok(a), Ok(e), Ok(s)) if a <= AU_HEADER_LINES && e <= EVENTS_HEADER_LINES && s <= 6
     )
 }
 
@@ -108,7 +111,7 @@ pub fn prune(root: &Path, b: Budget) -> io::Result<Pruned> {
         if total <= b.capture_bytes {
             break;
         }
-        if fs::remove_file(d.path.join(CAPTURE)).is_ok() {
+        if fs::remove_file(d.path.join(CAPTURE_FILE)).is_ok() {
             total -= d.capture;
             out.captures += 1;
             out.bytes += d.capture;
@@ -150,13 +153,13 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         let mut au = String::from("aulog 1\n# t_us sid bytes flags complete salvaged pts_us\n");
         au += &"1 0 10 0 1 0 0\n".repeat(aus);
-        fs::write(d.join("au.log"), au).unwrap();
+        fs::write(d.join(AU_FILE), au).unwrap();
         let mut ev = String::from("{\"format\":\"pal-events\",\"v\":1}\n");
         ev += &"{\"ev\":\"x\"}\n".repeat(events);
-        fs::write(d.join("events.jsonl"), ev).unwrap();
-        fs::write(d.join("stats.jsonl"), "{}\n".repeat(1 + stats)).unwrap();
+        fs::write(d.join(EVENTS_FILE), ev).unwrap();
+        fs::write(d.join(STATS_FILE), "{}\n".repeat(1 + stats)).unwrap();
         if capture > 0 {
-            fs::write(d.join(CAPTURE), vec![0u8; capture]).unwrap();
+            fs::write(d.join(CAPTURE_FILE), vec![0u8; capture]).unwrap();
         }
         d
     }
@@ -209,10 +212,10 @@ mod tests {
         .unwrap();
         // 1600 -> drop a (1200) -> b is kept -> drop c (800).
         assert_eq!((p.captures, p.bytes), (2, 800));
-        assert!(!a.join(CAPTURE).exists() && a.join("au.log").exists());
-        assert!(b.join(CAPTURE).exists());
-        assert!(!c.join(CAPTURE).exists());
-        assert!(d.join(CAPTURE).exists());
+        assert!(!a.join(CAPTURE_FILE).exists() && a.join(AU_FILE).exists());
+        assert!(b.join(CAPTURE_FILE).exists());
+        assert!(!c.join(CAPTURE_FILE).exists());
+        assert!(d.join(CAPTURE_FILE).exists());
         let _ = fs::remove_dir_all(&r);
     }
 
