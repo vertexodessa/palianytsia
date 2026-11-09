@@ -24,11 +24,9 @@ namespace {
 constexpr uint16_t kScanPids[] = {0xa81a, 0x881a, 0x8812};
 constexpr uint8_t kSa[6] = {0x57, 0x42, 0x75, 0x05, 0xd6, 0x00};
 
-// mabur::ht40_offset (common/include/mabur/ht40.h).
-uint8_t ht40_offset(uint8_t ch) {
-  if (ch >= 36 && ch <= 144 && (ch - 36) % 4 == 0) return ((ch - 36) / 4) % 2 == 0 ? 1 : 2;
-  if (ch >= 149 && ch <= 161 && (ch - 149) % 4 == 0) return ((ch - 149) / 4) % 2 == 0 ? 1 : 2;
-  return 0;
+SelectedChannel selected(uint8_t ch, uint8_t width_mhz, uint8_t ht40_offset) {
+  return width_mhz == 40 ? SelectedChannel{ch, ht40_offset, CHANNEL_WIDTH_40}
+                         : SelectedChannel{ch, 0, CHANNEL_WIDTH_20};
 }
 
 void set_err(char *err, size_t cap, const std::string &s) {
@@ -100,9 +98,7 @@ static dv_card *open_card(std::unique_ptr<dv_card> &c, const dv_cfg *cfg, char *
     c->dev.reset(static_cast<IRtlRadio *>(r.release()));
   if (!c->dev) { set_err(err, err_cap, "unsupported chip"); dv_close(c.release()); return nullptr; }
 
-  c->dev->InitWrite(cfg->width_mhz == 40
-                        ? SelectedChannel{cfg->channel, ht40_offset(cfg->channel), CHANNEL_WIDTH_40}
-                        : SelectedChannel{cfg->channel, 0, CHANNEL_WIDTH_20});
+  c->dev->InitWrite(selected(cfg->channel, cfg->width_mhz, cfg->ht40_offset));
   const devourer::AdapterCaps ac = c->dev->GetAdapterCaps();
   if (ac.chip_name) c->chip = ac.chip_name;
 
@@ -230,13 +226,9 @@ extern "C" int dv_fast_retune(dv_card *c, uint8_t ch) try {
   return -1;
 }
 
-extern "C" int dv_set_monitor(dv_card *c, uint8_t ch, uint8_t width_mhz) try {
+extern "C" int dv_set_monitor(dv_card *c, uint8_t ch, uint8_t width_mhz, uint8_t ht40_offset) try {
   if (!c || !c->dev) return -1;
-  const uint8_t w = width_mhz == 40 ? 40 : 20;
-  const uint8_t off = w == 40 ? ht40_offset(ch) : 0;
-  if (w == 40 && off == 0) return -2;
-  c->dev->SetMonitorChannel(w == 40 ? SelectedChannel{ch, off, CHANNEL_WIDTH_40}
-                                    : SelectedChannel{ch, 0, CHANNEL_WIDTH_20});
+  c->dev->SetMonitorChannel(selected(ch, width_mhz, ht40_offset));
   return 0;
 } catch (...) {
   return -1;

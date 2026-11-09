@@ -27,6 +27,7 @@ struct DvCfg {
     fd: c_int,
     channel: u8,
     width_mhz: u8,
+    ht40_offset: u8,
 }
 
 #[repr(C)]
@@ -83,7 +84,7 @@ extern "C" {
     fn dv_rx_energy(c: *mut DvCard, with_nhm: c_int, out: *mut DvEnergy) -> c_int;
     fn dv_rx_energy_scout(c: *mut DvCard, out: *mut DvEnergy) -> c_int;
     fn dv_fast_retune(c: *mut DvCard, ch: u8) -> c_int;
-    fn dv_set_monitor(c: *mut DvCard, ch: u8, width_mhz: u8) -> c_int;
+    fn dv_set_monitor(c: *mut DvCard, ch: u8, width_mhz: u8, ht40_offset: u8) -> c_int;
     fn dv_tuned_central(c: *mut DvCard) -> c_int;
     fn dv_arm_nhm_busy(c: *mut DvCard, period_4us: u16) -> c_int;
     fn dv_read_nhm_busy(c: *mut DvCard, out: *mut DvNhm) -> c_int;
@@ -198,9 +199,12 @@ impl Ctl<'_> {
 
     /// The full SetMonitorChannel.
     pub fn set_monitor(&self, ch: u8, width_mhz: u8) -> Result<(), String> {
-        match unsafe { dv_set_monitor(self.raw, ch, width_mhz) } {
+        let offset = pal_wire::ht40::ht40_offset(ch);
+        if width_mhz == 40 && offset == 0 {
+            return Err(format!("channel {ch} has no 40 MHz pair"));
+        }
+        match unsafe { dv_set_monitor(self.raw, ch, width_mhz, offset) } {
             0 => Ok(()),
-            -2 => Err(format!("channel {ch} has no 40 MHz pair")),
             r => Err(format!("set_monitor({ch}, {width_mhz}) failed ({r})")),
         }
     }
@@ -320,6 +324,7 @@ impl Card {
             fd,
             channel: cfg.channel,
             width_mhz: cfg.width_mhz,
+            ht40_offset: pal_wire::ht40::ht40_offset(cfg.channel),
         };
         let mut err = [0 as c_char; 256];
         let raw = unsafe { dv_open(&c, err.as_mut_ptr(), err.len()) };

@@ -34,7 +34,8 @@ typedef struct {
   int index;          /* ordinal among matches */
   int fd;             /* >= 0: wrap this fd (Android); vid/pid/index ignored */
   uint8_t channel;
-  uint8_t width_mhz;  /* 20 or 40 (secondary = mabur::ht40_offset) */
+  uint8_t width_mhz;  /* 20 or 40 */
+  uint8_t ht40_offset; /* at 40 MHz: 1 = secondary above, 2 = below */
 } dv_cfg;
 
 /* NULL on failure; err gets "no device", "claim failed rc=N", "unsupported chip". */
@@ -75,8 +76,8 @@ int dv_rx_energy(dv_card *c, int with_nhm, dv_energy *out);
 int dv_rx_energy_scout(dv_card *c, dv_energy *out);
 /* FastRetune(ch, cache_rf): the RF switch only, width kept. */
 int dv_fast_retune(dv_card *c, uint8_t ch);
-/* The full SetMonitorChannel at ch / width_mhz; -2 for 40 MHz without a pair. */
-int dv_set_monitor(dv_card *c, uint8_t ch, uint8_t width_mhz);
+/* The full SetMonitorChannel at ch / width_mhz. */
+int dv_set_monitor(dv_card *c, uint8_t ch, uint8_t width_mhz, uint8_t ht40_offset);
 int dv_tuned_central(dv_card *c);
 int dv_arm_nhm_busy(dv_card *c, uint16_t period_4us);
 int dv_read_nhm_busy(dv_card *c, dv_nhm *out);
