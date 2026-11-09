@@ -372,16 +372,7 @@ pub fn encode(m: &CalMsg, sysid: u8, compid: u8, seq: u8) -> Vec<u8> {
 
 /// `p` is zero-extended to the message's full length (the parser's view).
 pub fn decode(msgid: u32, p: &[u8]) -> Option<CalMsg> {
-    let need = match msgid {
-        MSG_SWEEP => 18,
-        MSG_ACK => 9,
-        MSG_SWEEP_DONE => 45,
-        MSG_APPLY => 32,
-        MSG_APPLIED => 57,
-        MSG_ABORT => 4,
-        _ => return None,
-    };
-    if p.len() < need {
+    if !is_cal_msgid(msgid) || p.len() < usize::from(mavlink::entry(msgid)?.2) {
         return None;
     }
     Some(match msgid {
@@ -446,7 +437,8 @@ pub fn decode(msgid: u32, p: &[u8]) -> Option<CalMsg> {
                 reason: String::from_utf8_lossy(&r[..n]).into_owned(),
             })
         }
-        _ => CalMsg::Abort(Abort { nonce: rd32(p, 0) }),
+        MSG_ABORT => CalMsg::Abort(Abort { nonce: rd32(p, 0) }),
+        _ => return None,
     })
 }
 
