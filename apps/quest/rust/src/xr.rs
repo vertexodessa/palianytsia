@@ -540,8 +540,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let mut ev = xr::EventDataBuffer::new();
     let (mut running, mut quit) = (false, false);
     let (mut frames, mut t_log) = (0u64, Instant::now());
-    let mut rate = (0.0f32, Instant::now(), 0u64);
-    let mut fps_est = crate::rate::FpsEstimate::default();
+    let mut refresh = crate::rate::Refresh::new(Instant::now());
     while !quit {
         drain_input(app);
         app.poll_events(Some(Duration::ZERO), |e| {
@@ -585,29 +584,19 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        // Match the display to the video every 2 s: the camera rate from
-        // the AU stamps, else (stamps not in yet) the decoded fps.
-        if exts.fb_display_refresh_rate && rate.1.elapsed() >= Duration::from_secs(2) {
+        if exts.fb_display_refresh_rate && refresh.due(Instant::now()) {
             let sh = hub.shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let f = sh.as_ref().map_or(0, |s| s.frames.load(Ordering::Relaxed));
-            let decoded =
-                fps_est.push(f.saturating_sub(rate.2) as f64 / rate.1.elapsed().as_secs_f64());
             let cam = sh.map_or(0, |s| s.cam_fps_x10.load(Ordering::Relaxed));
-            let fps = if cam > 0 { cam as f64 / 10.0 } else { decoded };
             let offered = session
                 .enumerate_display_refresh_rates()
                 .unwrap_or_default();
-            if let Some(r) = crate::rate::rate_for(fps, &offered) {
-                if (r - rate.0).abs() > 0.5 {
-                    match session.request_display_refresh_rate(r) {
-                        Ok(()) => log::info!("display {r} Hz for video {fps:.0} fps"),
-                        Err(e) => log::warn!("display {r} Hz refused: {e}"),
-                    }
-                    rate.0 = r;
+            if let Some((r, fps)) = refresh.tick(Instant::now(), f, cam, &offered) {
+                match session.request_display_refresh_rate(r) {
+                    Ok(()) => log::info!("display {r} Hz for video {fps:.0} fps"),
+                    Err(e) => log::warn!("display {r} Hz refused: {e}"),
                 }
             }
-            rate.1 = Instant::now();
-            rate.2 = f;
         }
 
         let mut fs = sys::FrameState {

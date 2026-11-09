@@ -1,5 +1,6 @@
 //! Display refresh rate for a video frame rate (spec 5.6 "Frame rate").
 //! Host-built so its tests run with the workspace's.
+use std::time::{Duration, Instant};
 
 /// Camera modes the drone runs (VENC_MODE presets), lowest first.
 const NOMINAL: &[f64] = &[30.0, 60.0, 90.0, 100.0, 120.0];
@@ -78,11 +79,122 @@ impl FpsEstimate {
     }
 }
 
+/// How often the display is matched to the video.
+const REFRESH_PERIOD: Duration = Duration::from_secs(2);
+
+/// The refresh-rate policy of the frame loop: every 2 s the camera rate from
+/// the AU stamps, else (stamps not in yet) the decoded fps, and a request
+/// only when the rate moved.
+pub struct Refresh {
+    current: f32,
+    last_t: Instant,
+    last_frames: u64,
+    est: FpsEstimate,
+}
+
+impl Refresh {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            current: 0.0,
+            last_t: now,
+            last_frames: 0,
+            est: FpsEstimate::default(),
+        }
+    }
+
+    pub fn due(&self, now: Instant) -> bool {
+        now.duration_since(self.last_t) >= REFRESH_PERIOD
+    }
+
+    /// The (rate, video fps) to request, if any. A link restart resets
+    /// `frames`, so the delta saturates.
+    pub fn tick(
+        &mut self,
+        now: Instant,
+        frames: u64,
+        cam_x10: u32,
+        offered: &[f32],
+    ) -> Option<(f32, f64)> {
+        let dt = now.duration_since(self.last_t).as_secs_f64();
+        let decoded = self
+            .est
+            .push(frames.saturating_sub(self.last_frames) as f64 / dt);
+        self.last_t = now;
+        self.last_frames = frames;
+        let fps = if cam_x10 > 0 {
+            f64::from(cam_x10) / 10.0
+        } else {
+            decoded
+        };
+        let r = rate_for(fps, offered)?;
+        if (r - self.current).abs() <= 0.5 {
+            return None;
+        }
+        self.current = r;
+        Some((r, fps))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{rate_for, FpsEstimate};
+    use super::{rate_for, FpsEstimate, Refresh};
+    use std::time::{Duration, Instant};
 
     const QUEST3: &[f32] = &[72.0, 80.0, 90.0, 120.0];
+
+    fn every_2s(r: &mut Refresh, t: &mut Instant) -> Instant {
+        *t += Duration::from_secs(2);
+        assert!(r.due(*t));
+        *t
+    }
+
+    #[test]
+    fn refresh_prefers_the_camera_rate_over_decoded_frames() {
+        let mut t = Instant::now();
+        let mut r = Refresh::new(t);
+        let now = every_2s(&mut r, &mut t);
+        // 180 decoded in 2 s reads 90 fps; the stamps say 120.
+        assert_eq!(r.tick(now, 180, 1200, QUEST3), Some((120.0, 120.0)));
+    }
+
+    #[test]
+    fn refresh_falls_back_to_decoded_frames() {
+        let mut t = Instant::now();
+        let mut r = Refresh::new(t);
+        let now = every_2s(&mut r, &mut t);
+        assert_eq!(r.tick(now, 180, 0, QUEST3), Some((90.0, 90.0)));
+    }
+
+    #[test]
+    fn refresh_requests_only_a_change() {
+        let mut t = Instant::now();
+        let mut r = Refresh::new(t);
+        let now = every_2s(&mut r, &mut t);
+        assert!(r.tick(now, 0, 1200, QUEST3).is_some());
+        let now = every_2s(&mut r, &mut t);
+        assert_eq!(r.tick(now, 0, 1200, QUEST3), None);
+        let now = every_2s(&mut r, &mut t);
+        assert_eq!(r.tick(now, 0, 900, QUEST3), Some((90.0, 90.0)));
+    }
+
+    #[test]
+    fn refresh_survives_the_counter_reset_of_a_link_restart() {
+        let mut t = Instant::now();
+        let mut r = Refresh::new(t);
+        let now = every_2s(&mut r, &mut t);
+        assert_eq!(r.tick(now, 180, 0, QUEST3), Some((90.0, 90.0)));
+        // The counter restarts at 0: no huge delta, the outage keeps the mode.
+        let now = every_2s(&mut r, &mut t);
+        assert_eq!(r.tick(now, 10, 0, QUEST3), None);
+    }
+
+    #[test]
+    fn refresh_waits_for_its_period() {
+        let t = Instant::now();
+        let r = Refresh::new(t);
+        assert!(!r.due(t + Duration::from_millis(1999)));
+        assert!(r.due(t + Duration::from_secs(2)));
+    }
 
     #[test]
     fn spec_modes() {
