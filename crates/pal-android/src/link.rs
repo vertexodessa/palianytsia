@@ -294,13 +294,8 @@ impl Link {
     /// when it was left behind wedged.
     pub fn stop(self) -> bool {
         self.request_quit();
-        let t0 = Instant::now();
-        while !self.core.is_finished() && t0.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let core_done = self.core.is_finished();
+        let core_done = join_within(self.core, Duration::from_secs(3));
         if core_done {
-            let _ = self.core.join();
             let _ = self.dec.join();
         } else {
             log::warn!("core thread did not stop in 3 s; leaving it");
@@ -308,6 +303,20 @@ impl Link {
         }
         core_done
     }
+}
+
+/// Waits up to `limit` for a thread. True: it ended and is joined. False: it
+/// is still running and is left behind.
+pub fn join_within<T>(h: JoinHandle<T>, limit: Duration) -> bool {
+    let t0 = Instant::now();
+    while !h.is_finished() && t0.elapsed() < limit {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let done = h.is_finished();
+    if done {
+        let _ = h.join();
+    }
+    done
 }
 
 /// AUs into MediaCodec; decoder errors go back to the IDR driver the same

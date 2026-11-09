@@ -104,13 +104,7 @@ impl Phone {
         // The OSD thread draws into a Surface the Activity may be about to
         // destroy: it checks quit every 100 ms at most.
         if let Some(o) = self.osd.take() {
-            let t1 = Instant::now();
-            while !o.is_finished() && t1.elapsed() < Duration::from_secs(1) {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if o.is_finished() {
-                let _ = o.join();
-            }
+            pal_android::join_within(o, Duration::from_secs(1));
         }
         self.link.take().is_none_or(Link::stop)
     }

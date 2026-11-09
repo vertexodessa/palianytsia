@@ -883,13 +883,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     hub.quit.store(true, Ordering::Relaxed);
     drop(osd);
     // The supervisor stops the link (bounded 3 s) before it returns.
-    let t0 = Instant::now();
-    while !sup.is_finished() && t0.elapsed() < Duration::from_secs(5) {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    if sup.is_finished() {
-        let _ = sup.join();
-    }
+    pal_android::join_within(sup, Duration::from_secs(5));
     // SAFETY: nothing draws any more.
     unsafe { gl.finish() };
     Ok(())
