@@ -22,26 +22,22 @@ fn rd16(p: &[u8]) -> u16 {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Unpacked {
+pub struct Unpacked<'a> {
     /// CRC-valid sub-block payloads, in body order.
-    pub survivors: Vec<Vec<u8>>,
-    pub n_blocks: usize,
+    pub survivors: Vec<&'a [u8]>,
     pub n_failed: usize,
     pub header_ok: bool,
-    /// Low 7 bits; 0 when the body is shorter than the header.
-    pub stream_id: u8,
     pub retx: bool,
     pub q_ms: u16,
     pub enc_us: u16,
     pub air_ms: u16,
 }
 
-pub fn unpack(body: &[u8], block_payload: usize) -> Unpacked {
+pub fn unpack(body: &[u8], block_payload: usize) -> Unpacked<'_> {
     let mut r = Unpacked::default();
     if block_payload == 0 || body.len() < HDR_LEN {
         return r;
     }
-    r.stream_id = body[3] & STREAM_ID_MASK;
     r.retx = body[3] & RETX_MARK != 0;
     r.header_ok =
         rd16(body) == MAGIC && body[2] == VER && usize::from(rd16(&body[4..])) == block_payload;
@@ -52,11 +48,10 @@ pub fn unpack(body: &[u8], block_payload: usize) -> Unpacked {
     }
     let stride = 2 + block_payload;
     let region = &body[HDR_LEN..];
-    r.n_blocks = region.len() / stride;
     for blk in region.chunks_exact(stride) {
         let payload = &blk[2..];
         if crc16_ccitt(payload) == rd16(blk) {
-            r.survivors.push(payload.to_vec());
+            r.survivors.push(payload);
         } else {
             r.n_failed += 1;
         }
@@ -135,7 +130,7 @@ mod tests {
         b[HDR_LEN + 22 + 5] ^= 0xFF; // corrupt block 1
         let u = unpack(&b, 20);
         assert!(u.header_ok);
-        assert_eq!((u.n_blocks, u.n_failed), (3, 1));
+        assert_eq!((u.survivors.len(), u.n_failed), (2, 1));
         assert_eq!(
             u.survivors,
             alloc::vec![alloc::vec![1u8; 20], alloc::vec![3u8; 20]]
