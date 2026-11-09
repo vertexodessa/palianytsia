@@ -112,6 +112,7 @@ extern "C" {
     ) -> c_int;
     fn pal_ref_param_refresh(r: *mut PalRefRaw);
     fn pal_ref_stats_json(r: *const PalRefRaw, buf: *mut c_char, cap: usize) -> usize;
+    fn pal_ref_link_op(r: *const PalRefRaw, mcs: *mut c_int, bw: *mut c_int);
 
     fn pal_card_new(
         radio: *mut c_void,
@@ -454,6 +455,12 @@ impl GsCore for RefCore {
 
     fn param_refresh(&mut self) {
         unsafe { pal_ref_param_refresh(self.raw) };
+    }
+
+    fn link_op(&self) -> (i32, i32) {
+        let (mut mcs, mut bw) = (-1, 0);
+        unsafe { pal_ref_link_op(self.raw, &mut mcs, &mut bw) };
+        (mcs, bw)
     }
 
     fn stats_json(&self) -> String {

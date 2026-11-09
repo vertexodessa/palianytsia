@@ -94,6 +94,8 @@ pub trait GsCore {
     fn tick(&mut self, now_us: u64, io: &mut dyn CoreIo);
     /// One line of JSON, the `webgs::stats_json` shape.
     fn stats_json(&self) -> String;
+    /// `(mcs, bw)` of the `stats_json` line; mcs is -1 while none is known.
+    fn link_op(&self) -> (i32, i32);
     /// Bytes from a local MAVLink peer (a GCS), cut at any boundary; tunneled
     /// to the drone under the live session. Gs mode only.
     fn mav_push_outbound(&mut self, _bytes: &[u8]) {}

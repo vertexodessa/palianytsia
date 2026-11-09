@@ -346,27 +346,17 @@ impl IdrDriver {
         if total != self.applied {
             self.applied = total;
             core.set_idr_requests(total as u32);
-            // Once per bump, not per tick: stats_json builds the whole line.
-            self.r.set_link_mbps(link_mbps(&core.stats_json()));
+            let (mcs, bw) = core.link_op();
+            self.r.set_link_mbps(link_mbps(mcs, bw));
         }
         self.r.take_events()
     }
 }
 
-/// The first `"key":<digits>` of a stats line.
-fn stats_uint(json: &str, key: &str) -> Option<u8> {
-    let at = json.find(&format!("\"{key}\":"))? + key.len() + 3;
-    let rest = &json[at..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-
-/// The rung's PHY rate from a stats line; 0 when it carries none.
-fn link_mbps(stats: &str) -> f64 {
-    match (stats_uint(stats, "mcs"), stats_uint(stats, "bw")) {
-        (Some(mcs), Some(bw)) => {
+/// The rung's PHY rate; 0 while the core knows no MCS (it reports -1).
+fn link_mbps(mcs: i32, bw: i32) -> f64 {
+    match (u8::try_from(mcs), u8::try_from(bw)) {
+        (Ok(mcs), Ok(bw)) => {
             pal_wire::profile::phy_rate_mbps(pal_wire::profile::PhyMode::Ht, mcs, bw)
         }
         _ => 0.0,
@@ -457,10 +447,9 @@ mod tests {
 
     #[test]
     fn link_rate_comes_from_the_stats_line() {
-        assert_eq!(link_mbps(r#"{"bw":20,"cards":[],"mcs":0}"#), 6.5);
-        assert_eq!(link_mbps(r#"{"mcs":3,"bw":40}"#), 54.0);
-        assert_eq!(link_mbps(r#"{"bw":20}"#), 0.0);
-        assert_eq!(link_mbps(r#"{"bw":null,"mcs":1}"#), 0.0);
+        assert_eq!(link_mbps(0, 20), 6.5);
+        assert_eq!(link_mbps(3, 40), 54.0);
+        assert_eq!(link_mbps(-1, 20), 0.0);
     }
 
     #[test]

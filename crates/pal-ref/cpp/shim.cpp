@@ -263,6 +263,15 @@ size_t pal_ref_stats_json(const pal_ref* r, char* buf, size_t cap) {
   return s.size();
 }
 
+void pal_ref_link_op(const pal_ref* r, int* mcs, int* bw) {
+  try {
+    const auto s = r->gs->stats();
+    *mcs = s.mcs;
+    *bw = s.bw;
+  } catch (...) {
+  }
+}
+
 pal_ffs* pal_ffs_open(const char* path, int cards, int drop_pct, uint32_t seed) {
   try {
     auto f = std::make_unique<pal_ffs>();

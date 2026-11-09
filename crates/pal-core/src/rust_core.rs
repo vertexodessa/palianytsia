@@ -971,6 +971,13 @@ impl GsCore for RustCore {
         }
     }
 
+    fn link_op(&self) -> (i32, i32) {
+        match &self.gs {
+            Some(g) => (g.vrx.cur_op().mcs, g.vrx.cur_op().bw),
+            None => (self.air_mcs, self.spotter_op.bw),
+        }
+    }
+
     /// WebGs::stats() + webgs::stats_json, key for key (no spotter follow,
     /// no MSP sink: those fields are null or 0).
     fn stats_json(&self) -> String {
@@ -987,8 +994,9 @@ impl GsCore for RustCore {
         j.set("session", g.is_some_and(Gs::linked));
         j.set("peer_acked", g.is_some_and(|g| g.vrx.peer_acked()));
         j.set("rung", g.map_or(-1, |g| g.vrx.ctl().rung()));
-        j.set("mcs", g.map_or(self.air_mcs, |g| g.vrx.cur_op().mcs));
-        j.set("bw", g.map_or(self.spotter_op.bw, |g| g.vrx.cur_op().bw));
+        let (mcs, bw) = self.link_op();
+        j.set("mcs", mcs);
+        j.set("bw", bw);
         j.set(
             "probe",
             g.map_or("", |g| g.vrx.ctl().probe_gate().state.as_str()),

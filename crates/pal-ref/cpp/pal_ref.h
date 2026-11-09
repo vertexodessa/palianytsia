@@ -63,6 +63,8 @@ void pal_ref_param_refresh(pal_ref* r);
 // Writes the stats JSON line; returns its full length (excluding NUL). The
 // output is truncated (and NUL-terminated) when cap is too small.
 size_t pal_ref_stats_json(const pal_ref* r, char* buf, size_t cap);
+// WebGs::Stats mcs and bw; left alone if the core throws.
+void pal_ref_link_op(const pal_ref* r, int* mcs, int* bw);
 
 // A card devourer-sys opened, lent to the core as a maburgs::LinkCard
 // (pal_card.cpp). With it the core is mabur's full GS: the ChannelCore picks,
