@@ -131,8 +131,32 @@ unsafe fn build(gl: &glow::Context, version: &str) -> Result<Gl, String> {
     })
 }
 
-unsafe fn upload(gl: &glow::Context, t: glow::Texture, w: usize, h: usize, fmt: u32, data: &[u8]) {
+/// One plane. `same_size`: the texture already has this storage, so only
+/// the pixels change and the driver need not allocate at video rate.
+unsafe fn upload(
+    gl: &glow::Context,
+    t: glow::Texture,
+    w: usize,
+    h: usize,
+    fmt: u32,
+    data: &[u8],
+    same_size: bool,
+) {
     gl.bind_texture(glow::TEXTURE_2D, Some(t));
+    if same_size {
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            fmt,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(data)),
+        );
+        return;
+    }
     let internal = if fmt == glow::RG { glow::RG8 } else { glow::R8 };
     gl.tex_image_2d(
         glow::TEXTURE_2D,
@@ -180,12 +204,13 @@ impl GlVideo {
                     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
                     if g.loaded.0 != f.seq {
                         let (cw, ch) = (p.w.div_ceil(2), p.h.div_ceil(2));
-                        upload(gl, g.tex[0], p.w, p.h, glow::RED, &p.y);
+                        let same = (g.loaded.1, g.loaded.2, g.loaded.3) == (p.w, p.h, p.nv12);
+                        upload(gl, g.tex[0], p.w, p.h, glow::RED, &p.y, same);
                         if p.nv12 {
-                            upload(gl, g.tex[1], cw, ch, glow::RG, &p.u);
+                            upload(gl, g.tex[1], cw, ch, glow::RG, &p.u, same);
                         } else {
-                            upload(gl, g.tex[1], cw, ch, glow::RED, &p.u);
-                            upload(gl, g.tex[2], cw, ch, glow::RED, &p.v);
+                            upload(gl, g.tex[1], cw, ch, glow::RED, &p.u, same);
+                            upload(gl, g.tex[2], cw, ch, glow::RED, &p.v, same);
                         }
                         g.loaded = (f.seq, p.w, p.h, p.nv12);
                         on_upload(f.t_dec);
