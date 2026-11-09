@@ -86,7 +86,6 @@ pub struct MediaCodecDecoder {
     sh: Arc<Shared>,
     out: Option<JoinHandle<()>>,
     pts: u64,
-    _win: NativeWindow,
 }
 
 impl MediaCodecDecoder {
@@ -115,7 +114,7 @@ impl MediaCodecDecoder {
             errors: AtomicU64::new(0),
             no_input: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
-            win: win.clone(),
+            win,
         });
         let s2 = sh.clone();
         let out = std::thread::Builder::new()
@@ -126,7 +125,6 @@ impl MediaCodecDecoder {
             sh,
             out: Some(out),
             pts: 0,
-            _win: win,
         })
     }
 
