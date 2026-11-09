@@ -182,12 +182,7 @@ fn parse() -> Opts {
             }
         }
         if o.ch == 0 {
-            o.ch = o
-                .cfg
-                .radio
-                .pin
-                .or(c.radio.channels.first().copied())
-                .unwrap_or(0);
+            o.ch = c.start_channel().unwrap_or(0);
         }
         o.width = o.cfg.rx_width();
     }

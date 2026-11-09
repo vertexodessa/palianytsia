@@ -68,11 +68,7 @@ fn link_radio(
         log::warn!("{s}");
     }
     let cfg = pal_core::config::parse_config_str(&toml).map_err(|e| e.to_string())?;
-    let ch = cfg
-        .radio
-        .pin
-        .or(cfg.radio.channels.first().copied())
-        .ok_or("config: no channel")?;
+    let ch = cfg.start_channel().ok_or("config: no channel")?;
     let width = cfg.rx_width();
     Ok((cfg, ch, width))
 }

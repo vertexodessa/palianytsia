@@ -760,6 +760,11 @@ impl Config {
     pub fn rx_width(&self) -> u8 {
         derived_width(&self.link)
     }
+
+    /// Where a link opens: the pin, else the first of `radio.channels`.
+    pub fn start_channel(&self) -> Option<u8> {
+        self.radio.pin.or(self.radio.channels.first().copied())
+    }
 }
 
 fn is_ipv4(s: &str) -> bool {
