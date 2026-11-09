@@ -5,7 +5,22 @@
 //! farther; the right grip carries the window in window mode.
 use openxr as xr;
 
+use crate::placement::Pose;
 use crate::placement::{rotate, Placement, Ray};
+
+/// `space` located in `base` at `t`, when the tracker knows it.
+pub fn locate(space: &xr::Space, base: &xr::Space, t: xr::Time) -> Option<Pose> {
+    let loc = space.locate(base, t).ok()?;
+    let ok = xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
+    if !loc.location_flags.contains(ok) {
+        return None;
+    }
+    let (p, q) = (loc.pose.position, loc.pose.orientation);
+    Some(Pose {
+        pos: [p.x, p.y, p.z],
+        rot: [q.x, q.y, q.z, q.w],
+    })
+}
 
 pub struct Input {
     set: xr::ActionSet,
@@ -126,18 +141,13 @@ impl Input {
         if !active {
             return f;
         }
-        let Ok(loc) = self.aim_space.locate(space, t) else {
+        let Some(p) = locate(&self.aim_space, space, t) else {
             return f;
         };
-        let ok = xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
-        if !loc.location_flags.contains(ok) {
-            return f;
-        }
-        let (p, q) = (loc.pose.position, loc.pose.orientation);
         let ray = Ray {
-            origin: [p.x, p.y, p.z],
-            // Forward is -Z rotated by q.
-            dir: rotate([q.x, q.y, q.z, q.w], [0.0, 0.0, -1.0]),
+            origin: p.pos,
+            // Forward is -Z rotated by the aim.
+            dir: rotate(p.rot, [0.0, 0.0, -1.0]),
         };
         f.aim = Some(ray);
         if let Some((_, [u, v])) = osd.hit(&ray) {

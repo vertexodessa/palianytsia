@@ -18,7 +18,7 @@ use openxr as xr;
 use openxr::sys;
 
 use crate::background::Background;
-use crate::input::Input;
+use crate::input::{locate, Input};
 use crate::osd::Osd;
 use crate::placement::{self, Grab, Placement, Pose, MAX_DIST_M, MIN_DIST_M};
 use crate::supervisor::Hub;
@@ -120,20 +120,6 @@ impl Screen {
         e.dist_m = (e.dist_m * (1.0 - 0.6 * dist * dt)).clamp(MIN_DIST_M, MAX_DIST_M);
         self.dirty = true;
     }
-}
-
-/// `space` located in `base` at `t`, when the tracker knows it.
-fn locate(space: &xr::Space, base: &xr::Space, t: xr::Time) -> Option<Pose> {
-    let loc = space.locate(base, t).ok()?;
-    let ok = xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID;
-    if !loc.location_flags.contains(ok) {
-        return None;
-    }
-    let (p, q) = (loc.pose.position, loc.pose.orientation);
-    Some(Pose {
-        pos: [p.x, p.y, p.z],
-        rot: [q.x, q.y, q.z, q.w],
-    })
 }
 
 /// Where the video hangs now and whether that is in LOCAL space (else
