@@ -59,6 +59,15 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// The decoder's error total after AU `au`: on a rise, the AU first and
+    /// then, with Release, the total `CoreLoop` reads with Acquire.
+    pub fn note_dec_errors(&self, au: u64, total: u64) {
+        if total > self.dec_errors.load(Ordering::Relaxed) {
+            self.dec_err_au.store(au, Ordering::Relaxed);
+            self.dec_errors.store(total, Ordering::Release);
+        }
+    }
+
     /// "ch 40 / 40 MHz" (the video width), or "searching for the drone:
     /// ch 64 / 40 MHz" (the receiver's width while it sweeps).
     pub fn radio_label(&self, width: u8) -> String {

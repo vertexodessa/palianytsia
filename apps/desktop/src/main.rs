@@ -356,7 +356,6 @@ fn run_decode(
         .unwrap_or_else(|e| die(&format!("decode: {e}")));
     let mut buf = Vec::new();
     let mut seq = 0u64;
-    let mut errs = 0;
     // One AU of lookahead: a frame whose successor is already queued is
     // never shown, so it skips the GPU download and RGBA conversion (the
     // bulk of the per-frame cost at 90 fps).
@@ -379,11 +378,7 @@ fn run_decode(
                 .fetch_max(t_dec1.saturating_sub(t_enq), Ordering::Relaxed);
         }
         let (f, e) = dec.counters();
-        if e > errs {
-            errs = e;
-            shared.dec_err_au.store(n, Ordering::Relaxed);
-            shared.dec_errors.store(e, Ordering::Release);
-        }
+        shared.note_dec_errors(n, e);
         if got == 0 {
             continue;
         }
