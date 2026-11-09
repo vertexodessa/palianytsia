@@ -52,8 +52,7 @@ pub fn parse_slice_header(nal: &[u8], sps: &Sps, pps: &Pps) -> Result<SliceHeade
     if h.nal_type > 21 {
         return Err(Malformed);
     }
-    h.rbsp = unescape(&nal[2..]);
-    let rbsp = std::mem::take(&mut h.rbsp);
+    let mut rbsp = unescape(&nal[2..]);
     let mut r = BitReader::new(&rbsp);
     h.first = r.flag();
     if (16..=23).contains(&h.nal_type) {
@@ -221,6 +220,7 @@ pub fn parse_slice_header(nal: &[u8], sps: &Sps, pps: &Pps) -> Result<SliceHeade
         return Err(Malformed);
     }
     h.data_byte = r.pos() / 8;
+    rbsp.truncate(h.data_byte);
     h.rbsp = rbsp;
     Ok(h)
 }
