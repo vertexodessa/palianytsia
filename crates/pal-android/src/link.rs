@@ -6,7 +6,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use decode::mediacodec::MediaCodecDecoder;
-use decode::Decoder;
 use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::RustCore;
 use pal_core::CoreOpts;

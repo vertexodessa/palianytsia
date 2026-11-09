@@ -6,7 +6,7 @@
 //!   DECBENCH_NO_RGBA=1: decode only (no download, no colour conversion).
 //!   DECBENCH_PLANES=1: packed YUV planes instead of RGBA (pal-desktop's
 //!   GPU-conversion path: download and copy, no swscale).
-use decode::{AvDecoder, Decoder, Planes};
+use decode::{AvDecoder, Planes};
 use std::time::Instant;
 
 fn main() {

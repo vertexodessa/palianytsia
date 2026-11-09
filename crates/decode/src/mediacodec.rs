@@ -22,8 +22,6 @@ use ndk::media::media_codec::{
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
 
-use crate::Decoder;
-
 /// PixelPilot's stale cap: a frame this late would only add latency.
 const STALE_US: u64 = 150_000;
 /// Frames per latency line in the log (~5 s at 60 fps).
@@ -205,10 +203,10 @@ fn output_loop(sh: &Shared) {
     }
 }
 
-impl Decoder for MediaCodecDecoder {
+impl MediaCodecDecoder {
     /// Queues the AU (waits up to 20 ms for an input buffer). Frames come
-    /// out on the output thread, so this always returns 0.
-    fn decode(&mut self, au: &[u8]) -> usize {
+    /// out on the output thread.
+    pub fn decode(&mut self, au: &[u8]) {
         let sh = &self.sh;
         match sh.codec.dequeue_input_buffer(Duration::from_millis(20)) {
             Ok(In::Buffer(mut b)) => {
@@ -218,7 +216,7 @@ impl Decoder for MediaCodecDecoder {
                     // IDR driver see the decoder error count move.
                     sh.errors.fetch_add(1, Ordering::Relaxed);
                     let _ = sh.codec.queue_input_buffer(b, 0, 0, self.pts, 0);
-                    return 0;
+                    return;
                 }
                 for (d, s) in dst.iter_mut().zip(au) {
                     d.write(*s);
@@ -245,15 +243,10 @@ impl Decoder for MediaCodecDecoder {
                 sh.errors.fetch_add(1, Ordering::Relaxed);
             }
         }
-        0
     }
 
-    /// Frames go to the Surface, never to memory.
-    fn rgba(&mut self, _out: &mut Vec<u8>) -> Option<(usize, usize)> {
-        None
-    }
-
-    fn counters(&self) -> (u64, u64) {
+    /// (frames out, decode errors) since open.
+    pub fn counters(&self) -> (u64, u64) {
         (
             self.sh.frames.load(Ordering::Relaxed),
             self.sh.errors.load(Ordering::Relaxed),

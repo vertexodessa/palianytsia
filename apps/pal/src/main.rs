@@ -246,11 +246,11 @@ impl CoreIo for Sink {
             i.on_au(&a, self.now_us);
         }
         if let Some(d) = self.dec.as_mut() {
-            decode::Decoder::decode(d, &a.data);
+            d.decode(&a.data);
             if let Some(i) = self.idr.as_mut() {
                 // Synchronous decode: the errors are this AU's.
                 let n = i.aus();
-                i.on_decoder_errors(decode::Decoder::counters(d).1, n, self.now_us);
+                i.on_decoder_errors(d.counters().1, n, self.now_us);
             }
         }
         self.aus += 1;
@@ -558,7 +558,7 @@ fn replay(o: Opts) {
         sink.aus, sink.truncated, sink.bytes, sink.sends, sink.mav
     );
     if let Some(d) = sink.dec.as_ref() {
-        let (f, e) = decode::Decoder::counters(d);
+        let (f, e) = d.counters();
         println!("decode frames={f} errors={e} hw_frames={}", d.hw_frames());
     }
     println!("stats {}", core.stats_json());

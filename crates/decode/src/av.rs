@@ -1,7 +1,7 @@
 //! libavcodec backend (Linux).
 use std::ffi::{c_char, c_int, CStr, CString};
 
-use crate::{Decoder, Planes};
+use crate::Planes;
 
 fn copy_plane(dst: &mut Vec<u8>, src: *const u8, stride: c_int, row_bytes: usize, rows: usize) {
     dst.resize(row_bytes * rows, 0);
@@ -137,13 +137,16 @@ impl Drop for AvDecoder {
     }
 }
 
-impl Decoder for AvDecoder {
-    fn decode(&mut self, au: &[u8]) -> usize {
+impl AvDecoder {
+    /// One Annex-B access unit. Returns how many frames came out (0 or 1
+    /// with low delay); errors are counted, never fatal.
+    pub fn decode(&mut self, au: &[u8]) -> usize {
         let r = unsafe { pal_dec_send(self.raw, au.as_ptr(), au.len()) };
         r.max(0) as usize
     }
 
-    fn rgba(&mut self, out: &mut Vec<u8>) -> Option<(usize, usize)> {
+    /// The newest frame as packed RGBA, or None before the first frame.
+    pub fn rgba(&mut self, out: &mut Vec<u8>) -> Option<(usize, usize)> {
         let (mut w, mut h) = (0, 0);
         if unsafe { pal_dec_size(self.raw, &mut w, &mut h) } == 0 {
             return None;
@@ -153,7 +156,8 @@ impl Decoder for AvDecoder {
         (unsafe { pal_dec_rgba(self.raw, out.as_mut_ptr(), out.len()) } == 0).then_some((w, h))
     }
 
-    fn counters(&self) -> (u64, u64) {
+    /// (frames out, decode errors) since open.
+    pub fn counters(&self) -> (u64, u64) {
         let (mut f, mut e) = (0, 0);
         unsafe { pal_dec_counters(self.raw, &mut f, &mut e) };
         (f as u64, e as u64)

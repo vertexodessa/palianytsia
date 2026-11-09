@@ -23,13 +23,3 @@ pub struct Planes {
     pub u: Vec<u8>,
     pub v: Vec<u8>,
 }
-
-pub trait Decoder: Send {
-    /// One Annex-B access unit. Returns how many frames came out (0 or 1
-    /// with low delay); errors are counted, never fatal.
-    fn decode(&mut self, au: &[u8]) -> usize;
-    /// The newest frame as packed RGBA, or None before the first frame.
-    fn rgba(&mut self, out: &mut Vec<u8>) -> Option<(usize, usize)>;
-    /// (frames out, decode errors) since open.
-    fn counters(&self) -> (u64, u64);
-}

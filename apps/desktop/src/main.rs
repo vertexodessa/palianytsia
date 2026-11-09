@@ -31,7 +31,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use decode::Decoder;
 use flightlog::capture::{self, Record};
 use flightlog::session::Session;
 use pal_core::refresh::IdrDriver;
