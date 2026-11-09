@@ -554,36 +554,7 @@ impl eframe::App for App {
                     let g = y.lock().unwrap_or_else(|p| p.into_inner());
                     g.as_ref().map(|f| (f.p.w as f32, f.p.h as f32))
                 });
-                if let (Some((w, h)), Some(y)) = (yuv_size, self.yuv.as_ref()) {
-                    let scale = (area.width() / w).min(area.height() / h);
-                    let r = egui::Rect::from_center_size(
-                        area.center(),
-                        egui::vec2(w * scale, h * scale),
-                    );
-                    let sh = self.shared.clone();
-                    ui.painter()
-                        .add(self.gl_video.callback(r, y.clone(), move |t_dec| {
-                            let l = &sh.lat;
-                            l.show_max
-                                .fetch_max(lat_us().saturating_sub(t_dec), Ordering::Relaxed);
-                            l.shown.fetch_add(1, Ordering::Relaxed);
-                        }));
-                } else if let Some(t) = &self.tex {
-                    let [w, h] = t.size().map(|v| v as f32);
-                    let scale = (area.width() / w).min(area.height() / h);
-                    let r = egui::Rect::from_center_size(
-                        area.center(),
-                        egui::vec2(w * scale, h * scale),
-                    );
-                    ui.painter().image(
-                        t.id(),
-                        r,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                }
-                // The HUD sits on the picture, not the window: same fit as
-                // the video above.
+                // The picture's fit in the window; the HUD sits on it too.
                 let src = yuv_size.or_else(|| {
                     self.tex.as_ref().map(|t| {
                         let [w, h] = t.size().map(|v| v as f32);
@@ -594,6 +565,23 @@ impl eframe::App for App {
                     let scale = (area.width() / w).min(area.height() / h);
                     egui::Rect::from_center_size(area.center(), egui::vec2(w * scale, h * scale))
                 });
+                if let (Some(_), Some(y)) = (yuv_size, self.yuv.as_ref()) {
+                    let sh = self.shared.clone();
+                    ui.painter()
+                        .add(self.gl_video.callback(vr, y.clone(), move |t_dec| {
+                            let l = &sh.lat;
+                            l.show_max
+                                .fetch_max(lat_us().saturating_sub(t_dec), Ordering::Relaxed);
+                            l.shown.fetch_add(1, Ordering::Relaxed);
+                        }));
+                } else if let Some(t) = &self.tex {
+                    ui.painter().image(
+                        t.id(),
+                        vr,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
                 chips_moved = self.console.overlay(
                     ui,
                     now,
