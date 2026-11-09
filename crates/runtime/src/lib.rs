@@ -675,6 +675,9 @@ fn search(
     shared.searching.store(true, Ordering::Relaxed);
     let t = Instant::now();
     let mut rounds = 0u32;
+    // pump's count: what the sweep takes off the queue must not read as a
+    // backlog on the latency line.
+    let taken = || shared.lat.rx_recv.fetch_add(1, Ordering::Relaxed);
     let found = 'sweep: loop {
         for &ch in &order {
             if shared.quit.load(Ordering::Relaxed) {
@@ -694,12 +697,16 @@ fn search(
             shared.channel.store(ch, Ordering::Relaxed);
             // Frames already in the USB pipeline belong to the old channel.
             std::thread::sleep(Duration::from_millis(5));
-            while rx.try_recv().is_ok() {}
+            while rx.try_recv().is_ok() {
+                taken();
+            }
             let h0 = hits.load(Ordering::Relaxed);
             cur.store(ch, Ordering::Relaxed);
             let end = Instant::now() + Duration::from_millis(DWELL_MS);
             while Instant::now() < end {
-                let _ = rx.recv_timeout(Duration::from_millis(20));
+                if rx.recv_timeout(Duration::from_millis(20)).is_ok() {
+                    taken();
+                }
                 if hits.load(Ordering::Relaxed).wrapping_sub(h0) >= FOUND_HITS {
                     break 'sweep Some(ch);
                 }
