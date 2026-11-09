@@ -860,29 +860,40 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
     (out, skipped)
 }
 
+fn parse_table(text: &str) -> R<Table> {
+    text.parse::<Table>()
+        .map_err(|e| ConfigError(format!("config: {e}")))
+}
+
+/// The edited config as text, validated as a whole.
+fn finish_edit(j: &Table) -> R<String> {
+    let out = toml::to_string(j).map_err(|e| ConfigError(format!("config: {e}")))?;
+    parse_config_str(&out)?;
+    Ok(out)
+}
+
+fn ensure_table<'a>(j: &'a mut Table, key: &str) -> R<&'a mut Table> {
+    j.entry(key)
+        .or_insert_with(|| Value::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ConfigError(format!("config: {key} is not a table")))
+}
+
 /// `radio.channels` = every 5 GHz grid channel the config's width can use
 /// (`grid_5g`); a `radio.use` and a pin stay as they are.
 pub fn with_search_grid(text: &str) -> R<String> {
     let width = parse_config_str(text)?.rx_width();
-    let mut j = text
-        .parse::<Table>()
-        .map_err(|e| ConfigError(format!("config: {e}")))?;
-    j.entry("radio")
-        .or_insert_with(|| Value::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| ConfigError("config: radio is not a table".into()))?
-        .insert(
-            "channels".into(),
-            Value::Array(
-                grid_5g(width)
-                    .into_iter()
-                    .map(|c| Value::Integer(c.into()))
-                    .collect(),
-            ),
-        );
-    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
-    parse_config_str(&out)?;
-    Ok(out)
+    let mut j = parse_table(text)?;
+    ensure_table(&mut j, "radio")?.insert(
+        "channels".into(),
+        Value::Array(
+            grid_5g(width)
+                .into_iter()
+                .map(|c| Value::Integer(c.into()))
+                .collect(),
+        ),
+    );
+    finish_edit(&j)
 }
 
 /// The operator's channel choice over the drone's set (`radio.channels`,
@@ -900,9 +911,7 @@ pub fn with_channels(text: &str, chosen: &[u8]) -> R<String> {
     if chosen.is_empty() {
         return Err(ConfigError("choose at least one channel".into()));
     }
-    let mut j = text
-        .parse::<Table>()
-        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    let mut j = parse_table(text)?;
     let radio = j
         .entry("radio")
         .or_insert_with(|| Value::Table(Table::new()))
@@ -917,9 +926,7 @@ pub fn with_channels(text: &str, chosen: &[u8]) -> R<String> {
             Value::Array(chosen.iter().map(|&c| Value::Integer(c.into())).collect()),
         );
     }
-    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
-    parse_config_str(&out)?;
-    Ok(out)
+    finish_edit(&j)
 }
 
 /// `text` with every `[[link.ladder]]` rung and `link.static_bw` at `bw`
@@ -932,9 +939,7 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     if bw != 20 && bw != 40 {
         return Err(ConfigError(format!("link width {bw}: must be 20 or 40")));
     }
-    let mut j = text
-        .parse::<Table>()
-        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    let mut j = parse_table(text)?;
     if let Some(r) = j.get_mut("radio").and_then(Value::as_table_mut) {
         r.remove("width");
     }
@@ -951,24 +956,14 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
     // Always: a static pin flies static_bw (default 20), and the adaptive
     // ladder ignores it.
     link.insert("static_bw".into(), Value::Integer(bw.into()));
-    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
-    parse_config_str(&out)?;
-    Ok(out)
+    finish_edit(&j)
 }
 
 /// `link.<key>` set to `v`, checked by the config parser.
 fn with_link_key(text: &str, key: &str, v: Value) -> R<String> {
-    let mut j = text
-        .parse::<Table>()
-        .map_err(|e| ConfigError(format!("config: {e}")))?;
-    j.entry("link")
-        .or_insert_with(|| Value::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| ConfigError("config: link is not a table".into()))?
-        .insert(key.into(), v);
-    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
-    parse_config_str(&out)?;
-    Ok(out)
+    let mut j = parse_table(text)?;
+    ensure_table(&mut j, "link")?.insert(key.into(), v);
+    finish_edit(&j)
 }
 
 /// `radio.channel` set to `ch` (a member of radio.channels), or "auto" for
@@ -976,22 +971,14 @@ fn with_link_key(text: &str, key: &str, v: Value) -> R<String> {
 /// searches the whole set for the drone and relocates it onto the pin.
 /// Comments are not kept; the result is validated as a whole.
 pub fn with_channel(text: &str, ch: u8) -> R<String> {
-    let mut j = text
-        .parse::<Table>()
-        .map_err(|e| ConfigError(format!("config: {e}")))?;
+    let mut j = parse_table(text)?;
     let v = if ch == 0 {
         Value::String("auto".into())
     } else {
         Value::Integer(ch.into())
     };
-    j.entry("radio")
-        .or_insert_with(|| Value::Table(Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| ConfigError("config: radio is not a table".into()))?
-        .insert("channel".into(), v);
-    let out = toml::to_string(&j).map_err(|e| ConfigError(format!("config: {e}")))?;
-    parse_config_str(&out)?;
-    Ok(out)
+    ensure_table(&mut j, "radio")?.insert("channel".into(), v);
+    finish_edit(&j)
 }
 
 pub fn parse_config_str(text: &str) -> R<Config> {
@@ -1019,7 +1006,6 @@ fn parse_config(j: &Table) -> R<Config> {
         ],
     )?;
     let mut c = Config::default();
-    let mut cards_absent = false;
     if let Some(r) = section(j, "radio")? {
         check_keys(
             r,
@@ -1150,8 +1136,6 @@ fn parse_config(j: &Table) -> R<Config> {
                     index: get_i32(t, "index", 0, 0, 15, &w)?,
                 });
             }
-        } else {
-            cards_absent = true;
         }
         if let Some(s) = section(r, "scan")? {
             let w = "radio.scan";
@@ -1192,7 +1176,6 @@ fn parse_config(j: &Table) -> R<Config> {
             sc.busy.blocked_pct = get_num(s, "blocked_pct", 30.0, 1.0, 100.0, w)?;
         }
     }
-    let _ = cards_absent;
     c.radio.auto_scan = c.radio.cards.is_empty();
     if !c.radio.auto_scan && c.radio.tx_card >= (c.radio.cards.len() + c.radio.relays.len()) as i32
     {
