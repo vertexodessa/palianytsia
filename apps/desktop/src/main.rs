@@ -5,10 +5,10 @@
 //! and the newest stats line.
 //!
 //!   pal-desktop -c gs.toml --replay bodies.bin [--mode gs|spotter] [--loop]
-//!   pal-desktop [-c gs.toml] [--live] [--ch N --width 20|40] [--bw 20|40] [--mode gs|spotter] [--card N] [--card2 N]
+//!   pal-desktop [-c gs.toml] [--live] [--ch N] [--bw 20|40] [--mode gs|spotter] [--card N] [--card2 N]
 //!     --bw: video link width (every ladder rung); default the saved pref (Link tab)
 //!     live is the default; config from -c, $PAL_CONFIG, or configs/gs-auto.toml (finds the drone);
-//!     channel/width from its radio section, mode gs
+//!     channel from its radio section, mode gs
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
@@ -114,7 +114,6 @@ fn parse() -> Opts {
                 }
             }
             "--ch" => o.ch = val().parse().unwrap_or_else(|_| die("--ch")),
-            "--width" => o.width = val().parse().unwrap_or_else(|_| die("--width")),
             "--card" => o.card = val().parse().unwrap_or_else(|_| die("--card")),
             "--card2" => o.card2 = Some(val().parse().unwrap_or_else(|_| die("--card2"))),
             "--mode" => {
@@ -160,8 +159,9 @@ fn parse() -> Opts {
     }
     if o.live {
         o.mode.get_or_insert(Mode::Gs);
-        // Channel and width from the config unless given: radio.channel's
-        // pin, else the first of radio.channels.
+        // Channel from the config unless given: radio.channel's pin, else
+        // the first of radio.channels. The width here is the fallback for a
+        // config with_link_bw (below) cannot rewrite.
         let cfg = o.config.as_ref().expect("config");
         let c = pal_core::config::load_config(cfg, None)
             .unwrap_or_else(|e| die(&format!("{}: {e}", cfg.display())));
@@ -180,9 +180,7 @@ fn parse() -> Opts {
                 .or(c.radio.channels.first().copied())
                 .unwrap_or(0);
         }
-        if o.width == 0 {
-            o.width = c.rx_width();
-        }
+        o.width = c.rx_width();
     }
     o
 }
@@ -653,14 +651,6 @@ fn main() {
         (sock, peer)
     });
     let shared = Arc::new(Shared::default());
-    if let Some(r) = o
-        .config
-        .as_ref()
-        .and_then(|c| pal_core::config::load_config(c, None).ok())
-        .and_then(|c| c.link.ladder_cfg.ladder.last().cloned())
-    {
-        shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
-    }
     let frame = Arc::new(Mutex::new(None));
     let yuv: Option<Arc<Mutex<Option<gl_video::YuvFrame>>>> =
         (!o.cpu_rgba).then(|| Arc::new(Mutex::new(None)));
@@ -704,6 +694,15 @@ fn main() {
         }
         o
     };
+    // From the config the core will read, after the width was applied to it.
+    if let Some(r) = o
+        .config
+        .as_ref()
+        .and_then(|c| pal_core::config::load_config(c, None).ok())
+        .and_then(|c| c.link.ladder_cfg.ladder.last().cloned())
+    {
+        shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
+    }
     let log_info = match &o.log_dir {
         Some(d) => format!("flight log in {}", d.display()),
         None => "flight log off (start with --log-dir DIR)".into(),

@@ -56,16 +56,20 @@ pub fn stamp(t: SystemTime) -> String {
     format!("{y:04}{m:02}{d:02}-{:02}{:02}", sod / 3600, sod % 3600 / 60)
 }
 
+/// The number in a session directory's name; `{:04}` grows past four digits.
+pub(crate) fn session_index(name: &str) -> Option<u32> {
+    let s = name.strip_prefix("fl-")?;
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().ok()
+}
+
 /// Next free `fl-NNNN` index under `root`.
 fn next_index(root: &Path) -> u32 {
     let Ok(rd) = fs::read_dir(root) else { return 1 };
     rd.filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let n = e.file_name().into_string().ok()?;
-            n.strip_prefix("fl-")?.get(..4)?.parse::<u32>().ok()
-        })
+        .filter_map(|e| session_index(&e.file_name().into_string().ok()?))
         .max()
-        .map_or(1, |n| n + 1)
+        .map_or(1, |n| n.saturating_add(1))
 }
 
 pub struct Session {
@@ -371,6 +375,17 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_index_grows_past_four_digits() {
+        let root = std::env::temp_dir().join(format!("pal-fl-index-{}", std::process::id()));
+        fs::create_dir_all(root.join("fl-9999_20261102-1000")).unwrap();
+        fs::create_dir_all(root.join("fl-10000_20261102-1001")).unwrap();
+        assert_eq!(next_index(&root), 10001);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(session_index("fl-1747-keep"), Some(1747));
+        assert_eq!(session_index("notes"), None);
+    }
 
     #[test]
     fn civil_dates() {

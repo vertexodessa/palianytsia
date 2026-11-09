@@ -153,31 +153,39 @@ impl RxTap for DevCard {
 }
 
 impl DevCard {
-    /// The full channel set (`set_monitor`) at `w`; `width()` is not
-    /// touched (a 40 MHz link on 165 tunes 20 and stays a 40 MHz link).
-    fn tune_full(&self, ch: u8, w: u8) -> bool {
-        let was = self.tuned_w.load(Ordering::Acquire);
-        self.tuned_w.store(w, Ordering::Release);
-        self.with_ctl(|c| {
-            self.rx_channel.store(0, Ordering::Release);
-            let r = c.set_monitor(ch, w);
+    /// Ends a move, control lock held. `channel` follows only a move that
+    /// worked: the retry must plan from where the card really is, or a failed
+    /// HT40 side change is retried as a FastRetune that keeps the old side.
+    fn end_move(&self, ch: u8, ok: bool) {
+        if ok {
             self.channel.store(ch, Ordering::Release);
-            self.rx_channel.store(ch, Ordering::Release);
-            match r {
-                Ok(()) => {
-                    eprintln!(
-                        "pal radio: card {} width {was} -> {w} MHz on ch {ch}",
-                        self.idx
-                    );
-                    true
-                }
-                Err(e) => {
-                    eprintln!("pal radio: card {}: {e}", self.idx);
-                    false
-                }
+        }
+        self.rx_channel
+            .store(self.channel.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// The full channel set (`set_monitor`) at `w`, control lock held;
+    /// `width()` is not touched (a 40 MHz link on 165 tunes 20 and stays a
+    /// 40 MHz link). `tuned_w` moves only on success: after a failure the
+    /// next retune must still see the width mismatch and try the full set.
+    fn tune_full(&self, c: &devourer_sys::Ctl, ch: u8, w: u8) -> bool {
+        self.rx_channel.store(0, Ordering::Release);
+        let r = c.set_monitor(ch, w);
+        self.end_move(ch, r.is_ok());
+        match r {
+            Ok(()) => {
+                let was = self.tuned_w.swap(w, Ordering::AcqRel);
+                eprintln!(
+                    "pal radio: card {} width {was} -> {w} MHz on ch {ch}",
+                    self.idx
+                );
+                true
             }
-        })
-        .unwrap_or(false)
+            Err(e) => {
+                eprintln!("pal radio: card {}: {e}", self.idx);
+                false
+            }
+        }
     }
 }
 
@@ -197,17 +205,17 @@ fn retune_plan(width: u8, tuned_w: u8, from: u8, to: u8) -> Option<u8> {
 
 impl ScoutRadio for DevCard {
     fn retune(&self, ch: u8) -> bool {
-        let from = self.channel.load(Ordering::Acquire);
-        if let Some(w) = retune_plan(self.width(), self.tuned_w.load(Ordering::Acquire), from, ch) {
-            return self.tune_full(ch, w);
-        }
         self.with_ctl(|c| {
+            let from = self.channel.load(Ordering::Acquire);
+            let tuned = self.tuned_w.load(Ordering::Acquire);
+            if let Some(w) = retune_plan(self.width(), tuned, from, ch) {
+                return self.tune_full(c, ch, w);
+            }
             // Blind the body stamp for the move: a frame picked up during
             // it reads 0 = unknown, not the new channel.
             self.rx_channel.store(0, Ordering::Release);
             let ok = c.fast_retune(ch);
-            self.channel.store(ch, Ordering::Release);
-            self.rx_channel.store(ch, Ordering::Release);
+            self.end_move(ch, ok);
             ok
         })
         .unwrap_or(false)
@@ -276,8 +284,16 @@ impl LinkCard for DevCard {
         if w == 40 && ht40_offset(ch) == 0 {
             return false;
         }
-        self.width.store(w, Ordering::Release);
-        self.tune_full(ch, w)
+        // Under the lock and only on success: a retune must not plan from a
+        // width the chip has not reached.
+        self.with_ctl(|c| {
+            let ok = self.tune_full(c, ch, w);
+            if ok {
+                self.width.store(w, Ordering::Release);
+            }
+            ok
+        })
+        .unwrap_or(false)
     }
     fn channel(&self) -> u8 {
         self.channel.load(Ordering::Acquire)

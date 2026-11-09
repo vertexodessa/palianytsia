@@ -52,8 +52,10 @@ struct dv_card {
   uint8_t offset = 0;
 };
 
-extern "C" dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap) try {
-  auto c = std::make_unique<dv_card>();
+// Fills the caller's `c` first, so that after a throw from bring-up dv_open
+// still holds the interface, handle and context to give back.
+static dv_card *open_card(std::unique_ptr<dv_card> &c, const dv_cfg *cfg, char *err, size_t err_cap) {
+  c = std::make_unique<dv_card>();
   if (cfg->fd >= 0) libusb_set_option(nullptr, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
   if (libusb_init(&c->ctx) != 0) { set_err(err, err_cap, "libusb_init"); return nullptr; }
   if (cfg->fd >= 0) {
@@ -118,9 +120,17 @@ extern "C" dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap) try {
   m.stbc = true;
   c->radiotap = devourer::build_stream_radiotap(m);
   return c.release();
-} catch (const std::exception &e) {
-  set_err(err, err_cap, std::string("exception: ") + e.what());
-  return nullptr;
+}
+
+extern "C" dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap) {
+  std::unique_ptr<dv_card> c;
+  try {
+    return open_card(c, cfg, err, err_cap);
+  } catch (const std::exception &e) {
+    set_err(err, err_cap, std::string("exception: ") + e.what());
+    dv_close(c.release());
+    return nullptr;
+  }
 }
 
 extern "C" int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user) {

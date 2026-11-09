@@ -526,7 +526,16 @@ fn replay(o: Opts) {
         z ^ (z >> 31)
     };
     for rec in r {
-        match rec.unwrap_or_else(|e| die(&format!("capture: {e}"))) {
+        let rec = match rec {
+            Ok(rec) => rec,
+            // A killed app can leave half a record; the flight before it counts.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                eprintln!("pal: capture ends in a torn record, stopping there: {e}");
+                break;
+            }
+            Err(e) => die(&format!("capture: {e}")),
+        };
+        match rec {
             Record::Body(b) => {
                 if o.drop_pct > 0 && (next() % 100) < u64::from(o.drop_pct) {
                     dropped += 1;

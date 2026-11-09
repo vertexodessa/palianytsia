@@ -43,7 +43,7 @@ fn sessions(root: &Path) -> io::Result<Vec<Dir>> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            let index = name.strip_prefix("fl-")?.get(..4)?.parse::<u32>().ok()?;
+            let index = crate::session::session_index(&name)?;
             let path = e.path();
             path.is_dir().then(|| Dir {
                 index,
@@ -233,6 +233,16 @@ mod tests {
         assert!(dirs[0].exists() && !dirs[1].exists() && !dirs[2].exists());
         assert!(dirs[3].exists() && dirs[4].exists());
         let _ = fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn the_newest_session_is_found_past_four_digits() {
+        let r = root("five");
+        let a = session(&r, 9999, 0, 0, 0);
+        let b = session(&r, 10000, 0, 0, 0);
+        let p = prune(&r, ROOMY).unwrap();
+        assert_eq!(p.empty_sessions, 1);
+        assert!(!a.exists() && b.exists());
     }
 
     #[test]
