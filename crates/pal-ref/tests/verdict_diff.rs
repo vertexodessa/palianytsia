@@ -6,6 +6,9 @@
 //! resets and new sessions), so each route to `interfered` is exercised.
 use std::os::raw::c_int;
 
+mod common;
+use common::Rng;
+
 use pal_core::chan::verdict::{HopVerdict, VerdictCardIn, VerdictLinkIn};
 use pal_core::config::{BusyCfg, HopCfg};
 use pal_ref as _;
@@ -74,26 +77,6 @@ extern "C" {
         rung: c_int,
         out: *mut VOut,
     );
-}
-
-/// xorshift64*: reproducible scripts without a dependency.
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-    fn unit(&mut self) -> f64 {
-        (self.next() >> 11) as f64 / (1u64 << 53) as f64
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        self.unit() < p
-    }
 }
 
 fn cfgs(r: &mut Rng) -> (HopCfg, BusyCfg) {

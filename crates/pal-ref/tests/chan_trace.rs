@@ -10,6 +10,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+mod common;
+use common::Rng;
+
 use pal_core::aggregator::Aggregator;
 use pal_core::chan::core::{
     ChannelCore, ChannelCoreCfg, ChannelSink, ChannelSnapshot, ChannelTickIn,
@@ -401,6 +404,14 @@ impl Duo {
         }
     }
 
+    /// An edit to one card's state, on both sides.
+    fn card(&self, card: usize, f: impl Fn(&mut pal_core::chan::fake::FakeState)) {
+        self.cards(|i, s| {
+            if i == card {
+                f(s);
+            }
+        });
+    }
     fn tick_tx(&mut self, session: bool, tx: usize) -> (bool, bool) {
         let now = self.ms();
         let inp = ChannelTickIn {
@@ -490,6 +501,28 @@ impl Duo {
     fn note_video(&mut self, ch: u8) {
         self.core.note_video(ch);
         self.cpp.note_video(ch);
+    }
+    fn died(&mut self, card: usize) {
+        self.core.on_card_died(card);
+        self.cpp.on_card_died(card);
+        self.sync("on_card_died");
+    }
+    fn reopened(&mut self, card: usize) {
+        self.core.on_card_reopened(card);
+        self.cpp.on_card_reopened(card);
+    }
+    fn inflight_step(&mut self) {
+        self.core.run_inflight_step();
+        self.cpp.run_inflight_step();
+        self.sync("run_inflight_step");
+    }
+    fn sampler_step(&mut self) {
+        self.core.run_sampler_step();
+        self.cpp.run_sampler_step();
+    }
+    fn au_end(&mut self) {
+        self.core.note_au_end();
+        self.cpp.note_au_end();
     }
     fn move_edge(&mut self) {
         self.vrx.test_set_move_edge();
@@ -617,11 +650,9 @@ impl Duo {
 #[test]
 fn auto_two_card_commits_at_maturity() {
     let mut d = Duo::new(2, None, 40);
-    d.cards(|i, s| {
-        if i == 1 {
-            s.cca_per_ms_on[40] = 5;
-            s.cca_per_ms_on[36] = 5;
-        }
+    d.card(1, |s| {
+        s.cca_per_ms_on[40] = 5;
+        s.cca_per_ms_on[36] = 5;
     });
     d.send_path();
     d.until(3000, false, "pick frozen on");
@@ -659,20 +690,15 @@ fn scout_card_death_and_reopen() {
     let mut d = Duo::new(2, None, 40);
     d.tick(false);
     d.cards(|i, s| s.is_alive = i != 1);
-    d.core.on_card_died(1);
-    d.cpp.on_card_died(1);
-    d.sync("on_card_died");
+    d.died(1);
     for _ in 0..20 {
         d.tick(false);
     }
-    d.cards(|i, s| {
-        if i == 1 {
-            s.is_alive = true;
-            s.width_mhz = 20;
-        }
+    d.card(1, |s| {
+        s.is_alive = true;
+        s.width_mhz = 20;
     });
-    d.core.on_card_reopened(1);
-    d.cpp.on_card_reopened(1);
+    d.reopened(1);
     for _ in 0..50 {
         d.tick(false);
     }
@@ -686,21 +712,16 @@ fn failed_width_resync_retries_once_a_second() {
         d.tick(true);
     }
     d.cards(|i, s| s.is_alive = i != 1);
-    d.core.on_card_died(1);
-    d.cpp.on_card_died(1);
-    d.sync("on_card_died");
-    d.cards(|i, s| {
-        if i == 1 {
-            s.is_alive = true;
-            s.ch = 40;
-            s.width_mhz = 20;
-            s.fail_set_width = true;
-            s.calls.clear();
-        }
+    d.died(1);
+    d.card(1, |s| {
+        s.is_alive = true;
+        s.ch = 40;
+        s.width_mhz = 20;
+        s.fail_set_width = true;
+        s.calls.clear();
     });
     let from = d.tr.len();
-    d.core.on_card_reopened(1);
-    d.cpp.on_card_reopened(1);
+    d.reopened(1);
     let end = d.ms() + 2500.0;
     while d.ms() < end {
         d.tick(true);
@@ -710,10 +731,8 @@ fn failed_width_resync_retries_once_a_second() {
         .filter(|l| l.starts_with("C1 set_width"))
         .count();
     assert_eq!(tries, 3);
-    d.cards(|i, s| {
-        if i == 1 {
-            s.fail_set_width = false;
-        }
+    d.card(1, |s| {
+        s.fail_set_width = false;
     });
     let healed = d.ms() + 1100.0;
     while d.ms() < healed {
@@ -764,9 +783,7 @@ fn two_card_order_confirm_verify() {
     assert!(d.has("verify_pass"));
     // The in-flight scout on the spare card, driven step by step.
     for _ in 0..6 {
-        d.core.run_inflight_step();
-        d.cpp.run_inflight_step();
-        d.sync("run_inflight_step");
+        d.inflight_step();
         for _ in 0..40 {
             d.vrx_video();
             d.tick(true);
@@ -813,10 +830,8 @@ fn one_card_order_rides_repeats() {
 #[test]
 fn auto_boot_hop_relocates_to_the_pick() {
     let mut d = Duo::new(2, None, 40);
-    d.cards(|i, s| {
-        if i == 1 {
-            s.nhm_busy_pct_on[64] = 100; // 64's pair is blocked
-        }
+    d.card(1, |s| {
+        s.nhm_busy_pct_on[64] = 100; // 64's pair is blocked
     });
     let visits = |d: &Duo, ch: u8| {
         let p = format!(" ch={ch} ");
@@ -850,8 +865,7 @@ fn sampled_record_span() {
     for _ in 0..2 * (d.cfg.hop.window_ms / 10) + 2 {
         d.tick(true);
     }
-    d.core.run_sampler_step();
-    d.cpp.run_sampler_step();
+    d.sampler_step();
     d.advance(10);
     d.tick_tx(true, 0);
     for _ in 0..13 {
@@ -861,8 +875,7 @@ fn sampled_record_span() {
         s.fr.own_air_us += 70000;
         s.fr.own += 10;
     });
-    d.core.run_sampler_step();
-    d.cpp.run_sampler_step();
+    d.sampler_step();
     d.advance(30);
     d.cards(|_, s| s.fr.own_air_us += 5000);
     d.tick_tx(true, 0);
@@ -883,11 +896,7 @@ fn disc_for_card_matches() {
         &d.cfg.link.key,
     );
     for ch in [64u8, 60, 40, 144] {
-        d.cards(|i, s| {
-            if i == 1 {
-                s.ch = ch
-            }
-        });
+        d.card(1, |s| s.ch = ch);
         assert_eq!(
             d.core.disc_for_card(&frame, 1),
             d.cpp.disc_for_card(&frame, 1)
@@ -909,20 +918,6 @@ impl Drop for Duo {
             })
             .collect();
         eprintln!("trace: {} lines,{kinds}", self.tr.len());
-    }
-}
-
-/// xorshift64*: a seeded script without a dependency.
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
     }
 }
 
@@ -961,21 +956,17 @@ fn random_scripts() {
                     let ch = set[r.below(4) as usize];
                     let v = [-1i32, 5, 25, 100][r.below(4) as usize];
                     let card = r.below(n as u64) as usize;
-                    d.cards(|i, s| {
-                        if i == card {
-                            s.nhm_busy_pct_on[ch as usize] = v;
-                        }
+                    d.card(card, |s| {
+                        s.nhm_busy_pct_on[ch as usize] = v;
                     });
                 }
                 57..=59 => {
                     let ch = set[r.below(4) as usize];
                     let v = [0u32, 5, 50][r.below(3) as usize];
                     let card = r.below(n as u64) as usize;
-                    d.cards(|i, s| {
-                        if i == card {
-                            s.cca_per_ms_on[ch as usize] = v;
-                            s.cca_per_ms_on[ch as usize - 4] = v;
-                        }
+                    d.card(card, |s| {
+                        s.cca_per_ms_on[ch as usize] = v;
+                        s.cca_per_ms_on[ch as usize - 4] = v;
                     });
                 }
                 60..=64 => d.cards(|_, s| s.fr.foreign += 40),
@@ -1006,41 +997,31 @@ fn random_scripts() {
                     d.note_video(ch);
                 }
                 79..=81 => {
-                    d.core.run_inflight_step();
-                    d.cpp.run_inflight_step();
-                    d.sync("run_inflight_step");
+                    d.inflight_step();
                 }
                 82 => d.move_edge(),
                 83 if n == 2 => {
                     let card = r.below(2) as usize;
-                    d.cards(|i, s| {
-                        if i == card {
-                            s.is_alive = false;
-                            s.is_ready = false;
-                        }
+                    d.card(card, |s| {
+                        s.is_alive = false;
+                        s.is_ready = false;
                     });
-                    d.core.on_card_died(card);
-                    d.cpp.on_card_died(card);
-                    d.sync("on_card_died");
+                    d.died(card);
                 }
                 84 => {
                     for card in 0..n {
                         if !d.cr[card].s().is_alive {
-                            d.cards(|i, s| {
-                                if i == card {
-                                    s.is_alive = true;
-                                    s.is_ready = true;
-                                }
+                            d.card(card, |s| {
+                                s.is_alive = true;
+                                s.is_ready = true;
                             });
-                            d.core.on_card_reopened(card);
-                            d.cpp.on_card_reopened(card);
+                            d.reopened(card);
                         }
                     }
                 }
                 85..=86 => d.cards(|i, s| s.retune_ok = i != n - 1 || r_ok(step)),
                 87..=89 => {
-                    d.core.note_au_end();
-                    d.cpp.note_au_end();
+                    d.au_end();
                 }
                 90..=91 => d.snapshot(r.below(n as u64) as usize),
                 92..=93 => {
