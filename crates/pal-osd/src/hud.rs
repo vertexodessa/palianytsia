@@ -6,7 +6,7 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Ui, Vec2};
 
 use crate::prefs::HudPrefs;
-use crate::telem::Telemetry;
+use crate::telem::{is_alert, Telemetry};
 use crate::{History, SIGNAL_HOLD_S};
 
 const WHITE: Color32 = Color32::from_rgb(240, 240, 240);
@@ -17,8 +17,6 @@ const OK: Color32 = Color32::from_rgb(110, 220, 140);
 /// Per-cell voltage thresholds for the battery colour (LiPo under load).
 const CELL_WARN_V: f32 = 3.5;
 const CELL_BAD_V: f32 = 3.3;
-/// Telemetry older than this reads as lost.
-const STALE_S: f64 = 3.0;
 /// How long an FC message stays on screen.
 const TEXT_S: f64 = 5.0;
 
@@ -54,7 +52,7 @@ pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f6
         );
     }
 
-    let fresh = t.last_s.is_some_and(|s| now_s - s <= STALE_S);
+    let fresh = t.is_fresh(now_s);
     let link = h.last();
     let session = link.is_some_and(|s| s.session);
 
@@ -197,7 +195,7 @@ fn messages(ui: &Ui, c: Pos2, r: Rect, t: &Telemetry, base: f32, now_s: f64) {
     // Below centre: the newest FC message, red for warnings and worse.
     if let Some((ts, sev, msg)) = t.texts.back() {
         if now_s - ts <= TEXT_S {
-            let col = if *sev <= 4 { BAD } else { WHITE };
+            let col = if is_alert(*sev) { BAD } else { WHITE };
             text(
                 ui,
                 c + Vec2::new(0.0, r.height() * 0.22),

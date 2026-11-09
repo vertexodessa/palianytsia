@@ -21,6 +21,15 @@ const ARMED: u8 = 128;
 const FC_SYS: u8 = 1;
 const FC_COMP: u8 = 1;
 
+/// Telemetry older than this reads as lost.
+pub const STALE_S: f64 = 3.0;
+
+/// MAV_SEVERITY_WARNING (4) and worse (lower numbers) are alerts, drawn red;
+/// NOTICE (5) and milder are routine FC chatter.
+pub fn is_alert(sev: u8) -> bool {
+    sev <= 4
+}
+
 fn f32_at(p: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]])
 }
@@ -156,6 +165,11 @@ impl Telemetry {
         }
     }
 
+    /// A flight-state packet from the FC arrived within `STALE_S`.
+    pub fn is_fresh(&self, now_s: f64) -> bool {
+        self.last_s.is_some_and(|s| now_s - s <= STALE_S)
+    }
+
     /// Armed time so far, the current arm included.
     pub fn flight_s(&self, now_s: f64) -> f64 {
         self.flown_s + self.armed_at.map_or(0.0, |t| now_s - t)
@@ -177,7 +191,7 @@ fn opt<T: std::fmt::Display>(v: Option<T>, unit: &str) -> String {
 
 /// The telemetry block: armed, attitude, altitude, speed, battery, GPS, texts.
 pub fn widget(ui: &mut Ui, t: &Telemetry, now_s: f64) {
-    let stale = t.last_s.is_none_or(|s| now_s - s > 3.0);
+    let stale = !t.is_fresh(now_s);
     egui::Frame::NONE
         .fill(Color32::from_black_alpha(160))
         .corner_radius(4.0)
@@ -242,7 +256,7 @@ pub fn widget(ui: &mut Ui, t: &Telemetry, now_s: f64) {
                 ),
             );
             for (_, sev, txt) in &t.texts {
-                let c = if *sev <= 3 {
+                let c = if is_alert(*sev) {
                     Color32::from_rgb(230, 80, 70)
                 } else {
                     Color32::LIGHT_GRAY
@@ -279,6 +293,21 @@ mod tests {
         // maburd's own component is ignored for flight state.
         t.on_packet(&pack_v2(MSG_HEARTBEAT, 1, 191, 3, &[0; 9]), 1.3);
         assert!(t.armed);
+    }
+
+    #[test]
+    fn warning_is_the_last_alert_severity() {
+        assert!(is_alert(4));
+        assert!(!is_alert(5));
+    }
+
+    #[test]
+    fn freshness_ends_past_the_stale_limit() {
+        let mut t = Telemetry::default();
+        assert!(!t.is_fresh(0.0));
+        t.last_s = Some(1.0);
+        assert!(t.is_fresh(1.0 + STALE_S));
+        assert!(!t.is_fresh(1.0 + STALE_S + 0.001));
     }
 
     #[test]
