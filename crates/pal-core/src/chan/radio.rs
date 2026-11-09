@@ -206,8 +206,14 @@ impl Default for WidthCard {
     }
 }
 
-/// Once per bring-up and width (tried resets on reopen, when the boot
-/// scout lets go of the card, or when the width flips).
+/// How long a card waits after a failed `set_width` before the next try: a
+/// transient USB error must not leave it at the wrong width, and a lasting
+/// one must not cost a full channel set every tick.
+pub const WIDTH_RETRY_MS: f64 = 1000.0;
+
+/// Once per bring-up and width (tried resets on reopen, when the boot scout
+/// lets go of it, when the width flips, or `WIDTH_RETRY_MS` after a failed
+/// `set_width`): a failed `set_width` is logged and paced.
 pub fn needs_width_fix(c: &WidthCard, want_mhz: u8) -> bool {
     c.ready && !c.tried && !c.busy && !c.scouting && c.width != want_mhz
 }

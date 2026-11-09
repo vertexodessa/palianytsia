@@ -680,6 +680,50 @@ fn scout_card_death_and_reopen() {
 }
 
 #[test]
+fn failed_width_resync_retries_once_a_second() {
+    let mut d = Duo::new(2, Some(40), 40);
+    for _ in 0..10 {
+        d.tick(true);
+    }
+    d.cards(|i, s| s.is_alive = i != 1);
+    d.core.on_card_died(1);
+    d.cpp.on_card_died(1);
+    d.sync("on_card_died");
+    d.cards(|i, s| {
+        if i == 1 {
+            s.is_alive = true;
+            s.ch = 40;
+            s.width_mhz = 20;
+            s.fail_set_width = true;
+            s.calls.clear();
+        }
+    });
+    let from = d.tr.len();
+    d.core.on_card_reopened(1);
+    d.cpp.on_card_reopened(1);
+    let end = d.ms() + 2500.0;
+    while d.ms() < end {
+        d.tick(true);
+    }
+    let tries = d.tr[from..]
+        .iter()
+        .filter(|l| l.starts_with("C1 set_width"))
+        .count();
+    assert_eq!(tries, 3);
+    d.cards(|i, s| {
+        if i == 1 {
+            s.fail_set_width = false;
+        }
+    });
+    let healed = d.ms() + 1100.0;
+    while d.ms() < healed {
+        d.tick(true);
+    }
+    assert_eq!(d.cr[1].s().width_mhz, 40);
+    d.snapshot(0);
+}
+
+#[test]
 fn pinned_relocation_confirm_and_dirty_pin() {
     let mut d = Duo::new(2, Some(40), 40);
     d.session_opened_on(64, 64);

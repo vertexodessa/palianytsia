@@ -43,7 +43,7 @@ use super::pair::any_pair_ranked;
 use super::plan::{ChannelPlan, ChannelPlanCfg, MoveEvent};
 use super::radio::{
     needs_width_fix, nhm_period_4us, width_resync_open, LinkCard, ScoutFrames, ScoutRadio,
-    WidthCard,
+    WidthCard, WIDTH_RETRY_MS,
 };
 use super::ranker::RankEntry;
 use super::sampler::{WindowGates, WindowSampler, WindowSamplerCfg};
@@ -55,7 +55,7 @@ use super::verdict::{
     rssi_raw_to_dbm, snr_raw_to_db, HopVerdict, Verdict, VerdictCardIn, VerdictLinkIn, VerdictOut,
 };
 use crate::aggregator::Aggregator;
-use crate::config::{HopCfg, RadioCfg};
+use crate::config::{ht40_offset, HopCfg, RadioCfg};
 use crate::link_health::S1LossWindow;
 use crate::vrx::{disc_for_channel, VrxController};
 
@@ -513,6 +513,8 @@ pub struct ChannelCore {
     /// The receiver width (cfg.width_mhz).
     width_mhz: u8,
     width_tried: Vec<bool>,
+    /// When a failed resync may run again; 0 = not due.
+    width_retry_ms: Vec<f64>,
     energy_last: Vec<Option<StatsEnergyIn>>,
     dwell_stats: Vec<Option<StatsDwellIn>>,
     window_prev: Vec<ScoutFrames>,
@@ -765,6 +767,7 @@ impl ChannelCore {
             gs_start_ms,
             cur_ch: vec![cfg.start_ch; n],
             width_tried: vec![false; n],
+            width_retry_ms: vec![0.0; n],
             energy_last: vec![None; n],
             dwell_stats: vec![None; n],
             window_prev: vec![ScoutFrames::default(); n],
@@ -2234,6 +2237,10 @@ impl ChannelCore {
         let live = self.live.clone();
         for (i, fe) in live.cards.iter().enumerate() {
             let scouting = scout_busy && self.is_scout_card(i);
+            if self.width_retry_ms[i] != 0.0 && self.now_ms_cur >= self.width_retry_ms[i] {
+                self.width_tried[i] = false;
+                self.width_retry_ms[i] = 0.0;
+            }
             let wc = WidthCard {
                 ready: fe.ready(),
                 width: fe.width(),
@@ -2253,6 +2260,10 @@ impl ChannelCore {
                     self.log(format!(
                         "maburgs radio: card {i} width resync to {w} MHz on ch {ch} failed"
                     ));
+                    // 40 on a channel with no pair cannot work until the channel changes.
+                    if w != 40 || ht40_offset(ch) != 0 {
+                        self.width_retry_ms[i] = self.now_ms_cur + WIDTH_RETRY_MS;
+                    }
                 }
             }
             // The scout's dwells, ranks and picks are as wide as its card.

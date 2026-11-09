@@ -25,6 +25,8 @@ impl FakeClock {
 pub struct FakeState {
     pub ch: u8,
     pub width_mhz: u8,
+    /// `set_width` is logged and fails.
+    pub fail_set_width: bool,
     pub is_ready: bool,
     pub is_alive: bool,
     pub scout_ok: bool,
@@ -71,6 +73,7 @@ impl FakeCard {
             st: Mutex::new(FakeState {
                 ch,
                 width_mhz: 20,
+                fail_set_width: false,
                 is_ready: true,
                 is_alive: true,
                 scout_ok: true,
@@ -231,6 +234,9 @@ impl LinkCard for FakeCard {
     fn set_width(&self, c: u8, w: u8) -> bool {
         self.call(format!("set_width {c}/{w}"));
         let mut s = self.s();
+        if s.fail_set_width {
+            return false;
+        }
         s.ch = c;
         s.width_mhz = w;
         true
