@@ -194,7 +194,6 @@ pub fn run(o: OsdIn) {
         ctx.set_pixels_per_point(ppp);
         let dec_errors = o.shared.dec_errors.load(Ordering::Relaxed);
         let mut pout = pal_osd::panel::PanelOut::default();
-        let mut stats_flip = false;
         let mut chips_moved = false;
         let out = ctx.run(input, |ctx| {
             pal_osd::panel::gear(ctx, &mut console.panel);
@@ -217,8 +216,7 @@ pub fn run(o: OsdIn) {
                     // gear and the panel are Areas above, so they win.
                     let bg = ui.interact(ui.max_rect(), egui::Id::new("bg"), egui::Sense::click());
                     if bg.clicked() && !console.panel.open {
-                        console.prefs.stats = !console.prefs.stats;
-                        stats_flip = true;
+                        console.toggle_stats();
                     }
                     let c = &mut console;
                     let searching = o.shared.searching.load(Ordering::Relaxed);
@@ -243,7 +241,7 @@ pub fn run(o: OsdIn) {
                 });
         });
         console.settle(&mut pout, Some(&o.cmd_tx));
-        if (stats_flip || chips_moved) && !pout.prefs_changed {
+        if chips_moved && !pout.prefs_changed {
             console.save_prefs();
         }
         if pout.relink {
