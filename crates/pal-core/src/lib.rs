@@ -71,6 +71,9 @@ pub struct Au {
     pub vcl_nal: u8,
 }
 
+/// The rendezvous nonce every app pins ("PAL1"): replays stay comparable.
+pub const RZ_NONCE: u32 = 0x5041_4c31;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// Drives the link: rendezvous, ladder, RCFs.

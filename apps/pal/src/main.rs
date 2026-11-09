@@ -21,7 +21,7 @@ use flightlog::capture::{self, Record};
 use flightlog::session::{self, Session};
 use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::{RustCore, RustOpts};
-use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
+use pal_core::{Au, CoreIo, GsCore, Mode, RxBody, RZ_NONCE};
 use pal_ref::{RefCore, RefOpts};
 use pal_wire::dot11;
 use std::io::{BufReader, BufWriter, Write};
@@ -30,8 +30,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-const RZ_NONCE: u32 = 0x5041_4c31; // "PAL1"
 
 #[derive(Default)]
 struct Opts {

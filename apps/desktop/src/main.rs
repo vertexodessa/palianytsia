@@ -36,11 +36,9 @@ use flightlog::capture::{self, Record};
 use flightlog::session::Session;
 use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::{RustCore, RustOpts};
-use pal_core::{GsCore, Mode};
+use pal_core::{GsCore, Mode, RZ_NONCE};
 use pal_ref::{RefCore, RefOpts};
 use runtime::{lat_us, CoreLoop, Drive, LiveCfg, LoopPorts, Search, Shared, Sink};
-
-const RZ_NONCE: u32 = 0x5041_4c31;
 
 #[derive(Clone, Default)]
 struct Opts {

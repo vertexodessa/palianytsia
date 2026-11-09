@@ -9,12 +9,9 @@ use decode::mediacodec::MediaCodecDecoder;
 use decode::Decoder;
 use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::{RustCore, RustOpts};
-use pal_core::Mode;
+use pal_core::{Mode, RZ_NONCE};
 use pal_osd::params::Cmd;
 use runtime::{CoreLoop, Shared, Sink};
-
-/// Same rendezvous nonce as the desktop: replays stay comparable.
-const RZ_NONCE: u32 = 0x5041_4c31;
 
 static LAST_ERR: Mutex<String> = Mutex::new(String::new());
 
