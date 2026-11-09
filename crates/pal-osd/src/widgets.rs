@@ -214,20 +214,6 @@ const OK: Color32 = Color32::from_rgb(90, 200, 120);
 const WARN: Color32 = Color32::from_rgb(230, 180, 60);
 const BAD: Color32 = Color32::from_rgb(230, 80, 70);
 
-trait Severity {
-    /// At least WARN (BAD stays BAD).
-    fn max_warn(self) -> Self;
-}
-impl Severity for Color32 {
-    fn max_warn(self) -> Self {
-        if self == BAD {
-            BAD
-        } else {
-            WARN
-        }
-    }
-}
-
 /// Per-second history for the 60 s monitor plots.
 #[derive(Default)]
 pub struct History {
@@ -595,7 +581,7 @@ pub fn chips(
                 if tc >= 85 {
                     c = BAD;
                 } else if tc >= 75 {
-                    c = c.max_warn();
+                    c = WARN;
                 }
             }
             chip("drone", &t, c, None);
