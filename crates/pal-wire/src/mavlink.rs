@@ -248,12 +248,10 @@ pub enum Framing {
     Incomplete,
     Ok,
     BadCrc,
-    BadSignature,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum St {
-    Uninit,
     Idle,
     GotStx,
     GotLength,
@@ -313,7 +311,7 @@ pub struct Parser {
 impl Default for Parser {
     fn default() -> Self {
         Self {
-            st: St::Uninit,
+            st: St::Idle,
             msg: Message::default(),
             crc: 0xFFFF,
             idx: 0,
@@ -327,7 +325,7 @@ impl Parser {
         *self = Self::default();
     }
     pub fn is_idle(&self) -> bool {
-        self.st <= St::Idle
+        self.st == St::Idle
     }
     pub fn message(&self) -> &Message {
         &self.msg
@@ -340,7 +338,7 @@ impl Parser {
     pub fn feed(&mut self, c: u8) -> Framing {
         let mut out = Framing::Incomplete;
         match self.st {
-            St::Uninit | St::Idle => {
+            St::Idle => {
                 if c == STX || c == STX_V1 {
                     self.st = St::GotStx;
                     self.msg.len = 0;
