@@ -66,7 +66,6 @@ void from_cpp(const mabur::node::RxBody& m, pal_rx_body* out) {
 
 struct pal_ref {
   maburgs::Config cfg;
-  std::atomic<uint8_t> stored_ch{0};
   std::unique_ptr<webgs::WebGs> gs;   // last: its threads die before the rest
 };
 
@@ -140,7 +139,6 @@ pal_ref* pal_ref_new_with_card(const char* config_path, pal_card* card, void* us
             a.skipped_before, a.vcl_nal, a.data.data(), a.data.size());
     };
     pal_ref* raw = r.get();
-    io.on_channel_store = [raw](uint8_t ch) { raw->stored_ch.store(ch, std::memory_order_relaxed); };
     io.on_log = [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); };
     webgs::Opts o;   // live: adaptive gap, random nonce, the scout thread
     maburgs::LinkCard* lc = pal_card_link(card);
@@ -161,10 +159,6 @@ uint64_t pal_ref_now_us(void) {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now().time_since_epoch())
                                    .count());
-}
-
-uint8_t pal_ref_stored_channel(const pal_ref* r) {
-  return r ? r->stored_ch.load(std::memory_order_relaxed) : 0;
 }
 
 void pal_ref_free(pal_ref* r) { delete r; }
@@ -272,11 +266,10 @@ void pal_ref_link_op(const pal_ref* r, int* mcs, int* bw) {
   }
 }
 
-pal_ffs* pal_ffs_open(const char* path, int cards, int drop_pct, uint32_t seed) {
+pal_ffs* pal_ffs_open(const char* path, int drop_pct, uint32_t seed) {
   try {
     auto f = std::make_unique<pal_ffs>();
     maburgs::FrameFileSource::Options o;
-    o.cards = cards;
     o.drop_pct = drop_pct;
     o.seed = seed;
     f->src = std::make_unique<maburgs::FrameFileSource>(path, o);

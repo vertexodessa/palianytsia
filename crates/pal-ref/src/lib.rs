@@ -135,14 +135,8 @@ extern "C" {
         err_cap: usize,
     ) -> *mut PalRefRaw;
     fn pal_ref_now_us() -> u64;
-    fn pal_ref_stored_channel(r: *const PalRefRaw) -> u8;
 
-    fn pal_ffs_open(
-        path: *const c_char,
-        cards: c_int,
-        drop_pct: c_int,
-        seed: u32,
-    ) -> *mut PalFfsRaw;
+    fn pal_ffs_open(path: *const c_char, drop_pct: c_int, seed: u32) -> *mut PalFfsRaw;
     fn pal_ffs_free(f: *mut PalFfsRaw);
     fn pal_ffs_next(f: *mut PalFfsRaw, out: *mut PalRxBody) -> c_int;
     fn pal_ffs_frames_read(f: *const PalFfsRaw) -> u64;
@@ -361,11 +355,6 @@ impl RefCore {
         })
     }
 
-    /// The channel the channel core asked to remember for the next start.
-    pub fn stored_channel(&self) -> Option<u8> {
-        Some(unsafe { pal_ref_stored_channel(self.raw) }).filter(|&c| c != 0)
-    }
-
     pub fn frame_gap_timeout_ms(&self) -> u32 {
         unsafe { pal_ref_frame_gap_timeout_ms(self.raw) }
     }
@@ -480,16 +469,16 @@ impl Drop for RefCore {
     }
 }
 
-/// maburd `--dry-run --out` frame file as `cards` virtual cards with
+/// maburd `--dry-run --out` frame file as one virtual card with
 /// deterministic per-card loss (mabur's `FrameFileSource`).
 pub struct FrameFile {
     raw: *mut PalFfsRaw,
 }
 
 impl FrameFile {
-    pub fn open(path: &Path, cards: i32, drop_pct: i32, seed: u32) -> Result<Self, String> {
+    pub fn open(path: &Path, drop_pct: i32, seed: u32) -> Result<Self, String> {
         let p = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
-        let raw = unsafe { pal_ffs_open(p.as_ptr(), cards, drop_pct, seed) };
+        let raw = unsafe { pal_ffs_open(p.as_ptr(), drop_pct, seed) };
         if raw.is_null() {
             return Err(format!("cannot read frame file {}", path.display()));
         }

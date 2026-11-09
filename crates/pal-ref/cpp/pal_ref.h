@@ -104,13 +104,9 @@ uint8_t pal_card_channel(const pal_card* c);
 pal_ref* pal_ref_new_with_card(const char* config_path, pal_card* card, void* user,
                                pal_au_cb on_au, char* err, size_t err_cap);
 uint64_t pal_ref_now_us(void);
-// The channel the core asked to remember for the next start (ChannelCore's
-// store), 0 = none yet.
-uint8_t pal_ref_stored_channel(const pal_ref* r);
-
 // maburd --dry-run --out frame file as N virtual cards with deterministic loss.
 typedef struct pal_ffs pal_ffs;
-pal_ffs* pal_ffs_open(const char* path, int cards, int drop_pct, uint32_t seed);
+pal_ffs* pal_ffs_open(const char* path, int drop_pct, uint32_t seed);
 void pal_ffs_free(pal_ffs* f);
 // 1 = body written to *out (out->body valid until the next call or free),
 // 0 = end of file.

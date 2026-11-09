@@ -83,7 +83,7 @@ fn main() {
     let [frames, out] = <[PathBuf; 2]>::try_from(pos).expect("need <frames.bin> <out.aus>");
     let config = config.expect("-c <gs.toml> is required");
 
-    let src = || FrameFile::open(&frames, 1, drop_pct, seed).unwrap();
+    let src = || FrameFile::open(&frames, drop_pct, seed).unwrap();
     let sink = || Sink::create(&out, sends.as_deref());
     let adaptive_gap = !fixed_gap;
     if rust {
