@@ -16,8 +16,6 @@ struct Phone {
     /// the relinks a settings change asks for (the bring-up takes seconds).
     cards: Arc<Mutex<Option<Arc<runtime::CardSet>>>>,
     args: Args,
-    /// Newest stats line, written by the OSD thread.
-    last: Arc<Mutex<String>>,
     osd: Option<JoinHandle<()>>,
     /// Touches from the Activity (pixels) into the OSD thread's egui.
     touch_tx: mpsc::Sender<crate::osd::Touch>,
@@ -44,7 +42,6 @@ fn start(fd: i32, args: Args) -> Result<Phone, String> {
         fd,
         cards: Arc::default(),
         args,
-        last: Arc::new(Mutex::new(String::new())),
         osd: None,
         touch_tx: mpsc::channel().0,
         relink: Arc::new(AtomicBool::new(false)),
@@ -82,7 +79,6 @@ impl Phone {
             win: a.osd_win.clone(),
             density: a.density,
             stats_rx: ports.stats_rx,
-            last: self.last.clone(),
             shared: link.shared.clone(),
             relink: self.relink.clone(),
             reopen: self.reopen.clone(),
@@ -196,22 +192,6 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
             0
         }
     }
-}
-
-#[no_mangle]
-pub extern "system" fn Java_org_palianytsia_phone_Native_stats(
-    mut env: JNIEnv,
-    _c: JClass,
-    h: jlong,
-) -> jstring {
-    if h == 0 {
-        return jstr(&mut env, "");
-    }
-    // SAFETY: h came from start() and stop() has not run (the Activity
-    // calls both on the UI thread).
-    let p = unsafe { &*(h as *mut Phone) };
-    let s = p.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    jstr(&mut env, &s)
 }
 
 #[no_mangle]

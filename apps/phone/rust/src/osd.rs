@@ -21,8 +21,6 @@ pub struct OsdIn {
     /// Android DisplayMetrics.density: egui points to pixels.
     pub density: f32,
     pub stats_rx: Receiver<String>,
-    /// The newest stats line, also read by the Java side.
-    pub last: Arc<Mutex<String>>,
     pub shared: Arc<Shared>,
     /// The drone's MAVLink packets (CoreIo::on_mav) for the flight HUD.
     pub mav_rx: Receiver<Vec<u8>>,
@@ -133,10 +131,6 @@ pub fn run(o: OsdIn) {
         Ok(x) => x,
         Err(e) => {
             log::error!("osd: {e}");
-            // Without an OSD the stats still reach Java.
-            while let Ok(s) = o.stats_rx.recv() {
-                *o.last.lock().unwrap_or_else(|p| p.into_inner()) = s;
-            }
             return;
         }
     };
@@ -170,7 +164,6 @@ pub fn run(o: OsdIn) {
         match o.stats_rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(s) => {
                 console.on_stats(t0.elapsed().as_secs_f64(), &s);
-                *o.last.lock().unwrap_or_else(|p| p.into_inner()) = s;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,

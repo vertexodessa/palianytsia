@@ -14,9 +14,6 @@ final class Native {
     static native long start(int usbFd, Surface video, Surface osd, float density,
             String configToml, String filesDir, String logDir);
 
-    /** Newest core stats line (JSON), "" before the first. */
-    static native String stats(long handle);
-
     /** A touch for the Rust-drawn OSD: action 0 down, 1 up, 2 move,
      *  3 cancel; x, y in Surface pixels. */
     static native void touch(long handle, int action, float x, float y);

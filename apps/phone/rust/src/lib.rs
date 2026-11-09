@@ -7,7 +7,6 @@
 //!   long start(int fd, Surface video, Surface osd, float density, String configToml,
 //!              String filesDir, String logDir)
 //!                             0 = failed, see lastError()
-//!   String stats(long h)      newest stats JSON ("" before the first)
 //!   void touch(long h, int action, float x, float y)  touches for the OSD (gear, panel, tap toggles stats)
 //!   boolean running(long h)  false once the core thread returned (card gone)
 //!   String lastError()
