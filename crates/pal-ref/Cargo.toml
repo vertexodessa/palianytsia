@@ -15,7 +15,7 @@ pal-wire = { workspace = true, optional = true }
 
 [features]
 # The glue that hands a live devourer-sys card to the C++ core
-# (runtime::Attach): pal-desktop and the Android apps.
+# (runtime::Attach): pal-desktop.
 live = ["dep:runtime", "dep:devourer-sys", "dep:pal-wire"]
 
 [dev-dependencies]

@@ -1,7 +1,6 @@
 //! Builds mabur's native web GS core from the pinned submodule with its own
 //! CMake (only the `mabur_web_core` target and what it needs), then the C ABI
-//! shim against it. Host (the test oracle) and aarch64 Android, where the
-//! C++ core with its ChannelCore drives the card in the phone/Quest apps.
+//! shim against it. Host only: the test oracle and pal-desktop --core ref.
 use std::path::PathBuf;
 
 fn main() {
@@ -15,30 +14,7 @@ fn main() {
         .canonicalize()
         .expect("third_party/devourer missing: git submodule update --init");
 
-    let android = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android");
-    let mut cfg = cmake::Config::new(&mabur);
-    if android {
-        // As devourer-sys: the NDK toolchain, and libusb (mabur's configure
-        // pulls devourer's CMake in, which asks pkg-config for it) from
-        // tools/android-libusb.sh. Nothing of it is linked here.
-        let ndk =
-            std::env::var("ANDROID_NDK_HOME").expect("ANDROID_NDK_HOME (tools/android-build.sh)");
-        let usb = PathBuf::from(
-            std::env::var("PAL_ANDROID_LIBUSB")
-                .expect("PAL_ANDROID_LIBUSB (tools/android-libusb.sh)"),
-        );
-        println!("cargo:rerun-if-env-changed=PAL_ANDROID_LIBUSB");
-        cfg.env("PKG_CONFIG_LIBDIR", usb.join("lib/pkgconfig"))
-            .env("PKG_CONFIG_PATH", "")
-            .define("CMAKE_FIND_ROOT_PATH", &usb)
-            .define(
-                "CMAKE_TOOLCHAIN_FILE",
-                format!("{ndk}/build/cmake/android.toolchain.cmake"),
-            )
-            .define("ANDROID_ABI", "arm64-v8a")
-            .define("ANDROID_PLATFORM", "android-29");
-    }
-    let dst = cfg
+    let dst = cmake::Config::new(&mabur)
         .define("DEVOURER_DIR", &devourer)
         .define("MABUR_BUILD_TESTS", "OFF")
         .define("MABUR_BUILD_DRONE", "OFF")
@@ -79,13 +55,9 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", b.join(dir).display());
         println!("cargo:rustc-link-lib=static={lib}");
     }
-    if android {
-        println!("cargo:rustc-link-lib=dylib=c++_shared");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=stdc++");
-        println!("cargo:rustc-link-lib=dylib=rt");
-        println!("cargo:rustc-link-lib=dylib=pthread");
-    }
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib=rt");
+    println!("cargo:rustc-link-lib=dylib=pthread");
 
     println!("cargo:rerun-if-changed=cpp");
     println!("cargo:rerun-if-changed=build.rs");
