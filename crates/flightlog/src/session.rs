@@ -24,14 +24,13 @@ pub const AULOG_MARKER: &str = "aulog 1";
 pub const VERSION: u32 = 1;
 
 /// Stats keys whose change is an event, in the order they are reported.
-pub const WATCHED: &[&str] = &[
+const WATCHED: &[&str] = &[
     "session",
     "key_mismatch",
     "drone_state",
     "rung",
     "mcs",
     "bw",
-    "channel",
     "resets",
 ];
 
@@ -148,30 +147,22 @@ impl Session {
             // Two lines in a row: a hop or a pick, not a dwell.
             let from = std::mem::replace(&mut self.channel, ch.clone());
             self.channel_seen = None;
-            self.event(
-                t_us,
-                "channel",
-                json!({"from": from.unwrap_or(Value::Null), "to": ch.unwrap_or(Value::Null)}),
-            )?;
+            self.event(t_us, "channel", json!({"from": from, "to": ch}))?;
         } else {
             self.channel_seen = ch;
         }
         if let Some(prev) = self.last.take() {
-            for k in WATCHED.iter().filter(|k| **k != "channel") {
+            for k in WATCHED {
                 let (a, b) = (prev.get(*k), m.get(*k));
                 if a != b {
-                    self.event(
-                        t_us,
-                        k,
-                        json!({"from": a.cloned().unwrap_or(Value::Null),
-                               "to": b.cloned().unwrap_or(Value::Null)}),
-                    )?;
+                    self.event(t_us, k, json!({"from": a, "to": b}))?;
                 }
             }
         }
-        self.last = Some(m.clone());
         m.insert("t_us".into(), json!(t_us));
-        writeln!(self.stats, "{}", Value::Object(m))
+        writeln!(self.stats, "{}", serde_json::to_string(&m)?)?;
+        self.last = Some(m); // t_us is not watched
+        Ok(())
     }
 
     pub fn event(&mut self, t_us: u64, ev: &str, detail: Value) -> io::Result<()> {
