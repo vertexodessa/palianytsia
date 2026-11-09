@@ -42,9 +42,8 @@ use runtime::{lat_us, CoreLoop, Drive, LiveCfg, LoopPorts, Search, Shared, Sink}
 
 #[derive(Clone, Default)]
 struct Opts {
-    config: Option<PathBuf>,
+    config: PathBuf,
     replay: Option<PathBuf>,
-    live: bool,
     ch: u8,
     /// radio.channel = "auto" and no --ch: sweep radio.channels for the
     /// drone (Rust core only; pal-ref's channel core would steer it).
@@ -65,7 +64,7 @@ struct Opts {
     /// A second card (scan index) for the channel core: receives too, and
     /// the core scouts on it. Only with an attached core (auto config).
     card2: Option<i32>,
-    mode: Option<Mode>,
+    mode: Mode,
     rust: bool,
     looping: bool,
     log_dir: Option<PathBuf>,
@@ -100,6 +99,7 @@ fn parse() -> Opts {
         secs: 5.0,
         ..Opts::default()
     };
+    let (mut config, mut mode, mut live) = (None, None, false);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut val = || {
@@ -107,9 +107,9 @@ fn parse() -> Opts {
                 .unwrap_or_else(|| die(&format!("{a} needs a value")))
         };
         match a.as_str() {
-            "-c" => o.config = Some(val().into()),
+            "-c" => config = Some(val().into()),
             "--replay" => o.replay = Some(val().into()),
-            "--live" => o.live = true,
+            "--live" => live = true,
             "--bw" => {
                 o.link_bw = match val().as_str() {
                     "20" => 20,
@@ -121,7 +121,7 @@ fn parse() -> Opts {
             "--card" => o.card = val().parse().unwrap_or_else(|_| die("--card")),
             "--card2" => o.card2 = Some(val().parse().unwrap_or_else(|_| die("--card2"))),
             "--mode" => {
-                o.mode = Some(match val().as_str() {
+                mode = Some(match val().as_str() {
                     "gs" => Mode::Gs,
                     "spotter" => Mode::Spotter,
                     m => die(&format!("--mode gs|spotter, got {m}")),
@@ -148,12 +148,11 @@ fn parse() -> Opts {
             s => die(&format!("unknown argument {s}")),
         }
     }
-    if o.live && o.replay.is_some() {
+    if live && o.replay.is_some() {
         die("--live and --replay are exclusive");
     }
     // No source given: live, the everyday case (`cargo run -p pal-desktop`).
-    o.live = o.replay.is_none();
-    if o.config.is_none() {
+    o.config = config.unwrap_or_else(|| {
         // -c, else $PAL_CONFIG, else the APKs' config: it finds the drone on
         // any channel of its set, where a pinned config waits on one.
         let p = std::env::var_os("PAL_CONFIG")
@@ -165,18 +164,18 @@ fn parse() -> Opts {
                 ))
             });
         eprintln!("pal-desktop: config {}", p.display());
-        o.config = Some(p);
-    }
+        p
+    });
     resolve_config(&mut o);
-    if o.live {
-        o.mode.get_or_insert(Mode::Gs);
+    o.mode = mode.unwrap_or(if o.live() { Mode::Gs } else { Mode::Spotter });
+    if o.live() {
         // Channel from the config unless given: radio.channel's pin, else
         // the first of radio.channels.
         let c = &o.cfg;
         if o.ch == 0 && c.radio.pin.is_none() {
             // A GS runs the channel core on the card (either core); a Rust
             // spotter, which has none, sweeps for the drone instead.
-            o.channel_core = o.mode == Some(Mode::Gs);
+            o.channel_core = o.mode == Mode::Gs;
             if o.rust && !o.channel_core {
                 o.search = o.cfg.radio.channels.clone();
             }
@@ -187,6 +186,12 @@ fn parse() -> Opts {
         o.width = o.cfg.rx_width();
     }
     o
+}
+
+impl Opts {
+    fn live(&self) -> bool {
+        self.replay.is_none()
+    }
 }
 
 fn prefs_path() -> PathBuf {
@@ -200,10 +205,10 @@ fn prefs_path() -> PathBuf {
 /// Reads the config once. A live run applies the video width when it
 /// starts: every ladder rung at --bw, else the saved pref.
 fn resolve_config(o: &mut Opts) {
-    let path = o.config.clone().expect("config");
+    let path = o.config.clone();
     let mut text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
-    if o.live {
+    if o.live() {
         let bw = match o.link_bw {
             0 => pal_osd::prefs::HudPrefs::load(&prefs_path()).link_bw,
             b => b,
@@ -217,7 +222,7 @@ fn resolve_config(o: &mut Opts) {
                         .join(format!("pal-desktop-{}-bw{bw}.toml", std::process::id()));
                     std::fs::write(&p, &text)
                         .unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
-                    o.config = Some(p.clone());
+                    o.config = p.clone();
                     o.ref_toml = Some(p);
                 }
             }
@@ -242,7 +247,7 @@ fn drive(o: &Opts) -> Drive {
             };
             runtime::dev_card::rust_channel_core(o.cfg.clone(), opts, o.width)
         } else {
-            pal_ref::live::channel_core(o.config.clone().expect("config"), o.ch, o.width)
+            pal_ref::live::channel_core(o.config.clone(), o.ch, o.width)
         };
         let extra = o.card2.map(|index| devourer_sys::Select::Scan { index });
         return Drive::Core {
@@ -252,7 +257,7 @@ fn drive(o: &Opts) -> Drive {
     }
     if o.search.is_empty() {
         return Drive::Pinned {
-            gs: o.mode == Some(Mode::Gs),
+            gs: o.mode == Mode::Gs,
         };
     }
     let o2 = o.clone();
@@ -267,7 +272,7 @@ fn drive(o: &Opts) -> Drive {
 
 fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
     let opts = CoreOpts {
-        mode: o.mode.unwrap_or(Mode::Spotter),
+        mode: o.mode,
         adaptive_gap: true,
         rz_nonce: RZ_NONCE,
         channel,
@@ -275,8 +280,7 @@ fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
     if o.rust {
         return Box::new(RustCore::new(&o.cfg, opts).unwrap_or_else(|e| die(&e)));
     }
-    let cfg = o.config.as_ref().expect("config");
-    Box::new(RefCore::new(cfg, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
+    Box::new(RefCore::new(&o.config, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
 }
 
 struct Frame {
@@ -662,13 +666,13 @@ fn main() {
     let yuv: Option<Arc<Mutex<Option<gl_video::YuvFrame>>>> =
         (!o.cpu_rgba).then(|| Arc::new(Mutex::new(None)));
     let log = o.log_dir.as_ref().map(|d| {
-        let cap = if o.live { 512 << 20 } else { 0 };
+        let cap = if o.live() { 512 << 20 } else { 0 };
         let s = Session::create(d, std::time::SystemTime::now(), cap)
             .unwrap_or_else(|e| die(&format!("{}: {e}", d.display())));
         eprintln!("pal-desktop: flight log {}", s.dir().display());
         s
     });
-    let channel = if o.live { o.ch } else { 0 };
+    let channel = if o.live() { o.ch } else { 0 };
     let prefs_path = prefs_path();
     if let Some(r) = o.cfg.link.ladder_cfg.ladder.last() {
         shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
@@ -687,7 +691,7 @@ fn main() {
         now_us: 0,
         pts_off_us: None,
         shared: shared.clone(),
-        idr: (o.mode == Some(Mode::Gs) && o.idr.unwrap_or(o.live)).then(IdrDriver::default),
+        idr: (o.mode == Mode::Gs && o.idr.unwrap_or(o.live())).then(IdrDriver::default),
         cam_fps: Default::default(),
     };
     let native = eframe::NativeOptions {

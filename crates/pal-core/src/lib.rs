@@ -98,11 +98,12 @@ impl Default for CoreOpts {
 /// The rendezvous nonce every app pins ("PAL1"): replays stay comparable.
 pub const RZ_NONCE: u32 = 0x5041_4c31;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     /// Drives the link: rendezvous, ladder, RCFs.
     Gs,
     /// Receive only; no transmit path by construction.
+    #[default]
     Spotter,
 }
 
