@@ -194,7 +194,7 @@ impl DevCard {
 /// The operator may choose channels on both sides of the pair grid (36 is
 /// HT40+, 40 HT40-) and 165, which has no pair; at 40 MHz those moves cannot
 /// keep the offset.
-fn retune_plan(width: u8, tuned_w: u8, from: u8, to: u8) -> Option<u8> {
+pub(crate) fn retune_plan(width: u8, tuned_w: u8, from: u8, to: u8) -> Option<u8> {
     let w = if width == 40 && ht40_offset(to) == 0 {
         20
     } else {

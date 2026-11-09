@@ -77,7 +77,6 @@ extern "C" {
     fn dv_open(cfg: *const DvCfg, err: *mut c_char, cap: usize) -> *mut DvCard;
     fn dv_start_rx(c: *mut DvCard, cb: RxCb, user: *mut c_void) -> c_int;
     fn dv_send_control(c: *mut DvCard, body: *const u8, len: usize) -> c_int;
-    fn dv_set_channel(c: *mut DvCard, ch: u8, width_mhz: u8) -> c_int;
     fn dv_chip(c: *const DvCard) -> *const c_char;
     fn dv_radio(c: *mut DvCard) -> *mut c_void;
     fn dv_close(c: *mut DvCard);
@@ -218,15 +217,6 @@ impl Ctl<'_> {
             0 => Ok(()),
             -2 => Err(format!("channel {ch} has no 40 MHz pair")),
             r => Err(format!("set_monitor({ch}, {width_mhz}) failed ({r})")),
-        }
-    }
-
-    /// FastRetune when only the channel changes, else SetMonitorChannel.
-    pub fn set_channel(&self, ch: u8, width_mhz: u8) -> Result<(), String> {
-        match unsafe { dv_set_channel(self.raw, ch, width_mhz) } {
-            0 => Ok(()),
-            -2 => Err(format!("channel {ch} has no 40 MHz pair")),
-            r => Err(format!("set_channel({ch}, {width_mhz}) failed ({r})")),
         }
     }
 
@@ -403,12 +393,6 @@ impl Card {
             raw: self.raw,
             _g: self.tx.lock().unwrap_or_else(|e| e.into_inner()),
         }
-    }
-
-    /// Moves the card to `ch` / `width_mhz` (FastRetune when only the
-    /// channel changes); never overlaps a send.
-    pub fn set_channel(&self, ch: u8, width_mhz: u8) -> Result<(), String> {
-        self.ctl().set_channel(ch, width_mhz)
     }
 
     /// GS uplink control frame around an RC body. Thread-safe.

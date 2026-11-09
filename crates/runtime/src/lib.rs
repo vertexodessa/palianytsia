@@ -656,13 +656,15 @@ pub const LOST_US: u64 = 8_000_000;
 
 /// Sweeps `set` (starting at `first`) until `hits` grows by FOUND_HITS
 /// within one dwell. Bodies queued meanwhile are dropped: none may reach a
-/// core built for another channel. None when asked to quit.
+/// core built for another channel. None when asked to quit. `tuned` is the
+/// channel and width the card is on, kept between sweeps.
 #[allow(clippy::too_many_arguments)]
 fn search(
     card: &devourer_sys::Card,
     set: &[u8],
     first: u8,
     width: u8,
+    tuned: &mut (u8, u8),
     cur: &AtomicU8,
     hits: &AtomicU32,
     rx: &Receiver<RxBody>,
@@ -680,7 +682,15 @@ fn search(
             }
             // Blind the RX stamp across the move, as maburgs' retune does.
             cur.store(0, Ordering::Relaxed);
-            card.set_channel(ch, width)?;
+            match dev_card::retune_plan(width, tuned.1, tuned.0, ch) {
+                Some(w) => {
+                    card.ctl().set_monitor(ch, w)?;
+                    tuned.1 = w;
+                }
+                None if card.ctl().fast_retune(ch) => {}
+                None => return Err(format!("fast_retune({ch}) failed")),
+            }
+            tuned.0 = ch;
             shared.channel.store(ch, Ordering::Relaxed);
             // Frames already in the USB pipeline belong to the old channel.
             std::thread::sleep(Duration::from_millis(5));
@@ -960,11 +970,15 @@ fn run_runtime_owned(
     let mut srch = search.filter(|s| !s.set.is_empty());
     let searching = srch.is_some();
     let mut core_ch = ch;
+    let mut tuned = (ch, width);
     // Sweeps, then rebuilds the core when the drone is elsewhere.
     let mut find = |cl: &mut CoreLoop, core_ch: &mut u8| -> Result<bool, String> {
         let s = srch.as_mut().expect("searching");
         let from = *core_ch;
-        let Some(ch) = self::search(card, &s.set, from, width, &cur, &hits, &rx, &shared)? else {
+        let Some(ch) = self::search(
+            card, &s.set, from, width, &mut tuned, &cur, &hits, &rx, &shared,
+        )?
+        else {
             return Ok(false);
         };
         if ch != *core_ch {

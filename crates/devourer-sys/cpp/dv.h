@@ -45,15 +45,9 @@ dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap);
 int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user);
 /* GS uplink control frame: MAX_RANGE radiotap + probe-req dot11 (canonical SA). */
 int dv_send_control(dv_card *c, const uint8_t *body, size_t len);
-/* Moves the running card to ch / width_mhz (20 or 40, secondary =
- * mabur::ht40_offset). Same width and offset: FastRetune (RF switch only,
- * ~1-3 ms); otherwise the full SetMonitorChannel. 0 on success, -2 for a
- * 40 MHz channel without a pair, -1 on a device error. A control-plane
- * call: never from the RX callback, never concurrent with a send. */
-int dv_set_channel(dv_card *c, uint8_t ch, uint8_t width_mhz);
 /* What the channel search reads (devourer RxEnergy / NhmBusy /
- * AdapterCaps), for the Rust LinkCard. Control-plane calls like
- * dv_set_channel: the caller serialises them with sends. */
+ * AdapterCaps), for the Rust LinkCard. Control-plane calls: never from
+ * the RX callback; the caller serialises them with sends. */
 typedef struct {
   uint8_t valid_fa, valid_igi, valid_nhm, valid_floor;
   uint32_t cca_ofdm, fa_ofdm;
