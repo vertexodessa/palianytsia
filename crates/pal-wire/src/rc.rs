@@ -562,10 +562,6 @@ pub fn frame_type(b: &[u8]) -> Option<u8> {
     Some(b[3])
 }
 
-pub fn is_foreign_rc_version(b: &[u8]) -> bool {
-    b.len() >= 4 && g16(b, 0) == RC_MAGIC && b[2] != RC_VERSION
-}
-
 /// `default` for the shipped key, else 4 hex chars of SipHash("mabur.key").
 pub fn key_fingerprint(k: &LinkKey) -> alloc::string::String {
     if *k == DEFAULT_LINK_KEY {

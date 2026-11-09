@@ -67,20 +67,19 @@ pub fn parse(d: &[u8], crc_err: bool, data_rate: u16) -> Verdict {
 mod tests {
     use super::*;
 
-    fn frame(fc: u8, sa: [u8; 6], seq: u16, body: usize) -> [u8; 64] {
+    fn frame(fc: u8, sa: [u8; 6], seq: u16) -> [u8; 64] {
         let mut f = [0u8; 64];
         f[0] = fc;
         f[10..16].copy_from_slice(&sa);
         let sc = (seq << 4).to_le_bytes();
         f[22] = sc[0];
         f[23] = sc[1];
-        let _ = body;
         f
     }
 
     #[test]
     fn qos_data_offset_and_seq() {
-        let f = frame(0x88, SA, 0xABC, 0);
+        let f = frame(0x88, SA, 0xABC);
         assert_eq!(
             parse(&f, false, 0x0F),
             Verdict::Body(Parsed {
@@ -93,7 +92,7 @@ mod tests {
 
     #[test]
     fn probe_req_offset_kestrel_rate() {
-        let f = frame(0x40, SA, 7, 0);
+        let f = frame(0x40, SA, 7);
         assert_eq!(
             parse(&f, false, 0x85),
             Verdict::Body(Parsed {
@@ -106,14 +105,14 @@ mod tests {
 
     #[test]
     fn foreign_unless_crc_bad() {
-        let f = frame(0x88, [1, 2, 3, 4, 5, 6], 1, 0);
+        let f = frame(0x88, [1, 2, 3, 4, 5, 6], 1);
         assert_eq!(parse(&f, false, 0x0C), Verdict::Foreign);
         assert!(matches!(parse(&f, true, 0x0C), Verdict::Body(_)));
     }
 
     #[test]
     fn short_frames() {
-        let f = frame(0x88, SA, 1, 0);
+        let f = frame(0x88, SA, 1);
         assert_eq!(parse(&f[..26], false, 0), Verdict::Short);
         assert!(matches!(parse(&f[..27], false, 0), Verdict::Body(_)));
         assert_eq!(parse(&f[..24], false, 0), Verdict::Short);

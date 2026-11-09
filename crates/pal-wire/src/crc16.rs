@@ -23,15 +23,8 @@ const fn make_table() -> [u16; 256] {
     t
 }
 
-/// The C++ default `init` is 0xFFFF.
-pub const INIT: u16 = 0xFFFF;
-
-pub fn crc16_ccitt_with(data: &[u8], init: u16) -> u16 {
-    data.iter().fold(init, |crc, &b| {
+pub fn crc16_ccitt(data: &[u8]) -> u16 {
+    data.iter().fold(0xFFFF, |crc, &b| {
         (crc << 8) ^ TABLE[usize::from((crc >> 8) as u8 ^ b)]
     })
-}
-
-pub fn crc16_ccitt(data: &[u8]) -> u16 {
-    crc16_ccitt_with(data, INIT)
 }
