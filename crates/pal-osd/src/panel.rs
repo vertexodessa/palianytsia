@@ -9,6 +9,11 @@ use egui::{Color32, RichText, Ui};
 use crate::params::{Cmd, Edits, Row, Table};
 use crate::prefs::HudPrefs;
 
+/// A button `h` points tall at least (0 = sized by its text, on desktop).
+pub(crate) fn btn(text: impl Into<egui::WidgetText>, h: f32) -> egui::Button<'static> {
+    egui::Button::new(text).min_size(egui::vec2(0.0, h))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tab {
     #[default]
@@ -480,12 +485,8 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                                     ui.label("Video width");
                                     for bw in [20u8, 40] {
                                         let on = i.prefs.link_bw == bw;
-                                        let b = egui::Button::new(format!("{bw} MHz"))
-                                            .selected(on)
-                                            .min_size(egui::vec2(
-                                                0.0,
-                                                if touch { 40.0 } else { 0.0 },
-                                            ));
+                                        let h = if touch { 40.0 } else { 0.0 };
+                                        let b = btn(format!("{bw} MHz"), h).selected(on);
                                         if ui.add(b).clicked() && !on {
                                             i.prefs.link_bw = bw;
                                             out.prefs_changed = true;
@@ -624,7 +625,7 @@ fn channels_button(ui: &mut Ui, prefs: &HudPrefs, set: &[u8], touch: bool) -> Op
         format!("{}, auto", l.join(" "))
     };
     let h = if touch { 40.0 } else { 0.0 };
-    let b = egui::Button::new(format!("Channels: {what}  >")).min_size(egui::vec2(0.0, h));
+    let b = btn(format!("Channels: {what}  >"), h);
     ui.add(b).clicked().then_some(offer)
 }
 
@@ -665,21 +666,16 @@ fn channel_menu(
     let h = if touch { 40.0 } else { 0.0 };
     let mut next = None;
     ui.horizontal(|ui| {
-        if ui
-            .add(egui::Button::new("<  Link").min_size(egui::vec2(0.0, h)))
-            .clicked()
-        {
+        if ui.add(btn("<  Link", h)).clicked() {
             out.back = true;
         }
         let all = cur.len() == offer.len();
-        let b = egui::Button::new("all")
-            .selected(all)
-            .min_size(egui::vec2(0.0, h));
+        let b = btn("all", h).selected(all);
         if ui.add(b).clicked() && !all {
             next = Some(Vec::new());
         }
         let running = scan.is_some_and(|s| s.running);
-        let b = egui::Button::new("rescan").min_size(egui::vec2(0.0, h));
+        let b = btn("rescan", h);
         if ui.add_enabled(!running, b).clicked() {
             out.rescan = Some(offer.clone());
         }

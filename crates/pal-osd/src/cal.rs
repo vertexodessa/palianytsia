@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::json::{bool_or, list, opt_f64, opt_i64, str_or, u64_or};
 
+use crate::panel::btn;
 use crate::params::{Cmd, Table};
 
 /// The drone row whose "none" undoes a calibration (mabur cfgparam).
@@ -157,6 +158,22 @@ fn reset_row(t: Option<&Table>) -> Option<(usize, bool)> {
     Some((i, flying_walls && t.linked && t.pending.is_none()))
 }
 
+fn abort_clicked(ui: &mut Ui, h: f32) -> bool {
+    ui.add(btn(RichText::new("Abort").color(BAD), h)).clicked()
+}
+
+/// The warning and its two buttons: Some(true) on `action`, Some(false) on
+/// Cancel, None while neither is pressed.
+fn confirm_row(ui: &mut Ui, warning: &str, action: &str, h: f32) -> Option<bool> {
+    ui.label(RichText::new(warning).color(WARN));
+    ui.horizontal(|ui| {
+        let go = ui.add(btn(action, h)).clicked();
+        let cancel = ui.add(btn("Cancel", h)).clicked();
+        go.then_some(true).or(cancel.then_some(false))
+    })
+    .inner
+}
+
 /// The block.
 pub fn ui(
     ui: &mut Ui,
@@ -183,10 +200,7 @@ pub fn ui(
             ))
             .color(WARN),
         );
-        if ui
-            .add(egui::Button::new(RichText::new("Abort").color(BAD)).min_size(egui::vec2(0.0, h)))
-            .clicked()
-        {
+        if abort_clicked(ui, h) {
             cmd = Some(Cmd::CalAbort);
         }
     } else if v.running {
@@ -209,70 +223,49 @@ pub fn ui(
                 .small()
                 .color(Color32::GRAY),
         );
-        if ui
-            .add(egui::Button::new(RichText::new("Abort").color(BAD)).min_size(egui::vec2(0.0, h)))
-            .clicked()
-        {
+        if abort_clicked(ui, h) {
             cmd = Some(Cmd::CalAbort);
         }
     } else if *confirm == Confirm::Calibrate {
-        ui.label(
-            RichText::new(
-                "The drone sweeps its TX power on every MCS and writes its own walls \
-                 (power_mode = offset). Video stops for about 40-80 s. Put the drone \
-                 a few metres away or more first: close up the receiver saturates \
-                 and the walls come out wrong.",
-            )
-            .color(WARN),
+        let answer = confirm_row(
+            ui,
+            "The drone sweeps its TX power on every MCS and writes its own walls \
+             (power_mode = offset). Video stops for about 40-80 s. Put the drone \
+             a few metres away or more first: close up the receiver saturates \
+             and the walls come out wrong.",
+            "Start calibration",
+            h,
         );
-        ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new("Start calibration").min_size(egui::vec2(0.0, h)))
-                .clicked()
-            {
+        if let Some(go) = answer {
+            if go {
                 cmd = Some(Cmd::CalStart);
-                *confirm = Confirm::None;
             }
-            if ui
-                .add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, h)))
-                .clicked()
-            {
-                *confirm = Confirm::None;
-            }
-        });
+            *confirm = Confirm::None;
+        }
     } else if let (Confirm::Reset, Some((row, true))) = (*confirm, reset) {
-        ui.label(
-            RichText::new(
-                "The drone goes back to its card's own TX power table (power_mode = none), \
-                 at once and across restarts. The measured walls stay in its config, \
-                 unused; the next calibration replaces them.",
-            )
-            .color(WARN),
+        let answer = confirm_row(
+            ui,
+            "The drone goes back to its card's own TX power table (power_mode = none), \
+             at once and across restarts. The measured walls stay in its config, \
+             unused; the next calibration replaces them.",
+            "Reset calibration",
+            h,
         );
-        ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new("Reset calibration").min_size(egui::vec2(0.0, h)))
-                .clicked()
-            {
+        if let Some(go) = answer {
+            if go {
                 cmd = Some(Cmd::Set(row, "none".into()));
-                *confirm = Confirm::None;
             }
-            if ui
-                .add(egui::Button::new("Cancel").min_size(egui::vec2(0.0, h)))
-                .clicked()
-            {
-                *confirm = Confirm::None;
-            }
-        });
+            *confirm = Confirm::None;
+        }
     } else {
         *confirm = Confirm::None;
         ui.horizontal(|ui| {
-            let b = egui::Button::new("Calibrate").min_size(egui::vec2(0.0, h));
+            let b = btn("Calibrate", h);
             if ui.add_enabled(v.capable, b).clicked() {
                 *confirm = Confirm::Calibrate;
             }
             if let Some((_, can)) = reset {
-                let b = egui::Button::new("Reset calibration").min_size(egui::vec2(0.0, h));
+                let b = btn("Reset calibration", h);
                 if ui.add_enabled(can, b).clicked() {
                     *confirm = Confirm::Reset;
                 }
