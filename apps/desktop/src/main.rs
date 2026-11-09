@@ -35,9 +35,10 @@ use decode::Decoder;
 use flightlog::capture::{self, Record};
 use flightlog::session::Session;
 use pal_core::refresh::IdrDriver;
-use pal_core::rust_core::{RustCore, RustOpts};
+use pal_core::rust_core::RustCore;
+use pal_core::CoreOpts;
 use pal_core::{GsCore, Mode, RZ_NONCE};
-use pal_ref::{RefCore, RefOpts};
+use pal_ref::RefCore;
 use runtime::{lat_us, CoreLoop, Drive, LiveCfg, LoopPorts, Search, Shared, Sink};
 
 #[derive(Clone, Default)]
@@ -234,7 +235,7 @@ fn resolve_config(o: &mut Opts) {
 fn drive(o: &Opts) -> Drive {
     if o.channel_core {
         let attach = if o.rust {
-            let opts = RustOpts {
+            let opts = CoreOpts {
                 mode: Mode::Gs,
                 adaptive_gap: true,
                 rz_nonce: RZ_NONCE,
@@ -264,22 +265,15 @@ fn drive(o: &Opts) -> Drive {
 }
 
 fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
-    let mode = o.mode.unwrap_or(Mode::Spotter);
-    if o.rust {
-        let opts = RustOpts {
-            mode,
-            adaptive_gap: true,
-            rz_nonce: RZ_NONCE,
-            channel,
-        };
-        return Box::new(RustCore::new(&o.cfg, opts).unwrap_or_else(|e| die(&e)));
-    }
-    let opts = RefOpts {
-        mode,
+    let opts = CoreOpts {
+        mode: o.mode.unwrap_or(Mode::Spotter),
         adaptive_gap: true,
         rz_nonce: RZ_NONCE,
         channel,
     };
+    if o.rust {
+        return Box::new(RustCore::new(&o.cfg, opts).unwrap_or_else(|e| die(&e)));
+    }
     let cfg = o.config.as_ref().expect("config");
     Box::new(RefCore::new(cfg, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
 }

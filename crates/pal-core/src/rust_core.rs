@@ -30,6 +30,7 @@ use crate::nack::{NackInputs, NackTailView};
 use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelectorCfg};
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
 use crate::vrx::{RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState};
+use crate::CoreOpts;
 use crate::{Au, CoreIo, GsCore, Mode, RxBody};
 use pal_wire::cal::{self, SweepSpec};
 use pal_wire::frame_wire::FrameHdr;
@@ -41,28 +42,6 @@ mod param_lane;
 use cal_lane::CalLane;
 use nack_lane::NackLane;
 use param_lane::{params_json, ParamLane};
-
-#[derive(Clone, Copy, Debug)]
-pub struct RustOpts {
-    pub mode: Mode,
-    /// false = fixed `video.frame_gap_timeout_ms`.
-    pub adaptive_gap: bool,
-    /// Pinned rendezvous vrx_nonce (replay); 0 = random.
-    pub rz_nonce: u32,
-    /// The channel a DISC proposes; 0 = the first of `radio.channels`.
-    pub channel: u8,
-}
-
-impl Default for RustOpts {
-    fn default() -> Self {
-        Self {
-            mode: Mode::Spotter,
-            adaptive_gap: true,
-            rz_nonce: 0,
-            channel: 0,
-        }
-    }
-}
 
 #[derive(Default, Clone, Copy, Debug)]
 struct Counters {
@@ -281,7 +260,7 @@ impl Gs {
 
 pub struct RustCore {
     mode: Mode,
-    opts: RustOpts,
+    opts: CoreOpts,
     now_us: u64,
     agg: Aggregator,
     fs: FrameStream,
@@ -346,13 +325,13 @@ macro_rules! au_out {
 }
 
 impl RustCore {
-    pub fn new(cfg: &Config, opts: RustOpts) -> Result<Self, String> {
+    pub fn new(cfg: &Config, opts: CoreOpts) -> Result<Self, String> {
         Self::build(cfg, opts, None)
     }
 
     /// A GS that drives `env.cards` (WebGs with a roster): `opts.channel`
     /// is the start channel (the card's), Mode::Gs.
-    pub fn with_cards(cfg: &Config, opts: RustOpts, env: ChanEnv) -> Result<Self, String> {
+    pub fn with_cards(cfg: &Config, opts: CoreOpts, env: ChanEnv) -> Result<Self, String> {
         if opts.mode != Mode::Gs {
             return Err("cards need Mode::Gs".into());
         }
@@ -362,7 +341,7 @@ impl RustCore {
         Self::build(cfg, opts, Some(env))
     }
 
-    fn build(cfg: &Config, opts: RustOpts, env: Option<ChanEnv>) -> Result<Self, String> {
+    fn build(cfg: &Config, opts: CoreOpts, env: Option<ChanEnv>) -> Result<Self, String> {
         let layers = cfg.uep_layers();
         // maburgs sizes both by its card roster; with none (replay, the
         // parity gates) it is WebGs's one card.
@@ -1147,11 +1126,11 @@ mod tests {
         }
     }
 
-    fn opts(ch: u8) -> RustOpts {
-        RustOpts {
+    fn opts(ch: u8) -> CoreOpts {
+        CoreOpts {
             mode: Mode::Gs,
             channel: ch,
-            ..RustOpts::default()
+            ..CoreOpts::default()
         }
     }
 
@@ -1471,7 +1450,7 @@ mod tests {
                 threaded: false,
             }
         };
-        let spot = RustOpts {
+        let spot = CoreOpts {
             mode: Mode::Spotter,
             ..opts(40)
         };

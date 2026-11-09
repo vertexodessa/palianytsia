@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use decode::mediacodec::MediaCodecDecoder;
 use decode::Decoder;
 use pal_core::refresh::IdrDriver;
-use pal_core::rust_core::{RustCore, RustOpts};
+use pal_core::rust_core::RustCore;
+use pal_core::CoreOpts;
 use pal_core::{Mode, RZ_NONCE};
 use pal_osd::params::Cmd;
 use runtime::{CoreLoop, Shared, Sink};
@@ -210,7 +211,7 @@ impl Link {
         let core_t = std::thread::Builder::new()
             .name("pal-core".into())
             .spawn(move || {
-                let opts = RustOpts {
+                let opts = CoreOpts {
                     mode: Mode::Gs,
                     adaptive_gap: true,
                     rz_nonce: RZ_NONCE,

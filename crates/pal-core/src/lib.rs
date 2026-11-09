@@ -71,6 +71,30 @@ pub struct Au {
     pub vcl_nal: u8,
 }
 
+/// What a core is started with; the same for the Rust core and mabur's.
+#[derive(Clone, Copy, Debug)]
+pub struct CoreOpts {
+    pub mode: Mode,
+    /// false = fixed `video.frame_gap_timeout_ms` (parity with maburgs
+    /// --dry-run).
+    pub adaptive_gap: bool,
+    /// Pinned rendezvous vrx_nonce and RCF tags (replay); 0 = random.
+    pub rz_nonce: u32,
+    /// The channel a DISC proposes; 0 = the first of `radio.channels`.
+    pub channel: u8,
+}
+
+impl Default for CoreOpts {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Spotter,
+            adaptive_gap: true,
+            rz_nonce: 0,
+            channel: 0,
+        }
+    }
+}
+
 /// The rendezvous nonce every app pins ("PAL1"): replays stay comparable.
 pub const RZ_NONCE: u32 = 0x5041_4c31;
 

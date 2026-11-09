@@ -15,7 +15,8 @@ use pal_core::chan::radio::{
     CardCaps, LinkCard, NhmBusyRead, ScoutEnergy, ScoutFrames, ScoutRadio,
 };
 use pal_core::config::{ht40_offset, Config};
-use pal_core::rust_core::{ChanEnv, RustCore, RustOpts};
+use pal_core::rust_core::{ChanEnv, RustCore};
+use pal_core::CoreOpts;
 use pal_wire::dot11;
 
 use crate::{mono_default, Attach, Attached, RxTap};
@@ -310,7 +311,7 @@ impl LinkCard for DevCard {
 /// scouts on another and every card's bodies feed the aggregator. The
 /// core's threads run on real time: `mono_default`, the clock the RX
 /// stamps and ticks use.
-pub fn rust_channel_core(cfg: Config, opts: RustOpts, width: u8) -> Attach {
+pub fn rust_channel_core(cfg: Config, opts: CoreOpts, width: u8) -> Attach {
     Box::new(move |cards| {
         let dcs: Vec<Arc<DevCard>> = cards
             .iter()

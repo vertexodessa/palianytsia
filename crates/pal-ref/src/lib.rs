@@ -9,6 +9,7 @@ pub mod chan_trace;
 #[cfg(feature = "live")]
 pub mod live;
 
+use pal_core::CoreOpts;
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::Path;
@@ -204,16 +205,6 @@ extern "C" fn send_tramp(user: *mut c_void, data: *const u8, len: usize) {
     }
 }
 
-pub struct RefOpts {
-    pub mode: Mode,
-    /// false = fixed `video.frame_gap_timeout_ms` (parity with maburgs --dry-run).
-    pub adaptive_gap: bool,
-    /// 0 = random; non-zero pins the DISC nonce and RCF tags.
-    pub rz_nonce: u32,
-    /// Channel the radio is tuned to; 0 = first `radio.channels` member.
-    pub channel: u8,
-}
-
 fn err_text(err: &[c_char]) -> String {
     unsafe { CStr::from_ptr(err.as_ptr()) }
         .to_string_lossy()
@@ -294,7 +285,7 @@ pub struct RefCore {
 }
 
 impl RefCore {
-    pub fn new(config: &Path, opts: RefOpts) -> Result<Self, String> {
+    pub fn new(config: &Path, opts: CoreOpts) -> Result<Self, String> {
         let path =
             CString::new(config.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
         let mut ctx = Box::new(Ctx { io: None });
@@ -545,7 +536,7 @@ mod tests {
             let p =
                 std::env::temp_dir().join(format!("pal-ref-bw{bw}-{}.toml", std::process::id()));
             std::fs::write(&p, out).unwrap();
-            let opts = RefOpts {
+            let opts = CoreOpts {
                 mode: Mode::Gs,
                 adaptive_gap: true,
                 rz_nonce: 1,

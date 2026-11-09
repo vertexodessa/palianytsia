@@ -10,9 +10,10 @@
 //! `--core rust` runs pal-core's RustCore instead, for the port's parity
 //! gate against the same frames. `--sends` writes every transmitted RC
 //! body as u32 len | bytes.
-use pal_core::rust_core::{RustCore, RustOpts};
+use pal_core::rust_core::RustCore;
+use pal_core::CoreOpts;
 use pal_core::{Au, CoreIo, GsCore, Mode};
-use pal_ref::{FrameFile, RefCore, RefOpts};
+use pal_ref::{FrameFile, RefCore};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -86,32 +87,20 @@ fn main() {
     let src = || FrameFile::open(&frames, drop_pct, seed).unwrap();
     let sink = || Sink::create(&out, sends.as_deref());
     let adaptive_gap = !fixed_gap;
+    let opts = CoreOpts {
+        mode,
+        adaptive_gap,
+        rz_nonce: 1,
+        channel: 0,
+    };
     if rust {
         let cfg = pal_core::config::load_config(&config, None).unwrap_or_else(|e| panic!("{e}"));
-        let mut core = RustCore::new(
-            &cfg,
-            RustOpts {
-                mode,
-                adaptive_gap,
-                rz_nonce: 1,
-                channel: 0,
-            },
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let mut core = RustCore::new(&cfg, opts).unwrap_or_else(|e| panic!("{e}"));
         let gap = cfg.video.frame_gap_timeout_ms;
         let ack = |c: &mut RustCore, t, _: &mut Sink| c.inject_disc_ack_for_replay(t);
         drive(&mut core, src(), sink(), fake_ack, ack, |_| gap);
     } else {
-        let mut core = RefCore::new(
-            &config,
-            RefOpts {
-                mode,
-                adaptive_gap,
-                rz_nonce: 1,
-                channel: 0,
-            },
-        )
-        .unwrap_or_else(|e| panic!("pal_ref_new: {e}"));
+        let mut core = RefCore::new(&config, opts).unwrap_or_else(|e| panic!("pal_ref_new: {e}"));
         let ack = |c: &mut RefCore, t, s: &mut Sink| c.inject_disc_ack_for_replay(t, s);
         let gap = |c: &RefCore| u64::from(c.frame_gap_timeout_ms());
         drive(&mut core, src(), sink(), fake_ack, ack, gap);

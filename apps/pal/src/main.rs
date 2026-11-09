@@ -20,9 +20,10 @@
 use flightlog::capture::{self, Record};
 use flightlog::session::{self, Session};
 use pal_core::refresh::IdrDriver;
-use pal_core::rust_core::{RustCore, RustOpts};
+use pal_core::rust_core::RustCore;
+use pal_core::CoreOpts;
 use pal_core::{Au, CoreIo, GsCore, Mode, RxBody, RZ_NONCE};
-use pal_ref::{RefCore, RefOpts};
+use pal_ref::RefCore;
 use pal_wire::dot11;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -287,34 +288,17 @@ fn core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
         .config
         .clone()
         .unwrap_or_else(|| die("-c <gs.toml> is required"));
-    let mode = o.mode.unwrap_or(Mode::Spotter);
+    let opts = CoreOpts {
+        mode: o.mode.unwrap_or(Mode::Spotter),
+        adaptive_gap: false,
+        rz_nonce: RZ_NONCE,
+        channel,
+    };
     if o.rust {
         let c = pal_core::config::load_config(&cfg, None).unwrap_or_else(|e| die(&e.to_string()));
-        return Box::new(
-            RustCore::new(
-                &c,
-                RustOpts {
-                    mode,
-                    adaptive_gap: false,
-                    rz_nonce: RZ_NONCE,
-                    channel,
-                },
-            )
-            .unwrap_or_else(|e| die(&e)),
-        );
+        return Box::new(RustCore::new(&c, opts).unwrap_or_else(|e| die(&e)));
     }
-    Box::new(
-        RefCore::new(
-            &cfg,
-            RefOpts {
-                mode,
-                adaptive_gap: false,
-                rz_nonce: RZ_NONCE,
-                channel,
-            },
-        )
-        .unwrap_or_else(|e| die(&format!("core: {e}"))),
-    )
+    Box::new(RefCore::new(&cfg, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
 }
 
 /// `pal live`'s side of the runtime's pump: capture and flight log around
