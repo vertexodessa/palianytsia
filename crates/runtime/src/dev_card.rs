@@ -109,10 +109,10 @@ impl DevCard {
     }
 
     /// The card under its control lock; None once it is closed.
-    fn with_ctl<R>(&self, f: impl FnOnce(&devourer_sys::Ctl) -> R) -> Option<R> {
+    fn with_ctl<R>(&self, f: impl FnOnce(&mut devourer_sys::Ctl) -> R) -> Option<R> {
         let card = self.card.upgrade()?;
-        let c = card.ctl();
-        Some(f(&c))
+        let mut c = card.ctl();
+        Some(f(&mut c))
     }
 }
 

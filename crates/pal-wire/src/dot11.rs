@@ -1,6 +1,10 @@
-//! dot11 RX parse, as maburgs `fill_rx_body` (`gs/src/dot11.cpp`). Header
-//! only: the caller copies `frame[body_off..]` (FCS included, as maburgs
-//! keeps it) and adds its own clock and card id.
+//! dot11 headers of the mabur link, as maburgs `gs/src/dot11.cpp`. RX parse
+//! (`fill_rx_body`), header only: the caller copies `frame[body_off..]` (FCS
+//! included, as maburgs keeps it) and adds its own clock and card id. TX:
+//! the GS uplink control frame (`build_control_frame`, minus the radiotap
+//! the card prepends).
+
+use alloc::vec::Vec;
 
 /// mabur's canonical SA, on both directions of the link.
 pub const SA: [u8; 6] = [0x57, 0x42, 0x75, 0x05, 0xd6, 0x00];
@@ -63,6 +67,28 @@ pub fn parse(d: &[u8], crc_err: bool, data_rate: u16) -> Verdict {
     })
 }
 
+/// Probe-request header of the GS uplink control frame.
+const CONTROL_HDR: usize = 24;
+
+/// dot11 GS uplink control frame around an RC body: probe request, broadcast
+/// DA, the canonical SA also as BSSID. `seq` is the 12-bit sequence number;
+/// the shift into the sequence-control field drops anything above it.
+pub fn control_frame(seq: u16, body: &[u8]) -> Vec<u8> {
+    let mut f = alloc::vec![0u8; CONTROL_HDR + body.len()];
+    f[0] = 0x40;
+    f[4..10].fill(0xff);
+    f[10..16].copy_from_slice(&SA);
+    f[16..22].copy_from_slice(&SA);
+    f[22..24].copy_from_slice(&(seq << 4).to_le_bytes());
+    f[CONTROL_HDR..].copy_from_slice(body);
+    f
+}
+
+/// The sequence number after `seq`, wrapping at the field's 12 bits.
+pub fn next_control_seq(seq: u16) -> u16 {
+    seq.wrapping_add(1) & 0xFFF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +143,36 @@ mod tests {
         assert!(matches!(parse(&f[..27], false, 0), Verdict::Body(_)));
         assert_eq!(parse(&f[..24], false, 0), Verdict::Short);
         assert_eq!(parse(&[], false, 0), Verdict::Short);
+    }
+
+    #[test]
+    fn control_frame_round_trips_through_parse() {
+        let body = [0xA5u8, 1, 2, 3, 4];
+        for seq in [0, 1, 0x7FF, 0xABC, 0xFFF] {
+            let f = control_frame(seq, &body);
+            assert_eq!(f.len(), 24 + body.len());
+            assert_eq!(
+                parse(&f, false, 0x0C),
+                Verdict::Body(Parsed {
+                    body_off: 24,
+                    mac_seq: seq,
+                    mcs: 0
+                })
+            );
+            assert_eq!(&f[24..], &body);
+        }
+    }
+
+    #[test]
+    fn control_frame_without_a_body_is_too_short_to_parse() {
+        assert_eq!(parse(&control_frame(5, &[]), false, 0x0C), Verdict::Short);
+    }
+
+    #[test]
+    fn control_seq_wraps_at_twelve_bits() {
+        assert_eq!(next_control_seq(0), 1);
+        assert_eq!(next_control_seq(0xFFE), 0xFFF);
+        assert_eq!(next_control_seq(0xFFF), 0);
     }
 
     #[test]

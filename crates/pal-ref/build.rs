@@ -34,6 +34,12 @@ fn main() {
         .file("cpp/pal_card.cpp")
         .file("cpp/chan_trace.cpp")
         .file("cpp/verdict_diff.cpp")
+        .file("cpp/control_frame.cpp")
+        // The oracle of tests/control_frame.rs. mabur_gs_dot11 is a separate
+        // CMake target and would pull the whole devourer library in for
+        // this one radiotap builder.
+        .file(mabur.join("gs/src/dot11.cpp"))
+        .file(devourer.join("src/RadiotapBuilder.cpp"))
         .include("cpp")
         .include(mabur.join("web/src"))
         .include(mabur.join("gs/src"))

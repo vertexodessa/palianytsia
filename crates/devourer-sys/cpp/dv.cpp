@@ -22,7 +22,6 @@
 
 namespace {
 constexpr uint16_t kScanPids[] = {0xa81a, 0x881a, 0x8812};
-constexpr uint8_t kSa[6] = {0x57, 0x42, 0x75, 0x05, 0xd6, 0x00};
 
 SelectedChannel selected(uint8_t ch, uint8_t width_mhz, uint8_t ht40_offset) {
   return width_mhz == 40 ? SelectedChannel{ch, ht40_offset, CHANNEL_WIDTH_40}
@@ -42,7 +41,6 @@ struct dv_card {
   std::shared_ptr<WiFiDriver> driver;
   std::shared_ptr<IRtlRadio> dev;
   std::thread rx;
-  uint16_t tx_seq = 0;
   std::string chip;
   std::vector<uint8_t> radiotap;
 };
@@ -150,21 +148,11 @@ extern "C" int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user) {
   return 0;
 }
 
-extern "C" int dv_send_control(dv_card *c, const uint8_t *body, size_t len) try {
+extern "C" int dv_send_control(dv_card *c, const uint8_t *dot11, size_t len) try {
   if (!c || !c->dev) return -1;
-  // As maburgs build_control_frame (gs/src/dot11.cpp).
-  std::vector<uint8_t> f(c->radiotap.size() + 24 + len);
+  std::vector<uint8_t> f(c->radiotap.size() + len);
   std::memcpy(f.data(), c->radiotap.data(), c->radiotap.size());
-  uint8_t *d = f.data() + c->radiotap.size();
-  d[0] = 0x40;
-  std::memset(d + 4, 0xff, 6);
-  std::memcpy(d + 10, kSa, 6);
-  std::memcpy(d + 16, kSa, 6);
-  const uint16_t sc = static_cast<uint16_t>(c->tx_seq << 4);
-  d[22] = static_cast<uint8_t>(sc & 0xff);
-  d[23] = static_cast<uint8_t>(sc >> 8);
-  if (len) std::memcpy(d + 24, body, len);
-  c->tx_seq = static_cast<uint16_t>((c->tx_seq + 1) & 0xFFF);
+  std::memcpy(f.data() + c->radiotap.size(), dot11, len);
   return c->dev->send_packet(f.data(), f.size()) ? 0 : -1;
 } catch (...) {
   return -1;

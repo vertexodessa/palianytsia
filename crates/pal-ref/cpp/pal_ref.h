@@ -83,7 +83,7 @@ typedef struct pal_card_rx {
   uint8_t sgi;
 } pal_card_rx;
 // send: transmit one RC body as a GS control frame, nonzero = sent (the host
-// owns the frame builder: devourer-sys dv_send_control). Called under the
+// owns the frame builder: pal-wire dot11::control_frame). Called under the
 // card's control lock, from the core's thread.
 typedef int (*pal_card_send_cb)(void* user, const uint8_t* body, size_t len);
 // radio: devourer's IRtlRadio* (dv_radio), already started at channel/width.

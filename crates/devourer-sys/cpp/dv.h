@@ -42,8 +42,8 @@ typedef struct {
 dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap);
 /* Starts the RX thread; cb runs on it. */
 int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user);
-/* GS uplink control frame: MAX_RANGE radiotap + probe-req dot11 (canonical SA). */
-int dv_send_control(dv_card *c, const uint8_t *body, size_t len);
+/* Sends a dot11 GS uplink control frame behind the MAX_RANGE radiotap. */
+int dv_send_control(dv_card *c, const uint8_t *dot11, size_t len);
 /* What the channel search reads (devourer RxEnergy / NhmBusy /
  * AdapterCaps), for the Rust LinkCard. Control-plane calls: never from
  * the RX callback; the caller serialises them with sends. */

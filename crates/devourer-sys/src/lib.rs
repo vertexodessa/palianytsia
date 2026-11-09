@@ -5,6 +5,8 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::{Mutex, MutexGuard};
 
+use pal_wire::dot11;
+
 #[repr(C)]
 struct DvRx {
     frame: *const u8,
@@ -76,7 +78,7 @@ type RxCb = extern "C" fn(*mut c_void, *const DvRx);
 extern "C" {
     fn dv_open(cfg: *const DvCfg, err: *mut c_char, cap: usize) -> *mut DvCard;
     fn dv_start_rx(c: *mut DvCard, cb: RxCb, user: *mut c_void) -> c_int;
-    fn dv_send_control(c: *mut DvCard, body: *const u8, len: usize) -> c_int;
+    fn dv_send_control(c: *mut DvCard, dot11: *const u8, len: usize) -> c_int;
     fn dv_chip(c: *const DvCard) -> *const c_char;
     fn dv_radio(c: *mut DvCard) -> *mut c_void;
     fn dv_close(c: *mut DvCard);
@@ -148,7 +150,7 @@ pub struct Caps {
 /// it is on) updates it while holding this.
 pub struct Ctl<'a> {
     raw: *mut DvCard,
-    _g: MutexGuard<'a, ()>,
+    seq: MutexGuard<'a, u16>,
 }
 
 impl Ctl<'_> {
@@ -232,8 +234,11 @@ impl Ctl<'_> {
     }
 
     /// GS uplink control frame around an RC body.
-    pub fn send_control(&self, body: &[u8]) -> bool {
-        unsafe { dv_send_control(self.raw, body.as_ptr(), body.len()) == 0 }
+    pub fn send_control(&mut self, body: &[u8]) -> bool {
+        let f = dot11::control_frame(*self.seq, body);
+        // A failed send keeps its number spent, as mabur's RadioFrontend.
+        *self.seq = dot11::next_control_seq(*self.seq);
+        unsafe { dv_send_control(self.raw, f.as_ptr(), f.len()) == 0 }
     }
 }
 
@@ -272,8 +277,9 @@ type Handler = Box<dyn FnMut(&RxFrame) + Send>;
 
 pub struct Card {
     raw: *mut DvCard,
-    /// The control-plane lock (`ctl`): sends, retunes, register reads.
-    tx: Mutex<()>,
+    /// The control-plane lock (`ctl`): sends, retunes, register reads. It
+    /// holds the next control frame sequence number, which only a send uses.
+    tx: Mutex<u16>,
     // Boxed twice so the C side holds a thin pointer that outlives start_rx.
     handler: Option<Box<Handler>>,
 }
@@ -335,7 +341,7 @@ impl Card {
         }
         Ok(Card {
             raw,
-            tx: Mutex::new(()),
+            tx: Mutex::new(0),
             handler: None,
         })
     }
@@ -371,7 +377,7 @@ impl Card {
     pub fn ctl(&self) -> Ctl<'_> {
         Ctl {
             raw: self.raw,
-            _g: self.tx.lock().unwrap_or_else(|e| e.into_inner()),
+            seq: self.tx.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
 
