@@ -180,6 +180,13 @@ int pal_dec_rgba(pal_dec* d, uint8_t* out, size_t cap) {
   d->sws = sws_getCachedContext(d->sws, w, h, (enum AVPixelFormat)f->format, w, h,
                                 AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
   if (!d->sws) return -1;
+  // As pal_dec_planes reports them to the shader: swscale's own default is
+  // BT.601 limited, whatever the stream signals. From d->frame, which keeps
+  // them through the download and the NV12 step.
+  const int full = d->frame->color_range == AVCOL_RANGE_JPEG || f->format == AV_PIX_FMT_YUVJ420P;
+  const int cs = d->frame->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709 : SWS_CS_DEFAULT;
+  sws_setColorspaceDetails(d->sws, sws_getCoefficients(cs), full, sws_getCoefficients(SWS_CS_DEFAULT), 1,
+                           0, 1 << 16, 1 << 16);
   uint8_t* dst[4] = {out, NULL, NULL, NULL};
   int stride[4] = {w * 4, 0, 0, 0};
   sws_scale(d->sws, (const uint8_t* const*)f->data, f->linesize, 0, h, dst, stride);
