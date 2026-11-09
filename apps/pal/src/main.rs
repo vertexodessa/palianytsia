@@ -520,14 +520,7 @@ fn replay(o: Opts) {
     let mut last_t = 0u64;
     // Synthetic loss: splitmix64 on a fixed seed, so both cores see the
     // same surviving bodies.
-    let mut rng = o.seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut next = move || {
-        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
+    let mut rng = o.seed.wrapping_add(pal_wire::sw::SPLITMIX_GAMMA);
     for rec in r {
         let rec = match rec {
             Ok(rec) => rec,
@@ -540,7 +533,9 @@ fn replay(o: Opts) {
         };
         match rec {
             Record::Body(b) => {
-                if o.drop_pct > 0 && (next() % 100) < u64::from(o.drop_pct) {
+                if o.drop_pct > 0
+                    && (pal_wire::sw::splitmix64(&mut rng) % 100) < u64::from(o.drop_pct)
+                {
                     dropped += 1;
                     continue;
                 }
