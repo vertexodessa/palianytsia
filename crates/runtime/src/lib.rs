@@ -115,6 +115,33 @@ pub struct Lat {
     pub skipped_rgba: AtomicU64,
 }
 
+/// One report's window counters, taken and reset together: whether the
+/// report prints or not, the next second starts from zero.
+struct LatWindow {
+    body_lag_max: u64,
+    cap_au_max: u64,
+    au_dec_max: u64,
+    show_max: u64,
+    dec_us_sum: u64,
+    dec_n: u64,
+    shown: u64,
+}
+
+impl Lat {
+    fn take_window(&self) -> LatWindow {
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        LatWindow {
+            body_lag_max: take(&self.body_lag_max),
+            cap_au_max: take(&self.cap_au_max),
+            au_dec_max: take(&self.au_dec_max),
+            show_max: take(&self.show_max),
+            dec_us_sum: take(&self.dec_us_sum),
+            dec_n: take(&self.dec_n),
+            shown: take(&self.shown),
+        }
+    }
+}
+
 pub struct Sink {
     /// AUs to the decoder, tagged with their number (`IdrDriver::aus`) and
     /// the lat_us() they were queued at.
@@ -265,7 +292,7 @@ impl CoreLoop {
         );
         self.sink.shared.event(
             if start { "cal_start" } else { "cal_abort" },
-            serde_json::json!({"result": match &r { Ok(()) => "ok".to_string(), Err(e) => e.clone() }}),
+            serde_json::json!({"result": result_text(&r, "ok")}),
         );
         self.cal.refusal = r.err();
     }
@@ -325,14 +352,33 @@ impl CoreLoop {
         }
         self.core.on_rx(b, &mut self.sink);
     }
+    /// One pass of the core loop: each step does what is due at `now`.
     pub fn tick(&mut self, now: u64) {
         self.sink.now_us = now;
+        self.drain_mav_udp();
+        self.drain_events(now);
+        self.feed_decoder_errors(now);
+        while let Ok(c) = self.ports.cmd_rx.try_recv() {
+            self.apply_cmd(c);
+        }
+        self.hand_cal_log_dir();
+        self.core.tick(now, &mut self.sink);
+        self.publish_params(now);
+        self.step_idr(now);
+        self.publish_stats(now);
+        self.report_lat(now);
+    }
+
+    fn drain_mav_udp(&mut self) {
         if let Some((sock, _)) = &self.sink.udp {
             let mut buf = [0u8; 2048];
             while let Ok((n, _)) = sock.recv_from(&mut buf) {
                 self.core.mav_push_outbound(&buf[..n]);
             }
         }
+    }
+
+    fn drain_events(&mut self, now: u64) {
         let evs = std::mem::take(
             &mut *self
                 .sink
@@ -347,6 +393,9 @@ impl CoreLoop {
                 let _ = l.event(now, ev, d);
             }
         }
+    }
+
+    fn feed_decoder_errors(&mut self, now: u64) {
         if let Some(i) = self.sink.idr.as_mut() {
             // Errors first (Acquire pairs with the decoder's Release): the AU
             // number read after it is the same rise's or a newer one.
@@ -354,158 +403,174 @@ impl CoreLoop {
             let e = sh.dec_errors.load(Ordering::Acquire);
             i.on_decoder_errors(e, sh.dec_err_au.load(Ordering::Relaxed), now);
         }
-        while let Ok(c) = self.ports.cmd_rx.try_recv() {
-            match c {
-                pal_osd::params::Cmd::Set(row, text) => {
-                    let r = self.core.param_set(row, &text);
-                    eprintln!("pal: param set {row} {text:?}: {r:?}");
-                    // Android has no stderr: the flight log keeps it.
-                    self.sink.shared.event(
-                        "param_set",
-                        serde_json::json!({"row": row, "value": text,
-                            "result": match &r { Ok(()) => "sent".to_string(), Err(e) => e.clone() }}),
-                    );
-                    let _ = self.ports.set_res_tx.try_send((row, r));
-                }
-                pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
-                pal_osd::params::Cmd::CalStart => self.cal_cmd(true),
-                pal_osd::params::Cmd::CalAbort => self.cal_cmd(false),
-                pal_osd::params::Cmd::ChannelScan(chs) => {
-                    let r = self.core.chan_scan(&chs);
-                    eprintln!("pal: channel scan {chs:?}: {r:?}");
-                }
-                pal_osd::params::Cmd::Channels(chs) => {
-                    let r = self.core.set_channels(&chs);
-                    eprintln!("pal: channels {chs:?}: {r:?}");
-                    self.sink.shared.event(
-                        "channels",
-                        serde_json::json!({"channels": chs,
-                            "result": match &r { Ok(()) => "ok".to_string(), Err(e) => e.clone() }}),
-                    );
-                }
+    }
+
+    fn apply_cmd(&mut self, c: pal_osd::params::Cmd) {
+        match c {
+            pal_osd::params::Cmd::Set(row, text) => {
+                let r = self.core.param_set(row, &text);
+                eprintln!("pal: param set {row} {text:?}: {r:?}");
+                // Android has no stderr: the flight log keeps it.
+                self.sink.shared.event(
+                    "param_set",
+                    serde_json::json!({"row": row, "value": text,
+                        "result": result_text(&r, "sent")}),
+                );
+                let _ = self.ports.set_res_tx.try_send((row, r));
+            }
+            pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
+            pal_osd::params::Cmd::CalStart => self.cal_cmd(true),
+            pal_osd::params::Cmd::CalAbort => self.cal_cmd(false),
+            pal_osd::params::Cmd::ChannelScan(chs) => {
+                let r = self.core.chan_scan(&chs);
+                eprintln!("pal: channel scan {chs:?}: {r:?}");
+            }
+            pal_osd::params::Cmd::Channels(chs) => {
+                let r = self.core.set_channels(&chs);
+                eprintln!("pal: channels {chs:?}: {r:?}");
+                self.sink.shared.event(
+                    "channels",
+                    serde_json::json!({"channels": chs, "result": result_text(&r, "ok")}),
+                );
             }
         }
+    }
+
+    fn hand_cal_log_dir(&mut self) {
         if !self.cal.log_dir_set {
             self.cal.log_dir_set = true;
             if let Some(l) = self.sink.log.as_ref() {
                 self.core.set_cal_log_dir(l.dir());
             }
         }
-        self.core.tick(now, &mut self.sink);
+    }
+
+    fn publish_params(&mut self, now: u64) {
         if now >= self.last_params_us + 500_000 {
             self.last_params_us = now;
             let _ = self.ports.params_tx.try_send(self.core.params_json(now));
         }
+    }
+
+    fn step_idr(&mut self, now: u64) {
         if let Some(i) = self.sink.idr.as_mut() {
             let evs = i.step(now, &mut *self.core);
             if let Some(l) = self.sink.log.as_mut() {
                 let _ = l.refresh_events(&evs);
             }
         }
-        // 10 Hz to the UI, 1 Hz to the flight log.
-        if now >= self.last_stats_us + 100_000 {
-            self.last_stats_us = now;
-            let line = self.core.stats_json();
-            if self.sink.log.is_some() && now >= self.last_log_us + 1_000_000 {
-                self.last_log_us = now;
-                if let Some(l) = self.sink.log.as_mut() {
-                    let _ = l.stats(now, &line);
-                    // A killed app (Android swipe, OOM) skips Drop: at most
-                    // one second of log is lost, a few writes a second.
-                    let _ = l.flush();
-                }
-                let cards = pal_osd::Snapshot::parse(&line).map(|s| s.cards);
-                for c in self.deaf.push(now as f64 / 1e6, &cards.unwrap_or_default()) {
-                    let ev = if c.deaf { "card_deaf" } else { "card_hearing" };
-                    eprintln!(
-                        "pal: card {} {ev}: {:.1} frames/s, best card {:.0}",
-                        c.card, c.fps, c.best_fps
-                    );
-                    self.sink.shared.event(
-                        ev,
-                        serde_json::json!({"card": c.card, "fps": (c.fps * 10.0).round() / 10.0,
-                            "best_fps": c.best_fps.round()}),
-                    );
-                }
-            }
-            let stats = stats_line::parse(&line);
-            self.sink.pts_off_us = stats.as_ref().and_then(stats_line::pts_off_us);
-            // The ladder and calibration views go to the UI only: the
-            // flight log keeps the webgs stats line both cores agree on.
-            let ladder = self.core.ladder_json();
-            if let Some(l) = ladder.as_deref() {
-                self.log_rung_reason(now, l);
-            }
-            let scan = self.core.chan_scan_json();
-            let cal = self.cal_line();
-            let ui = match stats {
-                Some(s) => stats_line::ui_line(
-                    s,
-                    &[("ladder", ladder.as_deref()), ("chscan", scan.as_deref())],
-                    cal,
-                ),
-                None => line,
-            };
-            let _ = self.ports.stats_tx.try_send(ui);
+    }
+
+    /// 10 Hz to the UI, 1 Hz to the flight log.
+    fn publish_stats(&mut self, now: u64) {
+        if now < self.last_stats_us + 100_000 {
+            return;
         }
-        if now >= self.last_lat_us + 1_000_000 {
-            self.last_lat_us = now;
-            let l = &self.sink.shared.lat;
-            // Without --lat the line still prints when a stage goes bad, so
-            // an intermittent multi-second lag leaves its breakdown behind.
-            // A decoder that stopped returning (a hung hwaccel driver) shows
-            // as AUs dropping while the frame count stands still.
-            let frames_now = self.sink.shared.frames.load(Ordering::Relaxed);
-            let drops_now = self.sink.shared.au_dropped.load(Ordering::Relaxed);
-            if drops_now > self.stall_mark.1 && frames_now == self.stall_mark.0 {
-                eprintln!(
-                    "pal: decoder stalled ({frames_now} frames, AUs dropping); a hung hwaccel driver? try --hwdec sw or another backend"
-                );
-            }
-            self.stall_mark = (frames_now, drops_now);
-            let bad = l.body_lag_max.load(Ordering::Relaxed) > 200_000
-                || l.cap_au_max.load(Ordering::Relaxed) > 500_000
-                || l.au_dec_max.load(Ordering::Relaxed) > 300_000
-                || l.show_max.load(Ordering::Relaxed) > 300_000
-                || l.rx_full.load(Ordering::Relaxed) > self.rx_full_seen;
-            self.rx_full_seen = l.rx_full.load(Ordering::Relaxed);
-            let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
-            if !self.lat && !bad {
-                for a in [
-                    &l.body_lag_max,
-                    &l.cap_au_max,
-                    &l.au_dec_max,
-                    &l.show_max,
-                    &l.dec_us_sum,
-                    &l.dec_n,
-                    &l.shown,
-                ] {
-                    take(a);
-                }
-                return;
-            }
-            let (sent, full, recv) = (
-                l.rx_sent.load(Ordering::Relaxed),
-                l.rx_full.load(Ordering::Relaxed),
-                l.rx_recv.load(Ordering::Relaxed),
-            );
-            let (dec_sum, dec_n) = (take(&l.dec_us_sum), take(&l.dec_n));
-            let frames = self.sink.shared.frames.load(Ordering::Relaxed);
+        self.last_stats_us = now;
+        let line = self.core.stats_json();
+        if self.sink.log.is_some() && now >= self.last_log_us + 1_000_000 {
+            self.last_log_us = now;
+            self.log_stats(now, &line);
+        }
+        let stats = stats_line::parse(&line);
+        self.sink.pts_off_us = stats.as_ref().and_then(stats_line::pts_off_us);
+        // The ladder and calibration views go to the UI only: the
+        // flight log keeps the webgs stats line both cores agree on.
+        let ladder = self.core.ladder_json();
+        if let Some(l) = ladder.as_deref() {
+            self.log_rung_reason(now, l);
+        }
+        let scan = self.core.chan_scan_json();
+        let cal = self.cal_line();
+        let ui = match stats {
+            Some(s) => stats_line::ui_line(
+                s,
+                &[("ladder", ladder.as_deref()), ("chscan", scan.as_deref())],
+                cal,
+            ),
+            None => line,
+        };
+        let _ = self.ports.stats_tx.try_send(ui);
+    }
+
+    /// The flight log's stats line, then the deaf-card check it feeds.
+    fn log_stats(&mut self, now: u64, line: &str) {
+        if let Some(l) = self.sink.log.as_mut() {
+            let _ = l.stats(now, line);
+            // A killed app (Android swipe, OOM) skips Drop: at most
+            // one second of log is lost, a few writes a second.
+            let _ = l.flush();
+        }
+        let cards = pal_osd::Snapshot::parse(line).map(|s| s.cards);
+        for c in self.deaf.push(now as f64 / 1e6, &cards.unwrap_or_default()) {
+            let ev = if c.deaf { "card_deaf" } else { "card_hearing" };
             eprintln!(
-                "lat: rx_queue={} rx_full={full} body_lag_max={}ms cap_au={}ms(max {}) au_to_frame_max={}ms dec_avg={:.1}ms dec_holds={} frame_to_screen_max={}ms shown/s={} au_drops={} rgba_skipped={}",
-                sent.saturating_sub(recv + full),
-                take(&l.body_lag_max) / 1000,
-                l.cap_au_last.load(Ordering::Relaxed) / 1000,
-                take(&l.cap_au_max) / 1000,
-                take(&l.au_dec_max) / 1000,
-                dec_sum as f64 / dec_n.max(1) as f64 / 1000.0,
-                l.aus_in.load(Ordering::Relaxed).saturating_sub(frames + self.sink.shared.au_dropped.load(Ordering::Relaxed)),
-                take(&l.show_max) / 1000,
-                take(&l.shown),
-                self.sink.shared.au_dropped.load(Ordering::Relaxed),
-                l.skipped_rgba.load(Ordering::Relaxed),
+                "pal: card {} {ev}: {:.1} frames/s, best card {:.0}",
+                c.card, c.fps, c.best_fps
+            );
+            self.sink.shared.event(
+                ev,
+                serde_json::json!({"card": c.card, "fps": (c.fps * 10.0).round() / 10.0,
+                    "best_fps": c.best_fps.round()}),
             );
         }
+    }
+
+    /// Once a second. Without --lat the line still prints when a stage goes
+    /// bad, so an intermittent multi-second lag leaves its breakdown behind.
+    fn report_lat(&mut self, now: u64) {
+        if now < self.last_lat_us + 1_000_000 {
+            return;
+        }
+        self.last_lat_us = now;
+        let sh = &self.sink.shared;
+        let l = &sh.lat;
+        let frames = sh.frames.load(Ordering::Relaxed);
+        let au_drops = sh.au_dropped.load(Ordering::Relaxed);
+        // A decoder that stopped returning (a hung hwaccel driver) shows
+        // as AUs dropping while the frame count stands still.
+        if au_drops > self.stall_mark.1 && frames == self.stall_mark.0 {
+            eprintln!(
+                "pal: decoder stalled ({frames} frames, AUs dropping); a hung hwaccel driver? try --hwdec sw or another backend"
+            );
+        }
+        self.stall_mark = (frames, au_drops);
+        let full = l.rx_full.load(Ordering::Relaxed);
+        let w = l.take_window();
+        let bad = w.body_lag_max > 200_000
+            || w.cap_au_max > 500_000
+            || w.au_dec_max > 300_000
+            || w.show_max > 300_000
+            || full > self.rx_full_seen;
+        self.rx_full_seen = full;
+        if !self.lat && !bad {
+            return;
+        }
+        let (sent, recv) = (
+            l.rx_sent.load(Ordering::Relaxed),
+            l.rx_recv.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "lat: rx_queue={} rx_full={full} body_lag_max={}ms cap_au={}ms(max {}) au_to_frame_max={}ms dec_avg={:.1}ms dec_holds={} frame_to_screen_max={}ms shown/s={} au_drops={au_drops} rgba_skipped={}",
+            sent.saturating_sub(recv + full),
+            w.body_lag_max / 1000,
+            l.cap_au_last.load(Ordering::Relaxed) / 1000,
+            w.cap_au_max / 1000,
+            w.au_dec_max / 1000,
+            w.dec_us_sum as f64 / w.dec_n.max(1) as f64 / 1000.0,
+            l.aus_in.load(Ordering::Relaxed).saturating_sub(frames + au_drops),
+            w.show_max / 1000,
+            w.shown,
+            l.skipped_rgba.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// A command's outcome for the flight log.
+fn result_text(r: &Result<(), String>, ok: &str) -> String {
+    match r {
+        Ok(()) => ok.to_string(),
+        Err(e) => e.clone(),
     }
 }
 
