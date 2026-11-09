@@ -6,7 +6,7 @@
 //! reads). Every device call holds the card's control lock (`Card::ctl`);
 //! the channel atomics change under it, so two retunes from two threads
 //! cannot leave `channel` naming the wrong one.
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use pal_core::chan::core::{MsClock, Sleeper, UsClock};
@@ -40,7 +40,6 @@ pub struct DevCard {
     /// The card's index in the core's roster (log lines only).
     idx: usize,
     caps: CardCaps,
-    ready: AtomicBool,
     rx_frames: AtomicU64,
     foreign: AtomicU64,
     own: AtomicU64,
@@ -94,7 +93,6 @@ impl DevCard {
             card: Arc::downgrade(card),
             idx,
             caps,
-            ready: AtomicBool::new(true),
             rx_frames: AtomicU64::new(0),
             foreign: AtomicU64::new(0),
             own: AtomicU64::new(0),
@@ -109,11 +107,8 @@ impl DevCard {
         }
     }
 
-    /// The card under its control lock; None once it is closed or down.
+    /// The card under its control lock; None once it is closed.
     fn with_ctl<R>(&self, f: impl FnOnce(&devourer_sys::Ctl) -> R) -> Option<R> {
-        if !self.ready() {
-            return None;
-        }
         let card = self.card.upgrade()?;
         let c = card.ctl();
         Some(f(&c))
@@ -255,10 +250,10 @@ impl ScoutRadio for DevCard {
 
 impl LinkCard for DevCard {
     fn ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        true
     }
     fn alive(&self) -> bool {
-        self.ready()
+        true
     }
     fn caps(&self) -> CardCaps {
         self.caps.clone()
