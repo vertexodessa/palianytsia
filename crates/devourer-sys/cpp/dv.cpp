@@ -44,7 +44,6 @@ struct dv_card {
   std::shared_ptr<WiFiDriver> driver;
   std::shared_ptr<IRtlRadio> dev;
   std::thread rx;
-  std::atomic<bool> alive{false};
   uint16_t tx_seq = 0;
   std::string chip;
   std::vector<uint8_t> radiotap;
@@ -131,7 +130,6 @@ extern "C" dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap) {
 
 extern "C" int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user) {
   if (!c || !c->dev || c->rx.joinable()) return -1;
-  c->alive = true;
   c->rx = std::thread([c, cb, user] {
     c->dev->StartRxLoop([cb, user](const Packet &p) {
       const auto &a = p.RxAtrib;
@@ -153,7 +151,6 @@ extern "C" int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user) {
       r.sgi = a.sgi != 0;
       cb(user, &r);
     });
-    c->alive = false;
   });
   return 0;
 }
@@ -282,7 +279,7 @@ extern "C" const char *dv_chip(const dv_card *c) {
 extern "C" void dv_close(dv_card *c) {
   if (!c) return;
   try {
-    if (c->dev && c->alive) c->dev->StopRxLoop();
+    if (c->dev && c->rx.joinable()) c->dev->StopRxLoop();
     if (c->rx.joinable()) c->rx.join();
     if (c->dev) c->dev->Stop();
   } catch (...) {
