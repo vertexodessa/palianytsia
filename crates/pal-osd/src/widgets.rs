@@ -277,36 +277,15 @@ impl History {
 /// One stats chip: what it says, before placement.
 struct Chip {
     label: &'static str,
+    /// Columns of its text, the longest text it shows in flight, so a chip
+    /// never changes size when a number gains or loses a digit and the
+    /// operator can park it next to another without the two colliding
+    /// later. A calibration line or a many-card row can still be longer and
+    /// widens its chip while it lasts.
+    cols: usize,
     text: String,
     color: Color32,
     hover: Option<String>,
-}
-
-/// Columns of each chip's text, the longest text it shows in flight, so a
-/// chip never changes size when a number gains or loses a digit and the
-/// operator can park it next to another without the two colliding later.
-/// A calibration line or a many-card row can still be longer and widens its
-/// chip while it lasts.
-fn chip_cols(label: &str, n_cards: usize) -> usize {
-    match label {
-        // "rung 12 MCS7 40M", "spotter MCS7 40M"
-        "link" => 16,
-        // "-100 dBm  SNR 30"
-        "signal" => 16,
-        "cards" => n_cards * CARD_COLS + 2 * n_cards.saturating_sub(1),
-        // "trunc 100.0 %  salv 9999  pre 100.0 %  post 100.0 %"
-        "loss" => 49,
-        // "120 fps  99.9 Mbit/s  dec err 999"
-        "video" => 33,
-        // "rendezvous  100 C"
-        "drone" => 17,
-        // "wait 100 %  rtt 1000 ms"
-        "uplink" => 23,
-        // "fill 99999  9999/s"
-        "nack" => 18,
-        "up" => UP_WIDTH,
-        _ => 0,
-    }
 }
 
 /// One card's entry in the cards chip: "c0 TX -100 dBm 999/s crc 99 %".
@@ -360,14 +339,13 @@ fn place_chips(
     ui: &Ui,
     region: Rect,
     chips: &[Chip],
-    n_cards: usize,
     pos: &mut std::collections::BTreeMap<String, [f32; 2]>,
 ) -> (f32, bool) {
     let gap = ui.spacing().item_spacing;
     let (mut x, mut y, mut row_h) = (region.min.x, region.min.y, 0.0f32);
     let mut changed = false;
     for c in chips {
-        let cols = chip_cols(c.label, n_cards).max(c.text.chars().count());
+        let cols = c.cols.max(c.text.chars().count());
         let size = chip_size(ui, c.label, cols);
         let at = if let Some(&[dx, dy]) = pos.get(c.label) {
             region.min + Vec2::new(dx, dy)
@@ -482,15 +460,16 @@ pub fn chips(
     dec_errors: u64,
 ) -> bool {
     let mut out: Vec<Chip> = Vec::new();
-    let mut n_cards = 0;
-    let mut chip = |label: &'static str, text: &str, color: Color32, hover: Option<String>| {
-        out.push(Chip {
-            label,
-            text: text.to_string(),
-            color,
-            hover,
-        })
-    };
+    let mut chip =
+        |label: &'static str, cols: usize, text: &str, color: Color32, hover: Option<String>| {
+            out.push(Chip {
+                label,
+                cols,
+                text: text.to_string(),
+                color,
+                hover,
+            })
+        };
     if let Some(s) = h.last() {
         let cal = s.cal.as_ref().and_then(cal::CalView::hud_line);
         let (link, c) = if s.key_mismatch {
@@ -505,7 +484,8 @@ pub fn chips(
         } else {
             ("beaconing".to_string(), WARN)
         };
-        chip("link", &link, c, None);
+        // "rung 12 MCS7 40M", "spotter MCS7 40M"
+        chip("link", 16, &link, c, None);
         let held = h.signal(SIGNAL_HOLD_S);
         let sig = match held {
             Some((r, n)) => format!("{r:>4.0} dBm  SNR {n:>2.0}"),
@@ -513,6 +493,7 @@ pub fn chips(
         };
         chip(
             "signal",
+            16, // "-100 dBm  SNR 30"
             &sig,
             if held.is_some_and(|(_, n)| n > 15.0) {
                 OK
@@ -524,9 +505,9 @@ pub fn chips(
         let rates = h.card_rates();
         if !rates.is_empty() {
             let deaf = rates.iter().any(|c| c.deaf);
-            n_cards = rates.len();
             chip(
                 "cards",
+                rates.len() * CARD_COLS + 2 * rates.len().saturating_sub(1),
                 &cards_line(&rates, s.tx_card),
                 if deaf { BAD } else { OK },
                 None,
@@ -547,6 +528,7 @@ pub fn chips(
         }
         chip(
             "loss",
+            49, // "trunc 100.0 %  salv 9999  pre 100.0 %  post 100.0 %"
             &loss,
             if pct < 2.0 {
                 OK
@@ -559,6 +541,7 @@ pub fn chips(
         );
         chip(
             "video",
+            33, // "120 fps  99.9 Mbit/s  dec err 999"
             &format!(
                 "{fps:>3.0} fps  {:>4.1} Mbit/s  dec err {:>3}",
                 kbps / 1000.0,
@@ -578,7 +561,8 @@ pub fn chips(
                     c = WARN;
                 }
             }
-            chip("drone", &t, c, None);
+            // "rendezvous  100 C"
+            chip("drone", 17, &t, c, None);
         }
         if s.mode == "gs" {
             let mut up = match s.uplink_pct {
@@ -593,12 +577,14 @@ pub fn chips(
                 ("ok", _) | ("wait", _) | ("none", _) => WARN,
                 _ => BAD,
             };
-            chip("uplink", &up, c, None);
+            // "wait 100 %  rtt 1000 ms"
+            chip("uplink", 23, &up, c, None);
             let mut nack = format!("fill {:>5}", s.nack_fill);
             if let Some(r) = s.nack_fill_pps {
                 nack += &format!("  {r:>4.0}/s");
             }
-            chip("nack", &nack, OK, None);
+            // "fill 99999  9999/s"
+            chip("nack", 18, &nack, OK, None);
         }
         if let (true, Some(l)) = (s.session, s.ladder.as_ref()) {
             let (txt, blocked) = l.summary();
@@ -609,13 +595,19 @@ pub fn chips(
                     *age as f64 / 1000.0
                 );
             }
-            chip("up", &txt, if blocked { WARN } else { OK }, Some(hover));
+            chip(
+                "up",
+                UP_WIDTH,
+                &txt,
+                if blocked { WARN } else { OK },
+                Some(hover),
+            );
         }
     } else {
-        chip("core", "waiting for stats", WARN, None);
+        chip("core", 0, "waiting for stats", WARN, None);
     }
     let region = ui.max_rect();
-    let (height, moved) = place_chips(ui, region, &out, n_cards, pos);
+    let (height, moved) = place_chips(ui, region, &out, pos);
     ui.allocate_space(Vec2::new(region.width(), height));
     moved
 }
