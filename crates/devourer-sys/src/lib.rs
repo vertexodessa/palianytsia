@@ -57,6 +57,7 @@ struct DvNhm {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct DvCaps {
     supported: u8,
     chip: [c_char; 32],
@@ -140,14 +141,6 @@ pub struct Caps {
     pub fast_retune: bool,
 }
 
-fn c_str(b: &[c_char]) -> String {
-    let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-    // c_char is i8 on x86_64 and u8 on aarch64: the cast is a no-op there.
-    #[allow(clippy::unnecessary_cast)]
-    let bytes: Vec<u8> = b[..n].iter().map(|&c| c as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 /// The card's control plane, held exclusively: sends, retunes and register
 /// reads never overlap (devourer's control calls are single-thread). A
 /// caller that must keep its own state in step with the card (the channel
@@ -159,24 +152,18 @@ pub struct Ctl<'a> {
 
 impl Ctl<'_> {
     pub fn caps(&self) -> Caps {
-        let mut o = DvCaps {
-            supported: 0,
-            chip: [0; 32],
-            gen: [0; 16],
-            tx_chains: 0,
-            rx_chains: 0,
-            bw_mask: 0,
-            tune5g_lo: 0,
-            tune5g_hi: 0,
-            fast_retune: 0,
-        };
+        let mut o = DvCaps::default();
         if unsafe { dv_get_caps(self.raw, &mut o) } != 0 {
             return Caps::default();
         }
         Caps {
             supported: o.supported != 0,
-            chip: c_str(&o.chip),
-            gen: c_str(&o.gen),
+            chip: unsafe { CStr::from_ptr(o.chip.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+            gen: unsafe { CStr::from_ptr(o.gen.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
             tx_chains: o.tx_chains,
             rx_chains: o.rx_chains,
             bw_mask: o.bw_mask,
