@@ -250,17 +250,19 @@ fn drive(o: &Opts) -> Drive {
             extra: extra.into_iter().collect(),
         };
     }
-    let o2 = o.clone();
-    Drive::Runtime {
-        gs: o.mode == Some(Mode::Gs),
-        search: Some(Search {
-            set: o.search.clone(),
-            remake: Box::new(move |ch| {
-                eprintln!("pal-desktop: drone found on ch {ch}");
-                Ok(make_core(&o2, ch))
-            }),
-        }),
+    if o.search.is_empty() {
+        return Drive::Pinned {
+            gs: o.mode == Some(Mode::Gs),
+        };
     }
+    let o2 = o.clone();
+    Drive::Sweep(Search {
+        set: o.search.clone(),
+        remake: Box::new(move |ch| {
+            eprintln!("pal-desktop: drone found on ch {ch}");
+            Ok(make_core(&o2, ch))
+        }),
+    })
 }
 
 fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {

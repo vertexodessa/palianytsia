@@ -614,10 +614,11 @@ pub struct LiveCfg {
 
 /// Who tunes the card(s), decided once by the app.
 pub enum Drive {
-    /// The runtime: the card stays on `LiveCfg::ch`, or sweeps for the
-    /// drone when `search` is given. `gs`: the card also transmits the
-    /// core's RC frames.
-    Runtime { gs: bool, search: Option<Search> },
+    /// The runtime keeps the card on `LiveCfg::ch`. `gs`: the card also
+    /// transmits the core's RC frames.
+    Pinned { gs: bool },
+    /// The runtime sweeps for the drone; the core never transmits.
+    Sweep(Search),
     /// A core that owns the cards (see `RxTap`): it finds the drone,
     /// retunes and transmits itself. `extra`: more cards next to the
     /// first (mabur's multi-card GS: every card receives, the channel core
@@ -629,8 +630,7 @@ pub enum Drive {
 }
 
 /// The channel set to sweep for the drone (radio.channel = "auto"): at
-/// start, and again after `LOST_US` without a drone frame. An empty set =
-/// stay on the channel. `remake` builds the core for the channel found: a
+/// start, and again after `LOST_US` without a drone frame. `remake` builds the core for the channel found: a
 /// core's DISC proposes the channel it was built for, and a core on the
 /// wrong one would steer the drone.
 pub struct Search {
@@ -737,10 +737,15 @@ pub fn run_live(cl: CoreLoop, o: LiveCfg, on_open: impl FnOnce(&str)) -> Result<
             on_open(set.chips());
             run_core_on(cl, &set, o.ch, o.width, attach)
         }
-        Drive::Runtime { gs, search } => {
+        Drive::Pinned { gs } => {
             let set = CardSet::open(vec![o.select], o.ch, o.width)?;
             on_open(set.chips());
-            run_runtime_owned(cl, &set, o.ch, o.width, gs, search)
+            run_runtime_owned(cl, &set, o.ch, o.width, gs, None)
+        }
+        Drive::Sweep(search) => {
+            let set = CardSet::open(vec![o.select], o.ch, o.width)?;
+            on_open(set.chips());
+            run_runtime_owned(cl, &set, o.ch, o.width, false, Some(search))
         }
     }
 }
@@ -978,7 +983,7 @@ fn run_runtime_owned(
     shared.channel.store(ch, Ordering::Relaxed);
     let card = &set.cards[0];
     let clock: fn() -> u64 = mono_default;
-    let mut srch = search.filter(|s| !s.set.is_empty());
+    let mut srch = search;
     let searching = srch.is_some();
     let mut core_ch = ch;
     let mut tuned = (ch, width);
@@ -1017,16 +1022,12 @@ fn run_runtime_owned(
             if h != seen.0 {
                 seen = (h, now);
             } else if searching && now.saturating_sub(seen.1) >= LOST_US {
-                // The core stays silent while the card sweeps: its DISC on a
-                // foreign channel could move a drone that is listening there.
                 cl.sink
                     .shared
                     .event("drone_lost", serde_json::json!({"ch": core_ch}));
-                let card_tx = cl.sink.card.take();
                 if !find(cl, &mut core_ch)? {
                     return Ok(false);
                 }
-                cl.sink.card = card_tx;
                 seen = (hits.load(Ordering::Relaxed), clock());
             }
             Ok(true)
