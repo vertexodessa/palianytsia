@@ -463,7 +463,7 @@ impl FrameStream {
         } else {
             return;
         };
-        let ty = (b[p] >> 1) & 0x3F;
+        let ty = hevc::nal::nal_type(b[p]);
         if !(32..=34).contains(&ty) {
             return;
         }

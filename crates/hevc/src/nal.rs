@@ -18,6 +18,11 @@ pub fn find_start_code(au: &[u8], from: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// The type field of a NAL header's first byte.
+pub fn nal_type(first: u8) -> u8 {
+    (first >> 1) & 0x3F
+}
+
 /// One NAL unit: `off..off+len` of the AU, from the 2-byte NAL header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NalView {
@@ -40,7 +45,7 @@ pub fn split_nals(au: &[u8]) -> Vec<NalView> {
             out.push(NalView {
                 off: begin,
                 len: end - begin,
-                ty: (au[begin] >> 1) & 0x3F,
+                ty: nal_type(au[begin]),
             });
         }
         match next {

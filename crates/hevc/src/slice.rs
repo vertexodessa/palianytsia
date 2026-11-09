@@ -44,7 +44,7 @@ pub fn parse_slice_header(nal: &[u8], sps: &Sps, pps: &Pps) -> Result<SliceHeade
     }
     let mut h = SliceHeader {
         nal_hdr: [nal[0], nal[1]],
-        nal_type: (nal[0] >> 1) & 0x3F,
+        nal_type: crate::nal::nal_type(nal[0]),
         slice_qp_y: 26,
         max_num_merge_cand: 5,
         ..Default::default()

@@ -49,22 +49,10 @@ struct Code {
 }
 
 fn find_codes(b: &[u8], from: usize, out: &mut Vec<Code>) {
-    let n = b.len();
     let mut j = from;
-    while j + 3 <= n {
-        if b[j] == 0 && b[j + 1] == 0 {
-            if b[j + 2] == 1 {
-                out.push(Code { pos: j, len: 3 });
-                j += 3;
-                continue;
-            }
-            if b[j + 2] == 0 && j + 4 <= n && b[j + 3] == 1 {
-                out.push(Code { pos: j, len: 4 });
-                j += 4;
-                continue;
-            }
-        }
-        j += 1;
+    while let Some((pos, len)) = hevc::nal::find_start_code(b, j) {
+        out.push(Code { pos, len });
+        j = pos + len;
     }
 }
 
@@ -264,7 +252,7 @@ impl SliceAssembler {
                     continue;
                 }
                 let nal = &rb[body..e];
-                let ty = (nal[0] >> 1) & 0x3F;
+                let ty = hevc::nal::nal_type(nal[0]);
                 let bytes = rb[s..e].to_vec();
                 if ty >= 32 {
                     if r == 0 && !seen_vcl {
@@ -306,7 +294,7 @@ impl SliceAssembler {
             if c.pos >= self.emitted {
                 break;
             }
-            if c.pos + c.len < self.buf.len() && ((self.buf[c.pos + c.len] >> 1) & 0x3F) < 32 {
+            if c.pos + c.len < self.buf.len() && hevc::nal::nal_type(self.buf[c.pos + c.len]) < 32 {
                 done += 1;
             }
         }
