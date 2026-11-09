@@ -8,6 +8,7 @@ pub mod channels;
 pub mod console;
 #[cfg(feature = "ui")]
 pub mod hud;
+mod json;
 #[cfg(feature = "ui")]
 pub mod panel;
 pub mod params;
@@ -20,6 +21,8 @@ pub mod telem;
 use std::collections::VecDeque;
 
 use serde_json::Value;
+
+use crate::json::{list, opt_i64, u64_or};
 
 #[cfg(feature = "ui")]
 mod widgets;
@@ -162,22 +165,11 @@ pub fn cards_line(rates: &[CardRate], tx: Option<u64>) -> String {
         .join("  ")
 }
 
-fn u(v: &Value, k: &str) -> u64 {
-    v.get(k).and_then(Value::as_u64).unwrap_or(0)
-}
-
 /// The per-card receive counters of a parsed stats line.
 pub fn cards_of(v: &Value) -> Vec<CardRx> {
-    v.get("cards")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .map(|c| CardRx {
-                    rssi: c.get("rssi").and_then(Value::as_i64),
-                    frames: u(c, "frames"),
-                    crc_fail: u(c, "crc_fail"),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    list(v, "cards", |c| CardRx {
+        rssi: opt_i64(c, "rssi"),
+        frames: u64_or(c, "frames", 0),
+        crc_fail: u64_or(c, "crc_fail", 0),
+    })
 }

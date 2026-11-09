@@ -3,6 +3,8 @@
 //! keys fall back to the defaults, so an old file never blocks start.
 use serde_json::{json, Value};
 
+use crate::json::{bool_or, opt_f64, str_or};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HudPrefs {
     pub dot: bool,
@@ -130,7 +132,7 @@ impl HudPrefs {
         let Ok(v) = serde_json::from_str::<Value>(s) else {
             return d;
         };
-        let b = |k: &str, def: bool| v.get(k).and_then(Value::as_bool).unwrap_or(def);
+        let b = |k: &str, def: bool| bool_or(&v, k, def);
         Self {
             dot: b("dot", d.dot),
             battery: b("battery", d.battery),
@@ -139,10 +141,7 @@ impl HudPrefs {
             link: b("link", d.link),
             messages: b("messages", d.messages),
             stats: b("stats", d.stats),
-            scale: v
-                .get("scale")
-                .and_then(Value::as_f64)
-                .map_or(d.scale, |x| (x as f32).clamp(0.6, 2.0)),
+            scale: opt_f64(&v, "scale").map_or(d.scale, |x| (x as f32).clamp(0.6, 2.0)),
             link_bw: match v.get("link_bw").and_then(Value::as_u64) {
                 Some(40) => 40,
                 _ => 20,
@@ -161,10 +160,8 @@ impl HudPrefs {
                     .into_iter()
                     .collect(),
             },
-            video_filter: VideoFilter::parse(
-                v.get("video_filter").and_then(Value::as_str).unwrap_or(""),
-            ),
-            quest_view: QuestView::parse(v.get("quest_view").and_then(Value::as_str).unwrap_or("")),
+            video_filter: VideoFilter::parse(&str_or(&v, "video_filter", "")),
+            quest_view: QuestView::parse(&str_or(&v, "quest_view", "")),
             s3_demote: b("s3_demote", d.s3_demote),
             chip_pos: v
                 .get("chip_pos")

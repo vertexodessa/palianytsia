@@ -7,6 +7,8 @@
 use egui::{Color32, RichText, Ui};
 use serde_json::Value;
 
+use crate::json::{bool_or, list, opt_f64, opt_i64, str_or, u64_or};
+
 use crate::params::{Cmd, Table};
 
 /// The drone row whose "none" undoes a calibration (mabur cfgparam).
@@ -60,57 +62,36 @@ pub struct CalView {
 
 impl CalView {
     pub fn parse(v: &Value) -> Option<Self> {
-        let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-        let u = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let widths = v
-            .get("widths")
-            .and_then(Value::as_array)
-            .map(|ws| {
-                ws.iter()
-                    .map(|w| CalWidth {
-                        bw: u(w, "bw") as u8,
-                        applied: w.get("applied").and_then(Value::as_bool).unwrap_or(false),
-                        apply_reason: s(w, "apply_reason"),
-                        eff_unknown: w
-                            .get("eff_unknown")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        rates: w
-                            .get("rates")
-                            .and_then(Value::as_array)
-                            .map(|rs| {
-                                rs.iter()
-                                    .map(|r| CalRate {
-                                        mcs: u(r, "mcs") as u8,
-                                        wall: r.get("wall").and_then(Value::as_i64),
-                                        park: r.get("park").and_then(Value::as_i64),
-                                        verify_pct: r.get("verify_pct").and_then(Value::as_i64),
-                                        eff: r.get("eff").and_then(Value::as_f64),
-                                        wall_flags: u(r, "wall_flags"),
-                                        cap_flags: u(r, "cap_flags"),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let widths = list(v, "widths", |w| CalWidth {
+            bw: u64_or(w, "bw", 0) as u8,
+            applied: bool_or(w, "applied", false),
+            apply_reason: str_or(w, "apply_reason", ""),
+            eff_unknown: bool_or(w, "eff_unknown", false),
+            rates: list(w, "rates", |r| CalRate {
+                mcs: u64_or(r, "mcs", 0) as u8,
+                wall: opt_i64(r, "wall"),
+                park: opt_i64(r, "park"),
+                verify_pct: opt_i64(r, "verify_pct"),
+                eff: opt_f64(r, "eff"),
+                wall_flags: u64_or(r, "wall_flags", 0),
+                cap_flags: u64_or(r, "cap_flags", 0),
+            }),
+        });
         Some(Self {
             state: v.get("state")?.as_str()?.to_string(),
-            running: v.get("running").and_then(Value::as_bool).unwrap_or(false),
-            sweep_k: u(v, "sweep_k"),
-            sweep_n: u(v, "sweep_n"),
-            kind: s(v, "kind"),
-            bw: u(v, "bw"),
-            cell_i: u(v, "cell_i"),
-            cell_n: u(v, "cell_n"),
-            channel: u(v, "channel"),
-            pick: s(v, "pick"),
-            fail_reason: s(v, "fail_reason"),
+            running: bool_or(v, "running", false),
+            sweep_k: u64_or(v, "sweep_k", 0),
+            sweep_n: u64_or(v, "sweep_n", 0),
+            kind: str_or(v, "kind", ""),
+            bw: u64_or(v, "bw", 0),
+            cell_i: u64_or(v, "cell_i", 0),
+            cell_n: u64_or(v, "cell_n", 0),
+            channel: u64_or(v, "channel", 0),
+            pick: str_or(v, "pick", ""),
+            fail_reason: str_or(v, "fail_reason", ""),
             widths,
             refusal: v.get("refusal").and_then(Value::as_str).map(str::to_string),
-            capable: v.get("capable").and_then(Value::as_bool).unwrap_or(false),
+            capable: bool_or(v, "capable", false),
         })
     }
 

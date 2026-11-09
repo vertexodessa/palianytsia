@@ -3,6 +3,8 @@
 //! the app forwards them to the core thread.
 use serde_json::Value;
 
+use crate::json::{bool_or, opt_i64, str_or};
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
     pub id: String,
@@ -28,10 +30,6 @@ pub struct Table {
     pub rows: Vec<Row>,
 }
 
-fn s(v: &Value, k: &str) -> String {
-    v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
-}
-
 impl Table {
     pub fn parse(line: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(line).ok()?;
@@ -40,27 +38,24 @@ impl Table {
             .as_array()?
             .iter()
             .map(|r| Row {
-                id: s(r, "id"),
-                section: s(r, "section"),
-                key: s(r, "key"),
-                ty: s(r, "type"),
-                apply: s(r, "apply"),
-                help: s(r, "help"),
+                id: str_or(r, "id", ""),
+                section: str_or(r, "section", ""),
+                key: str_or(r, "key", ""),
+                ty: str_or(r, "type", ""),
+                apply: str_or(r, "apply", ""),
+                help: str_or(r, "help", ""),
                 value: r.get("value").and_then(Value::as_str).map(str::to_string),
-                state: s(r, "state"),
-                status: s(r, "status"),
+                state: str_or(r, "state", ""),
+                status: str_or(r, "status", ""),
             })
             .collect();
         Some(Self {
-            linked: v.get("linked").and_then(Value::as_bool).unwrap_or(false),
+            linked: bool_or(&v, "linked", false),
             alive: v.get("alive").and_then(Value::as_bool),
-            list: s(&v, "list"),
-            mismatch: v.get("mismatch").and_then(Value::as_bool).unwrap_or(false),
-            pending: v
-                .get("pending")
-                .and_then(Value::as_i64)
-                .and_then(|p| usize::try_from(p).ok()),
-            spotter: s(&v, "mode") == "spotter",
+            list: str_or(&v, "list", ""),
+            mismatch: bool_or(&v, "mismatch", false),
+            pending: opt_i64(&v, "pending").and_then(|p| usize::try_from(p).ok()),
+            spotter: str_or(&v, "mode", "") == "spotter",
             rows,
         })
     }

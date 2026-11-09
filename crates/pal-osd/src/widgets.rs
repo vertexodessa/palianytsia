@@ -2,6 +2,8 @@
 use super::*;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Ui, Vec2};
 
+use crate::json::{bool_or, opt_f64, opt_i64, str_or, u64_or};
+
 /// The fields the OSD shows, parsed from one stats line.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -71,8 +73,8 @@ pub struct LadderUp {
 
 impl Ladder {
     fn parse(v: &Value) -> Option<Self> {
-        let i = |k: &str| v.get(k).and_then(Value::as_i64);
-        let f = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let i = |k: &str| opt_i64(v, k);
+        let f = |k: &str| opt_f64(v, k).unwrap_or(0.0);
         let up = v.get("probe").and_then(Value::as_str).map(|p| LadderUp {
             u: f("u"),
             up_util: f("up_util"),
@@ -82,8 +84,8 @@ impl Ladder {
             probe_rung: i("probe_rung").unwrap_or(-1),
             probe_u: f("probe_u"),
             probe_max_util: f("probe_max_util"),
-            streak: u(v, "streak"),
-            streak_need: u(v, "streak_need"),
+            streak: u64_or(v, "streak", 0),
+            streak_need: u64_or(v, "streak_need", 0),
             penalty_ms: i("penalty_ms").unwrap_or(0),
         });
         let last = v.get("last_reason").and_then(Value::as_str).map(|r| {
@@ -145,47 +147,29 @@ impl Snapshot {
     pub fn parse(line: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(line).ok()?;
         Some(Self {
-            mode: v
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-                .to_string(),
-            session: v.get("session").and_then(Value::as_bool).unwrap_or(false),
-            key_mismatch: v
-                .get("key_mismatch")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            rung: v.get("rung").and_then(Value::as_i64).unwrap_or(-1),
-            mcs: v.get("mcs").and_then(Value::as_i64).unwrap_or(-1),
-            bw: v.get("bw").and_then(Value::as_i64).unwrap_or(0),
-            drone_state: v.get("drone_state").and_then(Value::as_i64),
-            rssi_dbm: v.get("rssi_dbm").and_then(Value::as_f64),
-            snr_db: v.get("snr_db").and_then(Value::as_f64),
-            aus: u(&v, "aus"),
-            trunc: u(&v, "trunc"),
-            salvaged: u(&v, "salvaged"),
-            key_fp: v
-                .get("key_fp")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            rtt_ms: v.get("rtt_ms").and_then(Value::as_f64),
-            uplink: v
-                .get("uplink")
-                .and_then(Value::as_str)
-                .unwrap_or("none")
-                .to_string(),
-            uplink_pct: v.get("uplink_pct").and_then(Value::as_i64),
-            pre_fec_loss: v.get("pre_fec_loss").and_then(Value::as_f64),
-            residual: v.get("residual").and_then(Value::as_f64),
+            mode: str_or(&v, "mode", "?"),
+            session: bool_or(&v, "session", false),
+            key_mismatch: bool_or(&v, "key_mismatch", false),
+            rung: opt_i64(&v, "rung").unwrap_or(-1),
+            mcs: opt_i64(&v, "mcs").unwrap_or(-1),
+            bw: opt_i64(&v, "bw").unwrap_or(0),
+            drone_state: opt_i64(&v, "drone_state"),
+            rssi_dbm: opt_f64(&v, "rssi_dbm"),
+            snr_db: opt_f64(&v, "snr_db"),
+            aus: u64_or(&v, "aus", 0),
+            trunc: u64_or(&v, "trunc", 0),
+            salvaged: u64_or(&v, "salvaged", 0),
+            key_fp: str_or(&v, "key_fp", ""),
+            rtt_ms: opt_f64(&v, "rtt_ms"),
+            uplink: str_or(&v, "uplink", "none"),
+            uplink_pct: opt_i64(&v, "uplink_pct"),
+            pre_fec_loss: opt_f64(&v, "pre_fec_loss"),
+            residual: opt_f64(&v, "residual"),
             cards: cards_of(&v),
             tx_card: v.get("tx_card").and_then(Value::as_u64),
-            drone_temp_c: v.get("drone_temp_c").and_then(Value::as_i64),
-            nack_fill: v.get("nack").map_or(0, |n| u(n, "fill")),
-            nack_fill_pps: v
-                .get("nack")
-                .and_then(|n| n.get("fill_pps"))
-                .and_then(Value::as_f64),
+            drone_temp_c: opt_i64(&v, "drone_temp_c"),
+            nack_fill: v.get("nack").map_or(0, |n| u64_or(n, "fill", 0)),
+            nack_fill_pps: v.get("nack").and_then(|n| opt_f64(n, "fill_pps")),
             ladder: v.get("ladder").and_then(Ladder::parse),
             cal: v.get("cal").and_then(cal::CalView::parse),
             chscan: v.get("chscan").and_then(channels::ScanView::parse),

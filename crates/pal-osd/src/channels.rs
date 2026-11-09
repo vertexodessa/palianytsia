@@ -5,6 +5,8 @@
 use pal_wire::ht40::ht40_offset;
 use serde_json::Value;
 
+use crate::json::{bool_or, opt_f64, str_or, u64_or};
+
 /// The core's channel scan (`"chscan"` in the UI line).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScanView {
@@ -34,16 +36,16 @@ impl ScanView {
             .filter_map(|r| {
                 Some(ScanRowView {
                     ch: u8::try_from(r.get("ch")?.as_u64()?).ok()?,
-                    busy: r.get("busy").and_then(Value::as_f64),
-                    foreign: r.get("foreign").and_then(Value::as_f64),
-                    op: r.get("op").and_then(Value::as_bool).unwrap_or(false),
+                    busy: opt_f64(r, "busy"),
+                    foreign: opt_f64(r, "foreign"),
+                    op: bool_or(r, "op", false),
                 })
             })
             .collect();
         Some(Self {
-            running: v.get("state").and_then(Value::as_str) == Some("running"),
-            pass: v.get("pass").and_then(Value::as_u64).unwrap_or(0),
-            passes: v.get("passes").and_then(Value::as_u64).unwrap_or(0),
+            running: str_or(v, "state", "") == "running",
+            pass: u64_or(v, "pass", 0),
+            passes: u64_or(v, "passes", 0),
             rows,
         })
     }
