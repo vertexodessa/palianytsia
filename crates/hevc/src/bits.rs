@@ -115,19 +115,6 @@ impl BitWriter {
             self.put((v >> i) & 1 != 0);
         }
     }
-    pub fn ue(&mut self, v: u32) {
-        let x = u64::from(v) + 1;
-        let mut len = 0;
-        while (x >> len) > 1 {
-            len += 1;
-        }
-        for _ in 0..len {
-            self.put(false);
-        }
-        for i in (0..=len).rev() {
-            self.put((x >> i) & 1 != 0);
-        }
-    }
     /// Appends src bits [from_bit, to_bit).
     pub fn copy(&mut self, src: &[u8], from_bit: usize, to_bit: usize) {
         for b in from_bit..to_bit {
@@ -152,12 +139,10 @@ mod tests {
     use super::*;
     #[test]
     fn ue_se_roundtrip() {
-        let mut w = BitWriter::default();
-        for v in [0u32, 1, 2, 7, 255, 65535] {
-            w.ue(v);
-        }
-        let mut r = BitReader::new(w.bytes());
-        for v in [0u32, 1, 2, 7, 255, 65535] {
+        // ue(v) of 0, 1, 2, 7 and 255: 1 010 011 0001000 00000000100000000.
+        let bytes = [0b1010_0110, 0b0010_0000, 0b0000_0010, 0];
+        let mut r = BitReader::new(&bytes);
+        for v in [0u32, 1, 2, 7, 255] {
             assert_eq!(r.ue(), v);
         }
         assert!(!r.bad());

@@ -56,17 +56,6 @@ pub fn split_nals(au: &[u8]) -> Vec<NalView> {
     out
 }
 
-pub fn au_is_irap(au: &[u8]) -> bool {
-    split_nals(au).iter().any(|v| (16..=23).contains(&v.ty))
-}
-
-/// An IRAP, or an AU carrying an SPS (intra-refresh entry point).
-pub fn au_is_entry_point(au: &[u8]) -> bool {
-    split_nals(au)
-        .iter()
-        .any(|v| (16..=23).contains(&v.ty) || v.ty == 33)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
