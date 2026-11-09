@@ -129,7 +129,13 @@ fn parse() -> Opts {
                     m => die(&format!("--mode gs|spotter, got {m}")),
                 })
             }
-            "--core" => o.rust = val() != "ref",
+            "--core" => {
+                o.rust = match val().as_str() {
+                    "rust" => true,
+                    "ref" => false,
+                    c => die(&format!("--core rust|ref, got {c}")),
+                }
+            }
             "--loop" => o.looping = true,
             "--log-dir" => o.log_dir = Some(val().into()),
             "--snapshot" => o.snapshot = Some(val().into()),
@@ -305,7 +311,14 @@ fn run_replay(mut cl: CoreLoop, o: &Opts, path: PathBuf, repaint: egui::Context)
         let wall0 = Instant::now();
         let mut t0: Option<u64> = None;
         for rec in r {
-            let Ok(rec) = rec else { break };
+            let rec = match rec {
+                Ok(rec) => rec,
+                Err(e) if capture::is_torn_tail(&e) => {
+                    eprintln!("pal-desktop: capture ends in a torn record, stopping there: {e}");
+                    break;
+                }
+                Err(e) => die(&format!("capture: {e}")),
+            };
             let t = match &rec {
                 Record::Body(b) => b.mono_us,
                 Record::Tick(t) => *t,

@@ -326,6 +326,25 @@ fn mono_us(t0: Instant) -> u64 {
     1_000_000 + t0.elapsed().as_micros() as u64
 }
 
+/// One received body: capture, flight log, the count, then the core.
+fn ingest(
+    b: &RxBody,
+    cap: &mut Option<capture::Writer<BufWriter<std::fs::File>>>,
+    bodies: &mut u64,
+    sink: &mut Sink,
+    core: &mut dyn GsCore,
+) {
+    if let Some(c) = cap.as_mut() {
+        c.body(b).unwrap();
+    }
+    *bodies += 1;
+    sink.now_us = b.mono_us;
+    if let Some(l) = sink.log.as_mut() {
+        l.body(b).unwrap();
+    }
+    core.on_rx(b, sink);
+}
+
 fn live(o: Opts) {
     let mut core = core(&o, o.ch);
     let mut sink = Sink::new(&o);
@@ -400,9 +419,6 @@ fn live(o: Opts) {
         let wait = Duration::from_micros(next_tick.saturating_sub(now));
         match rx.recv_timeout(wait) {
             Ok(b) => {
-                if let Some(c) = cap.as_mut() {
-                    c.body(&b).unwrap();
-                }
                 if b.phy_valid && b.crc_ok {
                     rssi_sum += f64::from(b.rssi[0]) - 110.0;
                     rssi_n += 1;
@@ -410,12 +426,7 @@ fn live(o: Opts) {
                 if b.mcs != 255 {
                     mcs = b.mcs;
                 }
-                bodies += 1;
-                sink.now_us = b.mono_us;
-                if let Some(l) = sink.log.as_mut() {
-                    l.body(&b).unwrap();
-                }
-                core.on_rx(&b, &mut sink);
+                ingest(&b, &mut cap, &mut bodies, &mut sink, &mut *core);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => die("RX thread ended"),
@@ -471,11 +482,7 @@ fn live(o: Opts) {
     sink.card = None;
     drop(card); // last Arc: stops RX before the queue is drained
     while let Ok(b) = rx.try_recv() {
-        if let Some(c) = cap.as_mut() {
-            c.body(&b).unwrap();
-        }
-        sink.now_us = b.mono_us;
-        core.on_rx(&b, &mut sink);
+        ingest(&b, &mut cap, &mut bodies, &mut sink, &mut *core);
     }
     if let Some(c) = cap.as_mut() {
         c.flush().unwrap();
@@ -529,7 +536,7 @@ fn replay(o: Opts) {
         let rec = match rec {
             Ok(rec) => rec,
             // A killed app can leave half a record; the flight before it counts.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(e) if capture::is_torn_tail(&e) => {
                 eprintln!("pal: capture ends in a torn record, stopping there: {e}");
                 break;
             }

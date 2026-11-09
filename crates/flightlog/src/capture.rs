@@ -65,6 +65,16 @@ impl<W: Write> Writer<W> {
     }
 }
 
+/// No radio delivers a longer body; a length above it is a damaged file,
+/// not a record the file ended inside.
+const MAX_BODY: usize = 65535;
+
+/// A file that ends inside its last record: an app killed mid-write. The
+/// flight before it counts; any other read error means a damaged file.
+pub fn is_torn_tail(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::UnexpectedEof
+}
+
 pub struct Reader<R: BufRead> {
     r: R,
 }
@@ -98,6 +108,12 @@ impl<R: BufRead> Reader<R> {
                 let mut h = [0u8; 28];
                 self.r.read_exact(&mut h)?;
                 let len = u32::from_le_bytes(h[24..28].try_into().unwrap()) as usize;
+                if len > MAX_BODY {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("bad body length {len}"),
+                    ));
+                }
                 let mut body = vec![0u8; len];
                 self.r.read_exact(&mut body)?;
                 Ok(Some(Record::Body(RxBody {
@@ -183,7 +199,14 @@ mod tests {
         .unwrap();
         let bytes = w.into_inner();
         let mut r = Reader::new(&bytes[..bytes.len() - 1]).unwrap();
-        assert!(r.next_record().is_err());
+        assert!(is_torn_tail(&r.next_record().unwrap_err()));
+        // The length field (last four header bytes before the body).
+        let mut bad = bytes.clone();
+        let at = bad.len() - 10 - 4;
+        bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut r = Reader::new(&bad[..]).unwrap();
+        let e = r.next_record().unwrap_err();
+        assert!(!is_torn_tail(&e), "{e}");
         assert!(Reader::new(&b"palcap 2\n"[..]).is_err());
     }
 }
