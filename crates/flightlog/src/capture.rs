@@ -14,6 +14,10 @@ use std::io::{self, BufRead, Write};
 pub const MAGIC: &[u8] = b"palcap 1\n";
 const TAG_BODY: u8 = 1;
 const TAG_TICK: u8 = 2;
+/// A body record before its bytes: tag, then the fields up to `len`.
+const BODY_HEADER: usize = 29;
+/// A tick record: tag, `now_us`.
+const TICK_LEN: u64 = 9;
 
 #[derive(Clone, Debug)]
 pub enum Record {
@@ -23,16 +27,20 @@ pub enum Record {
 
 pub struct Writer<W: Write> {
     w: W,
+    written: u64,
 }
 
 impl<W: Write> Writer<W> {
     pub fn new(mut w: W) -> io::Result<Self> {
         w.write_all(MAGIC)?;
-        Ok(Self { w })
+        Ok(Self {
+            w,
+            written: MAGIC.len() as u64,
+        })
     }
 
     pub fn body(&mut self, b: &RxBody) -> io::Result<()> {
-        let mut h = [0u8; 31];
+        let mut h = [0u8; BODY_HEADER];
         h[0] = TAG_BODY;
         h[1] = b.card_id;
         h[2..10].copy_from_slice(&b.mono_us.to_le_bytes());
@@ -47,13 +55,22 @@ impl<W: Write> Writer<W> {
         h[23] = b.mcs;
         h[24] = b.rx_channel;
         h[25..29].copy_from_slice(&(b.body.len() as u32).to_le_bytes());
-        self.w.write_all(&h[..29])?;
-        self.w.write_all(&b.body)
+        self.w.write_all(&h)?;
+        self.w.write_all(&b.body)?;
+        self.written += (BODY_HEADER + b.body.len()) as u64;
+        Ok(())
     }
 
     pub fn tick(&mut self, now_us: u64) -> io::Result<()> {
         self.w.write_all(&[TAG_TICK])?;
-        self.w.write_all(&now_us.to_le_bytes())
+        self.w.write_all(&now_us.to_le_bytes())?;
+        self.written += TICK_LEN;
+        Ok(())
+    }
+
+    /// The file's length so far, magic included.
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -105,7 +122,7 @@ impl<R: BufRead> Reader<R> {
                 Ok(Some(Record::Tick(u64::from_le_bytes(t))))
             }
             TAG_BODY => {
-                let mut h = [0u8; 28];
+                let mut h = [0u8; BODY_HEADER - 1];
                 self.r.read_exact(&mut h)?;
                 let len = u32::from_le_bytes(h[24..28].try_into().unwrap()) as usize;
                 if len > MAX_BODY {

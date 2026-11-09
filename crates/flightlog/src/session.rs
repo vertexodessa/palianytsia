@@ -86,7 +86,6 @@ pub struct Session {
     au: BufWriter<File>,
     capture: Option<capture::Writer<BufWriter<File>>>,
     capture_cap: u64,
-    capture_bytes: u64,
     last: Option<Map<String, Value>>,
     /// `channel` as last logged, and a new value seen once: the stat is
     /// card 0's tuning, so a scout dwell on card 0 shows for one line.
@@ -129,7 +128,6 @@ impl Session {
             au,
             capture,
             capture_cap,
-            capture_bytes: 0,
             last: None,
             channel: None,
             channel_seen: None,
@@ -221,24 +219,33 @@ impl Session {
             return Ok(());
         };
         c.body(b)?;
-        self.capture_bytes += b.body.len() as u64 + 32;
-        if self.capture_bytes >= self.capture_cap {
-            self.close_capture(b.mono_us)?;
-        }
-        Ok(())
+        self.close_capture_at_cap(b.mono_us)
     }
 
+    /// Capture one tick; ticks count towards the cap like bodies do.
     pub fn tick(&mut self, now_us: u64) -> io::Result<()> {
-        match self.capture.as_mut() {
-            Some(c) => c.tick(now_us),
-            None => Ok(()),
+        let Some(c) = self.capture.as_mut() else {
+            return Ok(());
+        };
+        c.tick(now_us)?;
+        self.close_capture_at_cap(now_us)
+    }
+
+    fn close_capture_at_cap(&mut self, t_us: u64) -> io::Result<()> {
+        if self
+            .capture
+            .as_ref()
+            .is_some_and(|c| c.written() >= self.capture_cap)
+        {
+            self.close_capture(t_us)?;
         }
+        Ok(())
     }
 
     fn close_capture(&mut self, t_us: u64) -> io::Result<()> {
         if let Some(mut c) = self.capture.take() {
             c.flush()?;
-            let bytes = self.capture_bytes;
+            let bytes = c.written();
             self.event(t_us, "capture_cap", json!({ "bytes": bytes }))?;
         }
         Ok(())
@@ -374,6 +381,29 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ticks_alone_reach_the_cap_and_the_event_has_the_file_size() {
+        let root = std::env::temp_dir().join(format!("pal-fl-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut s = Session::create(&root, SystemTime::now(), 100).unwrap();
+        for t in 0..1000 {
+            s.tick(t).unwrap();
+        }
+        s.flush().unwrap();
+        let dir = fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+        // The magic is 9 bytes and a tick 9: 11 ticks are the first past 100.
+        let len = fs::metadata(dir.join(CAPTURE_FILE)).unwrap().len();
+        assert_eq!(len, 108);
+        let events = fs::read_to_string(dir.join(EVENTS_FILE)).unwrap();
+        let caps: Vec<&str> = events
+            .lines()
+            .filter(|l| l.contains("capture_cap"))
+            .collect();
+        assert_eq!(caps.len(), 1);
+        assert!(caps[0].contains("\"bytes\":108"), "{}", caps[0]);
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn the_next_index_grows_past_four_digits() {
