@@ -57,6 +57,12 @@ struct Opts {
     width: u8,
     /// Video link width (every ladder rung's bw); 0 = the saved pref.
     link_bw: u8,
+    /// What this run reads, resolved once in `parse`. On a live run it has
+    /// the video width applied.
+    cfg: pal_core::config::Config,
+    /// The generated copy `config` points at for mabur's core, which only
+    /// reads paths; removed at exit.
+    ref_toml: Option<PathBuf>,
     card: i32,
     /// A second card (scan index) for the channel core: receives too, and
     /// the core scouts on it. Only with an attached core (auto config).
@@ -157,32 +163,70 @@ fn parse() -> Opts {
         eprintln!("pal-desktop: config {}", p.display());
         o.config = Some(p);
     }
+    resolve_config(&mut o);
     if o.live {
         o.mode.get_or_insert(Mode::Gs);
         // Channel from the config unless given: radio.channel's pin, else
-        // the first of radio.channels. The width here is the fallback for a
-        // config with_link_bw (below) cannot rewrite.
-        let cfg = o.config.as_ref().expect("config");
-        let c = pal_core::config::load_config(cfg, None)
-            .unwrap_or_else(|e| die(&format!("{}: {e}", cfg.display())));
+        // the first of radio.channels.
+        let c = &o.cfg;
         if o.ch == 0 && c.radio.pin.is_none() {
             // A GS runs the channel core on the card (either core); a Rust
             // spotter, which has none, sweeps for the drone instead.
             o.channel_core = o.mode == Some(Mode::Gs);
             if o.rust && !o.channel_core {
-                o.search = c.radio.channels.clone();
+                o.search = o.cfg.radio.channels.clone();
             }
         }
         if o.ch == 0 {
-            o.ch = c
+            o.ch = o
+                .cfg
                 .radio
                 .pin
                 .or(c.radio.channels.first().copied())
                 .unwrap_or(0);
         }
-        o.width = c.rx_width();
+        o.width = o.cfg.rx_width();
     }
     o
+}
+
+fn prefs_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("palianytsia/hud.json")
+}
+
+/// Reads the config once. A live run applies the video width when it
+/// starts: every ladder rung at --bw, else the saved pref.
+fn resolve_config(o: &mut Opts) {
+    let path = o.config.clone().expect("config");
+    let mut text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+    if o.live {
+        let bw = match o.link_bw {
+            0 => pal_osd::prefs::HudPrefs::load(&prefs_path()).link_bw,
+            b => b,
+        };
+        match pal_core::config::with_link_bw(&text, bw) {
+            Ok(t) => {
+                eprintln!("pal-desktop: video width {bw} MHz");
+                text = t;
+                if !o.rust {
+                    let p = std::env::temp_dir()
+                        .join(format!("pal-desktop-{}-bw{bw}.toml", std::process::id()));
+                    std::fs::write(&p, &text)
+                        .unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
+                    o.config = Some(p.clone());
+                    o.ref_toml = Some(p);
+                }
+            }
+            Err(e) => eprintln!("pal-desktop: video width {bw} MHz not applied: {e}"),
+        }
+    }
+    o.cfg = pal_core::config::parse_config_str(&text)
+        .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
 }
 
 /// Who tunes the card(s) on a live run: on an auto config a GS hands the
@@ -190,18 +234,16 @@ fn parse() -> Opts {
 /// the channel, sweeping for the drone when `o.search` is set.
 fn drive(o: &Opts) -> Drive {
     if o.channel_core {
-        let p = o.config.clone().expect("config");
         let attach = if o.rust {
-            let c = pal_core::config::load_config(&p, None).unwrap_or_else(|e| die(&e.to_string()));
             let opts = RustOpts {
                 mode: Mode::Gs,
                 adaptive_gap: true,
                 rz_nonce: RZ_NONCE,
                 channel: o.ch,
             };
-            runtime::dev_card::rust_channel_core(c, opts, o.width)
+            runtime::dev_card::rust_channel_core(o.cfg.clone(), opts, o.width)
         } else {
-            pal_ref::live::channel_core(p, o.ch, o.width)
+            pal_ref::live::channel_core(o.config.clone().expect("config"), o.ch, o.width)
         };
         let extra = o.card2.map(|index| devourer_sys::Select::Scan { index });
         return Drive::Core {
@@ -223,20 +265,15 @@ fn drive(o: &Opts) -> Drive {
 }
 
 fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
-    let cfg = o
-        .config
-        .clone()
-        .unwrap_or_else(|| die("-c <gs.toml> is required"));
     let mode = o.mode.unwrap_or(Mode::Spotter);
     if o.rust {
-        let c = pal_core::config::load_config(&cfg, None).unwrap_or_else(|e| die(&e.to_string()));
         let opts = RustOpts {
             mode,
             adaptive_gap: true,
             rz_nonce: RZ_NONCE,
             channel,
         };
-        return Box::new(RustCore::new(&c, opts).unwrap_or_else(|e| die(&e)));
+        return Box::new(RustCore::new(&o.cfg, opts).unwrap_or_else(|e| die(&e)));
     }
     let opts = RefOpts {
         mode,
@@ -244,7 +281,8 @@ fn make_core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
         rz_nonce: RZ_NONCE,
         channel,
     };
-    Box::new(RefCore::new(&cfg, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
+    let cfg = o.config.as_ref().expect("config");
+    Box::new(RefCore::new(cfg, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
 }
 
 struct Frame {
@@ -662,47 +700,11 @@ fn main() {
         s
     });
     let channel = if o.live { o.ch } else { 0 };
-    let prefs_path = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("palianytsia/hud.json");
-    // The video width applies when the core starts (live only): every
-    // ladder rung at --bw, else the saved pref; the core reads a copy.
-    let o = {
-        let mut o = o;
-        if o.live {
-            let bw = match o.link_bw {
-                0 => pal_osd::prefs::HudPrefs::load(&prefs_path).link_bw,
-                b => b,
-            };
-            let cfg = o.config.clone().expect("config");
-            let text = std::fs::read_to_string(&cfg)
-                .unwrap_or_else(|e| die(&format!("{}: {e}", cfg.display())));
-            match pal_core::config::with_link_bw(&text, bw) {
-                Ok(t) => {
-                    let p = std::env::temp_dir()
-                        .join(format!("pal-desktop-{}-bw{bw}.toml", std::process::id()));
-                    std::fs::write(&p, t).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
-                    eprintln!("pal-desktop: video width {bw} MHz");
-                    o.config = Some(p);
-                    // The card opens at the link's width, not the original config's.
-                    o.width = bw;
-                }
-                Err(e) => eprintln!("pal-desktop: video width {bw} MHz not applied: {e}"),
-            }
-        }
-        o
-    };
-    // From the config the core will read, after the width was applied to it.
-    if let Some(r) = o
-        .config
-        .as_ref()
-        .and_then(|c| pal_core::config::load_config(c, None).ok())
-        .and_then(|c| c.link.ladder_cfg.ladder.last().cloned())
-    {
+    let prefs_path = prefs_path();
+    if let Some(r) = o.cfg.link.ladder_cfg.ladder.last() {
         shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
     }
+    let ref_toml = o.ref_toml.clone();
     let log_info = match &o.log_dir {
         Some(d) => format!("flight log in {}", d.display()),
         None => "flight log off (start with --log-dir DIR)".into(),
@@ -823,6 +825,9 @@ fn main() {
     let until = Instant::now() + Duration::from_secs(2);
     while !shared_main.core_done.load(Ordering::Acquire) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(p) = ref_toml {
+        let _ = std::fs::remove_file(p);
     }
     if let Err(e) = res {
         die(&format!("eframe: {e}"));
