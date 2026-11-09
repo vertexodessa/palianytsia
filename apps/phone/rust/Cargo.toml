@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 # Host builds compile an empty library so the workspace gates stay
 # platform-neutral; everything real is Android-only.
 [target.'cfg(target_os = "android")'.dependencies]
-pal-osd.workspace = true
+pal-osd = { workspace = true, features = ["ui"] }
 runtime.workspace = true
 pal-android = { path = "../../../crates/pal-android" }
 jni = "0.21"

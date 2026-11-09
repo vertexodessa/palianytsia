@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 pal-android = { path = "../../../crates/pal-android" }
-pal-osd.workspace = true
+pal-osd = { workspace = true, features = ["ui"] }
 runtime.workspace = true
 openxr = { version = "0.19", features = ["loaded"] }
 android-activity = { version = "0.6", features = ["native-activity"] }

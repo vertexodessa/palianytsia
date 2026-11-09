@@ -17,7 +17,7 @@ pal-ref = { workspace = true, features = ["live"] }
 devourer-sys.workspace = true
 flightlog.workspace = true
 decode.workspace = true
-pal-osd.workspace = true
+pal-osd = { workspace = true, features = ["ui"] }
 runtime.workspace = true
 eframe.workspace = true
 egui.workspace = true

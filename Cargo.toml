@@ -23,7 +23,7 @@ decode = { path = "crates/decode" }
 serde_json = "1"
 egui = "0.31"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
-pal-osd = { path = "crates/pal-osd" }
+pal-osd = { path = "crates/pal-osd", default-features = false }
 
 # Real-time video stays usable in debug builds.
 [profile.dev]

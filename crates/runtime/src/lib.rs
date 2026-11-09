@@ -501,8 +501,8 @@ impl CoreLoop {
             // one second of log is lost, a few writes a second.
             let _ = l.flush();
         }
-        let cards = pal_osd::Snapshot::parse(line).map(|s| s.cards);
-        for c in self.deaf.push(now as f64 / 1e6, &cards.unwrap_or_default()) {
+        let cards = serde_json::from_str(line).map_or(Vec::new(), |v| pal_osd::cards_of(&v));
+        for c in self.deaf.push(now as f64 / 1e6, &cards) {
             let ev = if c.deaf { "card_deaf" } else { "card_hearing" };
             eprintln!(
                 "pal: card {} {ev}: {:.1} frames/s, best card {:.0}",
