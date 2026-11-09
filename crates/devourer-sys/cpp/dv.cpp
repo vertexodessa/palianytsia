@@ -66,8 +66,7 @@ static dv_card *open_card(std::unique_ptr<dv_card> &c, const dv_cfg *cfg, char *
       libusb_device_descriptor dd;
       if (libusb_get_device_descriptor(list[i], &dd) != 0) continue;
       bool ok = false;
-      if (cfg->vid != 0) ok = dd.idVendor == cfg->vid && (cfg->pid == 0 || dd.idProduct == cfg->pid);
-      else if (dd.idVendor == 0x0bda) for (uint16_t p : kScanPids) ok |= dd.idProduct == p;
+      if (dd.idVendor == 0x0bda) for (uint16_t p : kScanPids) ok |= dd.idProduct == p;
       if (ok && match++ == cfg->index) d = list[i];
     }
     if (d && libusb_open(d, &c->h) != 0) c->h = nullptr;

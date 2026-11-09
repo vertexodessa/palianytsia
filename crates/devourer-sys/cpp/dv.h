@@ -31,8 +31,6 @@ typedef struct {
 typedef void (*dv_rx_cb)(void *user, const dv_rx *rx);
 
 typedef struct {
-  uint16_t vid;       /* 0 = scan the default list below */
-  uint16_t pid;
   int index;          /* ordinal among matches */
   int fd;             /* >= 0: wrap this fd (Android); vid/pid/index ignored */
   uint8_t channel;

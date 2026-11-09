@@ -23,8 +23,6 @@ struct DvRx {
 
 #[repr(C)]
 struct DvCfg {
-    vid: u16,
-    pid: u16,
     index: c_int,
     fd: c_int,
     channel: u8,
@@ -267,14 +265,7 @@ pub struct RxFrame<'a> {
 #[derive(Clone, Debug)]
 pub enum Select {
     /// 0bda:{a81a,881a,8812}, the n-th match.
-    Scan {
-        index: i32,
-    },
-    Id {
-        vid: u16,
-        pid: u16,
-        index: i32,
-    },
+    Scan { index: i32 },
     /// An already opened usbfs fd (Android `UsbDeviceConnection`).
     Fd(i32),
 }
@@ -333,14 +324,11 @@ extern "C" fn rx_tramp(user: *mut c_void, rx: *const DvRx) {
 
 impl Card {
     pub fn open(cfg: &Config) -> Result<Card, String> {
-        let (vid, pid, index, fd) = match cfg.select {
-            Select::Scan { index } => (0, 0, index, -1),
-            Select::Id { vid, pid, index } => (vid, pid, index, -1),
-            Select::Fd(fd) => (0, 0, 0, fd),
+        let (index, fd) = match cfg.select {
+            Select::Scan { index } => (index, -1),
+            Select::Fd(fd) => (0, fd),
         };
         let c = DvCfg {
-            vid,
-            pid,
             index,
             fd,
             channel: cfg.channel,
