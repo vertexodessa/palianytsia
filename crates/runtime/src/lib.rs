@@ -303,10 +303,7 @@ impl CoreLoop {
     /// the stats line has the rung but not why it moved (a demote with no
     /// loss in sight was unexplained, 2026-11-03). Sampled with the stats
     /// line, so of two moves within one tick only the second shows.
-    fn log_rung_reason(&mut self, now_us: u64, ladder: &str) {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(ladder) else {
-            return;
-        };
+    fn log_rung_reason(&mut self, now_us: u64, v: &serde_json::Value) {
         let (Some(age), Some(reason)) = (
             v.get("last_age_ms").and_then(serde_json::Value::as_i64),
             v.get("last_reason").and_then(serde_json::Value::as_str),
@@ -476,18 +473,15 @@ impl CoreLoop {
         self.sink.pts_off_us = stats.as_ref().and_then(stats_line::pts_off_us);
         // The ladder and calibration views go to the UI only: the
         // flight log keeps the webgs stats line both cores agree on.
-        let ladder = self.core.ladder_json();
-        if let Some(l) = ladder.as_deref() {
+        let json = |t: Option<String>| t.and_then(|t| serde_json::from_str(&t).ok());
+        let ladder = json(self.core.ladder_json());
+        if let Some(l) = &ladder {
             self.log_rung_reason(now, l);
         }
-        let scan = self.core.chan_scan_json();
+        let scan = json(self.core.chan_scan_json());
         let cal = self.cal_line();
         let ui = match stats {
-            Some(s) => stats_line::ui_line(
-                s,
-                &[("ladder", ladder.as_deref()), ("chscan", scan.as_deref())],
-                cal,
-            ),
+            Some(s) => stats_line::ui_line(s, [("ladder", ladder), ("chscan", scan)], cal),
             None => line,
         };
         let _ = self.ports.stats_tx.try_send(ui);
