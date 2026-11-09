@@ -255,12 +255,10 @@ impl Osd {
         let channels: &[u8] = self.link.as_ref().map_or(&[], |l| &l.info.channels);
         let cursor = self.pointer.filter(|_| console.panel.open);
         let mut pout = pal_osd::panel::PanelOut::default();
-        let dec = self.link.as_ref().map_or((0, 0), |l| {
-            (
-                l.shared.frames.load(Ordering::Relaxed),
-                l.shared.dec_errors.load(Ordering::Relaxed),
-            )
-        });
+        let dec_errors = self
+            .link
+            .as_ref()
+            .map_or(0, |l| l.shared.dec_errors.load(Ordering::Relaxed));
         let mut chips_moved = false;
         let out = self.ctx.run(input, |ctx| {
             pout = console.show_panel(ctx, link_info.clone(), log_info.clone(), channels);
@@ -284,7 +282,7 @@ impl Osd {
                             status,
                             fps,
                             kbps,
-                            dec,
+                            dec_errors,
                         },
                     );
                 });

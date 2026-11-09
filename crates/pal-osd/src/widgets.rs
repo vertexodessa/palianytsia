@@ -485,7 +485,7 @@ pub fn chips(
     h: &History,
     fps: f64,
     kbps: f64,
-    decode: (u64, u64),
+    dec_errors: u64,
 ) -> bool {
     let mut out: Vec<Chip> = Vec::new();
     let mut n_cards = 0;
@@ -568,7 +568,7 @@ pub fn chips(
             &format!(
                 "{fps:>3.0} fps  {:>4.1} Mbit/s  dec err {:>3}",
                 kbps / 1000.0,
-                decode.1
+                dec_errors
             ),
             OK,
             None,
@@ -708,7 +708,7 @@ mod tests {
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(region), |ui| {
-                        moved = chips(ui, pos, h, 120.0, 9000.0, (100, 0));
+                        moved = chips(ui, pos, h, 120.0, 9000.0, 0);
                     });
                 });
         });

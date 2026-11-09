@@ -192,7 +192,7 @@ pub fn run(o: OsdIn) {
             ..Default::default()
         };
         ctx.set_pixels_per_point(ppp);
-        let dec = (frames, o.shared.dec_errors.load(Ordering::Relaxed));
+        let dec_errors = o.shared.dec_errors.load(Ordering::Relaxed);
         let mut pout = pal_osd::panel::PanelOut::default();
         let mut stats_flip = false;
         let mut chips_moved = false;
@@ -237,7 +237,7 @@ pub fn run(o: OsdIn) {
                             status,
                             fps,
                             kbps: o.shared.rx_kbps(),
-                            dec,
+                            dec_errors,
                         },
                     );
                 });

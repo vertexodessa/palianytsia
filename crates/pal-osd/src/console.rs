@@ -33,7 +33,7 @@ pub struct OverlayIn {
     pub status: Option<egui::RichText>,
     pub fps: f64,
     pub kbps: f64,
-    pub dec: (u64, u64),
+    pub dec_errors: u64,
 }
 
 pub struct Console {
@@ -166,7 +166,7 @@ impl Console {
                         &self.hist,
                         o.fps,
                         o.kbps,
-                        o.dec,
+                        o.dec_errors,
                     );
                 }
                 crate::key_banner(ui, &self.hist);

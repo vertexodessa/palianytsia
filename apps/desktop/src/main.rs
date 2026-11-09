@@ -623,7 +623,7 @@ impl eframe::App for App {
                         status: None,
                         fps: self.fps,
                         kbps: self.shared.rx_kbps(),
-                        dec: (frames, self.shared.dec_errors.load(Ordering::Relaxed)),
+                        dec_errors: self.shared.dec_errors.load(Ordering::Relaxed),
                     },
                 );
             });
