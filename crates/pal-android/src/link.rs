@@ -60,12 +60,12 @@ pub enum Cards {
     },
 }
 
-/// The config a link runs, its start channel and its width: the toml with
-/// the operator's start-time choices applied.
+/// The config a link runs, its start channel and its width, with the
+/// operator's start-time choices applied.
 fn link_radio(
     toml: &str,
     pick: pal_core::config::LinkPick,
-) -> Result<(String, pal_core::config::Config, u8, u8), String> {
+) -> Result<(pal_core::config::Config, u8, u8), String> {
     let (toml, skipped) = pal_core::config::with_link_pick(toml, pick);
     for s in skipped {
         log::warn!("{s}");
@@ -77,7 +77,7 @@ fn link_radio(
         .or(cfg.radio.channels.first().copied())
         .ok_or("config: no channel")?;
     let width = cfg.rx_width();
-    Ok((toml, cfg, ch, width))
+    Ok((cfg, ch, width))
 }
 
 /// Opens the cards behind `fds` where a link on `toml` + `pick` starts, so
@@ -87,7 +87,7 @@ pub fn open_cards(
     toml: &str,
     pick: pal_core::config::LinkPick,
 ) -> Result<Arc<runtime::CardSet>, String> {
-    let (_, _, ch, width) = link_radio(toml, pick)?;
+    let (_, ch, width) = link_radio(toml, pick)?;
     let selects = fds.iter().map(|&f| devourer_sys::Select::Fd(f)).collect();
     runtime::CardSet::open(selects, ch, width).map(Arc::new)
 }
@@ -140,7 +140,7 @@ impl Link {
         if let Cards::Kept { fds, .. } = &c.cards {
             fds.first().ok_or("no card fd")?;
         }
-        let (_, cfg, ch, width) = link_radio(&c.toml, c.pick.clone())?;
+        let (cfg, ch, width) = link_radio(&c.toml, c.pick.clone())?;
         let channels = cfg.radio.channels.clone();
         let dec = MediaCodecDecoder::new(win, 1920, 1080)?;
 
