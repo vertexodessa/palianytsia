@@ -29,7 +29,6 @@ pub use widgets::*;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CardRx {
     pub rssi: Option<i64>,
-    pub video: u64,
     /// Every frame the card delivered, CRC failures included.
     pub frames: u64,
     pub crc_fail: u64,
@@ -175,7 +174,6 @@ pub fn cards_of(v: &Value) -> Vec<CardRx> {
             a.iter()
                 .map(|c| CardRx {
                     rssi: c.get("rssi").and_then(Value::as_i64),
-                    video: u(c, "video"),
                     frames: u(c, "frames"),
                     crc_fail: u(c, "crc_fail"),
                 })

@@ -37,24 +37,18 @@ fn i16_at(p: &[u8], o: usize) -> i16 {
 #[derive(Clone, Debug, Default)]
 pub struct Telemetry {
     pub last_s: Option<f64>,
-    pub packets: u64,
     pub armed: bool,
-    pub custom_mode: u32,
-    pub vehicle_type: u8,
     pub roll_deg: f32,
     pub pitch_deg: f32,
     pub yaw_deg: f32,
     pub alt_rel_m: Option<f32>,
     pub groundspeed_ms: Option<f32>,
     pub climb_ms: Option<f32>,
-    pub heading_deg: Option<i16>,
     pub throttle_pct: Option<u16>,
     pub batt_v: Option<f32>,
     pub batt_a: Option<f32>,
     pub batt_mah: Option<i32>,
-    pub batt_pct: Option<i8>,
     pub sats: Option<u8>,
-    pub fix_type: u8,
     pub lat_lon: Option<(f64, f64)>,
     pub home: Option<(f64, f64)>,
     pub texts: VecDeque<(f64, u8, String)>,
@@ -103,12 +97,9 @@ impl Telemetry {
         if (m.sysid, m.compid) != (FC_SYS, FC_COMP) {
             return; // maburd's own component (191) speaks params, not flight state
         }
-        self.packets += 1;
         self.last_s = Some(now_s);
         match m.msgid {
             MSG_HEARTBEAT => {
-                self.custom_mode = u32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]);
-                self.vehicle_type = pl[4];
                 let armed = pl[6] & ARMED != 0;
                 // Home is where the drone arms with a fix.
                 if armed && !self.armed {
@@ -132,11 +123,8 @@ impl Telemetry {
                 }
                 let ca = i16_at(pl, 16);
                 self.batt_a = (ca >= 0).then(|| f32::from(ca) / 100.0);
-                let pct = pl[30] as i8;
-                self.batt_pct = (pct >= 0).then_some(pct);
             }
             MSG_GPS_RAW_INT => {
-                self.fix_type = pl[28];
                 self.sats = (pl[29] != u8::MAX).then_some(pl[29]);
             }
             MSG_ATTITUDE => {
@@ -158,7 +146,6 @@ impl Telemetry {
             MSG_VFR_HUD => {
                 self.groundspeed_ms = Some(f32_at(pl, 4));
                 self.climb_ms = Some(f32_at(pl, 12));
-                self.heading_deg = Some(i16_at(pl, 16));
                 self.throttle_pct = Some(u16_at(pl, 18));
             }
             MSG_BATTERY_STATUS => {
@@ -289,7 +276,6 @@ mod tests {
         assert!((t.roll_deg - 28.6479).abs() < 1e-3);
         assert_eq!(t.batt_v, Some(16.1));
         assert_eq!(t.batt_a, Some(12.34));
-        assert_eq!(t.batt_pct, Some(80));
         // maburd's own component is ignored for flight state.
         t.on_packet(&pack_v2(MSG_HEARTBEAT, 1, 191, 3, &[0; 9]), 1.3);
         assert!(t.armed);

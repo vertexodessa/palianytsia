@@ -51,7 +51,6 @@ pub struct CalView {
     /// 112", "auto: moved to 112", "pinned", ...).
     pub pick: String,
     pub fail_reason: String,
-    pub sweeps: Vec<String>,
     pub widths: Vec<CalWidth>,
     /// The last start's refusal ("refused: link is down", ...).
     pub refusal: Option<String>,
@@ -109,16 +108,6 @@ impl CalView {
             channel: u(v, "channel"),
             pick: s(v, "pick"),
             fail_reason: s(v, "fail_reason"),
-            sweeps: v
-                .get("sweeps")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
             widths,
             refusal: v.get("refusal").and_then(Value::as_str).map(str::to_string),
             capable: v.get("capable").and_then(Value::as_bool).unwrap_or(false),
@@ -424,7 +413,6 @@ mod tests {
         assert!(v.running && v.capable);
         assert_eq!((v.sweep_k, v.sweep_n, v.channel), (1, 2, 144));
         assert_eq!(v.pick, "onecard");
-        assert_eq!(v.sweeps, ["power20", "cap20"]);
         let w = &v.widths[0];
         assert!(w.applied);
         assert_eq!(

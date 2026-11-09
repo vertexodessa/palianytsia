@@ -14,12 +14,9 @@ pub struct Snapshot {
     pub drone_state: Option<i64>,
     pub rssi_dbm: Option<f64>,
     pub snr_db: Option<f64>,
-    pub bodies: u64,
     pub aus: u64,
     pub trunc: u64,
     pub salvaged: u64,
-    pub sends: u64,
-    pub resets: u64,
     /// Fingerprint of our pairing key; "default" for `mabur-default-00`.
     pub key_fp: String,
     pub rtt_ms: Option<f64>,
@@ -30,7 +27,7 @@ pub struct Snapshot {
     pub pre_fec_loss: Option<f64>,
     pub residual: Option<f64>,
     /// Per-card receive (two or more cards only): smoothed RSSI and the
-    /// video bodies the card has delivered.
+    /// frames the card has delivered.
     pub cards: Vec<CardRx>,
     /// The card the uplink transmits on (two or more cards only).
     pub tx_card: Option<u64>,
@@ -164,12 +161,9 @@ impl Snapshot {
             drone_state: v.get("drone_state").and_then(Value::as_i64),
             rssi_dbm: v.get("rssi_dbm").and_then(Value::as_f64),
             snr_db: v.get("snr_db").and_then(Value::as_f64),
-            bodies: u(&v, "bodies"),
             aus: u(&v, "aus"),
             trunc: u(&v, "trunc"),
             salvaged: u(&v, "salvaged"),
-            sends: u(&v, "sends"),
-            resets: u(&v, "resets"),
             key_fp: v
                 .get("key_fp")
                 .and_then(Value::as_str)
@@ -877,7 +871,6 @@ mod tests {
             rssi,
             frames,
             crc_fail,
-            ..CardRx::default()
         }
     }
 
