@@ -301,6 +301,26 @@ fn core(o: &Opts, channel: u8) -> Box<dyn GsCore> {
     Box::new(RefCore::new(&cfg, opts).unwrap_or_else(|e| die(&format!("core: {e}"))))
 }
 
+/// The `--param-set` entries still to send, in time order.
+struct ParamScript(std::iter::Peekable<std::vec::IntoIter<(f64, usize, String)>>);
+
+impl ParamScript {
+    fn new(sets: &[(f64, usize, String)]) -> Self {
+        let mut sets = sets.to_vec();
+        sets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self(sets.into_iter().peekable())
+    }
+
+    /// Sends each entry whose time `due` says has come. `tools/m1-replay.sh`
+    /// compares the printed lines.
+    fn fire(&mut self, core: &mut dyn GsCore, due: impl Fn(f64) -> bool) {
+        while let Some((ts, row, text)) = self.0.next_if(|(ts, _, _)| due(*ts)) {
+            let r = core.param_set(row, &text);
+            println!("param t={ts} row={row} text={text} -> {r:?}");
+        }
+    }
+}
+
 /// `pal live`'s side of the runtime's pump: capture and flight log around
 /// the core, and the per-second figures.
 struct Live {
@@ -308,7 +328,7 @@ struct Live {
     sink: Sink,
     cap: Option<capture::Writer<BufWriter<std::fs::File>>>,
     t0: Instant,
-    sets: std::iter::Peekable<std::vec::IntoIter<(f64, usize, String)>>,
+    sets: ParamScript,
     print_params: bool,
     last_params: String,
     last_stats: u64,
@@ -347,10 +367,7 @@ impl runtime::BodyLoop for Live {
             l.tick(now).unwrap();
         }
         let el = self.t0.elapsed().as_secs_f64();
-        while let Some((ts, row, text)) = self.sets.next_if(|(ts, _, _)| el >= *ts) {
-            let r = self.core.param_set(row, &text);
-            println!("param t={ts} row={row} text={text} -> {r:?}");
-        }
+        self.sets.fire(&mut *self.core, |ts| el >= ts);
         self.core.tick(now, &mut self.sink);
         if self.print_params {
             // Live: print each change of a row's state as it happens.
@@ -408,14 +425,12 @@ fn live(o: Opts) {
         }
     }
 
-    let mut sets = o.param_sets.clone();
-    sets.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut live = Live {
         core,
         sink,
         cap,
         t0,
-        sets: sets.into_iter().peekable(),
+        sets: ParamScript::new(&o.param_sets),
         print_params: !o.param_sets.is_empty(),
         last_params: String::new(),
         last_stats: 0,
@@ -498,9 +513,7 @@ fn replay(o: Opts) {
     let (mut bodies, mut ticks, mut dropped) = (0u64, 0u64, 0u64);
     let mut last_stats = 0u64;
     let mut t_first: Option<u64> = None;
-    let mut sets = o.param_sets.clone();
-    sets.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut sets = sets.into_iter().peekable();
+    let mut sets = ParamScript::new(&o.param_sets);
     let mut last_t = 0u64;
     // Synthetic loss: splitmix64 on a fixed seed, so both cores see the
     // same surviving bodies.
@@ -532,12 +545,7 @@ fn replay(o: Opts) {
                 sink.now_us = t;
                 last_t = t;
                 let t0 = *t_first.get_or_insert(t);
-                while let Some((ts, row, text)) =
-                    sets.next_if(|(ts, _, _)| t >= t0 + (*ts * 1e6) as u64)
-                {
-                    let r = core.param_set(row, &text);
-                    println!("param t={ts} row={row} text={text} -> {r:?}");
-                }
+                sets.fire(&mut *core, |ts| t >= t0 + (ts * 1e6) as u64);
                 core.tick(t, &mut sink);
                 sink.idr_step(t, &mut *core);
                 sink.log_stats(t, &mut last_stats, &*core);
