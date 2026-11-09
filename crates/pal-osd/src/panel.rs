@@ -249,9 +249,14 @@ fn state_color(st: &str) -> Color32 {
 }
 
 /// One drone row: name, live value, a control, and its state.
+/// Whether a row takes a set now. A read-only row never does.
+fn settable(r: &Row, t: &Table) -> bool {
+    t.linked && t.pending.is_none() && r.value.is_some() && r.apply != "read-only"
+}
+
 fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool) -> Option<Cmd> {
     let mut cmd = None;
-    let can = t.linked && t.pending.is_none() && r.value.is_some();
+    let can = settable(r, t);
     let help = format!("{} ({}, applies by {})\n{}", r.id, r.ty, r.apply, r.help);
     ui.label(RichText::new(format!("{}.{}", r.section, r.key)).strong())
         .on_hover_text(&help);
@@ -298,7 +303,7 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool)
             }
             _ => {
                 ui.label(RichText::new(&v).monospace());
-                if !touch {
+                if !touch && r.apply != "read-only" {
                     ui.add(
                         egui::TextEdit::singleline(&mut e.text[i])
                             .hint_text("new")
@@ -793,6 +798,25 @@ mod tests {
             .iter()
             .any(|s| s.starts_with("100@") || s.starts_with("90@2944")));
         assert!(m.contains(&"60@2560x1440/native".to_string()));
+    }
+
+    #[test]
+    fn a_read_only_row_takes_no_set() {
+        let t = Table {
+            linked: true,
+            ..Default::default()
+        };
+        let r = Row {
+            value: Some("1".into()),
+            apply: "live".into(),
+            ..Default::default()
+        };
+        assert!(settable(&r, &t));
+        let ro = Row {
+            apply: "read-only".into(),
+            ..r
+        };
+        assert!(!settable(&ro, &t));
     }
 
     #[test]
