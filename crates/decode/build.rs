@@ -44,8 +44,6 @@ fn main() {
     }
     // Android decodes with MediaCodec (src/mediacodec.rs): no libavcodec.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
-        println!("cargo:rustc-link-lib=dylib=mediandk");
-        println!("cargo:rustc-link-lib=dylib=android");
         return;
     }
     let mut b = cc::Build::new();
