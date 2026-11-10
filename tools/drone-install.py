@@ -398,10 +398,11 @@ def backup(drone, old_bin, old_cfg, script):
     if old_cfg:
         drone.fetch("/etc/mabur.toml", path / "mabur.toml")
     (path / ".drone-backup").touch()
-    if old_bin and sha256(path / "maburd") != old_bin:
-        raise Abort("backup of maburd is corrupt")
-    if old_cfg and sha256(path / "mabur.toml") != old_cfg:
-        raise Abort("backup of mabur.toml is corrupt")
+    for name, want in (("maburd", old_bin), ("mabur.toml", old_cfg)):
+        if want and sha256(path / name) != want:
+            # The marked folder would pass as a rollback source and install the corrupt copy.
+            shutil.rmtree(path)
+            raise Abort(f"backup of {name} is corrupt")
     if old_bin:
         say(f"== backup: {path}   (rollback: {script} {drone.name} {path})")
         return path

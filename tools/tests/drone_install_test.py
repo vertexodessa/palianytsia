@@ -358,12 +358,10 @@ SCENARIOS = [
       rc=1, toml=CFG_KEY, changes={}, backup=None, says=["read of the drone's mabur.toml is corrupt"]),
     # A backup that failed its sha must not stay behind as a rollback source.
     S("corrupt_backup_leaves_no_backup_folder", env={"FAKE_CORRUPT": "/usr/bin/maburd"},
-      xfail="the folder stays with its .drone-backup mark and the corrupt maburd, so it rolls back as a backup",
       rc=1, toml=CFG_KEY, changes={}, backup=None, says=["backup of maburd is corrupt"]),
     # --config skips the read of the drone's config, so the backup is its first read.
     S("corrupt_backup_of_config_leaves_no_backup_folder", argv=("-y", "--config", "D", "PKG"),
       env={"FAKE_CORRUPT": "/etc/mabur.toml"},
-      xfail="the folder stays with its .drone-backup mark and the corrupt mabur.toml, so it rolls back as a backup",
       rc=1, toml=CFG_KEY, changes={}, backup=None, says=["backup of mabur.toml is corrupt"]),
     # The copy onto flash comes up short: the run says so and the backup is the way back.
     S("overlay_full_on_copy_fails_install", env={"FAKE_FULL": "1"},
