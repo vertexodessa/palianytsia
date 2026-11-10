@@ -37,6 +37,7 @@ The NEON GF(256) kernel the phone and the Quest use is not built on x86: CI job 
 pal-fec, pal-wire and pal-core tests on aarch64 under qemu-user. After a `gf256.rs` change, also run
 the test binary that `tools/android-build.sh test -p pal-fec --lib --no-run` prints on a headset
 (push to `/data/local/tmp`, run it there).
+Toolchain: `rust-toolchain.toml` pins rustc for the gates, CI and releases; bump `channel` in a commit of its own with the clippy fixes the new version asks for (`rustup toolchain install` fetches it).
 Docs: do not copy shas or versions into README/spec; point at the tree (`git submodule status`,
 `release/MABUR_RELEASE`). A commit that bumps a pin, cuts a release or closes a Status item updates
 `docs/spec.md` Status in the same commit; resolved items get "Resolved YYYY-MM-DD", not deletion.

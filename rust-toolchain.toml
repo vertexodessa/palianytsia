@@ -1,0 +1,8 @@
+# The one Rust toolchain of the gates, CI and the release builds. A new
+# stable brings new clippy lints, and clippy runs with -D warnings; moving
+# this pin is its own commit, together with the fixes the new lints ask for.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-linux-android"]

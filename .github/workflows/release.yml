@@ -35,9 +35,8 @@ jobs:
           submodules: true
       - name: Host packages
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libavcodec-dev libavutil-dev libswscale-dev pkg-config cmake
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -77,9 +76,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
       - name: NDK
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
@@ -128,7 +126,8 @@ jobs:
           submodules: true
       - name: Host packages
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libudev-dev libva-dev libvdpau-dev libx11-dev libxext-dev libxv-dev nasm pkg-config cmake
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
       - name: Static FFmpeg
         run: tools/ffmpeg-static.sh > ffmpeg.log 2>&1 || { tail -40 ffmpeg.log; exit 1; }
       - name: pal-desktop
