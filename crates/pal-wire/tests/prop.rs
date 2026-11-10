@@ -381,6 +381,50 @@ proptest! {
         parse_all_rc(&bent, &k, &c);
     }
 
+    /// A count or length field decides where the parser looks for the CRC,
+    /// so a bent frame passes the CRC with the field out of range only when
+    /// its length happens to match: with the NACK count bound removed, the
+    /// tests above stayed green at the default case count and failed at
+    /// `PAL_PROP_SCALE=50`. Here the frame is resized to its own lying field
+    /// and the CRC written where the parser looks, so the bound is all that
+    /// stands between the field and the entry array.
+    #[test]
+    fn rc_count_and_length_fields_that_lie(
+        n in nack(),
+        cnt: u8,
+        m in mav(),
+        pl in 0usize..1400,
+        tagged: bool,
+        fill: u8,
+        k in key(),
+        c in ctx(),
+    ) {
+        let sized = |mut b: Vec<u8>, plen: usize| {
+            b.resize(plen, fill);
+            let crc = crc16_ccitt(&b);
+            b.extend_from_slice(&crc.to_le_bytes());
+            b
+        };
+        // The NACK layout, from the packer: fixed part, entries, tag, CRC.
+        let len_of = |cnt: u8| rc::pack_nack(&rc::Nack { n: cnt, ..n }, &k, &c).len();
+        let entry = len_of(2) - len_of(1);
+        let fixed = len_of(1) - entry - rc::TAG_LEN - 2;
+        let mut b = rc::pack_nack(&n, &k, &c);
+        b[fixed - 1] = cnt;
+        let b = sized(b, fixed + usize::from(cnt) * entry + rc::TAG_LEN);
+        parse_all_rc(&b, &k, &c);
+        prop_assert_eq!(
+            rc::parse_nack(&b).is_some(),
+            (1..=rc::MAX_NACK_ENTRIES).contains(&usize::from(cnt))
+        );
+
+        let mut b = rc::pack_mav(&m, tagged, &k, &c);
+        b[8..10].copy_from_slice(&(pl as u16).to_le_bytes());
+        let b = sized(b, rc::MAV_FIXED_LEN + pl + if tagged { rc::TAG_LEN } else { 0 });
+        parse_all_rc(&b, &k, &c);
+        prop_assert_eq!(rc::parse_mav(&b, tagged).is_some(), pl <= rc::MAV_MAX_PAYLOAD);
+    }
+
     #[test]
     fn rc_round_trips(
         r in rcf(),
