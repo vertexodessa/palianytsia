@@ -56,6 +56,9 @@ struct Opts {
     rust: bool,
     drop_pct: u32,
     seed: u64,
+    /// Replay: panic after this many bodies, to prove the panic hook. Not
+    /// in the usage text: a test switch.
+    panic_after: Option<u64>,
     /// Live: IDR requests on (`--no-idr` off). Replay: off (`--idr` on).
     idr: Option<bool>,
     pos: Vec<PathBuf>,
@@ -112,6 +115,9 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             }
             "--drop-pct" => o.drop_pct = val().parse().unwrap_or_else(|_| die("--drop-pct")),
             "--seed" => o.seed = val().parse().unwrap_or_else(|_| die("--seed")),
+            "--panic-after" => {
+                o.panic_after = Some(val().parse().unwrap_or_else(|_| die("--panic-after")))
+            }
             "--core" => {
                 o.rust = match val().as_str() {
                     "rust" => true,
@@ -552,6 +558,9 @@ fn replay(o: Opts) {
                     continue;
                 }
                 bodies += 1;
+                if o.panic_after == Some(bodies) {
+                    panic!("--panic-after {bodies}: forced panic");
+                }
                 sink.now_us = b.mono_us;
                 core.on_rx(&b, &mut sink);
             }
@@ -637,6 +646,12 @@ fn log_summary(o: Opts) {
     if !s.cards.is_empty() {
         println!("  cards: {}", s.cards.join("; "));
     }
+    if let Some(t) = &s.panic_prev {
+        println!("  the previous run panicked:");
+        for l in t.lines() {
+            println!("    {l}");
+        }
+    }
     println!(
         "  span {:.1} s, {} stats lines, capture {}",
         s.span_s,
@@ -677,11 +692,16 @@ fn log_summary(o: Opts) {
     }
 }
 
+fn with_panic_hook(o: Opts) -> Opts {
+    runtime::install_panic_hook(o.log_dir.as_deref());
+    o
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("live") => live(parse(args)),
-        Some("replay") => replay(parse(args)),
+        Some("live") => live(with_panic_hook(parse(args))),
+        Some("replay") => replay(with_panic_hook(parse(args))),
         Some("log") => log_summary(parse(args)),
         Some("--version" | "-V") => println!("{}", pal_build::version_text("pal")),
         _ => die("usage: pal live|replay|log ... (see src/main.rs)"),

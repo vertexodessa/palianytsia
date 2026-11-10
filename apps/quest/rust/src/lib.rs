@@ -36,6 +36,10 @@ fn android_main(app: android_activity::AndroidApp) {
             .with_max_level(log::LevelFilter::Info)
             .with_tag("palquest"),
     );
+    // The flight-log root xr::run hands the supervisor.
+    let log_dir = app.external_data_path().map(|d| d.join("logs"));
+    runtime::install_panic_hook(log_dir.as_deref());
+    runtime::panic_hook::arm_panic_test();
     if let Err(e) = xr::run(&app) {
         log::error!("quest: {e}");
     }

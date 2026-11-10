@@ -148,6 +148,8 @@ pub extern "system" fn Java_org_palianytsia_phone_Native_start(
         .unwrap_or_default();
     let prefs_path = std::path::Path::new(&dir).join("hud.json");
     let log_dir: String = env.get_string(&log_dir).map(Into::into).unwrap_or_default();
+    runtime::install_panic_hook(Some(std::path::Path::new(&log_dir)));
+    runtime::panic_hook::arm_panic_test();
     // SAFETY: a live android.view.Surface from the Activity's SurfaceHolder.
     let win = unsafe {
         ndk::native_window::NativeWindow::from_surface(

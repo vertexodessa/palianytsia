@@ -648,6 +648,7 @@ impl eframe::App for App {
 
 fn main() {
     let o = parse();
+    runtime::install_panic_hook(o.log_dir.as_deref());
     // Every dropped AU breaks the reference chain until the next intra
     // refresh (a 2-slot queue dropped 6 AUs at replay start and the
     // decoder logged missing POCs), so the queue absorbs decoder warm-up.

@@ -10,11 +10,13 @@
 //!
 //! The first event, `build`, says what wrote the session: version, commit,
 //! pins, app, core, mode and the config's sha256. Card chips follow as a
-//! `cards` event once the cards are open.
+//! `cards` event once the cards are open. A `panic.txt` the panic hook left
+//! in the root is reported once, in the next session, as `panic_prev`.
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pal_core::{Au, RxBody};
@@ -27,6 +29,12 @@ pub const STATS_FORMAT: &str = "pal-stats";
 pub const EVENTS_FORMAT: &str = "pal-events";
 pub const AULOG_MARKER: &str = "aulog 1";
 pub const VERSION: u32 = 1;
+/// In the log root: what the panic hook appends to. The next session moves
+/// it into its own directory as `PANIC_PREV_FILE`.
+pub const PANIC_FILE: &str = "panic.txt";
+pub const PANIC_PREV_FILE: &str = "panic_prev.txt";
+/// Bytes of a previous panic.txt copied into the `panic_prev` event.
+const PANIC_PREV_MAX: u64 = 16 << 10;
 /// Events a session writes whether or not a drone was ever heard.
 pub const BOOKKEEPING: &[&str] = &["build", "cards"];
 
@@ -62,6 +70,38 @@ pub fn build_record(run: &Run) -> Value {
         "mode": run.mode,
         "config_sha256": run.config.map(sha256_hex),
     })
+}
+
+/// The directory name of the session this process opened last, for the
+/// panic hook, which must not take a lock the panicking thread may hold.
+static LAST_OPENED: AtomicPtr<String> = AtomicPtr::new(std::ptr::null_mut());
+
+pub fn last_opened() -> Option<&'static str> {
+    // SAFETY: null or from Box::into_raw in set_last_opened, never freed.
+    unsafe { LAST_OPENED.load(Ordering::Acquire).as_ref() }.map(String::as_str)
+}
+
+fn set_last_opened(name: String) {
+    // The previous name leaks (tens of bytes a session): a panic hook on
+    // another thread may be reading it.
+    LAST_OPENED.store(Box::into_raw(Box::new(name)), Ordering::Release);
+}
+
+/// Moves a panic.txt from `root` into `dir` and returns its text (the first
+/// PANIC_PREV_MAX bytes). Moved, or removed when the move fails, so the
+/// next session does not report it again.
+fn take_panic(root: &Path, dir: &Path) -> Option<String> {
+    let src = root.join(PANIC_FILE);
+    let mut text = Vec::new();
+    File::open(&src)
+        .ok()?
+        .take(PANIC_PREV_MAX)
+        .read_to_end(&mut text)
+        .ok()?;
+    if fs::rename(&src, dir.join(PANIC_PREV_FILE)).is_err() {
+        let _ = fs::remove_file(&src);
+    }
+    (!text.is_empty()).then(|| String::from_utf8_lossy(&text).into_owned())
 }
 
 /// A line of events.jsonl holding one of the BOOKKEEPING events.
@@ -170,9 +210,17 @@ impl Session {
         let mut events = create(&dir, EVENTS_FILE)?;
         writeln!(events, "{}", json!({"format": EVENTS_FORMAT, "v": VERSION}))?;
         write_event(&mut events, 0, "build", build_record(run))?;
+        if let Some(text) = take_panic(root, &dir) {
+            write_event(&mut events, 0, "panic_prev", json!({ "text": text }))?;
+        }
         let mut au = create(&dir, AU_FILE)?;
         writeln!(au, "{AULOG_MARKER}")?;
         writeln!(au, "# t_us sid bytes flags complete salvaged pts_us")?;
+        // A release build aborts on a panic without dropping the writers:
+        // the headers and the build event at least reach the disk.
+        for w in [&mut stats, &mut events, &mut au] {
+            w.flush()?;
+        }
         let capture = if capture_cap > 0 {
             Some(capture::Writer::new(BufWriter::with_capacity(
                 1 << 20,
@@ -181,6 +229,9 @@ impl Session {
         } else {
             None
         };
+        if let Some(n) = dir.file_name().and_then(|n| n.to_str()) {
+            set_last_opened(n.to_string());
+        }
         Ok(Self {
             dir,
             stats,
@@ -341,6 +392,8 @@ pub struct Summary {
     pub build: Option<Value>,
     /// Each `cards` event's chips, in order.
     pub cards: Vec<String>,
+    /// A `panic_prev` event's text: how the previous run ended.
+    pub panic_prev: Option<String>,
 }
 
 fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io::Result<()> {
@@ -424,6 +477,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             "cards" => s
                 .cards
                 .push(v.get("chips").and_then(Value::as_str).unwrap_or("?").into()),
+            "panic_prev" => s.panic_prev = v.get("text").and_then(Value::as_str).map(Into::into),
             _ => {}
         }
         if ev == "session" {
@@ -520,6 +574,32 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         assert_eq!(session_index("fl-1747-keep"), Some(1747));
         assert_eq!(session_index("notes"), None);
+    }
+
+    #[test]
+    fn a_panic_file_is_reported_once_by_the_next_session() {
+        let root = std::env::temp_dir().join(format!("pal-fl-panic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join(PANIC_FILE), "panicked at src/x.rs:7:5:\nboom\n").expect("w");
+        let first = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN)
+            .expect("create")
+            .dir()
+            .to_path_buf();
+        // Tests in parallel open sessions too: only that some name is set.
+        assert!(last_opened().is_some_and(|n| n.starts_with("fl-")));
+        let sum = summarize(&first).expect("summary");
+        assert!(sum
+            .panic_prev
+            .as_deref()
+            .is_some_and(|t| t.contains("src/x.rs:7")));
+        assert!(!root.join(PANIC_FILE).exists() && first.join(PANIC_PREV_FILE).exists());
+        let second = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN)
+            .expect("create")
+            .dir()
+            .to_path_buf();
+        assert!(summarize(&second).expect("summary").panic_prev.is_none());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

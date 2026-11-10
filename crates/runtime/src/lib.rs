@@ -14,7 +14,10 @@ use pal_wire::dot11;
 
 pub mod cam_fps;
 pub mod dev_card;
+pub mod panic_hook;
 pub mod stats_line;
+
+pub use panic_hook::install_panic_hook;
 
 /// Core tick period.
 pub const TICK_US: u64 = 2000;
