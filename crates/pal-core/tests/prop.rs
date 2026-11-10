@@ -967,3 +967,49 @@ proptest! {
         run_frame_stream(ops, &f.aus[seed_au % f.aus.len()].0, false)?;
     }
 }
+
+/// Open finding (same in mabur): a body kept with a bad FCS has its
+/// sub-blocks salvaged by their own CRC, and the SBI header that names the
+/// stream has none. One bit error in the stream byte moves every CRC-good
+/// block of the body to stream 1, whose decoder and FrameStream then emit
+/// an AU the drone never sent there. Found by `impaired_air_keeps_the_au_contract`
+/// at `PAL_PROP_SCALE=400 PAL_PROP_SEED=4404`; this is the same hit, every
+/// fifth body.
+#[test]
+#[ignore = "open: a bit error in the SBI stream byte of an FCS-bad body moves its blocks to stream 1 (same in mabur)"]
+fn stream_byte_flip_on_a_bad_fcs_body() {
+    let s = Stream {
+        frames: 32,
+        seq0: 0,
+        frame_id0: 0,
+        bpb: 4,
+        every: 3,
+        win: 6,
+        sliced: false,
+        discont_at: None,
+    };
+    let (bodies, _) = drone(&s);
+    let air: Vec<_> = bodies
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut b)| {
+            if i % 5 == 4 {
+                b[3] ^= 1;
+                (b, false)
+            } else {
+                (b, true)
+            }
+        })
+        .collect();
+    let mut c = core(Mode::Spotter, true);
+    let mut io = Io::default();
+    replay(&mut c, &air, &mut io, 1_000_000, 300);
+    let on_1 = io.aus.iter().filter(|a| a.sid != 0).count();
+    assert_eq!(
+        on_1,
+        0,
+        "{} of {} AUs came out on another stream",
+        on_1,
+        io.aus.len()
+    );
+}
