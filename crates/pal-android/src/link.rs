@@ -319,8 +319,9 @@ pub fn join_within<T>(h: JoinHandle<T>, limit: Duration) -> bool {
     done
 }
 
-/// AUs into MediaCodec; decoder errors go back to the IDR driver the same
-/// way the desktop's decode thread reports them.
+/// AUs into MediaCodec; decoder damage (errors, and AUs the codec took no
+/// buffer for) goes back to the IDR driver the same way the desktop's decode
+/// thread reports its errors.
 fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>, sh: &Shared) {
     // Once a second: a line when AUs came in but no frame came out, so a
     // stall on the glass leaves its cause in logcat.
@@ -337,7 +338,7 @@ fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>,
         if let Some((n, _t, au)) = got {
             aus += 1;
             dec.decode(&au);
-            sh.note_dec_errors(n, dec.counters().1);
+            sh.note_dec_errors(n, dec.damage());
         }
         let (f, errs) = dec.counters();
         sh.frames.store(f, Ordering::Relaxed);

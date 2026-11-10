@@ -3,12 +3,17 @@
 //! ANativeWindow (no copy, no GL pass). An output thread releases each frame
 //! as it comes out; a frame older than `STALE_US` since its AU was queued is
 //! dropped instead of shown. No flush on loss: the next IDR heals.
+//! An AU that never reached the codec (no input buffer in time, or larger
+//! than the buffer) breaks the reference chain like a decode error does:
+//! `damage()` counts both for the IDR driver.
 //!
 //! The codec is the platform's pick for video/hevc unless the system
 //! property `debug.pal.decoder` names one (the Quest also lists
 //! `c2.qti.hevc.decoder.low_latency`); every `LAT_WINDOW` frames the log
 //! gets the queue-to-output time per frame, so two codecs compare on one
-//! headset by `setprop` and a relaunch.
+//! headset by `setprop` and a relaunch. `debug.pal.dec_starve N` drops
+//! every Nth AU the way a missing input buffer does (a bench switch for the
+//! heal path; unset in flight).
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,17 +32,18 @@ const STALE_US: u64 = 150_000;
 /// Frames per latency line in the log (~5 s at 60 fps).
 const LAT_WINDOW: usize = 300;
 const DECODER_PROP: &std::ffi::CStr = c"debug.pal.decoder";
+const STARVE_PROP: &std::ffi::CStr = c"debug.pal.dec_starve";
 
 extern "C" {
     // bionic; PROP_VALUE_MAX is 92 bytes with the NUL.
     fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> i32;
 }
 
-/// `debug.pal.decoder`, if set.
-fn decoder_prop() -> Option<String> {
+/// A system property's value, if set.
+fn prop(name: &std::ffi::CStr) -> Option<String> {
     let mut v = [0 as std::ffi::c_char; 92];
     // SAFETY: a NUL-terminated name and a PROP_VALUE_MAX buffer.
-    let n = unsafe { __system_property_get(DECODER_PROP.as_ptr(), v.as_mut_ptr()) };
+    let n = unsafe { __system_property_get(name.as_ptr(), v.as_mut_ptr()) };
     if n <= 0 {
         return None;
     }
@@ -49,7 +55,7 @@ fn decoder_prop() -> Option<String> {
 /// The named codec when the property names one that opens, else the
 /// platform's pick for the type.
 fn open_codec() -> Result<MediaCodec, String> {
-    if let Some(name) = decoder_prop() {
+    if let Some(name) = prop(DECODER_PROP) {
         match MediaCodec::from_codec_name(&name) {
             Some(c) => return Ok(c),
             None => log::warn!("mediacodec: {name} (debug.pal.decoder) did not open"),
@@ -84,6 +90,10 @@ pub struct MediaCodecDecoder {
     sh: Arc<Shared>,
     out: Option<JoinHandle<()>>,
     pts: u64,
+    /// `debug.pal.dec_starve`: every this-many-th AU is dropped as if no
+    /// input buffer had come; 0 = off.
+    starve_every: u64,
+    fed: u64,
 }
 
 impl MediaCodecDecoder {
@@ -119,16 +129,30 @@ impl MediaCodecDecoder {
             .name("pal-mc-out".into())
             .spawn(move || output_loop(&s2))
             .map_err(|e| e.to_string())?;
+        let starve_every = prop(STARVE_PROP).and_then(|v| v.parse().ok()).unwrap_or(0);
+        if starve_every > 0 {
+            log::warn!("mediacodec: dropping every {starve_every}th AU (debug.pal.dec_starve)");
+        }
         Ok(Self {
             sh,
             out: Some(out),
             pts: 0,
+            starve_every,
+            fed: 0,
         })
     }
 
     /// AUs dropped for want of an input buffer since open.
     pub fn no_input(&self) -> u64 {
         self.sh.no_input.load(Ordering::Relaxed)
+    }
+
+    /// Events since open that left the reference chain broken: decode
+    /// errors and AUs that never reached the codec. The picture stays
+    /// damaged from each until an IRAP, and with no periodic one in the
+    /// stream (`venc.gop_s = 0`) that IRAP has to be asked for.
+    pub fn damage(&self) -> u64 {
+        self.sh.errors.load(Ordering::Relaxed) + self.sh.no_input.load(Ordering::Relaxed)
     }
 
     /// Frames dropped by the stale cap since open.
@@ -208,6 +232,11 @@ impl MediaCodecDecoder {
     /// out on the output thread.
     pub fn decode(&mut self, au: &[u8]) {
         let sh = &self.sh;
+        self.fed += 1;
+        if self.starve_every > 0 && self.fed.is_multiple_of(self.starve_every) {
+            sh.no_input.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         match sh.codec.dequeue_input_buffer(Duration::from_millis(20)) {
             Ok(In::Buffer(mut b)) => {
                 let dst = b.buffer_mut();
