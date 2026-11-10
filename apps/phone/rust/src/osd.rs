@@ -4,16 +4,14 @@
 //! One thread owns the EGL context; it redraws when a stats line arrives
 //! (10 Hz) and clears to transparent around the widgets.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use glow::HasContext;
 use khronos_egl as egl;
 use ndk::native_window::NativeWindow;
 use pal_osd::console::{Console, Feeds};
 use pal_osd::panel::Panel;
-use pal_osd::params::Cmd;
 use runtime::Shared;
 
 pub struct OsdIn {
