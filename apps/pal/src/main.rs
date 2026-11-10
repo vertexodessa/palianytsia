@@ -6,7 +6,7 @@
 //!   pal live   -c gs.toml --ch 144 --width 40 [--mode gs|spotter] [--secs 30]
 //!              [--card N] [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
 //!              [--log-dir DIR [--capture-mb N]] [--core ref|rust] [--param-set T_S,ROW,TEXT ...]
-//!   pal replay <bodies.bin> -c gs.toml [--mode gs|spotter] [--dump out.h265]
+//!   pal replay <bodies.bin>...|<fl-NNNN_...> -c gs.toml [--mode gs|spotter] [--dump out.h265]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
 //!              [--param-set T_S,ROW,TEXT ...]   F18 sets; prints `param` results and `params`
@@ -525,8 +525,16 @@ fn live(o: Opts) {
 }
 
 fn replay(o: Opts) {
-    let [path] = <[PathBuf; 1]>::try_from(o.pos.clone())
-        .unwrap_or_else(|_| die("replay needs one <bodies.bin>"));
+    // A session's capture is bodies.bin plus tail segments: a session
+    // directory replays all of them in order, and so do several files.
+    let paths = match &o.pos[..] {
+        [] => die("replay needs <bodies.bin>..., or a flight-log directory"),
+        [d] if d.is_dir() => flightlog::session::capture_files(d),
+        files => files.to_vec(),
+    };
+    if paths.is_empty() {
+        die("replay: no capture files");
+    }
     let mut core = core(&o, 0);
     let mut sink = Sink::new(&o);
     if o.idr == Some(true) {
@@ -536,9 +544,12 @@ fn replay(o: Opts) {
             eprintln!("pal: --idr needs --mode gs (Spotter sends no RCF); ignored");
         }
     }
-    let f = std::fs::File::open(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
-    let r = capture::Reader::new(BufReader::with_capacity(1 << 20, f))
-        .unwrap_or_else(|e| die(&e.to_string()));
+    let r = paths.iter().flat_map(|path| {
+        let f =
+            std::fs::File::open(path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+        capture::Reader::new(BufReader::with_capacity(1 << 20, f))
+            .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())))
+    });
     let (mut bodies, mut ticks, mut dropped) = (0u64, 0u64, 0u64);
     let mut last_stats = 0u64;
     let mut t_first: Option<u64> = None;
@@ -570,6 +581,11 @@ fn replay(o: Opts) {
                     panic!("--panic-after {bodies}: forced panic");
                 }
                 sink.now_us = b.mono_us;
+                // --capture-mb re-captures what the core was fed, the
+                // synthetic loss applied: the replayed run as a capture.
+                if let Some(l) = sink.log.as_mut() {
+                    l.body(&b).unwrap();
+                }
                 core.on_rx(&b, &mut sink);
             }
             Record::Tick(t) => {
@@ -578,6 +594,9 @@ fn replay(o: Opts) {
                 last_t = t;
                 let t0 = *t_first.get_or_insert(t);
                 sets.fire(&mut *core, |ts| t >= t0 + (ts * 1e6) as u64);
+                if let Some(l) = sink.log.as_mut() {
+                    l.tick(t).unwrap();
+                }
                 core.tick(t, &mut sink);
                 sink.log_fec(&mut *core);
                 sink.idr_step(t, &mut *core);

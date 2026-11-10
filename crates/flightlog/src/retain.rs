@@ -1,6 +1,7 @@
-//! What a log root keeps. Captures are the bulk (up to 256 MB a session on
-//! Android, 7.9 GB on the Quest after two days); a session's text files are
-//! ~30 KB. So captures go first, oldest first, until they fit the budget;
+//! What a log root keeps. Captures are the bulk (up to 512 MB a session on
+//! Android: bodies.bin plus its tail segments; 7.9 GB on the Quest after
+//! two days); a session's text files are
+//! ~30 KB. So captures go first (all of a session's segments together), oldest first, until they fit the budget;
 //! whole sessions go only past a count cap; sessions that never saw a frame
 //! (a link restarting with no drone: 1665 of them on 2026-11-02) go at once,
 //! except the newest, which may be the one worth reading.
@@ -13,8 +14,8 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use crate::session::{
-    is_bookkeeping, AU_FILE, AU_HEADER_LINES, BOOKKEEPING, CAPTURE_FILE, EVENTS_FILE,
-    EVENTS_HEADER_LINES, STATS_FILE,
+    is_bookkeeping, AU_FILE, AU_HEADER_LINES, BOOKKEEPING, EVENTS_FILE, EVENTS_HEADER_LINES,
+    STATS_FILE,
 };
 
 pub const KEEP_FILE: &str = "keep";
@@ -52,7 +53,10 @@ fn sessions(root: &Path) -> io::Result<Vec<Dir>> {
             path.is_dir().then(|| Dir {
                 index,
                 keep: path.join(KEEP_FILE).exists(),
-                capture: fs::metadata(path.join(CAPTURE_FILE)).map_or(0, |m| m.len()),
+                capture: crate::session::capture_files(&path)
+                    .iter()
+                    .map(|f| fs::metadata(f).map_or(0, |m| m.len()))
+                    .sum(),
                 path,
             })
         })
@@ -123,7 +127,11 @@ pub fn prune(root: &Path, b: Budget) -> io::Result<Pruned> {
         if total <= b.capture_bytes {
             break;
         }
-        if fs::remove_file(d.path.join(CAPTURE_FILE)).is_ok() {
+        let files = crate::session::capture_files(&d.path);
+        if files
+            .iter()
+            .fold(!files.is_empty(), |ok, f| fs::remove_file(f).is_ok() && ok)
+        {
             total -= d.capture;
             out.captures += 1;
             out.bytes += d.capture;
@@ -148,6 +156,7 @@ pub fn prune(root: &Path, b: Budget) -> io::Result<Pruned> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::CAPTURE_FILE;
 
     fn session(root: &Path, i: u32, aus: usize, events: usize, capture: usize) -> PathBuf {
         session_n(root, i, aus, events, capture, 2)
@@ -211,6 +220,29 @@ mod tests {
         assert_eq!(p.empty_sessions, 2);
         assert!(!a.exists() && !g.exists());
         assert!(b.exists() && c.exists() && d.exists() && e.exists() && f.exists());
+        let _ = fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn a_session_capture_counts_and_goes_with_its_tail_segments() {
+        let r = root("tail");
+        let a = session(&r, 1, 1, 0, 300);
+        for n in [3, 4] {
+            fs::write(a.join(crate::session::tail_name(n)), vec![0u8; 300]).unwrap();
+        }
+        let b = session(&r, 2, 1, 0, 300);
+        let p = prune(
+            &r,
+            Budget {
+                capture_bytes: 500,
+                sessions: usize::MAX,
+            },
+        )
+        .unwrap();
+        // a holds 900 with its tails: all of it goes, b fits.
+        assert_eq!((p.captures, p.bytes), (1, 900));
+        assert!(crate::session::capture_files(&a).is_empty());
+        assert!(b.join(CAPTURE_FILE).exists());
         let _ = fs::remove_dir_all(&r);
     }
 

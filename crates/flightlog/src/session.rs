@@ -113,6 +113,37 @@ pub fn is_bookkeeping(line: &str) -> bool {
 }
 
 pub(crate) const CAPTURE_FILE: &str = "bodies.bin";
+/// One capture segment: about a minute of a 10 Mbit/s link.
+const CAPTURE_SEGMENT: u64 = 64 << 20;
+
+/// Tail segment `n` (1, 2, ...) of a session's capture; names sort in
+/// recording order.
+pub fn tail_name(n: u64) -> String {
+    format!("bodies-tail-{n:05}.bin")
+}
+
+/// The session's capture files in recording order: bodies.bin, then the
+/// tail segments still on disk.
+pub fn capture_files(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("bodies-tail-") && n.ends_with(".bin"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    let first = dir.join(CAPTURE_FILE);
+    if first.exists() {
+        v.insert(0, first);
+    }
+    v
+}
 pub(crate) const AU_FILE: &str = "au.log";
 pub(crate) const EVENTS_FILE: &str = "events.jsonl";
 pub(crate) const STATS_FILE: &str = "stats.jsonl";
@@ -184,6 +215,11 @@ pub struct Session {
     fec: LineWriter,
     capture: Option<capture::Writer<BufWriter<File>>>,
     capture_cap: u64,
+    /// One capture file's size limit; below twice it the capture is one
+    /// bodies.bin that stops at the cap.
+    capture_seg: u64,
+    /// The tail segments on disk, oldest first, by number.
+    tails: std::collections::VecDeque<u64>,
     last: Option<Map<String, Value>>,
     /// `channel` as last logged, and a new value seen once: the stat is
     /// card 0's tuning, so a scout dwell on card 0 shows for one line.
@@ -221,7 +257,10 @@ fn create(dir: &Path, name: &str) -> io::Result<LineWriter> {
 }
 
 impl Session {
-    /// `capture_cap`: bodies.bin byte cap, 0 = no capture.
+    /// `capture_cap`: the capture's bytes on disk, 0 = no capture. From two
+    /// 64 MB segments up it is bodies.bin (the first segment) plus a ring of
+    /// tail segments (`capture_seg` events); below, one bodies.bin that
+    /// stops at the cap (`capture_cap` event).
     pub fn create(root: &Path, now: SystemTime, capture_cap: u64, run: &Run) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let dir = root.join(format!("fl-{:04}_{}", next_index(root), stamp(now)));
@@ -263,6 +302,8 @@ impl Session {
             fec,
             capture,
             capture_cap,
+            capture_seg: CAPTURE_SEGMENT,
+            tails: std::collections::VecDeque::new(),
             last: None,
             channel: None,
             channel_seen: None,
@@ -457,15 +498,60 @@ impl Session {
         })
     }
 
+    /// Segments the cap holds: bodies.bin (the link-up) plus the ring of
+    /// tails; 1 = no ring.
+    fn capture_segments(&self) -> u64 {
+        (self.capture_cap / self.capture_seg.max(1)).max(1)
+    }
+
     fn close_capture_at_cap(&mut self, t_us: u64) -> io::Result<()> {
-        if self
-            .capture
-            .as_ref()
-            .is_some_and(|c| c.written() >= self.capture_cap)
-        {
-            self.close_capture(t_us)?;
+        let segs = self.capture_segments();
+        let limit = if segs >= 2 {
+            self.capture_seg
+        } else {
+            self.capture_cap
+        };
+        if !self.capture.as_ref().is_some_and(|c| c.written() >= limit) {
+            return Ok(());
         }
-        Ok(())
+        if segs < 2 {
+            return self.close_capture(t_us);
+        }
+        self.next_tail(t_us, segs - 1)
+    }
+
+    /// The current file is full: the next tail segment opens and the oldest
+    /// beyond `keep` goes, so the end of a long session survives. Each
+    /// segment is a whole `palcap 1` file that replays on its own.
+    fn next_tail(&mut self, t_us: u64, keep: u64) -> io::Result<()> {
+        if let Some(mut c) = self.capture.take() {
+            c.flush()?;
+        }
+        let n = self.tails.back().map_or(1, |k| k + 1);
+        let name = tail_name(n);
+        self.capture = Some(capture::Writer::new(BufWriter::with_capacity(
+            1 << 20,
+            File::create(self.dir.join(&name))?,
+        ))?);
+        self.tails.push_back(n);
+        let mut dropped = Value::Null;
+        while self.tails.len() as u64 > keep {
+            if let Some(old) = self.tails.pop_front() {
+                let old = tail_name(old);
+                fs::remove_file(self.dir.join(&old))?;
+                dropped = json!(old);
+            }
+        }
+        self.write_event(
+            t_us,
+            "capture_seg",
+            json!({ "file": name, "dropped": dropped }),
+        )
+    }
+
+    #[cfg(test)]
+    fn set_capture_segment(&mut self, bytes: u64) {
+        self.capture_seg = bytes;
     }
 
     fn close_capture(&mut self, t_us: u64) -> io::Result<()> {
@@ -612,7 +698,7 @@ fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io
 
 pub fn summarize(dir: &Path) -> io::Result<Summary> {
     let mut s = Summary {
-        has_capture: dir.join(CAPTURE_FILE).exists(),
+        has_capture: !capture_files(dir).is_empty(),
         ..Summary::default()
     };
     let (mut t_min, mut t_max) = (u64::MAX, 0u64);
@@ -837,6 +923,53 @@ mod tests {
             stamp(UNIX_EPOCH + std::time::Duration::from_secs(1_761_955_260)),
             "20251101-0001"
         );
+    }
+
+    #[test]
+    fn a_long_capture_keeps_its_first_segment_and_the_last_ones() {
+        let root = std::env::temp_dir().join(format!("pal-fl-ring-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // Cap 4 segments of 1000 B: bodies.bin plus the 3 newest tails.
+        let mut s = Session::create(&root, UNIX_EPOCH, 4000, &TEST_RUN).expect("create");
+        s.set_capture_segment(1000);
+        let b = RxBody {
+            body: vec![0u8; 100],
+            ..RxBody::default()
+        };
+        // 129 bytes a record after the 9 byte magic: a file turns over after
+        // its 8th record, so 60 records are bodies.bin and tails 1 to 7.
+        for i in 0..60u64 {
+            s.body(&RxBody {
+                mono_us: i,
+                ..b.clone()
+            })
+            .expect("body");
+        }
+        let dir = s.dir().to_path_buf();
+        drop(s);
+        let names: Vec<String> = capture_files(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["bodies.bin", &tail_name(5), &tail_name(6), &tail_name(7)]
+        );
+        // Every segment replays on its own, the newest from where it began.
+        let first = |p: &Path| {
+            let r = capture::Reader::new(io::BufReader::new(File::open(p).unwrap())).unwrap();
+            match r.into_iter().next() {
+                Some(Ok(capture::Record::Body(b))) => b.mono_us,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(first(&dir.join(tail_name(7))), 56);
+        assert_eq!(first(&dir.join(CAPTURE_FILE)), 0);
+        let ev = fs::read_to_string(dir.join(EVENTS_FILE)).expect("events");
+        assert_eq!(ev.matches("\"capture_seg\"").count(), 7);
+        assert!(!ev.contains("capture_cap"));
+        assert!(summarize(&dir).expect("summary").has_capture);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

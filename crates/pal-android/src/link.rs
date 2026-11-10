@@ -165,8 +165,10 @@ impl Link {
             Ok(_) => {}
             Err(e) => log::warn!("flight log prune: {}: {e}", c.log_dir.display()),
         }
-        // Same layout as pal-desktop --log-dir (pal log reads it), bodies
-        // capped at 256 MB per session so a replay can rerun a bad flight.
+        // Same layout as pal-desktop --log-dir (pal log reads it). The
+        // capture keeps 512 MB a session: the first 64 MB segment (link-up)
+        // and the newest seven, so the end of a long flight is there to
+        // replay.
         // The process name tells the phone app from the Quest app.
         let app = std::fs::read("/proc/self/cmdline").ok().and_then(|b| {
             let n = b.split(|&x| x == 0).next()?;
@@ -183,7 +185,7 @@ impl Link {
         let (log, log_info) = match flightlog::session::Session::create(
             &c.log_dir,
             std::time::SystemTime::now(),
-            256 << 20,
+            512 << 20,
             &run,
         ) {
             Ok(s) => {

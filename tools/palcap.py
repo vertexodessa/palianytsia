@@ -10,8 +10,25 @@ SBI_MAGIC = 0xF5B0
 SW_MAGIC = 0xF541
 
 
+def capture_files(path):
+    """A session directory's capture in recording order (bodies.bin, then the tail segments
+    still on disk), or [path] for a file."""
+    import os
+    if not os.path.isdir(path):
+        return [path]
+    tails = sorted(n for n in os.listdir(path) if n.startswith("bodies-tail-") and n.endswith(".bin"))
+    first = ["bodies.bin"] if os.path.exists(os.path.join(path, "bodies.bin")) else []
+    return [os.path.join(path, n) for n in first + tails]
+
+
 def records(path):
-    """Yields Body records; ticks are skipped."""
+    """Yields Body records of a capture file, or of every segment of a session directory in
+    order; ticks are skipped."""
+    for p in capture_files(path):
+        yield from _records(p)
+
+
+def _records(path):
     b = open(path, "rb").read()
     assert b[:9] == b"palcap 1\n", b[:9]
     i, n = 9, len(b)

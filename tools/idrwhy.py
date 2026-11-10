@@ -12,7 +12,7 @@ d = sys.argv[1].rstrip("/")
 RATE = {0: 6.5, 1: 13, 2: 19.5, 3: 26, 4: 39, 5: 52}  # HT20 long GI 1 stream, Mb/s
 vt, vm, vq = [], [], []       # video body time, mcs, q_ms
 tt, td, tw, tk = [], [], [], []  # telem time, txq_drops, txq_wait_max, cmd_kbps
-for r in palcap.records(d + "/bodies.bin"):
+for r in palcap.records(d):
     if not r.crc:
         continue
     b = r.body
