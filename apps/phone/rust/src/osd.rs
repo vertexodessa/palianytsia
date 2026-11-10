@@ -170,7 +170,7 @@ pub fn run(o: OsdIn) {
             },
         );
         let frames = o.shared.frames.load(Ordering::Relaxed);
-        let fps = console.fps(frames);
+        let fps = console.on_frames(now, frames);
         let (w, h) = (o.win.width().max(1) as u32, o.win.height().max(1) as u32);
         let ppp = o.density.max(1.0);
         let mut events = Vec::new();

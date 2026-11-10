@@ -16,6 +16,7 @@ use glow::HasContext;
 use openxr as xr;
 use pal_osd::console::{Console, Feeds};
 use pal_osd::panel::Panel;
+use pal_osd::stall::Stall;
 
 use crate::input::Frame;
 use crate::supervisor::{Hub, LinkUi};
@@ -59,6 +60,8 @@ pub struct Osd {
     t0: Instant,
     last_draw: Option<Instant>,
     fps: f64,
+    /// The stall state the last draw showed.
+    drawn_stall: Stall,
 }
 
 impl Osd {
@@ -130,6 +133,7 @@ impl Osd {
             t0: Instant::now(),
             last_draw: None,
             fps: 0.0,
+            drawn_stall: Stall::None,
         })
     }
 
@@ -168,7 +172,9 @@ impl Osd {
             for c in self.console.drain(now, feeds) {
                 log::info!("{c}");
             }
-            self.fps = self.console.fps(l.shared.frames.load(Ordering::Relaxed));
+            self.fps = self
+                .console
+                .on_frames(now, l.shared.frames.load(Ordering::Relaxed));
         }
         // Pointer events only while the panel is open: in flight the ray
         // and the trigger do nothing.
@@ -202,11 +208,24 @@ impl Osd {
         } else {
             self.pointer = None;
         }
-        let every = if self.console.panel.open { 33 } else { 250 };
+        // A stalled picture redraws at 10 Hz so its age keeps counting, and
+        // at once when the stall state changes: the idle cadence alone
+        // would show "NO VIDEO" up to 250 ms late and keep it after the
+        // first new frame.
+        let stall = self.console.stall();
+        changed |= !stall.same_kind(&self.drawn_stall);
+        let every = if self.console.panel.open {
+            33
+        } else if stall != Stall::None {
+            100
+        } else {
+            250
+        };
         let due = self
             .last_draw
             .is_none_or(|t| t.elapsed() >= Duration::from_millis(every));
         if fresh || due || changed {
+            self.drawn_stall = stall;
             let mut status = hub.status.lock().unwrap_or_else(|p| p.into_inner()).clone();
             if let Some(l) = self.link.as_ref() {
                 if status.is_empty() && l.shared.searching.load(Ordering::Relaxed) {

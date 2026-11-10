@@ -15,6 +15,7 @@ pub mod params;
 #[cfg(feature = "ui")]
 pub mod pointer;
 pub mod prefs;
+pub mod stall;
 #[cfg(feature = "ui")]
 pub mod telem;
 

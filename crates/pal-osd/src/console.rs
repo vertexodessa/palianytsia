@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::panel::{Panel, PanelIn, PanelOut};
 use crate::params::{Cmd, Edits, Table};
 use crate::prefs::HudPrefs;
+use crate::stall::{FrameAge, Stall};
 use crate::telem::Telemetry;
 use crate::{History, Snapshot};
 
@@ -47,6 +48,10 @@ pub struct Console {
     /// Decoded frames per second over the last full second, the frame
     /// count it was taken at, and when.
     fps: (f64, u64, Instant),
+    /// The age of the picture on the glass. It survives `new_session`: a
+    /// relink leaves the old picture up, and that picture is still stale.
+    age: FrameAge,
+    stall: Stall,
 }
 
 impl Console {
@@ -62,6 +67,8 @@ impl Console {
             panel,
             prefs_path,
             fps: (0.0, 0, Instant::now()),
+            age: FrameAge::default(),
+            stall: Stall::None,
         }
     }
 
@@ -123,9 +130,12 @@ impl Console {
         changes
     }
 
-    /// Decoded fps from the decoder's running frame count, recomputed once
-    /// a second.
-    pub fn fps(&mut self, frames: u64) -> f64 {
+    /// The decoder's running frame count at `now` (seconds), once per OSD
+    /// tick: stamps the picture's age for the stall marker and returns the
+    /// decoded fps, recomputed once a second.
+    pub fn on_frames(&mut self, now: f64, frames: u64) -> f64 {
+        self.age.note(now, frames);
+        self.stall = self.age.stall(now);
         let dt = self.fps.2.elapsed().as_secs_f64();
         if dt >= 1.0 {
             self.fps = (
@@ -137,8 +147,13 @@ impl Console {
         self.fps.0
     }
 
-    /// The flight overlay: HUD, status line, stats chips and the key
-    /// banner. True when the operator moved a chip.
+    /// How stale the picture is as of the last `on_frames`.
+    pub fn stall(&self) -> Stall {
+        self.stall
+    }
+
+    /// The flight overlay: HUD, stall marker, status line, stats chips and
+    /// the key banner. True when the operator moved a chip.
     pub fn overlay(&mut self, ui: &mut egui::Ui, now: f64, o: OverlayIn) -> bool {
         let r = crate::panel::hud_rect(ui.ctx(), &self.panel, o.video);
         crate::hud::hud(
@@ -150,6 +165,8 @@ impl Console {
             now,
             &self.prefs,
         );
+        // On the video itself, whatever the HUD prefs: it cannot be hidden.
+        crate::hud::stall(ui, o.video, self.stall, self.prefs.scale);
         let mismatch = self.hist.last().is_some_and(|s| s.key_mismatch);
         let mut moved = false;
         if self.prefs.stats || mismatch || o.status.is_some() {
@@ -306,6 +323,20 @@ mod tests {
         c.settle(&mut out, None);
         assert!(rx.try_recv().is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_picture_age_survives_a_new_session() {
+        let mut c = Console::new(tmp("stall"), Panel::default());
+        c.on_frames(0.0, 0);
+        assert_eq!(c.stall(), Stall::None, "no video yet");
+        c.on_frames(1.0, 10);
+        c.new_session();
+        // The new link restarts the count; the old picture is still up.
+        c.on_frames(1.6, 0);
+        assert!(matches!(c.stall(), Stall::NoVideo(_)));
+        c.on_frames(1.7, 1);
+        assert_eq!(c.stall(), Stall::None);
     }
 
     #[test]

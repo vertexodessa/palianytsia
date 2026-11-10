@@ -3,9 +3,10 @@
 //! painted straight over the video rect with shadowed text so it reads on
 //! any background. The detailed link statistics (`chips`) are a separate,
 //! off-by-default view.
-use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, StrokeKind, Ui, Vec2};
 
 use crate::prefs::HudPrefs;
+use crate::stall::Stall;
 use crate::telem::{is_alert, Telemetry};
 use crate::{History, SIGNAL_HOLD_S};
 
@@ -188,6 +189,41 @@ fn nav(ui: &Ui, r: Rect, t: &Telemetry, base: f32, pad: f32) {
             WHITE,
         );
         y = b.top() - base * 0.15;
+    }
+}
+
+/// The stall marker over the video rect `v` (not the HUD's rect, which an
+/// open panel narrows: the frame belongs around the picture). `scale` is
+/// the operator's text scale.
+pub fn stall(ui: &Ui, v: Rect, s: Stall, scale: f32) {
+    let base = (v.height() / 22.0).clamp(11.0, 22.0) * scale;
+    match s {
+        Stall::None => {}
+        Stall::Late(age) => {
+            // Centre top: the corners hold the timer and the link readout.
+            text(
+                ui,
+                v.center_top() + Vec2::new(0.0, base * 0.8),
+                Align2::CENTER_TOP,
+                &format!("FRAME AGE {:.0} ms", age * 1000.0),
+                base,
+                WARN,
+            );
+        }
+        Stall::NoVideo(age) => {
+            let w = (base * 0.3).max(3.0);
+            ui.painter()
+                .rect_stroke(v, 0.0, Stroke::new(w, BAD), StrokeKind::Inside);
+            // Above the centre dot, mirroring the FC messages below it.
+            text(
+                ui,
+                v.center() - Vec2::new(0.0, v.height() * 0.22),
+                Align2::CENTER_CENTER,
+                &format!("NO VIDEO {age:.1} s"),
+                base * 1.6,
+                BAD,
+            );
+        }
     }
 }
 

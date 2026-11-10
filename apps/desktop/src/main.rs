@@ -504,7 +504,7 @@ impl eframe::App for App {
             }
         }
         let frames = self.shared.frames.load(Ordering::Relaxed);
-        self.fps = self.console.fps(frames);
+        self.fps = self.console.on_frames(now, frames);
         // Hotkeys only while no text field has focus (typing a value must
         // not toggle panels).
         let typing = ctx.memory(|m| m.focused().is_some());
