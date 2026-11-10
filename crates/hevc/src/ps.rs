@@ -298,7 +298,9 @@ pub fn parse_pps(nal: &[u8]) -> Result<Pps, PsStatus> {
     p.cabac_init_present = r.flag();
     p.num_ref_idx_l0_default = r.ue() + 1;
     p.num_ref_idx_l1_default = r.ue() + 1;
-    p.init_qp = 26 + r.se();
+    // Wraps as the C++ int sum does on its targets; the slice clamps the
+    // QP it derives before any table lookup.
+    p.init_qp = 26i32.wrapping_add(r.se());
     r.u(1);
     r.u(1);
     if r.flag() {

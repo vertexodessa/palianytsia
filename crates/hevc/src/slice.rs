@@ -107,10 +107,13 @@ pub fn parse_slice_header(nal: &[u8], sps: &Sps, pps: &Pps) -> Result<SliceHeade
         if sps.long_term {
             let n_sps = if sps.num_lt_sps > 0 { r.ue() } else { 0 };
             let n_pics = r.ue();
-            if n_sps > sps.num_lt_sps || n_sps + n_pics > 32 {
+            // The C++ unsigned sum: a hostile count wraps it small, and
+            // the loop then reads what the wrapped count says.
+            let n_lt = n_sps.wrapping_add(n_pics);
+            if n_sps > sps.num_lt_sps || n_lt > 32 {
                 return Err(Malformed);
             }
-            for i in 0..n_sps + n_pics {
+            for i in 0..n_lt {
                 if i < n_sps {
                     let mut li = 0;
                     if sps.num_lt_sps > 1 {
@@ -185,7 +188,8 @@ pub fn parse_slice_header(nal: &[u8], sps: &Sps, pps: &Pps) -> Result<SliceHeade
         }
         h.max_num_merge_cand = 5 - five_minus;
     }
-    h.slice_qp_y = pps.init_qp + r.se();
+    // Wraps as the C++ int sum does on its targets; init_ctx clamps it.
+    h.slice_qp_y = pps.init_qp.wrapping_add(r.se());
     if pps.chroma_qp_offsets_present {
         r.se();
         r.se();
