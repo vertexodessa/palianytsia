@@ -25,6 +25,13 @@ fn body(card: u8, mono_us: u64, seq: u16) -> RxBody {
     }
 }
 
+/// An RC frame of type `ty` (RC_MAGIC 0x5243, version, type), padded.
+fn rc(ty: u8) -> Vec<u8> {
+    let mut b = vec![0x43, 0x52, 18, ty];
+    b.resize(24, 0);
+    b
+}
+
 #[test]
 fn losstrace_counts_the_union_loss_across_a_wrap_and_a_silence() {
     if Command::new("python3").arg("--version").output().is_err() {
@@ -41,9 +48,21 @@ fn losstrace_counts_the_union_loss_across_a_wrap_and_a_silence() {
     // 1 ms apart. Card 0 misses seq 10, card 1 misses 10 and 20..=22: the
     // union lost one frame.
     let seg1 = (4000u16..4096).chain(0..200);
-    for s in seg1 {
+    for (i, s) in seg1.enumerate() {
         if s != 10 {
-            w.body(&body(0, t, s)).expect("body");
+            let mut b = body(0, t, s);
+            // A drone MAV frame continues the drone's counter: it counts.
+            if s == 100 {
+                b.body = rc(8);
+            }
+            w.body(&b).expect("body");
+        }
+        // The GS's own uplink, heard by card 1 with the GS's counter: an
+        // RCF every 10 frames and a GS MAV frame now and then.
+        if i % 10 == 5 {
+            let mut g = body(1, t + 50, 1500 + i as u16);
+            g.body = rc(if i % 30 == 5 { 8 } else { 1 });
+            w.body(&g).expect("body");
         }
         if s != 10 && !(20..=22).contains(&s) {
             let mut b = body(1, t + 100, s);
@@ -99,6 +118,7 @@ fn losstrace_counts_the_union_loss_across_a_wrap_and_a_silence() {
     let union = v["loss_pct_union"].as_f64().expect("union");
     assert!((union - 100.0 / 396.0).abs() < 1e-9, "{union}");
     assert_eq!(v["fcs_failed"]["1"], 1);
+    assert_eq!(v["gs_frames_heard"], 30);
     // Only the drone's -30 dBm: the phy-invalid frame adds no -110 bucket.
     for card in ["0", "1"] {
         let keys: Vec<&String> = v["loss_pct_by_rssi_bucket_card"][card]

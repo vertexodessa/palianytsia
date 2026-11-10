@@ -87,3 +87,23 @@ def sbi(body, check_crc=False):
             envs.append(Env(bool(fl & 1), seq, wl, key, ok and m == SW_MAGIC))
         off += 2 + bp
     return sid & 0x7F, bool(sid & 0x80), q, enc, air, envs
+
+
+RC_MAGIC = 0x5243
+# RC types (third_party/mabur common rc_proto): the GS sends RCF 1, DISC 2, NACK 7; the drone
+# DISC_ACK 3 and TELEM 4; MAV 8 goes both ways.
+RC_GS = (1, 2, 7)
+
+
+def sender(body, sbi_parsed=None):
+    """'gs' for the GS's RC frames (RCF, DISC, NACK), 'mav' for a MAV frame (either side: the
+    caller decides by sequence number), 'drone' for the rest (SBI video, DISC_ACK, TELEM; a
+    capture holds nothing else)."""
+    if sbi_parsed is None:
+        sbi_parsed = sbi(body)
+    if not sbi_parsed and len(body) >= 4 and struct.unpack_from("<H", body, 0)[0] == RC_MAGIC:
+        if body[3] in RC_GS:
+            return "gs"
+        if body[3] == 8:
+            return "mav"
+    return "drone"

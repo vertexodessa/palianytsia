@@ -12,6 +12,11 @@ cards demodulate, not the drone; 29 % at the drone's RSSI (>= -40 dBm) with an H
 drone's own frames damaged (most still start with the SBI magic; 10 % of all FCS-failed records
 have a good copy on the other card). So the FCS-failed count is no measure of the drone's loss.
 
+The cards also hear the GS's own uplink (RCF, DISC, NACK and its MAV frames), numbered by the
+GS's counter; those are left out (GS frames heard), a MAV frame counts as the drone's when its
+number continues the drone's counter. Left in, they broke the unwrap into made-up outages and
+loss runs (the outage lists of fl-1813 and fl-1772 before this).
+
 The 12-bit counter cannot be unwrapped across a silence: after more than OUTAGE_US with no frame
 from any card, a new segment starts and the frames between are unknown (an outage with no count).
 
@@ -25,6 +30,10 @@ path = sys.argv[1]
 recs = []          # (mono, card, mac_seq, mcs, rssi_best, snr_best, sid, retx, nenv)
 bad = C.Counter()  # FCS-failed per card
 salv = C.Counter()
+# The cards also hear the GS's own uplink (RCF, DISC, NACK, its MAV frames), numbered by the
+# GS's counter: those frames are left out, or they break the unwrap of the drone's counter.
+gs_frames = 0
+MAV = -2  # sid of a MAV frame, sender decided by its sequence number below
 for r in palcap.records(path):
     if not r.crc:
         bad[r.card] += 1
@@ -34,12 +43,31 @@ for r in palcap.records(path):
             salv["env_bad"] += sum(1 for e in s[5] if not e.crc_ok)
         continue
     s = palcap.sbi(r.body)
+    kind = palcap.sender(r.body, s)
+    if kind == "gs":
+        gs_frames += 1
+        continue
     sid, retx, nenv = (s[0], s[1], len(s[5])) if s else (-1, False, 0)
+    if kind == "mav":
+        sid = MAV
     # RSSI and SNR are only meaningful when the PHY status was valid.
     rssi = max(r.rssi) - 110 if r.phy else None
     snr = max(r.snr) if r.phy else None
     recs.append((r.mono, r.card, r.mac_seq, r.mcs, rssi, snr, sid, retx, nenv))
 recs.sort()
+# A MAV frame is the drone's when its number continues the drone's counter (the frames around it
+# in time are the drone's video), the GS's otherwise.
+MAV_NEAR = 64
+kept, last_seq = [], None
+for x in recs:
+    if x[6] == MAV:
+        if last_seq is None or min((x[2] - last_seq) & 0xFFF, (last_seq - x[2]) & 0xFFF) > MAV_NEAR:
+            gs_frames += 1
+            continue
+    else:
+        last_seq = x[2]
+    kept.append(x)
+recs = kept
 cards = sorted({r[1] for r in recs})
 
 # An outage (no card hears anything for OUTAGE_US, or the counter jumps back: drone restart, hop)
@@ -72,6 +100,7 @@ t_of = lambda u: min(v[0] for v in got[u].values())
 
 out = {"file": path, "cards": cards, "secs": (recs[-1][0] - recs[0][0]) / 1e6}
 out["fcs_failed"] = {str(c): bad[c] for c in cards}
+out["gs_frames_heard"] = gs_frames
 out["salvage_envelopes"] = dict(salv)
 keys = sorted(got)
 
@@ -224,7 +253,7 @@ if "--json" in sys.argv:
     json.dump([(r[0] - t0, r[1], r[2], r[3], r[4]) for r in runs],
               open(sys.argv[sys.argv.index("--json") + 1].replace(".json", ".runs.json"), "w"))
 h = lambda k: out[k]
-print(f"{path.split('/')[-2]}/{path.split('/')[-1]}: {out['secs']:.0f} s, {sent} frames sent, outages {out['outages']} ({out['outage_secs']:.1f} s), FCS-failed {dict(bad)}")
+print(f"{path.split('/')[-2]}/{path.split('/')[-1]}: {out['secs']:.0f} s, {sent} frames sent, outages {out['outages']} ({out['outage_secs']:.1f} s), FCS-failed {dict(bad)}, GS frames heard {gs_frames}")
 print("  loss % per card", {k: round(v, 3) for k, v in out["loss_pct_card"].items()},
       "union", round(out["loss_pct_union"], 4),
       "if independent", round(out.get("loss_pct_if_independent", float('nan')), 4),
