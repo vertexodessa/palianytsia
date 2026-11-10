@@ -708,6 +708,7 @@ fn log_summary(o: Opts) {
     if let Some(fec) = &s.fec {
         print_fec(fec);
     }
+    print_keyframes(&s.keyframes, s.span_s);
     if let Some((t, values)) = &s.params {
         print_params(*t, values);
     }
@@ -744,6 +745,55 @@ fn same_value(text: &str, bundle: &toml::Value) -> bool {
 
 /// The drone's parameters in the session's last snapshot; those that
 /// differ from the bundle are listed with the bundle's value.
+/// Keyframe traffic: requests per minute by reason, heal times, the worst
+/// 10 s and IRAP sizes per rung (what a keyframe budget is sized from).
+fn print_keyframes(k: &flightlog::keyframes::Keyframes, span_s: f64) {
+    use flightlog::keyframes::pct;
+    if k.requests() == 0 && k.bytes_by_rung.is_empty() {
+        return;
+    }
+    let per_min = |n: u64| {
+        if span_s > 0.0 {
+            n as f64 * 60.0 / span_s
+        } else {
+            0.0
+        }
+    };
+    let reasons: Vec<String> = k
+        .by_reason
+        .iter()
+        .map(|(r, n)| format!("{r} {n} ({:.1}/min)", per_min(*n)))
+        .collect();
+    println!(
+        "  keyframe requests {} ({:.1}/min): {}; retries {} (most for one request {}); busiest 10 s: {} from {:.1} s",
+        k.requests(),
+        per_min(k.requests()),
+        if reasons.is_empty() { "-".into() } else { reasons.join(", ") },
+        k.retries,
+        k.max_retry,
+        k.peak_10s.0,
+        k.peak_10s.1 as f64 / 1e6
+    );
+    if !k.heal_ms.is_empty() {
+        let h = &k.heal_ms;
+        println!(
+            "  keyframe heals {}: p50 {} ms, p99 {} ms, max {} ms",
+            h.len(),
+            pct(h, 50),
+            pct(h, 99),
+            pct(h, 100)
+        );
+    }
+    for (rung, b) in &k.bytes_by_rung {
+        println!(
+            "  keyframes on rung {rung}: {}, bytes p50 {} max {}",
+            b.len(),
+            pct(b, 50),
+            pct(b, 100)
+        );
+    }
+}
+
 /// The loss-run shape FEC has to cover: an episode is one run of missing
 /// source symbols closed by the decoder's window, so its size against the
 /// window says whether the overhead fits the losses.

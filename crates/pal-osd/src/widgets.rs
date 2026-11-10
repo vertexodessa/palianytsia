@@ -19,6 +19,8 @@ pub struct Snapshot {
     pub aus: u64,
     pub trunc: u64,
     pub salvaged: u64,
+    /// Keyframe request epochs sent so far (first tries and retries).
+    pub idr_req: u64,
     /// Fingerprint of our pairing key; "default" for `mabur-default-00`.
     pub key_fp: String,
     pub rtt_ms: Option<f64>,
@@ -161,6 +163,7 @@ impl Snapshot {
             aus: u64_or(&v, "aus", 0),
             trunc: u64_or(&v, "trunc", 0),
             salvaged: u64_or(&v, "salvaged", 0),
+            idr_req: u64_or(&v, "idr_req", 0),
             key_fp: str_or(&v, "key_fp", ""),
             rtt_ms: opt_f64(&v, "rtt_ms"),
             uplink: str_or(&v, "uplink", "none"),
@@ -260,6 +263,16 @@ impl History {
             .rev()
             .take_while(|(t, _)| t_last - t <= hold_s)
             .find_map(|(_, s)| s.rssi_dbm.zip(s.snr_db))
+    }
+    /// How much counter `f` grew over the last `window_s` (0 with one row).
+    pub fn grew(&self, window_s: f64, f: impl Fn(&Snapshot) -> u64) -> u64 {
+        let Some((t1, new)) = self.rows.back() else {
+            return 0;
+        };
+        let start = self.rows.partition_point(|(t, _)| t1 - t > window_s);
+        self.rows
+            .get(start)
+            .map_or(0, |(_, old)| f(new).saturating_sub(f(old)))
     }
     fn series(&self, f: impl Fn(&Snapshot) -> Option<f64>) -> Vec<(f64, f64)> {
         self.rows
@@ -438,6 +451,11 @@ fn pct(v: f64) -> String {
 /// lossy u 0.26 > 0.05".
 const UP_WIDTH: usize = 46;
 
+/// The keyframes chip: request epochs counted over this window, and the
+/// count from which it shows.
+const KEYFRAME_WINDOW_S: f64 = 10.0;
+const KEYFRAME_STORM: u64 = 5;
+
 /// How long the signal chip keeps the last rssi/SNR through null windows.
 pub(crate) const SIGNAL_HOLD_S: f64 = 1.5;
 
@@ -545,6 +563,23 @@ pub fn chips(
             OK,
             None,
         );
+        // A keyframe storm: one request with its retries sends up to about
+        // 10 in 10 s at the longest retry gap (1 s), so 5 or more is either
+        // several losses close together or a request that does not heal.
+        let asks = h.grew(KEYFRAME_WINDOW_S, |s| s.idr_req);
+        if asks >= KEYFRAME_STORM {
+            chip(
+                "keyframes",
+                21, // "keyframes 99 in 10 s"
+                &format!("keyframes {asks:>2} in 10 s"),
+                if asks >= 2 * KEYFRAME_STORM {
+                    BAD
+                } else {
+                    WARN
+                },
+                None,
+            );
+        }
         if let Some(d) = s.drone_state {
             let mut c = if d == 2 { OK } else { WARN };
             let mut t = drone_state_name(d).to_string();
@@ -704,6 +739,36 @@ mod tests {
     fn chip_rect(ctx: &egui::Context, label: &str) -> Rect {
         ctx.memory(|m| m.area_rect(egui::Id::new(("pal-chip", label))))
             .expect("chip drawn")
+    }
+
+    #[test]
+    fn the_keyframes_chip_shows_from_five_requests_in_ten_seconds() {
+        let ctx = egui::Context::default();
+        let region = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(600.0, 400.0));
+        let mut pos = Default::default();
+        let drawn = |ctx: &egui::Context| {
+            ctx.memory(|m| m.area_rect(egui::Id::new(("pal-chip", "keyframes"))))
+                .is_some()
+        };
+        let snap = |idr_req| Snapshot {
+            mode: "gs".into(),
+            session: true,
+            idr_req,
+            ..Default::default()
+        };
+        let mut h = History::default();
+        // Three in the last 10 s: no chip.
+        for (t, n) in [(0.0, 10), (5.0, 12), (10.0, 14), (15.0, 15)] {
+            h.push(t, snap(n));
+        }
+        assert_eq!(h.grew(10.0, |s| s.idr_req), 3);
+        chip_frame(&ctx, region, &mut pos, &h, vec![]);
+        assert!(!drawn(&ctx));
+        // The window now starts at the 10 s row (14): five, the threshold.
+        h.push(16.0, snap(19));
+        assert_eq!(h.grew(10.0, |s| s.idr_req), 5);
+        chip_frame(&ctx, region, &mut pos, &h, vec![]);
+        assert!(drawn(&ctx));
     }
 
     #[test]

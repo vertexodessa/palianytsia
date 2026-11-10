@@ -531,6 +531,7 @@ pub struct Summary {
     pub hops: Vec<(u64, String, u64, u64, f64)>,
     /// fec.log's episodes per layer; None for a session written before it.
     pub fec: Option<[FecTotals; 2]>,
+    pub keyframes: crate::keyframes::Keyframes,
 }
 
 /// One layer's loss episodes in fec.log.
@@ -635,6 +636,9 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
         s.aus += 1;
         s.au_bytes += bytes;
         s.idr += u64::from(flags & 0x01 != 0);
+        if flags & 0x01 != 0 {
+            s.keyframes.idr(t, bytes);
+        }
         if complete == 0 {
             s.truncated += 1;
             s.truncated_base += u64::from(sid == 0);
@@ -649,6 +653,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             if let Some(t) = v.get("t_us").and_then(Value::as_u64) {
                 t_min = t_min.min(t);
                 t_max = t_max.max(t);
+                s.keyframes.stats(t, &v);
                 if let Some(us) = v.get("log_max_us").and_then(Value::as_u64) {
                     if s.log_max_us.is_none_or(|(m, _)| us > m) {
                         s.log_max_us = Some((us, t));
@@ -672,6 +677,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             .and_then(Value::as_str)
             .unwrap_or("?")
             .to_string();
+        s.keyframes.event(&ev, &v);
         match ev.as_str() {
             "build" if s.build.is_none() => s.build = Some(v.clone()),
             "cards" => s
@@ -708,6 +714,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
     }
     s.events = counts;
     s.fec = read_fec(&dir.join(FEC_FILE))?;
+    s.keyframes.finish();
     if t_max >= t_min && t_min != u64::MAX {
         s.span_s = (t_max - t_min) as f64 / 1e6;
     }
