@@ -61,8 +61,8 @@ pairing key.
   `runtime::dev_card::rust_channel_core`, clock `runtime` mono); `--core ref` uses mabur's C++ one
   (`pal_ref::live`, clock `pal_ref::now_us`). pal-ref is no longer in the Android build. A Rust
   spotter on an auto config still uses the old `runtime::run_live` sweep (400 ms per channel, 3
-  CRC-good drone frames = found, again after 8 s without drone frames; events `search`,
-  `drone_found`, `drone_lost`). Pinned configs never search. On the bench the prelude ranking moves
+  CRC-good drone frames = found, again after 8 s without drone frames; after 2 passes it also listens on
+  the rest of the 5 GHz grid; events `search`, `search_grid`, `drone_found`, `drone_lost`). Pinned configs never search. On the bench the prelude ranking moves
   the quad from 40 to 144 (both cores, 2026-11-01).
 - Release APKs: `PAL_RELEASE=1 tools/{phone,quest}-apk.sh`, signed from
   `~/.config/palianytsia/release-signing.properties` (key `~/.android/palianytsia-release.jks`, never in the

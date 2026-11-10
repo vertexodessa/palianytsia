@@ -652,6 +652,10 @@ pub const DWELL_MS: u64 = 400;
 pub const FOUND_HITS: u32 = 3;
 /// No drone frame for this long while searching is enabled: sweep again.
 pub const LOST_US: u64 = 8_000_000;
+/// Passes over the set before the sweep also listens on the rest of the
+/// 5 GHz grid: a drone follows a GS to any grid channel and parks there on
+/// boot, as in the channel core's search (mabur 39039eac).
+pub const GRID_AFTER_ROUNDS: u32 = 2;
 
 /// Sweeps `set` (starting at `first`) until `hits` grows by FOUND_HITS
 /// within one dwell. Bodies queued meanwhile are dropped: none may reach a
@@ -714,6 +718,14 @@ fn search(
         rounds += 1;
         if rounds == 1 {
             shared.event("search", serde_json::json!({"set": set, "first": first}));
+        }
+        if rounds == GRID_AFTER_ROUNDS {
+            let grid: Vec<u8> = pal_wire::ht40::grid_5g(width)
+                .into_iter()
+                .filter(|c| !order.contains(c))
+                .collect();
+            shared.event("search_grid", serde_json::json!({"channels": grid.len()}));
+            order.extend(grid);
         }
     };
     shared.searching.store(false, Ordering::Relaxed);
