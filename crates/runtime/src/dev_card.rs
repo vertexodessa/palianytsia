@@ -34,6 +34,75 @@ fn to_scout(e: devourer_sys::Energy) -> ScoutEnergy {
     }
 }
 
+/// How long each pair of the core's cards sat on different channels (a card
+/// mid-retune is on none), so a card's frame rate can be judged on its
+/// time on the link card's channel only. Taken on retunes and by the core
+/// loop's stats pass, never on the RX path.
+pub(crate) struct ChannelBook {
+    inner: Mutex<Book>,
+}
+
+struct Book {
+    at_us: u64,
+    /// Per card; 0 while it retunes.
+    ch: Vec<u8>,
+    /// `apart_us[i * n + j]`: cards i and j on different channels.
+    apart_us: Vec<u64>,
+}
+
+impl Book {
+    fn advance(&mut self, now_us: u64) {
+        let dt = now_us.saturating_sub(self.at_us);
+        self.at_us = self.at_us.max(now_us);
+        let n = self.ch.len();
+        for i in 0..n {
+            for j in 0..n {
+                let (a, b) = (self.ch[i], self.ch[j]);
+                if i != j && (a == 0 || b == 0 || a != b) {
+                    self.apart_us[i * n + j] += dt;
+                }
+            }
+        }
+    }
+}
+
+impl ChannelBook {
+    pub(crate) fn new(n: usize, ch: u8, now_us: u64) -> Self {
+        Self {
+            inner: Mutex::new(Book {
+                at_us: now_us,
+                ch: vec![ch; n],
+                apart_us: vec![0; n * n],
+            }),
+        }
+    }
+
+    fn book(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Card `card` is on `ch` (0 = retuning) from `now_us` on.
+    pub(crate) fn set(&self, now_us: u64, card: usize, ch: u8) {
+        let mut b = self.book();
+        b.advance(now_us);
+        if let Some(c) = b.ch.get_mut(card) {
+            *c = ch;
+        }
+    }
+
+    /// Time cards `card` and `other` spent apart up to `now_us`.
+    pub(crate) fn apart_us(&self, now_us: u64, card: usize, other: usize) -> u64 {
+        let mut b = self.book();
+        b.advance(now_us);
+        let n = b.ch.len();
+        if card < n && other < n {
+            b.apart_us[card * n + other]
+        } else {
+            0
+        }
+    }
+}
+
 pub struct DevCard {
     // Weak: the card's RX handler holds this (the tap), so a strong ref
     // would keep the card open forever.
@@ -56,12 +125,20 @@ pub struct DevCard {
     tuned_w: AtomicU8,
     /// The stamp RX bodies get; 0 while a retune is in flight.
     rx_channel: AtomicU8,
+    /// Shared by the core's cards: where each one is tuned, over time.
+    book: Arc<ChannelBook>,
 }
 
 impl DevCard {
     /// RadioFrontend::start_ after InitWrite: the caps and which energy
     /// counters this chip has.
-    pub fn new(card: &Arc<devourer_sys::Card>, idx: usize, ch: u8, width: u8) -> Self {
+    pub(crate) fn new(
+        card: &Arc<devourer_sys::Card>,
+        idx: usize,
+        ch: u8,
+        width: u8,
+        book: Arc<ChannelBook>,
+    ) -> Self {
         let (ac, e) = {
             let c = card.ctl();
             (c.caps(), c.rx_energy(true))
@@ -105,7 +182,14 @@ impl DevCard {
             width: AtomicU8::new(if width == 40 { 40 } else { 20 }),
             tuned_w: AtomicU8::new(if width == 40 { 40 } else { 20 }),
             rx_channel: AtomicU8::new(ch),
+            book,
         }
+    }
+
+    /// The RX stamp blinds for a move; the book counts the card as away.
+    fn begin_move(&self) {
+        self.rx_channel.store(0, Ordering::Release);
+        self.book.set(mono_default(), self.idx, 0);
     }
 
     /// The card under its control lock; None once it is closed.
@@ -146,6 +230,9 @@ impl RxTap for DevCard {
     fn channel(&self) -> u8 {
         LinkCard::channel(self)
     }
+    fn off_link_us(&self, link: usize) -> u64 {
+        self.book.apart_us(mono_default(), self.idx, link)
+    }
 }
 
 impl DevCard {
@@ -156,8 +243,9 @@ impl DevCard {
         if ok {
             self.channel.store(ch, Ordering::Release);
         }
-        self.rx_channel
-            .store(self.channel.load(Ordering::Acquire), Ordering::Release);
+        let now = self.channel.load(Ordering::Acquire);
+        self.rx_channel.store(now, Ordering::Release);
+        self.book.set(mono_default(), self.idx, now);
     }
 
     /// The full channel set (`set_monitor`) at `w`, control lock held;
@@ -165,7 +253,7 @@ impl DevCard {
     /// 40 MHz link). `tuned_w` moves only on success: after a failure the
     /// next retune must still see the width mismatch and try the full set.
     fn tune_full(&self, c: &devourer_sys::Ctl, ch: u8, w: u8) -> bool {
-        self.rx_channel.store(0, Ordering::Release);
+        self.begin_move();
         let r = c.set_monitor(ch, w);
         self.end_move(ch, r.is_ok());
         match r {
@@ -209,7 +297,7 @@ impl ScoutRadio for DevCard {
             }
             // Blind the body stamp for the move: a frame picked up during
             // it reads 0 = unknown, not the new channel.
-            self.rx_channel.store(0, Ordering::Release);
+            self.begin_move();
             let ok = c.fast_retune(ch);
             self.end_move(ch, ok);
             ok
@@ -313,10 +401,11 @@ impl LinkCard for DevCard {
 /// stamps and ticks use.
 pub fn rust_channel_core(cfg: Config, opts: CoreOpts, width: u8) -> Attach {
     Box::new(move |cards| {
+        let book = Arc::new(ChannelBook::new(cards.len(), opts.channel, mono_default()));
         let dcs: Vec<Arc<DevCard>> = cards
             .iter()
             .enumerate()
-            .map(|(i, c)| Arc::new(DevCard::new(c, i, opts.channel, width)))
+            .map(|(i, c)| Arc::new(DevCard::new(c, i, opts.channel, width, book.clone())))
             .collect();
         let now_us: UsClock = Arc::new(mono_default);
         let now_ms: MsClock = Arc::new(|| mono_default() / 1000);
@@ -339,6 +428,31 @@ pub fn rust_channel_core(cfg: Config, opts: CoreOpts, width: u8) -> Attach {
             clock: mono_default,
         })
     })
+}
+
+#[cfg(test)]
+mod book_tests {
+    use super::ChannelBook;
+
+    #[test]
+    fn a_scout_dwell_counts_as_time_apart_from_the_link_card() {
+        let b = ChannelBook::new(2, 100, 1_000_000);
+        // Card 1: a 2 ms retune, 320 ms on 153, a 2 ms retune back.
+        b.set(2_000_000, 1, 0);
+        b.set(2_002_000, 1, 153);
+        b.set(2_322_000, 1, 0);
+        b.set(2_324_000, 1, 100);
+        assert_eq!(b.apart_us(3_000_000, 1, 0), 324_000);
+        assert_eq!(b.apart_us(3_000_000, 0, 1), 324_000);
+        assert_eq!(b.apart_us(3_000_000, 1, 1), 0);
+        // The link card hops and the scout follows 50 ms later.
+        b.set(4_000_000, 0, 0);
+        b.set(4_001_000, 0, 36);
+        b.set(4_051_000, 1, 36);
+        assert_eq!(b.apart_us(5_000_000, 1, 0), 324_000 + 51_000);
+        // A card the book does not have reads 0.
+        assert_eq!(b.apart_us(5_000_000, 2, 0), 0);
+    }
 }
 
 #[cfg(test)]

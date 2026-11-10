@@ -239,6 +239,8 @@ pub struct CoreLoop {
     rung_seen_ms: i64,
     /// The flight log's write error has been reported.
     log_err_told: bool,
+    /// The cards the core drives, in card order (`watch_cards`).
+    taps: Vec<Arc<dyn RxTap>>,
 }
 
 /// The loop's channels to the UI.
@@ -279,6 +281,7 @@ impl CoreLoop {
             deaf: pal_osd::DeafWatch::default(),
             rung_seen_ms: i64::MIN,
             log_err_told: false,
+            taps: Vec::new(),
         }
     }
 
@@ -482,11 +485,12 @@ impl CoreLoop {
         }
         self.last_stats_us = now;
         let line = self.core.stats_json();
+        let stats = stats_line::parse(&line);
+        let off = self.card_off_us(stats.as_ref());
         if self.sink.log.is_some() && now >= self.last_log_us + 1_000_000 {
             self.last_log_us = now;
-            self.log_stats(now, &line);
+            self.log_stats(now, &line, &off);
         }
-        let stats = stats_line::parse(&line);
         self.sink.pts_off_us = stats.as_ref().and_then(stats_line::pts_off_us);
         // The ladder and calibration views go to the UI only: the
         // flight log keeps the webgs stats line both cores agree on.
@@ -498,10 +502,16 @@ impl CoreLoop {
         let scan = json(self.core.chan_scan_json());
         let cal = self.cal_line();
         let log_err = self.log_err();
+        let off = (!off.is_empty()).then(|| off.into());
         let ui = match stats {
             Some(s) => stats_line::ui_line(
                 s,
-                [("ladder", ladder), ("chscan", scan), ("log_err", log_err)],
+                [
+                    ("ladder", ladder),
+                    ("chscan", scan),
+                    ("log_err", log_err),
+                    ("card_off_us", off),
+                ],
                 cal,
             ),
             None => line,
@@ -525,15 +535,34 @@ impl CoreLoop {
         Some(text.into())
     }
 
+    /// Each card's time off the transmitting card's channel, from the
+    /// cards' taps; empty for a core that does not drive the cards.
+    fn card_off_us(&self, stats: Option<&serde_json::Value>) -> Vec<u64> {
+        let tx = stats
+            .and_then(|s| s.get("tx_card"))
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |t| t as usize);
+        self.taps.iter().map(|t| t.off_link_us(tx)).collect()
+    }
+
+    /// The cards a core drives (`run_core_on`), for their time off the
+    /// link channel.
+    pub fn watch_cards(&mut self, taps: Vec<Arc<dyn RxTap>>) {
+        self.taps = taps;
+    }
+
     /// The flight log's stats line, then the deaf-card check it feeds.
-    fn log_stats(&mut self, now: u64, line: &str) {
+    fn log_stats(&mut self, now: u64, line: &str, off: &[u64]) {
         if let Some(l) = self.sink.log.as_mut() {
             let _ = l.stats(now, line);
             // A killed app (Android swipe, OOM) skips Drop: at most
             // one second of log is lost, a few writes a second.
             let _ = l.flush();
         }
-        let cards = serde_json::from_str(line).map_or(Vec::new(), |v| pal_osd::cards_of(&v));
+        let mut cards = serde_json::from_str(line).map_or(Vec::new(), |v| pal_osd::cards_of(&v));
+        for (c, &o) in cards.iter_mut().zip(off) {
+            c.off_link_us = o;
+        }
         for c in self.deaf.push(now as f64 / 1e6, &cards) {
             let ev = if c.deaf { "card_deaf" } else { "card_hearing" };
             eprintln!(
@@ -655,6 +684,11 @@ pub trait RxTap: Send + Sync {
     fn on_rx(&self, f: &devourer_sys::RxFrame, v: &dot11::Verdict) -> Option<u8>;
     /// The channel the card is on now.
     fn channel(&self) -> u8;
+    /// Microseconds this card has spent on another channel than card
+    /// `link` (or mid-retune) since the core attached; 0 where unknown.
+    fn off_link_us(&self, _link: usize) -> u64 {
+        0
+    }
 }
 
 pub struct Attached {
@@ -1009,6 +1043,7 @@ pub fn run_core_on(
     shared.channel.store(ch, Ordering::Relaxed);
     let at = attach(&set.cards)?;
     cl.set_core(at.core);
+    cl.watch_cards(at.taps.clone());
     let clock = at.clock;
     // The link card's channel is the one the UI shows.
     let link = at.taps.first().cloned();

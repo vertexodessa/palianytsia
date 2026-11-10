@@ -870,6 +870,7 @@ mod tests {
             rssi,
             frames,
             crc_fail,
+            ..CardRx::default()
         }
     }
 
