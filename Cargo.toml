@@ -21,6 +21,7 @@ pal-fec = { path = "crates/pal-fec" }
 hevc = { path = "crates/hevc" }
 decode = { path = "crates/decode" }
 serde_json = "1"
+libc = "0.2"
 egui = "0.31"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 pal-osd = { path = "crates/pal-osd", default-features = false }

@@ -2268,6 +2268,7 @@ version = "0.0.1"
 dependencies = [
  "devourer-sys",
  "flightlog",
+ "libc",
  "log",
  "pal-build",
  "pal-core",

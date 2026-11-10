@@ -43,6 +43,8 @@ pub struct Snapshot {
     pub cal: Option<cal::CalView>,
     /// The operator's channel scan (UI stats line only).
     pub chscan: Option<channels::ScanView>,
+    /// The write error that stopped the flight log (UI stats line only).
+    pub log_err: Option<String>,
 }
 
 /// What the next rung promote waits on (`GsCore::ladder_json`).
@@ -173,6 +175,7 @@ impl Snapshot {
             ladder: v.get("ladder").and_then(Ladder::parse),
             cal: v.get("cal").and_then(cal::CalView::parse),
             chscan: v.get("chscan").and_then(channels::ScanView::parse),
+            log_err: v.get("log_err").and_then(Value::as_str).map(str::to_string),
         })
     }
 }
@@ -595,6 +598,11 @@ pub fn chips(
                 Some(hover),
             );
         }
+        if let Some(e) = &s.log_err {
+            // Last in the row: it appears mid-flight and must not push the
+            // other chips around.
+            chip("log", 0, &format!("STOPPED: {e}"), BAD, None);
+        }
     } else {
         chip("core", 0, "waiting for stats", WARN, None);
     }
@@ -790,6 +798,13 @@ mod tests {
         let two = Snapshot::parse(r#"{"cards":[{"frames":10,"video":30,"crc_fail":0,"rssi":-45},{"frames":9,"video":10,"crc_fail":1,"rssi":null}]}"#)
             .unwrap();
         assert_eq!((two.cards[0].frames, two.cards[1].crc_fail), (10, 1));
+        assert_eq!(two.log_err, None);
+        let stopped =
+            Snapshot::parse(r#"{"log_err":"No space left on device (os error 28)"}"#).unwrap();
+        assert_eq!(
+            stopped.log_err.as_deref(),
+            Some("No space left on device (os error 28)")
+        );
         let s = Snapshot::parse(r#"{"mode":"gs","key_fp":"default","key_mismatch":false,"rtt_ms":6.1,"uplink":"ok","uplink_pct":92,"pre_fec_loss":0.085,"residual":0.0106,"drone_temp_c":46,"nack":{"fill":48,"fill_pps":0.0}}"#)
             .expect("parse");
         assert_eq!(

@@ -168,11 +168,15 @@ fn next_index(root: &Path) -> u32 {
         .map_or(1, |n| n.saturating_add(1))
 }
 
+/// Where a line file's text goes: a buffered file, or what a test puts
+/// around it (`Session::wrap_writers`).
+pub type LineWriter = Box<dyn Write + Send>;
+
 pub struct Session {
     dir: PathBuf,
-    stats: BufWriter<File>,
-    events: BufWriter<File>,
-    au: BufWriter<File>,
+    stats: LineWriter,
+    events: LineWriter,
+    au: LineWriter,
     capture: Option<capture::Writer<BufWriter<File>>>,
     capture_cap: u64,
     last: Option<Map<String, Value>>,
@@ -180,6 +184,10 @@ pub struct Session {
     /// card 0's tuning, so a scout dwell on card 0 shows for one line.
     channel: Option<Value>,
     channel_seen: Option<Value>,
+    /// The first write error. From then on nothing is written: a writer
+    /// that failed may hold half a record, and retrying it on every call
+    /// would cost the core thread a syscall per AU on a full disk.
+    failed: Option<io::Error>,
 }
 
 fn write_event(w: &mut impl Write, t_us: u64, ev: &str, detail: Value) -> io::Result<()> {
@@ -192,11 +200,11 @@ fn write_event(w: &mut impl Write, t_us: u64, ev: &str, detail: Value) -> io::Re
     writeln!(w, "{}", Value::Object(m))
 }
 
-fn create(dir: &Path, name: &str) -> io::Result<BufWriter<File>> {
-    Ok(BufWriter::with_capacity(
+fn create(dir: &Path, name: &str) -> io::Result<LineWriter> {
+    Ok(Box::new(BufWriter::with_capacity(
         1 << 16,
         File::create(dir.join(name))?,
-    ))
+    )))
 }
 
 impl Session {
@@ -242,6 +250,7 @@ impl Session {
             last: None,
             channel: None,
             channel_seen: None,
+            failed: None,
         })
     }
 
@@ -249,11 +258,46 @@ impl Session {
         &self.dir
     }
 
+    /// The bodies.bin byte cap the session was created with; 0 = no capture.
+    pub fn capture_cap(&self) -> u64 {
+        self.capture_cap
+    }
+
+    /// The write error that stopped the log, if one did.
+    pub fn write_error(&self) -> Option<&io::Error> {
+        self.failed.as_ref()
+    }
+
+    /// Puts `f`'s writer around each line file's (stats, events, au), e.g.
+    /// one that fails after some bytes.
+    pub fn wrap_writers(&mut self, mut f: impl FnMut(&'static str, LineWriter) -> LineWriter) {
+        for (name, w) in [
+            (STATS_FILE, &mut self.stats),
+            (EVENTS_FILE, &mut self.events),
+            (AU_FILE, &mut self.au),
+        ] {
+            let inner = std::mem::replace(w, Box::new(io::sink()));
+            *w = f(name, inner);
+        }
+    }
+
+    /// Runs one write unless the log has stopped; latches its error.
+    fn guard(&mut self, w: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<()> {
+        if let Some(e) = &self.failed {
+            return Err(e.kind().into());
+        }
+        w(self).inspect_err(|e| self.failed = Some(io::Error::new(e.kind(), e.to_string())))
+    }
+
     /// One `stats_json` line, stamped; changes of the watched keys since
     /// the previous line become events.
     pub fn stats(&mut self, t_us: u64, line: &str) -> io::Result<()> {
+        self.guard(|s| s.write_stats(t_us, line))
+    }
+
+    fn write_stats(&mut self, t_us: u64, line: &str) -> io::Result<()> {
         let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(line) else {
-            return self.event(t_us, "bad_stats", json!({ "line": line }));
+            return self.write_event(t_us, "bad_stats", json!({ "line": line }));
         };
         let ch = m.get("channel").cloned();
         if self.last.is_none() {
@@ -264,7 +308,7 @@ impl Session {
             // Two lines in a row: a hop or a pick, not a dwell.
             let from = std::mem::replace(&mut self.channel, ch.clone());
             self.channel_seen = None;
-            self.event(t_us, "channel", json!({"from": from, "to": ch}))?;
+            self.write_event(t_us, "channel", json!({"from": from, "to": ch}))?;
         } else {
             self.channel_seen = ch;
         }
@@ -272,7 +316,7 @@ impl Session {
             for k in WATCHED {
                 let (a, b) = (prev.get(*k), m.get(*k));
                 if a != b {
-                    self.event(t_us, k, json!({"from": a, "to": b}))?;
+                    self.write_event(t_us, k, json!({"from": a, "to": b}))?;
                 }
             }
         }
@@ -283,11 +327,22 @@ impl Session {
     }
 
     pub fn event(&mut self, t_us: u64, ev: &str, detail: Value) -> io::Result<()> {
+        self.guard(|s| s.write_event(t_us, ev, detail))
+    }
+
+    fn write_event(&mut self, t_us: u64, ev: &str, detail: Value) -> io::Result<()> {
         write_event(&mut self.events, t_us, ev, detail)
     }
 
     /// IDR request path: `idr_req` per epoch bump, `idr_heal` per clearing IRAP.
     pub fn refresh_events(&mut self, evs: &[pal_core::refresh::Event]) -> io::Result<()> {
+        if evs.is_empty() {
+            return Ok(());
+        }
+        self.guard(|s| s.write_refresh_events(evs))
+    }
+
+    fn write_refresh_events(&mut self, evs: &[pal_core::refresh::Event]) -> io::Result<()> {
         for e in evs {
             let (ev, d) = if e.kind == 'H' {
                 (
@@ -300,40 +355,50 @@ impl Session {
                     json!({"reason": e.reason.as_str(), "epoch": e.epoch, "retry": e.retries}),
                 )
             };
-            self.event(e.t_ms * 1000, ev, d)?;
+            self.write_event(e.t_ms * 1000, ev, d)?;
         }
         Ok(())
     }
 
     pub fn au(&mut self, t_us: u64, a: &Au) -> io::Result<()> {
-        writeln!(
-            self.au,
-            "{t_us} {} {} {} {} {} {}",
-            a.sid,
-            a.data.len(),
-            a.flags,
-            u8::from(a.complete),
-            u8::from(a.salvaged),
-            a.pts_us
-        )
+        self.guard(|s| {
+            writeln!(
+                s.au,
+                "{t_us} {} {} {} {} {} {}",
+                a.sid,
+                a.data.len(),
+                a.flags,
+                u8::from(a.complete),
+                u8::from(a.salvaged),
+                a.pts_us
+            )
+        })
     }
 
     /// Capture one body; stops (with one event) once the cap is reached.
     pub fn body(&mut self, b: &RxBody) -> io::Result<()> {
-        let Some(c) = self.capture.as_mut() else {
+        if self.capture.is_none() {
             return Ok(());
-        };
-        c.body(b)?;
-        self.close_capture_at_cap(b.mono_us)
+        }
+        self.guard(|s| {
+            if let Some(c) = s.capture.as_mut() {
+                c.body(b)?;
+            }
+            s.close_capture_at_cap(b.mono_us)
+        })
     }
 
     /// Capture one tick; ticks count towards the cap like bodies do.
     pub fn tick(&mut self, now_us: u64) -> io::Result<()> {
-        let Some(c) = self.capture.as_mut() else {
+        if self.capture.is_none() {
             return Ok(());
-        };
-        c.tick(now_us)?;
-        self.close_capture_at_cap(now_us)
+        }
+        self.guard(|s| {
+            if let Some(c) = s.capture.as_mut() {
+                c.tick(now_us)?;
+            }
+            s.close_capture_at_cap(now_us)
+        })
     }
 
     fn close_capture_at_cap(&mut self, t_us: u64) -> io::Result<()> {
@@ -351,25 +416,30 @@ impl Session {
         if let Some(mut c) = self.capture.take() {
             c.flush()?;
             let bytes = c.written();
-            self.event(t_us, "capture_cap", json!({ "bytes": bytes }))?;
+            self.write_event(t_us, "capture_cap", json!({ "bytes": bytes }))?;
         }
         Ok(())
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        self.stats.flush()?;
-        self.events.flush()?;
-        self.au.flush()?;
-        if let Some(c) = self.capture.as_mut() {
-            c.flush()?;
-        }
-        Ok(())
+        self.guard(|s| {
+            s.stats.flush()?;
+            s.events.flush()?;
+            s.au.flush()?;
+            if let Some(c) = s.capture.as_mut() {
+                c.flush()?;
+            }
+            Ok(())
+        })
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.flush();
+        // A stopped log is not flushed again: its error is already latched.
+        if self.failed.is_none() {
+            let _ = self.flush();
+        }
     }
 }
 

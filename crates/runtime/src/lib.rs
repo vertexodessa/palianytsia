@@ -179,6 +179,7 @@ impl CoreIo for Sink {
             i.aus()
         });
         if let Some(l) = self.log.as_mut() {
+            // A failed write stops the session; `CoreLoop::log_err` tells.
             let _ = l.au(self.now_us, &a);
         }
         if let Some(off) = self.pts_off_us {
@@ -236,6 +237,8 @@ pub struct CoreLoop {
     deaf: pal_osd::DeafWatch,
     /// Core time (ms) of the last ladder transition logged as rung_reason.
     rung_seen_ms: i64,
+    /// The flight log's write error has been reported.
+    log_err_told: bool,
 }
 
 /// The loop's channels to the UI.
@@ -260,6 +263,7 @@ struct CalUi {
 impl CoreLoop {
     /// `lat`: the --lat latency report on stderr.
     pub fn new(core: Box<dyn GsCore>, sink: Sink, ports: LoopPorts, lat: bool) -> Self {
+        warn_low_log_space(&sink);
         Self {
             core,
             sink,
@@ -274,6 +278,7 @@ impl CoreLoop {
             cal: CalUi::default(),
             deaf: pal_osd::DeafWatch::default(),
             rung_seen_ms: i64::MIN,
+            log_err_told: false,
         }
     }
 
@@ -492,11 +497,32 @@ impl CoreLoop {
         }
         let scan = json(self.core.chan_scan_json());
         let cal = self.cal_line();
+        let log_err = self.log_err();
         let ui = match stats {
-            Some(s) => stats_line::ui_line(s, [("ladder", ladder), ("chscan", scan)], cal),
+            Some(s) => stats_line::ui_line(
+                s,
+                [("ladder", ladder), ("chscan", scan), ("log_err", log_err)],
+                cal,
+            ),
             None => line,
         };
         let _ = self.ports.stats_tx.try_send(ui);
+    }
+
+    /// The error that stopped the flight log, for the UI line. The write
+    /// calls' own results are dropped on purpose: the session latches the
+    /// first error and this reads it once per stats pass. Told once (stderr
+    /// and an event); the log itself can no longer take it.
+    fn log_err(&mut self) -> Option<serde_json::Value> {
+        let text = self.sink.log.as_ref()?.write_error()?.to_string();
+        if !self.log_err_told {
+            self.log_err_told = true;
+            eprintln!("pal: flight log stopped: {text}");
+            self.sink
+                .shared
+                .event("log_error", serde_json::json!({ "error": text }));
+        }
+        Some(text.into())
     }
 
     /// The flight log's stats line, then the deaf-card check it feeds.
@@ -578,6 +604,43 @@ fn result_text(r: &Result<(), String>, ok: &str) -> String {
         Ok(()) => ok.to_string(),
         Err(e) => e.clone(),
     }
+}
+
+/// Warns once at start when the log's volume has less room than the
+/// capture cap: a full disk stops the whole log, not only the capture.
+fn warn_low_log_space(sink: &Sink) {
+    let Some(l) = &sink.log else { return };
+    let cap = l.capture_cap();
+    let Some(free) = free_bytes(l.dir()) else {
+        return;
+    };
+    if cap > 0 && free < cap {
+        eprintln!(
+            "pal: flight log volume has {} MB free, less than the {} MB capture cap",
+            free >> 20,
+            cap >> 20
+        );
+        sink.shared.event(
+            "log_space",
+            serde_json::json!({"free_bytes": free, "capture_cap": cap}),
+        );
+    }
+}
+
+/// Bytes an unprivileged writer may still use on the volume holding `p`.
+fn free_bytes(p: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is plain old data that the call fills in; zeroed is a
+    // valid value of it.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is NUL-terminated and outlives the call; `st` is writable.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // Both fields are 32-bit on 32-bit targets.
+    #[allow(clippy::useless_conversion)]
+    Some(u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize)))
 }
 
 /// Builds a core for the channel the drone was found on.
@@ -1110,6 +1173,9 @@ pub fn pump<L: BodyLoop>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::Write;
+
     /// The formula Sink computed inline before it called
     /// pal_core::uplink::cap_to_complete_us: kept to prove the two agree.
     fn inline_before(now_us: u64, off: i64, pts: u32) -> u64 {
@@ -1135,5 +1201,141 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A volume that takes `left` more bytes over all the session's line
+    /// files, then fails every write as a full disk would.
+    #[derive(Default)]
+    struct Disk {
+        left: u64,
+        failed: bool,
+        calls_after: u64,
+    }
+
+    struct FailAfter(Arc<Mutex<Disk>>, flightlog::session::LineWriter);
+
+    impl Write for FailAfter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let mut d = self.0.lock().unwrap();
+            if d.failed {
+                d.calls_after += 1;
+            }
+            if d.failed || (b.len() as u64) > d.left {
+                d.failed = true;
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            d.left -= b.len() as u64;
+            self.1.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let mut d = self.0.lock().unwrap();
+            if d.failed {
+                d.calls_after += 1;
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            self.1.flush()
+        }
+    }
+
+    /// One AU per tick and a stats line, like a live session.
+    struct AuCore;
+
+    impl GsCore for AuCore {
+        fn on_rx(&mut self, _: &RxBody, _: &mut dyn CoreIo) {}
+        fn tick(&mut self, _: u64, io: &mut dyn CoreIo) {
+            io.on_au(Au {
+                data: vec![0; 100],
+                complete: true,
+                ..Au::default()
+            });
+        }
+        fn stats_json(&self) -> String {
+            r#"{"session":true,"rung":0}"#.into()
+        }
+        fn link_op(&self) -> (i32, i32) {
+            (0, 20)
+        }
+    }
+
+    #[test]
+    fn free_space_reads_the_volume_or_nothing() {
+        assert!(free_bytes(&std::env::temp_dir()).is_some_and(|b| b > 0));
+        assert_eq!(free_bytes(std::path::Path::new("/no/such/dir")), None);
+    }
+
+    #[test]
+    fn a_full_disk_stops_the_log_once_and_the_ui_line_says_so() {
+        let root = std::env::temp_dir().join(format!("pal-rt-logerr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let run = flightlog::session::Run {
+            app: "test",
+            core: "rust",
+            mode: "gs",
+            config: None,
+        };
+        let mut log = Session::create(&root, std::time::SystemTime::now(), 0, &run).unwrap();
+        let disk = Arc::new(Mutex::new(Disk {
+            left: 4000,
+            ..Disk::default()
+        }));
+        log.wrap_writers(|_, w| Box::new(FailAfter(disk.clone(), w)));
+        let (au_tx, _au_rx) = mpsc::sync_channel(1 << 16);
+        let (mav_tx, _mav_rx) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared::default());
+        let sink = Sink {
+            au_tx,
+            pts_off_us: None,
+            mav_tx,
+            udp: None,
+            card: None,
+            log: Some(log),
+            now_us: 0,
+            shared: shared.clone(),
+            idr: None,
+            cam_fps: Default::default(),
+        };
+        let (stats_tx, stats_rx) = mpsc::sync_channel(1 << 12);
+        let (params_tx, _params_rx) = mpsc::sync_channel(1 << 12);
+        let (_cmd_tx, cmd_rx) = mpsc::sync_channel(1);
+        let (set_res_tx, _set_res_rx) = mpsc::sync_channel(1);
+        let ports = LoopPorts {
+            stats_tx,
+            params_tx,
+            cmd_rx,
+            set_res_tx,
+        };
+        let mut cl = CoreLoop::new(Box::new(AuCore), sink, ports, false);
+        let mut told = Vec::new();
+        let mut t = 1_000_000;
+        // 5 s of ticks: the au.log lines alone pass 4000 bytes in well
+        // under a second, so the disk fills early and stays full.
+        while t < 6_000_000 {
+            cl.tick(t);
+            // What the next tick would drain into the log, taken first.
+            told.extend(shared.events.lock().unwrap().drain(..));
+            t += TICK_US;
+        }
+        drop(cl);
+        let logged: Vec<_> = told.iter().filter(|(ev, _)| *ev == "log_error").collect();
+        assert_eq!(logged.len(), 1, "{told:?}");
+        assert!(
+            logged[0].1["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("No space left")),
+            "{:?}",
+            logged[0]
+        );
+        let d = disk.lock().unwrap();
+        assert!(d.failed);
+        assert_eq!(d.calls_after, 0, "writes after the first failure");
+        let last = stats_rx.try_iter().last().expect("UI lines");
+        let v: serde_json::Value = serde_json::from_str(&last).unwrap();
+        assert!(
+            v["log_err"]
+                .as_str()
+                .is_some_and(|e| e.contains("No space left")),
+            "{last}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
