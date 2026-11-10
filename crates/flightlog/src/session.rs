@@ -116,6 +116,10 @@ pub(crate) const CAPTURE_FILE: &str = "bodies.bin";
 pub(crate) const AU_FILE: &str = "au.log";
 pub(crate) const EVENTS_FILE: &str = "events.jsonl";
 pub(crate) const STATS_FILE: &str = "stats.jsonl";
+/// mabur's loss-episode log, same name and text as its GS writes
+/// (gs/src/fec_log.cpp), so mabur's flightreport.py reads it.
+pub(crate) const FEC_FILE: &str = "fec.log";
+const FEC_FORMAT: &str = "feclog 4";
 /// Lines `Session::create` writes before any data.
 pub(crate) const AU_HEADER_LINES: usize = 2;
 pub(crate) const EVENTS_HEADER_LINES: usize = 1;
@@ -177,6 +181,7 @@ pub struct Session {
     stats: LineWriter,
     events: LineWriter,
     au: LineWriter,
+    fec: LineWriter,
     capture: Option<capture::Writer<BufWriter<File>>>,
     capture_cap: u64,
     last: Option<Map<String, Value>>,
@@ -232,9 +237,11 @@ impl Session {
         let mut au = create(&dir, AU_FILE)?;
         writeln!(au, "{AULOG_MARKER}")?;
         writeln!(au, "# t_us sid bytes flags complete salvaged pts_us")?;
+        let mut fec = create(&dir, FEC_FILE)?;
+        writeln!(fec, "{FEC_FORMAT}")?;
         // A release build aborts on a panic without dropping the writers:
         // the headers and the build event at least reach the disk.
-        for w in [&mut stats, &mut events, &mut au] {
+        for w in [&mut stats, &mut events, &mut au, &mut fec] {
             w.flush()?;
         }
         let capture = if capture_cap > 0 {
@@ -253,6 +260,7 @@ impl Session {
             stats,
             events,
             au,
+            fec,
             capture,
             capture_cap,
             last: None,
@@ -278,13 +286,14 @@ impl Session {
         self.failed.as_ref()
     }
 
-    /// Puts `f`'s writer around each line file's (stats, events, au), e.g.
+    /// Puts `f`'s writer around each line file's (stats, events, au, fec), e.g.
     /// one that fails after some bytes.
     pub fn wrap_writers(&mut self, mut f: impl FnMut(&'static str, LineWriter) -> LineWriter) {
         for (name, w) in [
             (STATS_FILE, &mut self.stats),
             (EVENTS_FILE, &mut self.events),
             (AU_FILE, &mut self.au),
+            (FEC_FILE, &mut self.fec),
         ] {
             let inner = std::mem::replace(w, Box::new(io::sink()));
             *w = f(name, inner);
@@ -369,8 +378,28 @@ impl Session {
         self.guard(|s| s.write_refresh_events(evs))
     }
 
+    /// Loss episodes from `GsCore::take_fec_rows`, already in fec.log text.
+    pub fn fec_rows(&mut self, rows: &[String]) -> io::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.guard(|s| {
+            for r in rows {
+                writeln!(s.fec, "{r}")?;
+            }
+            Ok(())
+        })
+    }
+
     fn write_refresh_events(&mut self, evs: &[pal_core::refresh::Event]) -> io::Result<()> {
         for e in evs {
+            // fec.log's `I` / `H` lines (FecLog::request / heal) beside the
+            // episodes they answer.
+            if e.kind == 'H' {
+                writeln!(self.fec, "H {} {} {}", e.t_ms, e.heal_ms, e.retries)?;
+            } else {
+                writeln!(self.fec, "I {} {} {}", e.t_ms, e.reason.as_str(), e.epoch)?;
+            }
             let (ev, d) = if e.kind == 'H' {
                 (
                     "idr_heal",
@@ -453,6 +482,7 @@ impl Session {
             s.stats.flush()?;
             s.events.flush()?;
             s.au.flush()?;
+            s.fec.flush()?;
             if let Some(c) = s.capture.as_mut() {
                 c.flush()?;
             }
@@ -499,6 +529,66 @@ pub struct Summary {
     /// Channel core hop steps: (t_us, kind, epoch, target, ms since the
     /// order) in log order.
     pub hops: Vec<(u64, String, u64, u64, f64)>,
+    /// fec.log's episodes per layer; None for a session written before it.
+    pub fec: Option<[FecTotals; 2]>,
+}
+
+/// One layer's loss episodes in fec.log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FecTotals {
+    pub episodes: u64,
+    /// Episodes by missing source symbols: 1, 2, 3-5, 6-10, 11+.
+    pub by_missing: [u64; 5],
+    pub missing: u64,
+    pub recovered: u64,
+    pub retx: u64,
+    pub abandoned: u64,
+}
+
+impl FecTotals {
+    pub const BUCKETS: [&'static str; 5] = ["1", "2", "3-5", "6-10", "11+"];
+
+    fn add(&mut self, missing: u64, recovered: u64, retx: u64, abandoned: u64) {
+        self.episodes += 1;
+        let b = match missing {
+            0 | 1 => 0,
+            2 => 1,
+            3..=5 => 2,
+            6..=10 => 3,
+            _ => 4,
+        };
+        self.by_missing[b] += 1;
+        self.missing += missing;
+        self.recovered += recovered;
+        self.retx += retx;
+        self.abandoned += abandoned;
+    }
+}
+
+/// Episode rows of a fec.log (`I` / `H` lines and unknown text skipped).
+fn read_fec(path: &Path) -> io::Result<Option<[FecTotals; 2]>> {
+    let f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut t = [FecTotals::default(); 2];
+    for l in BufReader::new(f).lines() {
+        let l = l?;
+        let f: Vec<&str> = l.split(' ').collect();
+        if f.len() != 14 {
+            continue;
+        }
+        let n = |i: usize| f[i].parse::<u64>().ok();
+        let (Some(sid), Some(m), Some(rec), Some(rtx), Some(ab)) = (n(1), n(7), n(8), n(9), n(10))
+        else {
+            continue;
+        };
+        if let Some(x) = t.get_mut(sid as usize) {
+            x.add(m, rec, rtx, ab);
+        }
+    }
+    Ok(Some(t))
 }
 
 fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io::Result<()> {
@@ -617,6 +707,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
         }
     }
     s.events = counts;
+    s.fec = read_fec(&dir.join(FEC_FILE))?;
     if t_max >= t_min && t_min != u64::MAX {
         s.span_s = (t_max - t_min) as f64 / 1e6;
     }
@@ -785,6 +876,52 @@ mod tests {
 
     /// Writes into a file that blocks (flash GC, a full device) stall the
     /// core thread; the stats row after such a call says how long.
+    #[test]
+    fn loss_episodes_and_refresh_rows_go_to_fec_log_in_mabur_text() {
+        use pal_core::refresh::{Event, Reason};
+        let root = std::env::temp_dir().join(format!("pal-fl-fec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut s = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
+        s.fec_rows(&[
+            "1000 0 2 20 0.50 100 1 1 1 0 0 0 2 32".into(),
+            "1200 0 2 20 0.50 200 12 7 5 1 1 0 3 32".into(),
+            "1300 1 2 20 0.25 300 4 3 0 0 3 0 1 32".into(),
+        ])
+        .expect("rows");
+        let ev = |kind, t_ms| Event {
+            kind,
+            reason: Reason::Lost,
+            epoch: 4,
+            t_ms,
+            heal_ms: 350,
+            retries: 1,
+        };
+        s.refresh_events(&[ev('I', 1250), ev('H', 1600)])
+            .expect("refresh");
+        let dir = s.dir().to_path_buf();
+        drop(s);
+        let text = fs::read_to_string(dir.join(FEC_FILE)).expect("fec.log");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "feclog 4");
+        assert_eq!(lines[4], "I 1250 lost 4");
+        assert_eq!(lines[5], "H 1600 350 1");
+        let fec = summarize(&dir).expect("summary").fec.expect("fec totals");
+        assert_eq!(fec[0].episodes, 2);
+        assert_eq!(fec[0].by_missing, [1, 0, 0, 1, 0]);
+        assert_eq!(
+            (
+                fec[0].missing,
+                fec[0].recovered,
+                fec[0].retx,
+                fec[0].abandoned
+            ),
+            (8, 6, 1, 1)
+        );
+        assert_eq!(fec[1].by_missing, [0, 0, 1, 0, 0]);
+        assert_eq!(fec[1].abandoned, 3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_slow_write_shows_in_the_next_stats_row_and_the_summary() {
         struct Slow(LineWriter, Arc<AtomicBool>);

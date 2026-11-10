@@ -387,6 +387,7 @@ impl CoreLoop {
         self.hand_cal_log_dir();
         self.core.tick(now, &mut self.sink);
         self.log_chan_records(now);
+        self.log_fec_rows();
         self.publish_params(now);
         self.step_idr(now);
         self.publish_stats(now);
@@ -473,6 +474,15 @@ impl CoreLoop {
 
     /// The channel core's records into the flight log, each under its own
     /// event name; dropped unread when there is no log.
+    /// Taken every tick with or without a log, like the channel records,
+    /// so the core's queue stays short.
+    fn log_fec_rows(&mut self) {
+        let rows = self.core.take_fec_rows();
+        if let Some(l) = self.sink.log.as_mut() {
+            let _ = l.fec_rows(&rows);
+        }
+    }
+
     fn log_chan_records(&mut self, now: u64) {
         let recs = self.core.take_chan_records();
         let Some(l) = self.sink.log.as_mut() else {

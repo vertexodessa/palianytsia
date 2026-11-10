@@ -179,6 +179,13 @@ pub trait GsCore {
     fn take_chan_records(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// Loss episodes closed since the last call, one fec.log row each in
+    /// mabur's `feclog 4` text: `t_ms sid mcs bw ov first_seq span missing
+    /// recovered retx abandoned stale repairs window`. The oracle's shim
+    /// does not expose its episodes: empty.
+    fn take_fec_rows(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     /// The run's state and result table as one JSON object (`cal::status_json`).
     fn cal_json(&self) -> Option<String> {
         None

@@ -285,7 +285,13 @@ pub struct RustCore {
     stored_ch: Arc<AtomicU8>,
     /// The channel core's records for the flight log.
     chan_recs: Arc<std::sync::Mutex<ChanRecords>>,
+    /// Closed loss episodes as fec.log rows, until the loop takes them.
+    fec_rows: std::collections::VecDeque<String>,
 }
+
+/// Rows kept for a loop that never takes them (no flight log): about a
+/// minute of a bad link, oldest dropped.
+const FEC_ROWS_CAP: usize = 4096;
 
 /// What `with_cards` needs beyond the config: the cards and the channel
 /// core's clock (real time when threaded; the tick clock otherwise).
@@ -448,6 +454,38 @@ impl RustCore {
         Self::build(cfg, opts, None)
     }
 
+    /// mabur's GS drains the episodes every tick and stamps each with the op
+    /// and that layer's commanded overhead as of the tick (gs/src/main.cpp);
+    /// the row text is FecLog::row's, so flightreport.py reads the file.
+    fn queue_fec_rows(&mut self, now_ms: u64, op: &OpPoint) {
+        for sid in 0..2 {
+            let ov = if sid == 0 {
+                op.overhead_base
+            } else {
+                op.overhead_enh
+            };
+            for e in self.agg.decoder_mut().take_episodes(sid) {
+                if self.fec_rows.len() >= FEC_ROWS_CAP {
+                    self.fec_rows.pop_front();
+                }
+                self.fec_rows.push_back(format!(
+                    "{now_ms} {sid} {} {} {ov:.2} {} {} {} {} {} {} {} {} {}",
+                    op.mcs,
+                    op.bw,
+                    e.first_seq as u32,
+                    e.span,
+                    e.missing,
+                    e.recovered,
+                    e.retx,
+                    e.abandoned,
+                    e.stale,
+                    e.repairs,
+                    e.window
+                ));
+            }
+        }
+    }
+
     /// A GS that drives `env.cards` (WebGs with a roster): `opts.channel`
     /// is the start channel (the card's), Mode::Gs.
     pub fn with_cards(cfg: &Config, opts: CoreOpts, env: ChanEnv) -> Result<Self, String> {
@@ -579,6 +617,7 @@ impl RustCore {
             idr_req: 0,
             stored_ch,
             chan_recs,
+            fec_rows: std::collections::VecDeque::new(),
         })
     }
 
@@ -925,6 +964,7 @@ impl GsCore for RustCore {
             },
         };
         let lh = self.lha.tick(now_ms as f64, &mut self.agg, &inp);
+        self.queue_fec_rows(now_ms, &inp.op);
         if let Some(g) = self.gs.as_mut() {
             if let Some(t) = lh.probe_tail_ms {
                 g.slot.set_probe_tail_ms(t);
@@ -1061,6 +1101,10 @@ impl GsCore for RustCore {
     fn take_chan_records(&mut self) -> Vec<String> {
         let mut r = self.chan_recs.lock().unwrap_or_else(|p| p.into_inner());
         r.q.drain(..).collect()
+    }
+
+    fn take_fec_rows(&mut self) -> Vec<String> {
+        self.fec_rows.drain(..).collect()
     }
 
     fn cal_abort(&mut self) {

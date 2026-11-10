@@ -233,6 +233,14 @@ impl Sink {
         }
     }
 
+    /// The core's closed loss episodes into fec.log, every tick.
+    fn log_fec(&mut self, core: &mut dyn GsCore) {
+        let rows = core.take_fec_rows();
+        if let Some(l) = self.log.as_mut() {
+            l.fec_rows(&rows).unwrap();
+        }
+    }
+
     /// Once a second of core clock: the stats line into the flight log.
     fn log_stats(&mut self, now_us: u64, last: &mut u64, core: &dyn GsCore) {
         if self.log.is_some() && now_us >= *last + 1_000_000 {
@@ -571,6 +579,7 @@ fn replay(o: Opts) {
                 let t0 = *t_first.get_or_insert(t);
                 sets.fire(&mut *core, |ts| t >= t0 + (ts * 1e6) as u64);
                 core.tick(t, &mut sink);
+                sink.log_fec(&mut *core);
                 sink.idr_step(t, &mut *core);
                 sink.log_stats(t, &mut last_stats, &*core);
             }
@@ -696,6 +705,9 @@ fn log_summary(o: Opts) {
             );
         }
     }
+    if let Some(fec) = &s.fec {
+        print_fec(fec);
+    }
     if let Some((t, values)) = &s.params {
         print_params(*t, values);
     }
@@ -732,6 +744,32 @@ fn same_value(text: &str, bundle: &toml::Value) -> bool {
 
 /// The drone's parameters in the session's last snapshot; those that
 /// differ from the bundle are listed with the bundle's value.
+/// The loss-run shape FEC has to cover: an episode is one run of missing
+/// source symbols closed by the decoder's window, so its size against the
+/// window says whether the overhead fits the losses.
+fn print_fec(fec: &[flightlog::session::FecTotals; 2]) {
+    for (sid, t) in fec.iter().enumerate() {
+        if t.episodes == 0 {
+            println!("  fec.log sid {sid}: no loss episodes");
+            continue;
+        }
+        let hist: Vec<String> = flightlog::session::FecTotals::BUCKETS
+            .iter()
+            .zip(t.by_missing)
+            .map(|(b, n)| format!("{b}:{n}"))
+            .collect();
+        println!(
+            "  fec.log sid {sid}: {} episodes by missing symbols [{}]; missing {}, recovered {}, retx {}, abandoned {}",
+            t.episodes,
+            hist.join(" "),
+            t.missing,
+            t.recovered,
+            t.retx,
+            t.abandoned
+        );
+    }
+}
+
 fn print_params(t_us: u64, values: &serde_json::Map<String, serde_json::Value>) {
     let bundle: toml::Table = BUNDLE_TOML.parse().unwrap_or_default();
     let mut differ = Vec::new();
