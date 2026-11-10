@@ -19,12 +19,21 @@ cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-and
   "$A/jniLibs/arm64-v8a/"
 cp "$CFG" "$A/assets/gs.toml"
 XR_VER=1.1.43
+# The loader .so ships inside the signed APK, so the AAR is held to the
+# sha256 Maven Central publishes for it, checked on every run: a cached copy
+# that changed stops the build as surely as a bad download.
+XR_SHA256=7e1b36141f9a4f1fa4a7e061936344fd9fcd36bce6c47eae2ad09812736167b6
 AAR=$ROOT/target/android/openxr_loader_for_android-$XR_VER.aar
 if [[ ! -f $AAR ]]; then
   mkdir -p "$(dirname "$AAR")"
   curl -fsSL -o "$AAR.part" \
     "https://repo1.maven.org/maven2/org/khronos/openxr/openxr_loader_for_android/$XR_VER/openxr_loader_for_android-$XR_VER.aar"
   mv "$AAR.part" "$AAR"
+fi
+if ! echo "$XR_SHA256  $AAR" | sha256sum -c --quiet -; then
+  rm -f "$AAR"
+  echo "quest-apk: $AAR is not sha256 $XR_SHA256; deleted, a rerun downloads it again" >&2
+  exit 1
 fi
 unzip -o -j -q "$AAR" prefab/modules/openxr_loader/libs/android.arm64-v8a/libopenxr_loader.so \
   -d "$A/jniLibs/arm64-v8a/"

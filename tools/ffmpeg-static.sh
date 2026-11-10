@@ -22,10 +22,17 @@ TAR=$SRC/ffmpeg-$VER.tar.xz
 echo "$SHA  $TAR" | sha256sum -c -
 rm -rf "$SRC/ffmpeg-$VER"
 tar -C "$SRC" -xf "$TAR"
-NV=${NV_HEADERS_TAG:-n12.1.14.0}
-rm -rf "$SRC/nv-codec-headers"
-git clone -q --depth 1 -b "$NV" https://github.com/FFmpeg/nv-codec-headers "$SRC/nv-codec-headers"
-make -C "$SRC/nv-codec-headers" PREFIX="$OUT" install >/dev/null
+# nv-codec-headers by commit, not by tag: a tag can be moved, a commit sha
+# names its content. This is tag n12.1.14.0.
+NV_SHA=${NV_HEADERS_SHA:-1889e62e2d35ff7aa9baca2bceb14f053785e6f1}
+NV_DIR=$SRC/nv-codec-headers
+rm -rf "$NV_DIR"
+git init -q "$NV_DIR"
+git -C "$NV_DIR" fetch -q --depth 1 https://github.com/FFmpeg/nv-codec-headers "$NV_SHA"
+git -C "$NV_DIR" checkout -q --detach FETCH_HEAD
+[[ $(git -C "$NV_DIR" rev-parse HEAD) == "$NV_SHA" ]] ||
+  { echo "nv-codec-headers: HEAD is not $NV_SHA" >&2; exit 1; }
+make -C "$NV_DIR" PREFIX="$OUT" install >/dev/null
 export PKG_CONFIG_PATH="$OUT/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 cd "$SRC/ffmpeg-$VER"
 ./configure --prefix="$OUT" --enable-static --disable-shared --enable-pic \
