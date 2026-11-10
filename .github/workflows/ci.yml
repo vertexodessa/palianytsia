@@ -32,6 +32,31 @@ jobs:
       - name: Drone installer against fake drones
         run: python3 tools/tests/drone_install_test.py
 
+  android:
+    # The phone and Quest crates compile only for aarch64-linux-android, so
+    # the host gates never see their cfg(target_os = "android") code; without
+    # this job a break there surfaces in the release workflow at tag time.
+    runs-on: ubuntu-24.04
+    env:
+      # The NDK of release.yml's apks job.
+      NDK_VERSION: 29.0.14206865
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: clippy
+      - name: NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Android clippy
+        run: tools/android-build.sh clippy -p decode -p pal-android -p pal-quest -p pal-phone --locked -- -D warnings
+      - name: Android build (debug, no Gradle, no signing)
+        run: tools/android-build.sh build -p pal-phone -p pal-quest --locked
+
   maburd:
     # Two independent builds of the same commit; the compare job below
     # requires byte-identical binaries.

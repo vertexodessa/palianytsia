@@ -30,6 +30,8 @@ tools/m0-parity.sh     # pal-ref == mabur's webgs replay on maburd dry-run files
 tools/m1-replay.sh     # ref == rust: AUs, sent RC bytes, final stats line, --idr path
 tools/doc-check.sh     # docs vs tree: .gitmodules branches, MABUR_RELEASE, RC_VERSION, release tag, paths
 python3 tools/tests/drone_install_test.py   # drone-install.py against fake drones: exit code, mabur.toml, changed paths, backup
+tools/android-build.sh clippy -p decode -p pal-android -p pal-quest -p pal-phone -- -D warnings
+tools/android-build.sh build -p pal-phone -p pal-quest   # aarch64 Android, debug, no Gradle (CI job android)
 ```
 The NEON GF(256) kernel the phone and the Quest use is not built on x86: CI job `aarch64-qemu` runs the
 pal-fec, pal-wire and pal-core tests on aarch64 under qemu-user. After a `gf256.rs` change, also run
