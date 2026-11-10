@@ -657,26 +657,27 @@ pub const LOST_US: u64 = 8_000_000;
 /// boot, as in the channel core's search (mabur 39039eac).
 pub const GRID_AFTER_ROUNDS: u32 = 2;
 
+mod sweep;
+
 /// Sweeps `set` (starting at `first`) until `hits` grows by FOUND_HITS
 /// within one dwell. Bodies queued meanwhile are dropped: none may reach a
 /// core built for another channel. None when asked to quit. `tuned` is the
 /// channel and width the card is on, kept between sweeps.
 #[allow(clippy::too_many_arguments)]
 fn search(
-    card: &devourer_sys::Card,
+    io: &mut impl sweep::SweepIo,
     set: &[u8],
     first: u8,
     width: u8,
     tuned: &mut (u8, u8),
     cur: &AtomicU8,
     hits: &AtomicU32,
-    rx: &Receiver<RxBody>,
     shared: &Shared,
 ) -> Result<Option<u8>, String> {
     let mut order = vec![first];
     order.extend(set.iter().copied().filter(|&c| c != first));
     shared.searching.store(true, Ordering::Relaxed);
-    let t = Instant::now();
+    let t = io.now_us();
     let mut rounds = 0u32;
     // pump's count: what the sweep takes off the queue must not read as a
     // backlog on the latency line.
@@ -690,24 +691,24 @@ fn search(
             cur.store(0, Ordering::Relaxed);
             match dev_card::retune_plan(width, tuned.1, tuned.0, ch) {
                 Some(w) => {
-                    card.ctl().set_monitor(ch, w)?;
+                    io.set_monitor(ch, w)?;
                     tuned.1 = w;
                 }
-                None if card.ctl().fast_retune(ch) => {}
+                None if io.fast_retune(ch) => {}
                 None => return Err(format!("fast_retune({ch}) failed")),
             }
             tuned.0 = ch;
             shared.channel.store(ch, Ordering::Relaxed);
             // Frames already in the USB pipeline belong to the old channel.
-            std::thread::sleep(Duration::from_millis(5));
-            while rx.try_recv().is_ok() {
+            io.sleep(Duration::from_millis(5));
+            while io.try_take() {
                 taken();
             }
             let h0 = hits.load(Ordering::Relaxed);
             cur.store(ch, Ordering::Relaxed);
-            let end = Instant::now() + Duration::from_millis(DWELL_MS);
-            while Instant::now() < end {
-                if rx.recv_timeout(Duration::from_millis(20)).is_ok() {
+            let end = io.now_us() + DWELL_MS * 1000;
+            while io.now_us() < end {
+                if io.take_within(Duration::from_millis(20)) {
                     taken();
                 }
                 if hits.load(Ordering::Relaxed).wrapping_sub(h0) >= FOUND_HITS {
@@ -732,7 +733,7 @@ fn search(
     if let Some(ch) = found {
         shared.event(
             "drone_found",
-            serde_json::json!({"ch": ch, "ms": t.elapsed().as_millis() as u64, "rounds": rounds}),
+            serde_json::json!({"ch": ch, "ms": (io.now_us() - t) / 1000, "rounds": rounds}),
         );
     }
     Ok(found)
@@ -1003,8 +1004,9 @@ fn run_runtime_owned(
     let mut find = |cl: &mut CoreLoop, core_ch: &mut u8| -> Result<bool, String> {
         let s = srch.as_mut().expect("searching");
         let from = *core_ch;
+        let mut io = sweep::LiveSweep { card, rx: &rx };
         let Some(ch) = self::search(
-            card, &s.set, from, width, &mut tuned, &cur, &hits, &rx, &shared,
+            &mut io, &s.set, from, width, &mut tuned, &cur, &hits, &shared,
         )?
         else {
             return Ok(false);
@@ -1022,7 +1024,7 @@ fn run_runtime_owned(
     if gs {
         cl.sink.card = Some(card.clone());
     }
-    let mut seen = (hits.load(Ordering::Relaxed), clock());
+    let mut seen = sweep::Heard::new(hits.load(Ordering::Relaxed), clock());
     let r = pump(
         &mut cl,
         &rx,
@@ -1030,17 +1032,14 @@ fn run_runtime_owned(
         &shared,
         |_, _| {},
         |cl, now| {
-            let h = hits.load(Ordering::Relaxed);
-            if h != seen.0 {
-                seen = (h, now);
-            } else if searching && now.saturating_sub(seen.1) >= LOST_US {
+            if seen.lost(hits.load(Ordering::Relaxed), now) && searching {
                 cl.sink
                     .shared
                     .event("drone_lost", serde_json::json!({"ch": core_ch}));
                 if !find(cl, &mut core_ch)? {
                     return Ok(false);
                 }
-                seen = (hits.load(Ordering::Relaxed), clock());
+                seen = sweep::Heard::new(hits.load(Ordering::Relaxed), clock());
             }
             Ok(true)
         },
