@@ -494,6 +494,8 @@ pub struct Summary {
     /// The longest flight-log write call over the stats rows and the row
     /// time it was reported at (µs); None when no row has `log_max_us`.
     pub log_max_us: Option<(u64, u64)>,
+    /// The last `params` event: its time (µs) and the drone's {id: value}.
+    pub params: Option<(u64, Map<String, Value>)>,
 }
 
 fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io::Result<()> {
@@ -583,6 +585,12 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
                 .cards
                 .push(v.get("chips").and_then(Value::as_str).unwrap_or("?").into()),
             "panic_prev" => s.panic_prev = v.get("text").and_then(Value::as_str).map(Into::into),
+            "params" => {
+                if let Some(m) = v.get("values").and_then(Value::as_object) {
+                    let t = v.get("t_us").and_then(Value::as_u64).unwrap_or(0);
+                    s.params = Some((t, m.clone()));
+                }
+            }
             _ => {}
         }
         if ev == "session" {

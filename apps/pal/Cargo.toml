@@ -16,3 +16,4 @@ runtime.workspace = true
 flightlog.workspace = true
 decode.workspace = true
 pal-build.workspace = true
+toml = "0.8"

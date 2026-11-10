@@ -685,6 +685,9 @@ fn log_summary(o: Opts) {
             t as f64 / 1e6
         );
     }
+    if let Some((t, values)) = &s.params {
+        print_params(*t, values);
+    }
     let ev: Vec<String> = s.events.iter().map(|(k, n)| format!("{k} {n}")).collect();
     println!(
         "  events: {}",
@@ -696,6 +699,55 @@ fn log_summary(o: Opts) {
     );
     if let Some(v) = &s.last_stats {
         println!("  last stats: {v}");
+    }
+}
+
+/// The drone config the release installs: what "default" means for a
+/// parameter the session ran with.
+const BUNDLE_TOML: &str = include_str!("../../../release/drone/mabur.toml");
+
+/// `text` (the parameter client's value) against the bundle's value.
+fn same_value(text: &str, bundle: &toml::Value) -> bool {
+    match bundle {
+        toml::Value::Boolean(b) => text == if *b { "1" } else { "0" },
+        toml::Value::Integer(i) => text.parse::<i64>().is_ok_and(|x| x == *i),
+        toml::Value::Float(f) => text
+            .parse::<f64>()
+            .is_ok_and(|x| (x - f).abs() <= 1e-6 * f.abs().max(1.0)),
+        toml::Value::String(b) => text == b,
+        _ => false,
+    }
+}
+
+/// The drone's parameters in the session's last snapshot; those that
+/// differ from the bundle are listed with the bundle's value.
+fn print_params(t_us: u64, values: &serde_json::Map<String, serde_json::Value>) {
+    let bundle: toml::Table = BUNDLE_TOML.parse().unwrap_or_default();
+    let mut differ = Vec::new();
+    for (id, v) in values {
+        let text = v.as_str().unwrap_or_default();
+        let row = pal_core::mav::TABLE.iter().find(|r| r.id == id);
+        // What the drone reports about itself (its camera's modes) has no
+        // default to differ from.
+        if row.is_some_and(|r| matches!(r.apply, pal_core::mav::Apply::ReadOnly)) {
+            continue;
+        }
+        let def = row.and_then(|r| bundle.get(r.section)?.get(r.key));
+        if def.is_some_and(|d| same_value(text, d)) {
+            continue;
+        }
+        let name = row.map_or(String::new(), |r| format!(" {}.{}", r.section, r.key));
+        let def = def.map_or("not in the bundle".to_string(), |d| format!("bundle {d}"));
+        differ.push(format!("    {id}{name} = {text} ({def})"));
+    }
+    println!(
+        "  drone parameters at {:.1} s: {} read, {} differ from release/drone/mabur.toml",
+        t_us as f64 / 1e6,
+        values.len(),
+        differ.len()
+    );
+    for l in differ {
+        println!("{l}");
     }
 }
 

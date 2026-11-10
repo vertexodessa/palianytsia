@@ -239,6 +239,8 @@ pub struct CoreLoop {
     rung_seen_ms: Option<i64>,
     /// The flight log's write error has been reported.
     log_err_told: bool,
+    /// The drone's parameter table as last read, for the flight log.
+    params: ParamLog,
     /// The cards the core drives, in card order (`watch_cards`).
     taps: Vec<Arc<dyn RxTap>>,
 }
@@ -281,6 +283,7 @@ impl CoreLoop {
             deaf: pal_osd::DeafWatch::default(),
             rung_seen_ms: None,
             log_err_told: false,
+            params: ParamLog::default(),
             taps: Vec::new(),
         }
     }
@@ -430,10 +433,12 @@ impl CoreLoop {
             pal_osd::params::Cmd::Set(row, text) => {
                 let r = self.core.param_set(row, &text);
                 eprintln!("pal: param set {row} {text:?}: {r:?}");
-                // Android has no stderr: the flight log keeps it.
+                // Android has no stderr: the flight log keeps it. Row
+                // numbers move between releases; the id does not.
+                let (id, prev) = self.params.row(row);
                 self.sink.shared.event(
                     "param_set",
-                    serde_json::json!({"row": row, "value": text,
+                    serde_json::json!({"row": row, "id": id, "prev": prev, "value": text,
                         "result": result_text(&r, "sent")}),
                 );
                 let _ = self.ports.set_res_tx.try_send((row, r));
@@ -468,7 +473,11 @@ impl CoreLoop {
     fn publish_params(&mut self, now: u64) {
         if now >= self.last_params_us + 500_000 {
             self.last_params_us = now;
-            let _ = self.ports.params_tx.try_send(self.core.params_json(now));
+            let j = self.core.params_json(now);
+            if let Some(values) = self.params.note(&j) {
+                self.sink.shared.event("params", values);
+            }
+            let _ = self.ports.params_tx.try_send(j);
         }
     }
 
@@ -630,6 +639,56 @@ impl CoreLoop {
             l.skipped_rgba.load(Ordering::Relaxed),
             log_max as f64 / 1000.0,
         );
+    }
+}
+
+/// The drone's parameter table for the flight log. Without it a session
+/// does not say what the drone ran (encoder floor, power mode, FEC
+/// window), and an A/B read from two sessions credits the wrong change.
+#[derive(Default)]
+struct ParamLog {
+    /// (id, value) per table row, from the last `params_json`.
+    rows: Vec<(String, Option<String>)>,
+    /// The {id: value} map last written; None until the next listing.
+    logged: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ParamLog {
+    /// Reads one `params_json`. Returns the snapshot to log: the first
+    /// full read after a listing (each link-up re-lists), then whenever a
+    /// value differs from the last one written.
+    fn note(&mut self, json: &str) -> Option<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        let s = |x: &serde_json::Value| x.as_str().map(str::to_string);
+        self.rows = v
+            .get("rows")?
+            .as_array()?
+            .iter()
+            .map(|r| (s(&r["id"]).unwrap_or_default(), s(&r["value"])))
+            .collect();
+        let list = v.get("list").and_then(serde_json::Value::as_str);
+        if !matches!(list, Some("complete" | "partial")) {
+            // Unlinked or listing: the next table is a new snapshot.
+            self.logged = None;
+            return None;
+        }
+        let values: serde_json::Map<_, _> = self
+            .rows
+            .iter()
+            .filter_map(|(id, v)| Some((id.clone(), v.clone()?.into())))
+            .collect();
+        if values.is_empty() || self.logged.as_ref() == Some(&values) {
+            return None;
+        }
+        self.logged = Some(values.clone());
+        Some(serde_json::json!({"list": list, "values": values}))
+    }
+
+    /// Row `row`'s id and its value before a set.
+    fn row(&self, row: usize) -> (Option<&str>, Option<&str>) {
+        self.rows
+            .get(row)
+            .map_or((None, None), |(id, v)| (Some(id.as_str()), v.as_deref()))
     }
 }
 
@@ -1216,6 +1275,36 @@ pub fn pump<L: BodyLoop>(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn table(list: &str, min_iqp: Option<&str>) -> String {
+        serde_json::json!({"list": list, "rows": [
+            {"id": "RADIO_PWR_MODE", "value": "offset"},
+            {"id": "VENC_MIN_IQP", "value": min_iqp},
+        ]})
+        .to_string()
+    }
+
+    /// The table is logged once per listing and again when a value moves;
+    /// a set names the parameter and what it was before.
+    #[test]
+    fn the_drone_parameters_are_logged_per_listing_and_on_change() {
+        let mut p = ParamLog::default();
+        assert_eq!(p.note(&table("pending", None)), None, "still listing");
+        let first = p.note(&table("complete", Some("34"))).expect("first table");
+        assert_eq!(first["values"]["VENC_MIN_IQP"], "34");
+        assert_eq!(first["values"]["RADIO_PWR_MODE"], "offset");
+        assert_eq!(p.note(&table("complete", Some("34"))), None, "same values");
+        assert_eq!(p.row(1), (Some("VENC_MIN_IQP"), Some("34")));
+        assert_eq!(p.row(9), (None, None));
+        let moved = p
+            .note(&table("complete", Some("42")))
+            .expect("a value moved");
+        assert_eq!(moved["values"]["VENC_MIN_IQP"], "42");
+        // Link lost and found: the next listing logs the table again.
+        assert_eq!(p.note(&table("none", None)), None);
+        assert!(p.note(&table("complete", Some("42"))).is_some());
+        assert_eq!(p.note("not json"), None);
+    }
 
     /// The formula Sink computed inline before it called
     /// pal_core::uplink::cap_to_complete_us: kept to prove the two agree.

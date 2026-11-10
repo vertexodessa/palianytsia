@@ -1929,6 +1929,7 @@ dependencies = [
  "pal-wire",
  "runtime",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
