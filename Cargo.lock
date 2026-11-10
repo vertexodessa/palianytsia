@@ -471,6 +471,7 @@ dependencies = [
  "cc",
  "log",
  "ndk",
+ "ndk-sys 0.6.0+11769913",
 ]
 
 [[package]]

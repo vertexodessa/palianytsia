@@ -5,7 +5,13 @@
 //! dropped instead of shown. No flush on loss: the next IDR heals.
 //! An AU that never reached the codec (no input buffer in time, or larger
 //! than the buffer) breaks the reference chain like a decode error does:
-//! `damage()` counts both for the IDR driver.
+//! `damage()` counts decode errors, missing buffers and oversize AUs for the
+//! IDR driver.
+//!
+//! The input buffers are sized by `MAX_INPUT` and the output by the largest
+//! camera mode, not by what the codec derives from the size hint: a keyframe
+//! that outgrew a derived buffer would be dropped, ask for another keyframe
+//! of the same size, and loop until the scene got simpler.
 //!
 //! The codec is the platform's pick for video/hevc unless the system
 //! property `debug.pal.decoder` names one (the Quest also lists
@@ -33,6 +39,25 @@ const STALE_US: u64 = 150_000;
 const LAT_WINDOW: usize = 300;
 const DECODER_PROP: &std::ffi::CStr = c"debug.pal.decoder";
 const STARVE_PROP: &std::ffi::CStr = c"debug.pal.dec_starve";
+/// Input buffer bytes asked for: the median keyframe measured at 2944x1656
+/// with the shipped `VENC_MIN_IQP` is 239 KB, and the largest was not
+/// recorded, so this leaves eight times that.
+const MAX_INPUT: i32 = 2 << 20;
+/// The largest mode in the drone's driver list (mabur
+/// `drone/venc/camera_modes.c` `k4K`, 3840x2160 at up to 33 fps; venc.size
+/// may use all of it when a recording needs that mode): a mode switch then
+/// stays inside the buffers the codec already has.
+const MAX_W: i32 = 3840;
+const MAX_H: i32 = 2160;
+
+/// A media format key as libmediandk exports it.
+fn key(k: *const std::ffi::c_char) -> &'static str {
+    // SAFETY: the AMEDIAFORMAT_KEY_* constants are static NUL-terminated
+    // ASCII in libmediandk.
+    unsafe { std::ffi::CStr::from_ptr(k) }
+        .to_str()
+        .unwrap_or("")
+}
 
 extern "C" {
     // bionic; PROP_VALUE_MAX is 92 bytes with the NUL.
@@ -74,6 +99,9 @@ struct Shared {
     /// AUs dropped because no input buffer freed up within 20 ms (a
     /// decoder that stopped consuming).
     no_input: AtomicU64,
+    /// AUs dropped for being larger than the input buffer: a buffer size
+    /// problem, not a codec fault, so kept apart from `errors`.
+    oversize: AtomicU64,
     /// (pts, queued at) of AUs in flight, oldest first.
     queued: Mutex<VecDeque<(u64, Instant)>>,
     /// The output surface, to log the buffer size the codec gave it.
@@ -94,25 +122,60 @@ pub struct MediaCodecDecoder {
     /// input buffer had come; 0 = off.
     starve_every: u64,
     fed: u64,
+    /// The first input buffer's length is in the log.
+    buf_logged: bool,
+}
+
+/// The decoder format: the stream's type, the size hint, the low-latency
+/// keys and, with `bounds`, the buffer sizes above.
+fn configure(
+    codec: &MediaCodec,
+    win: &NativeWindow,
+    w: i32,
+    h: i32,
+    bounds: bool,
+) -> Result<(), String> {
+    let mut fmt = MediaFormat::new();
+    fmt.set_str("mime", "video/hevc");
+    fmt.set_i32("width", w);
+    fmt.set_i32("height", h);
+    fmt.set_i32("low-latency", 1);
+    fmt.set_i32("vendor.qti-ext-dec-low-latency.enable", 1);
+    fmt.set_i32("vendor.qti-ext-dec-picture-order.enable", 1);
+    if bounds {
+        // SAFETY: reads of libmediandk's constant key pointers.
+        let (k_in, k_w, k_h) = unsafe {
+            (
+                ndk_sys::AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
+                ndk_sys::AMEDIAFORMAT_KEY_MAX_WIDTH,
+                ndk_sys::AMEDIAFORMAT_KEY_MAX_HEIGHT,
+            )
+        };
+        fmt.set_i32(key(k_in), MAX_INPUT);
+        fmt.set_i32(key(k_w), MAX_W);
+        fmt.set_i32(key(k_h), MAX_H);
+    }
+    codec
+        .configure(&fmt, Some(win), MediaCodecDirection::Decoder)
+        .map_err(|e| format!("configure: {e:?}"))
 }
 
 impl MediaCodecDecoder {
     /// `w`/`h` are a hint for the first buffers; the stream's SPS rules.
     pub fn new(win: NativeWindow, w: i32, h: i32) -> Result<Self, String> {
-        let codec = open_codec()?;
+        let mut codec = open_codec()?;
         let name = codec.name().unwrap_or_else(|_| "?".into());
         log::info!("mediacodec: {name}");
-        let mut fmt = MediaFormat::new();
-        fmt.set_str("mime", "video/hevc");
-        fmt.set_i32("width", w);
-        fmt.set_i32("height", h);
-        fmt.set_i32("low-latency", 1);
-        fmt.set_i32("vendor.qti-ext-dec-low-latency.enable", 1);
-        fmt.set_i32("vendor.qti-ext-dec-picture-order.enable", 1);
-        codec
-            .configure(&fmt, Some(&win), MediaCodecDirection::Decoder)
-            .map_err(|e| format!("configure: {e:?}"))?;
+        if let Err(e) = configure(&codec, &win, w, h, true) {
+            // A codec that refuses the bounds still decodes with the sizes it
+            // derives itself; a fresh instance, since a failed configure may
+            // leave this one in its error state.
+            log::warn!("mediacodec: configure with max sizes: {e}; again without");
+            codec = open_codec()?;
+            configure(&codec, &win, w, h, false)?;
+        }
         codec.start().map_err(|e| format!("start: {e:?}"))?;
+        log::info!("mediacodec: input format {}", codec.input_format());
         let sh = Arc::new(Shared {
             codec,
             name,
@@ -121,6 +184,7 @@ impl MediaCodecDecoder {
             stale: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             no_input: AtomicU64::new(0),
+            oversize: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
             win,
         });
@@ -139,6 +203,7 @@ impl MediaCodecDecoder {
             pts: 0,
             starve_every,
             fed: 0,
+            buf_logged: false,
         })
     }
 
@@ -147,12 +212,19 @@ impl MediaCodecDecoder {
         self.sh.no_input.load(Ordering::Relaxed)
     }
 
+    /// AUs dropped for being larger than the input buffer since open.
+    pub fn oversize(&self) -> u64 {
+        self.sh.oversize.load(Ordering::Relaxed)
+    }
+
     /// Events since open that left the reference chain broken: decode
     /// errors and AUs that never reached the codec. The picture stays
     /// damaged from each until an IRAP, and with no periodic one in the
     /// stream (`venc.gop_s = 0`) that IRAP has to be asked for.
     pub fn damage(&self) -> u64 {
-        self.sh.errors.load(Ordering::Relaxed) + self.sh.no_input.load(Ordering::Relaxed)
+        self.sh.errors.load(Ordering::Relaxed)
+            + self.sh.no_input.load(Ordering::Relaxed)
+            + self.sh.oversize.load(Ordering::Relaxed)
     }
 
     /// Frames dropped by the stale cap since open.
@@ -240,10 +312,23 @@ impl MediaCodecDecoder {
         match sh.codec.dequeue_input_buffer(Duration::from_millis(20)) {
             Ok(In::Buffer(mut b)) => {
                 let dst = b.buffer_mut();
+                if !self.buf_logged {
+                    self.buf_logged = true;
+                    log::info!(
+                        "mediacodec {}: input buffer {} bytes (asked {MAX_INPUT})",
+                        sh.name,
+                        dst.len()
+                    );
+                }
                 if au.len() > dst.len() {
                     // A truncated AU decodes to garbage; skip it and let the
-                    // IDR driver see the decoder error count move.
-                    sh.errors.fetch_add(1, Ordering::Relaxed);
+                    // IDR driver see the damage count move.
+                    let n = sh.oversize.fetch_add(1, Ordering::Relaxed) + 1;
+                    log::warn!(
+                        "mediacodec: AU of {} bytes over the {} byte input buffer ({n} so far)",
+                        au.len(),
+                        dst.len()
+                    );
                     let _ = sh.codec.queue_input_buffer(b, 0, 0, self.pts, 0);
                     return;
                 }

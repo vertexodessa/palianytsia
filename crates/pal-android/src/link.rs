@@ -339,7 +339,8 @@ pub fn join_within<T>(h: JoinHandle<T>, limit: Duration) -> bool {
 fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>, sh: &Shared) {
     // Once a second: a line when AUs came in but no frame came out, so a
     // stall on the glass leaves its cause in logcat.
-    let (mut t, mut aus, mut f0, mut s0, mut n0) = (Instant::now(), 0u64, 0u64, 0u64, 0u64);
+    let (mut t, mut aus, mut f0, mut s0, mut n0, mut o0) =
+        (Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64);
     // Since when no AU has come (after video once flowed): one line and one
     // event per outage, not one a second (60 a minute with the drone off).
     let mut starved: Option<Instant> = None;
@@ -357,20 +358,21 @@ fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>,
         let (f, errs) = dec.counters();
         sh.frames.store(f, Ordering::Relaxed);
         if t.elapsed() >= Duration::from_secs(1) {
-            let (st, ni) = (dec.stale(), dec.no_input());
+            let (st, ni, ov) = (dec.stale(), dec.no_input(), dec.oversize());
             // Under 5 AUs is decoder warm-up after start or a heal, not a
             // stall: a stuck second at 90 fps brings ~90.
             if aus >= 5 && f == f0 {
                 let drops = sh.au_dropped.load(Ordering::Relaxed);
                 log::warn!(
-                    "video stalled: {aus} AUs in, 0 frames out; stale {} no_input {} errors {errs} au_drops {drops}",
+                    "video stalled: {aus} AUs in, 0 frames out; stale {} no_input {} oversize {} errors {errs} au_drops {drops}",
                     st - s0,
                     ni - n0,
+                    ov - o0,
                 );
                 sh.event(
                     "video_stall",
                     serde_json::json!({"aus_in": aus, "stale": st - s0, "no_input": ni - n0,
-                        "dec_errors": errs, "au_drops": drops}),
+                        "oversize": ov - o0, "dec_errors": errs, "au_drops": drops}),
                 );
             } else if aus == 0 && sh.frames.load(Ordering::Relaxed) > 0 && starved.is_none() {
                 log::warn!("video stalled: no AUs from the core for 1 s");
@@ -384,7 +386,7 @@ fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>,
                     sh.event("video_back", serde_json::json!({ "after_ms": ms }));
                 }
             }
-            (t, aus, f0, s0, n0) = (Instant::now(), 0, f, st, ni);
+            (t, aus, f0, s0, n0, o0) = (Instant::now(), 0, f, st, ni, ov);
         }
     }
     log::info!("decode loop ended ({} stale frames dropped)", dec.stale());
