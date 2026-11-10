@@ -396,7 +396,7 @@ The script never flashes, never touches MTD, and is run by the operator, not by 
 
 1. Unit: golden vectors for wire, FEC, SBI, profile (from mabur).
 2. Differential replay: the same capture (section 7 format) through `pal-ref` and the Rust core; AU bytes, AU flags and sent RC bytes must be identical (`rz_nonce` pinned). This is the gate for every core change. Captures: a clean bench run, a 20 % body-loss run, a drone restart, a key mismatch; a channel move joins when the channel core is ported (M4). Before live captures exist (M0), maburd `--dry-run --out` frame files with `FrameFileSource`'s synthetic per-card loss stand in.
-3. FEC bench on the host and on the phone's CPU: symbols/s and worst-case decode time per body, Rust vs C++ (`criterion`, run on device via `cargo ndk`).
+3. FEC bench on the host and on the phone's CPU: symbols/s and worst-case decode time per body (`crates/pal-fec/examples/fec_bench.rs`, self-timed with no dependency so the `tools/android-build.sh` build runs from `/data/local/tmp`; resolved 2026-11-10 except Rust vs C++, which needs a C shim for mabur's decoder: pal-ref wraps WebGs only).
 4. Hardware, before any "replaces PixelPilot" claim: G2G median/p95 on the LED rig, RCF heard %, truncated-AU rate over a fixed 10 min bench run, both apps on the same phone, drone and rung.
 5. CI: fmt, clippy `-D warnings`, `cargo test --locked`, the parity gate, an APK build. Taken from openipc-rs's CI, minus the platforms we do not ship.
 
