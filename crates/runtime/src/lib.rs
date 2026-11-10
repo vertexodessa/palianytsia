@@ -386,6 +386,7 @@ impl CoreLoop {
         }
         self.hand_cal_log_dir();
         self.core.tick(now, &mut self.sink);
+        self.log_chan_records(now);
         self.publish_params(now);
         self.step_idr(now);
         self.publish_stats(now);
@@ -466,6 +467,25 @@ impl CoreLoop {
             self.cal.log_dir_set = true;
             if let Some(l) = self.sink.log.as_ref() {
                 self.core.set_cal_log_dir(l.dir());
+            }
+        }
+    }
+
+    /// The channel core's records into the flight log, each under its own
+    /// event name; dropped unread when there is no log.
+    fn log_chan_records(&mut self, now: u64) {
+        let recs = self.core.take_chan_records();
+        let Some(l) = self.sink.log.as_mut() else {
+            return;
+        };
+        for r in recs {
+            if let Ok(serde_json::Value::Object(mut m)) = serde_json::from_str(&r) {
+                let ev = m.remove("ev");
+                let ev = ev
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("chan");
+                let _ = l.event(now, ev, m.into());
             }
         }
     }

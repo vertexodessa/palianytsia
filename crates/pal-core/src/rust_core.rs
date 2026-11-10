@@ -283,6 +283,8 @@ pub struct RustCore {
     idr_req: u32,
     /// The channel core's remembered-channel store (0 = none yet).
     stored_ch: Arc<AtomicU8>,
+    /// The channel core's records for the flight log.
+    chan_recs: Arc<std::sync::Mutex<ChanRecords>>,
 }
 
 /// What `with_cards` needs beyond the config: the cards and the channel
@@ -296,16 +298,133 @@ pub struct ChanEnv {
     pub threaded: bool,
 }
 
-/// WebGs's ChannelSink: the stderr lines go out, the scan.log records
-/// have no home here.
-struct LogSink;
+/// The channel core's records for the flight log, one JSON object each
+/// with its event name in `ev` (`GsCore::take_chan_records`). Without them
+/// a channel change or a silence in a session could not be explained.
+#[derive(Default)]
+pub struct ChanRecords {
+    q: std::collections::VecDeque<String>,
+    /// Records thrown away because the queue was full (nobody drained).
+    pub dropped: u64,
+}
+
+impl ChanRecords {
+    /// About a minute of busy records; a loop that never drains (a
+    /// replay without a log) keeps the newest.
+    const CAP: usize = 1024;
+    fn push(&mut self, ev: &'static str, mut j: J) {
+        j.set("ev", ev);
+        if self.q.len() >= Self::CAP {
+            self.q.pop_front();
+            self.dropped += 1;
+        }
+        self.q.push_back(j.dump());
+    }
+}
+
+/// WebGs's ChannelSink: the stderr lines go out; the scan.log records go
+/// to the flight log instead (`ChanRecords`).
+struct LogSink {
+    recs: Arc<std::sync::Mutex<ChanRecords>>,
+    /// The verdict last recorded: only a change is a record.
+    verdict: Option<(&'static str, bool)>,
+    /// Dwell records are cut to one per 200 ms (the scout's dwells are
+    /// 250 ms or longer per card; a second card doubles them).
+    next_dwell_ms: f64,
+}
+
+impl LogSink {
+    fn push(&self, ev: &'static str, j: J) {
+        self.recs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(ev, j);
+    }
+}
 
 impl ChannelSink for LogSink {
-    fn dwell(&mut self, _: f64, _: usize, _: &ScoutDwell) {}
-    fn pick(&mut self, _: f64, _: Option<u8>, _: u64, _: &[RankEntry], _: i32) {}
-    fn moved(&mut self, _: &MoveEvent) {}
-    fn verdict(&mut self, _: f64, _: &VerdictOut, _: &[VerdictCardIn], _: &VerdictLinkIn) {}
-    fn hop(&mut self, _: &HopEvent) {}
+    fn dwell(&mut self, t_ms: f64, card: usize, d: &ScoutDwell) {
+        if t_ms < self.next_dwell_ms {
+            return;
+        }
+        self.next_dwell_ms = t_ms + 200.0;
+        let mut j = J::obj();
+        j.set("t_ms", t_ms);
+        j.set("card", card as u64);
+        j.set("ch", d.ch);
+        j.set("width", d.width_mhz);
+        j.set("observe_ms", d.observe_ms);
+        j.set(
+            "busy_pct",
+            if d.busy_valid {
+                J::F(d.busy_pct)
+            } else {
+                J::Null
+            },
+        );
+        j.set("frames", d.frames);
+        j.set("in_session", d.in_session);
+        self.push("scout_dwell", j);
+    }
+    fn pick(&mut self, t_ms: f64, picked: Option<u8>, rounds: u64, _: &[RankEntry], _: i32) {
+        let mut j = J::obj();
+        j.set("t_ms", t_ms);
+        j.set("picked", picked.map_or(J::Null, J::from));
+        j.set("rounds", rounds);
+        self.push("chan_pick", j);
+    }
+    fn moved(&mut self, e: &MoveEvent) {
+        let mut j = J::obj();
+        j.set("t_ms", e.t_ms);
+        j.set("card", e.card.map_or(-1, |c| c as i64));
+        j.set("from", e.from);
+        j.set("to", e.to);
+        j.set("reason", e.reason.as_str());
+        self.push("chan_move", j);
+    }
+    fn verdict(
+        &mut self,
+        t_ms: f64,
+        o: &VerdictOut,
+        cards: &[VerdictCardIn],
+        link: &VerdictLinkIn,
+    ) {
+        let now = (o.v.as_str(), o.trigger);
+        if self.verdict == Some(now) {
+            return;
+        }
+        self.verdict = Some(now);
+        let valid = || cards.iter().filter(|c| c.valid);
+        let mut j = J::obj();
+        j.set("t_ms", t_ms);
+        j.set("v", now.0);
+        j.set("trigger", o.trigger);
+        j.set("evidence", o.evidence);
+        j.set("ref_rung", o.ref_rung);
+        // The worst card's airtime: what an interfered verdict rests on.
+        let busy = valid()
+            .filter(|c| c.busy_valid)
+            .map(|c| c.nhm_busy_pct)
+            .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))));
+        j.set("busy_pct", busy.map_or(J::Null, J::F));
+        j.set(
+            "foreign",
+            valid().map(|c| u64::from(c.foreign)).sum::<u64>(),
+        );
+        j.set("pre_fec_loss", link.pre_fec_loss);
+        self.push("verdict", j);
+    }
+    fn hop(&mut self, e: &HopEvent) {
+        let mut j = J::obj();
+        j.set("t_ms", e.t_ms);
+        j.set("kind", e.kind);
+        j.set("epoch", e.epoch);
+        j.set("target", e.target);
+        j.set("score", e.score);
+        j.set("ms", e.elapsed_ms);
+        j.set("reason", e.reason.as_str());
+        self.push("hop", j);
+    }
     fn log(&mut self, line: &str) {
         eprintln!("{line}");
     }
@@ -384,6 +503,7 @@ impl RustCore {
             }
         });
         let stored_ch = Arc::new(AtomicU8::new(0));
+        let chan_recs = Arc::new(std::sync::Mutex::new(ChanRecords::default()));
         let mut gs = gs;
         if let (Some(g), Some(env)) = (gs.as_mut(), env) {
             let cc = ChannelCoreCfg {
@@ -401,7 +521,11 @@ impl RustCore {
             g.chan = Some(ChannelCore::new(
                 cc,
                 env.cards.clone(),
-                Box::new(LogSink),
+                Box::new(LogSink {
+                    recs: chan_recs.clone(),
+                    verdict: None,
+                    next_dwell_ms: f64::MIN,
+                }),
                 Box::new(move |c| {
                     st.store(c, Ordering::Relaxed);
                     true
@@ -454,6 +578,7 @@ impl RustCore {
             channel: ch,
             idr_req: 0,
             stored_ch,
+            chan_recs,
         })
     }
 
@@ -933,6 +1058,11 @@ impl GsCore for RustCore {
         self.gs.as_ref()?.chan.as_ref()?.op_scan_json()
     }
 
+    fn take_chan_records(&mut self) -> Vec<String> {
+        let mut r = self.chan_recs.lock().unwrap_or_else(|p| p.into_inner());
+        r.q.drain(..).collect()
+    }
+
     fn cal_abort(&mut self) {
         if let Some(g) = self.gs.as_mut() {
             g.cal.abort(g.chan.as_mut());
@@ -1097,6 +1227,86 @@ impl GsCore for RustCore {
 
 #[cfg(test)]
 mod tests {
+
+    /// A hop, a plan move and a verdict change each become one record; a
+    /// verdict that did not change and a dwell inside 200 ms of the last
+    /// recorded one do not.
+    #[test]
+    fn the_channel_core_records_go_to_the_flight_log_queue() {
+        use crate::chan::plan::MoveReason;
+        use crate::chan::verdict::Verdict;
+        let recs = Arc::new(std::sync::Mutex::new(ChanRecords::default()));
+        let mut s = LogSink {
+            recs: recs.clone(),
+            verdict: None,
+            next_dwell_ms: f64::MIN,
+        };
+        let d = ScoutDwell {
+            ch: 161,
+            busy_valid: true,
+            busy_pct: 12.5,
+            ..ScoutDwell::default()
+        };
+        s.dwell(1000.0, 1, &d);
+        s.dwell(1100.0, 1, &d);
+        s.dwell(1250.0, 0, &d);
+        let card = VerdictCardIn {
+            valid: true,
+            busy_valid: true,
+            nhm_busy_pct: 33.0,
+            foreign: 7,
+            ..VerdictCardIn::default()
+        };
+        let link = VerdictLinkIn {
+            pre_fec_loss: 0.25,
+            recovered: 0,
+        };
+        let o = VerdictOut {
+            v: Verdict::Interfered,
+            trigger: true,
+            ..VerdictOut::default()
+        };
+        s.verdict(2000.0, &o, &[card, VerdictCardIn::default()], &link);
+        s.verdict(3000.0, &o, &[card], &link);
+        s.moved(&MoveEvent {
+            t_ms: 2500.0,
+            card: None,
+            from: 40,
+            to: 161,
+            reason: MoveReason::LinkFound,
+        });
+        s.hop(&HopEvent {
+            t_ms: 2600.0,
+            kind: "lead_confirm",
+            epoch: 1,
+            target: 40,
+            score: 0,
+            elapsed_ms: 249.0,
+            reason: String::new(),
+        });
+        let got: Vec<String> = recs.lock().unwrap().q.drain(..).collect();
+        let evs: Vec<&str> = got
+            .iter()
+            .map(|r| {
+                r.split("\"ev\":\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            evs,
+            ["scout_dwell", "scout_dwell", "verdict", "chan_move", "hop"],
+            "{got:?}"
+        );
+        assert!(got[0].contains("\"busy_pct\":12.5") && got[0].contains("\"ch\":161"));
+        assert!(got[2].contains("\"v\":\"interfered\"") && got[2].contains("\"busy_pct\":33.0"));
+        assert!(got[2].contains("\"foreign\":7"), "{}", got[2]);
+        assert!(got[3].contains("\"card\":-1") && got[3].contains("\"reason\":\"link_found\""));
+        assert!(got[4].contains("\"ms\":249.0") && got[4].contains("\"kind\":\"lead_confirm\""));
+    }
     use super::*;
     use crate::chan::fake::{FakeCard, FakeClock};
     use crate::config::load_config;

@@ -172,6 +172,13 @@ pub trait GsCore {
     fn chan_scan_json(&self) -> Option<String> {
         None
     }
+    /// The channel core's records since the last call (hop steps, plan
+    /// moves, verdict changes, scout dwells, picks), one JSON object each
+    /// with the event name in `ev`; for the flight log only. mabur's GS
+    /// writes them to scan.log, which the oracle has no home for: empty.
+    fn take_chan_records(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     /// The run's state and result table as one JSON object (`cal::status_json`).
     fn cal_json(&self) -> Option<String> {
         None

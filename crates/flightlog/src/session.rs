@@ -496,6 +496,9 @@ pub struct Summary {
     pub log_max_us: Option<(u64, u64)>,
     /// The last `params` event: its time (µs) and the drone's {id: value}.
     pub params: Option<(u64, Map<String, Value>)>,
+    /// Channel core hop steps: (t_us, kind, epoch, target, ms since the
+    /// order) in log order.
+    pub hops: Vec<(u64, String, u64, u64, f64)>,
 }
 
 fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io::Result<()> {
@@ -585,6 +588,13 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
                 .cards
                 .push(v.get("chips").and_then(Value::as_str).unwrap_or("?").into()),
             "panic_prev" => s.panic_prev = v.get("text").and_then(Value::as_str).map(Into::into),
+            "hop" => {
+                let u = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+                let kind = v.get("kind").and_then(Value::as_str).unwrap_or("?");
+                let ms = v.get("ms").and_then(Value::as_f64).unwrap_or(0.0);
+                s.hops
+                    .push((u("t_us"), kind.into(), u("epoch"), u("target"), ms));
+            }
             "params" => {
                 if let Some(m) = v.get("values").and_then(Value::as_object) {
                     let t = v.get("t_us").and_then(Value::as_u64).unwrap_or(0);

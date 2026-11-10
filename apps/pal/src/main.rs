@@ -685,6 +685,17 @@ fn log_summary(o: Opts) {
             t as f64 / 1e6
         );
     }
+    if !s.hops.is_empty() {
+        // Each step with its time since the hop's order: lead_confirm is
+        // the link back on air, the interruption the hop cost.
+        println!("  hops ({} steps):", s.hops.len());
+        for (t, kind, epoch, target, ms) in s.hops.iter().take(40) {
+            println!(
+                "    {:.3} s  epoch {epoch} -> {target}: {kind} +{ms:.0} ms",
+                *t as f64 / 1e6
+            );
+        }
+    }
     if let Some((t, values)) = &s.params {
         print_params(*t, values);
     }
