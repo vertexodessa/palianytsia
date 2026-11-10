@@ -469,6 +469,7 @@ name = "decode"
 version = "0.0.1"
 dependencies = [
  "cc",
+ "hevc",
  "log",
  "ndk",
  "ndk-sys 0.6.0+11769913",

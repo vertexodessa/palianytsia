@@ -19,7 +19,15 @@
 //! gets the queue-to-output time per frame, so two codecs compare on one
 //! headset by `setprop` and a relaunch. `debug.pal.dec_starve N` drops
 //! every Nth AU the way a missing input buffer does (a bench switch for the
-//! heal path; unset in flight).
+//! heal path; unset in flight). `debug.pal.dec_break N` stops the codec
+//! behind this wrapper once per process, after N AUs: every call fails from
+//! then on, as in the codec's error state (a bench switch for the decode
+//! loop's rebuild; unset in flight).
+//!
+//! A codec in its error state is never revived here: `decode` says what
+//! became of each AU (`watchdog::Fed`) and the caller drops the decoder and
+//! builds a new one (`watchdog::Watchdog`). Warnings from a failing codec
+//! are limited to one a second.
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,12 +41,21 @@ use ndk::media::media_codec::{
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
 
+use crate::watchdog::{Fed, LogEvery};
+
 /// PixelPilot's stale cap: a frame this late would only add latency.
 const STALE_US: u64 = 150_000;
 /// Frames per latency line in the log (~5 s at 60 fps).
 const LAT_WINDOW: usize = 300;
 const DECODER_PROP: &std::ffi::CStr = c"debug.pal.decoder";
 const STARVE_PROP: &std::ffi::CStr = c"debug.pal.dec_starve";
+const BREAK_PROP: &std::ffi::CStr = c"debug.pal.dec_break";
+/// `debug.pal.dec_break` has fired: once per process, so the rebuilt codec
+/// is left alone.
+static BROKE: AtomicBool = AtomicBool::new(false);
+/// One warning line per this many ms from a failing codec (a dead one fails
+/// every call: 200 a second on the output thread alone).
+const WARN_EVERY_MS: u64 = 1000;
 /// Input buffer bytes asked for: the median keyframe measured at 2944x1656
 /// with the shipped `VENC_MIN_IQP` is 239 KB, and the largest was not
 /// recorded, so this leaves eight times that.
@@ -106,6 +123,14 @@ struct Shared {
     queued: Mutex<VecDeque<(u64, Instant)>>,
     /// The output surface, to log the buffer size the codec gave it.
     win: NativeWindow,
+    /// Clock of the warning limits.
+    t0: Instant,
+}
+
+impl Shared {
+    fn ms(&self) -> u64 {
+        self.t0.elapsed().as_millis() as u64
+    }
 }
 
 // SAFETY: AMediaCodec allows one thread queueing input while another
@@ -124,6 +149,10 @@ pub struct MediaCodecDecoder {
     fed: u64,
     /// The first input buffer's length is in the log.
     buf_logged: bool,
+    /// `debug.pal.dec_break`: the AU count at which the codec is stopped
+    /// behind the wrapper; 0 = off.
+    break_after: u64,
+    in_warn: LogEvery,
 }
 
 /// The decoder format: the stream's type, the size hint, the low-latency
@@ -187,6 +216,7 @@ impl MediaCodecDecoder {
             oversize: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
             win,
+            t0: Instant::now(),
         });
         let s2 = sh.clone();
         let out = std::thread::Builder::new()
@@ -197,6 +227,13 @@ impl MediaCodecDecoder {
         if starve_every > 0 {
             log::warn!("mediacodec: dropping every {starve_every}th AU (debug.pal.dec_starve)");
         }
+        let break_after = match prop(BREAK_PROP).and_then(|v| v.parse().ok()) {
+            Some(n) if n > 0 && !BROKE.load(Ordering::Relaxed) => {
+                log::warn!("mediacodec: stopping the codec after {n} AUs (debug.pal.dec_break)");
+                n
+            }
+            _ => 0,
+        };
         Ok(Self {
             sh,
             out: Some(out),
@@ -204,6 +241,8 @@ impl MediaCodecDecoder {
             starve_every,
             fed: 0,
             buf_logged: false,
+            break_after,
+            in_warn: LogEvery::new(WARN_EVERY_MS),
         })
     }
 
@@ -225,6 +264,11 @@ impl MediaCodecDecoder {
         self.sh.errors.load(Ordering::Relaxed)
             + self.sh.no_input.load(Ordering::Relaxed)
             + self.sh.oversize.load(Ordering::Relaxed)
+    }
+
+    /// Frames the codec has put out since open, shown or dropped as stale.
+    pub fn output(&self) -> u64 {
+        self.sh.frames.load(Ordering::Relaxed) + self.sh.stale.load(Ordering::Relaxed)
     }
 
     /// Frames dropped by the stale cap since open.
@@ -251,6 +295,7 @@ fn log_latency(name: &str, ages: &mut Vec<u64>) {
 
 fn output_loop(sh: &Shared) {
     let mut ages = Vec::with_capacity(LAT_WINDOW);
+    let mut warn = LogEvery::new(WARN_EVERY_MS);
     while !sh.stop.load(Ordering::Relaxed) {
         match sh.codec.dequeue_output_buffer(Duration::from_millis(10)) {
             Ok(Out::Buffer(ob)) => {
@@ -292,7 +337,9 @@ fn output_loop(sh: &Shared) {
             Ok(_) => {}
             Err(e) => {
                 sh.errors.fetch_add(1, Ordering::Relaxed);
-                log::warn!("mediacodec: dequeue_output {e:?}");
+                if let Some(held) = warn.hit(sh.ms()) {
+                    log::warn!("mediacodec: dequeue_output {e:?} ({held} more not logged)");
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
@@ -302,12 +349,16 @@ fn output_loop(sh: &Shared) {
 impl MediaCodecDecoder {
     /// Queues the AU (waits up to 20 ms for an input buffer). Frames come
     /// out on the output thread.
-    pub fn decode(&mut self, au: &[u8]) {
+    pub fn decode(&mut self, au: &[u8]) -> Fed {
         let sh = &self.sh;
         self.fed += 1;
         if self.starve_every > 0 && self.fed.is_multiple_of(self.starve_every) {
             sh.no_input.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Fed::NoInput;
+        }
+        if self.fed == self.break_after && !BROKE.swap(true, Ordering::Relaxed) {
+            log::warn!("mediacodec: codec stopped behind the decoder (debug.pal.dec_break)");
+            let _ = sh.codec.stop();
         }
         match sh.codec.dequeue_input_buffer(Duration::from_millis(20)) {
             Ok(In::Buffer(mut b)) => {
@@ -330,7 +381,7 @@ impl MediaCodecDecoder {
                         dst.len()
                     );
                     let _ = sh.codec.queue_input_buffer(b, 0, 0, self.pts, 0);
-                    return;
+                    return Fed::Oversize;
                 }
                 for (d, s) in dst.iter_mut().zip(au) {
                     d.write(*s);
@@ -341,20 +392,27 @@ impl MediaCodecDecoder {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push_back((self.pts, Instant::now()));
-                if sh
-                    .codec
-                    .queue_input_buffer(b, 0, au.len(), self.pts, 0)
-                    .is_err()
-                {
-                    sh.errors.fetch_add(1, Ordering::Relaxed);
+                match sh.codec.queue_input_buffer(b, 0, au.len(), self.pts, 0) {
+                    Ok(()) => Fed::Queued,
+                    Err(e) => {
+                        sh.errors.fetch_add(1, Ordering::Relaxed);
+                        if let Some(held) = self.in_warn.hit(sh.ms()) {
+                            log::warn!("mediacodec: queue_input {e:?} ({held} more not logged)");
+                        }
+                        Fed::Failed
+                    }
                 }
             }
             Ok(_) => {
                 sh.no_input.fetch_add(1, Ordering::Relaxed);
+                Fed::NoInput
             }
             Err(e) => {
-                log::warn!("mediacodec: dequeue_input {e:?}");
                 sh.errors.fetch_add(1, Ordering::Relaxed);
+                if let Some(held) = self.in_warn.hit(sh.ms()) {
+                    log::warn!("mediacodec: dequeue_input {e:?} ({held} more not logged)");
+                }
+                Fed::Failed
             }
         }
     }
@@ -375,5 +433,8 @@ impl Drop for MediaCodecDecoder {
             let _ = t.join();
         }
         let _ = self.sh.codec.stop();
+        // The joined output thread held the only other `sh`: the codec is
+        // deleted, and lets go of the window, as this returns, so the next
+        // decoder can configure on the same window (one producer at a time).
     }
 }

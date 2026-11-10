@@ -8,6 +8,7 @@ mod av;
 pub use av::AvDecoder;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
+pub mod watchdog;
 
 /// One frame as tightly packed YUV planes, for a GPU colour conversion.
 #[derive(Default, Clone)]

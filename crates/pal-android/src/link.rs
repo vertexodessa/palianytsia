@@ -6,6 +6,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use decode::mediacodec::MediaCodecDecoder;
+use decode::watchdog::{starts_with_irap, Verdict, Watchdog};
+use ndk::native_window::NativeWindow;
 use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::RustCore;
 use pal_core::CoreOpts;
@@ -135,7 +137,7 @@ impl Link {
         }
         let (cfg, ch, width) = link_radio(&c.toml, c.pick.clone())?;
         let channels = cfg.radio.channels.clone();
-        let dec = MediaCodecDecoder::new(win, 1920, 1080)?;
+        let dec = MediaCodecDecoder::new(win.clone(), DEC_HINT.0, DEC_HINT.1)?;
 
         let (au_tx, au_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(8);
         let (stats_tx, stats_rx) = mpsc::sync_channel(4);
@@ -218,7 +220,7 @@ impl Link {
         let sh = shared.clone();
         let dec_t = std::thread::Builder::new()
             .name("pal-decode".into())
-            .spawn(move || decode_loop(dec, au_rx, &sh))
+            .spawn(move || decode_loop(dec, win, au_rx, &sh))
             .map_err(|e| e.to_string())?;
         let cards = c.cards;
         let core_t = std::thread::Builder::new()
@@ -333,14 +335,106 @@ pub fn join_within<T>(h: JoinHandle<T>, limit: Duration) -> bool {
     done
 }
 
+/// The size a codec is configured with; the stream's SPS rules.
+const DEC_HINT: (i32, i32) = (1920, 1080);
+
+/// Counters summed over every codec of the link, so the UI and the stall
+/// line see no step back when a codec is replaced.
+#[derive(Clone, Copy, Default)]
+struct DecTotals {
+    frames: u64,
+    errors: u64,
+    stale: u64,
+    no_input: u64,
+    oversize: u64,
+}
+
+impl DecTotals {
+    fn of(d: &MediaCodecDecoder) -> Self {
+        let (frames, errors) = d.counters();
+        Self {
+            frames,
+            errors,
+            stale: d.stale(),
+            no_input: d.no_input(),
+            oversize: d.oversize(),
+        }
+    }
+    fn plus(self, o: Self) -> Self {
+        Self {
+            frames: self.frames + o.frames,
+            errors: self.errors + o.errors,
+            stale: self.stale + o.stale,
+            no_input: self.no_input + o.no_input,
+            oversize: self.oversize + o.oversize,
+        }
+    }
+}
+
+/// Logs and records one decoder failure: the dropped codec's counters, or
+/// why the next one did not open.
+fn note_restart(sh: &Shared, v: Verdict, now_ms: u64, last: DecTotals, open_err: Option<&str>) {
+    let Verdict::Rebuild {
+        cause,
+        rebuild_at_ms,
+        streak,
+    } = v
+    else {
+        return;
+    };
+    let wait = rebuild_at_ms - now_ms;
+    let c = cause.as_str();
+    match open_err {
+        Some(e) => log::warn!(
+            "decoder restart: {c}, failure {streak} in a row, next codec in {wait} ms; {e}"
+        ),
+        None => log::warn!(
+            "decoder restart: {c}, failure {streak} in a row, next codec in {wait} ms; frames {} errors {}",
+            last.frames,
+            last.errors
+        ),
+    }
+    let mut d = serde_json::json!({"cause": c, "streak": streak, "wait_ms": wait,
+        "frames": last.frames, "dec_errors": last.errors});
+    if let Some(e) = open_err {
+        d["error"] = e.into();
+    }
+    sh.event("decoder_restart", d);
+}
+
 /// AUs into MediaCodec; decoder damage (errors, and AUs the codec took no
 /// buffer for) goes back to the IDR driver the same way the desktop's decode
 /// thread reports its errors.
-fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>, sh: &Shared) {
+///
+/// A codec that dies (`decode::watchdog`) is dropped, which releases the
+/// window, and a new one is built on it with the next AU, after the
+/// watchdog's back-off. The damage total the IDR driver sees rises by
+/// exactly one per rebuild, tagged with the AU at hand: the new codec has no
+/// reference until an IRAP, and one rise arms one keyframe request (its
+/// retries until the IRAP are the requester's). The dying codec's errors are
+/// held back while its run of refused AUs lasts and dropped with it, so they
+/// arm nothing.
+fn decode_loop(
+    dec: MediaCodecDecoder,
+    win: NativeWindow,
+    au_rx: Receiver<(u64, u64, Vec<u8>)>,
+    sh: &Shared,
+) {
+    let t_start = Instant::now();
+    let ms = || t_start.elapsed().as_millis() as u64;
+    let mut dec = Some(dec);
+    let mut wd = Watchdog::default();
+    // Counters of the codecs already dropped.
+    let mut gone = DecTotals::default();
+    // The damage total last given to the IDR driver, and the part of it that
+    // came before the running codec.
+    let (mut reported, mut dmg_base) = (0u64, 0u64);
+    // While there is no codec: when to build the next one; and when the last
+    // one failed.
+    let (mut rebuild_at, mut failed_at): (Option<u64>, u64) = (None, 0);
     // Once a second: a line when AUs came in but no frame came out, so a
     // stall on the glass leaves its cause in logcat.
-    let (mut t, mut aus, mut f0, mut s0, mut n0, mut o0) =
-        (Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut t, mut aus, mut last) = (Instant::now(), 0u64, DecTotals::default());
     // Since when no AU has come (after video once flowed): one line and one
     // event per outage, not one a second (60 a minute with the drone off).
     let mut starved: Option<Instant> = None;
@@ -352,29 +446,68 @@ fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>,
         };
         if let Some((n, _t, au)) = got {
             aus += 1;
-            dec.decode(&au);
-            sh.note_dec_errors(n, dec.damage());
+            let now = ms();
+            if dec.is_none() && rebuild_at.is_some_and(|r| now >= r) {
+                match MediaCodecDecoder::new(win.clone(), DEC_HINT.0, DEC_HINT.1) {
+                    Ok(d) => {
+                        log::info!("decoder rebuilt {} ms after the failure", now - failed_at);
+                        dmg_base = reported + 1;
+                        reported = dmg_base;
+                        sh.note_dec_errors(n, reported);
+                        dec = Some(d);
+                        rebuild_at = None;
+                    }
+                    Err(e) => {
+                        let v = wd.open_failed(now);
+                        if let Verdict::Rebuild { rebuild_at_ms, .. } = v {
+                            rebuild_at = Some(rebuild_at_ms);
+                        }
+                        note_restart(sh, v, now, DecTotals::default(), Some(&e));
+                    }
+                }
+            }
+            if let Some(d) = dec.as_mut() {
+                let fed = d.decode(&au);
+                match wd.fed(now, fed, starts_with_irap(&au), d.output()) {
+                    Verdict::Keep { report: true } => {
+                        reported = dmg_base + d.damage();
+                        sh.note_dec_errors(n, reported);
+                    }
+                    Verdict::Keep { report: false } => {}
+                    v @ Verdict::Rebuild { rebuild_at_ms, .. } => {
+                        let mine = DecTotals::of(d);
+                        gone = gone.plus(mine);
+                        // Released here, before the next codec takes the window.
+                        dec = None;
+                        failed_at = now;
+                        rebuild_at = Some(rebuild_at_ms);
+                        note_restart(sh, v, now, mine, None);
+                    }
+                }
+            }
         }
-        let (f, errs) = dec.counters();
-        sh.frames.store(f, Ordering::Relaxed);
+        let tot = dec.as_ref().map_or(gone, |d| gone.plus(DecTotals::of(d)));
+        sh.frames.store(tot.frames, Ordering::Relaxed);
         if t.elapsed() >= Duration::from_secs(1) {
-            let (st, ni, ov) = (dec.stale(), dec.no_input(), dec.oversize());
             // Under 5 AUs is decoder warm-up after start or a heal, not a
             // stall: a stuck second at 90 fps brings ~90.
-            if aus >= 5 && f == f0 {
+            if aus >= 5 && tot.frames == last.frames {
                 let drops = sh.au_dropped.load(Ordering::Relaxed);
+                let (st, ni, ov) = (
+                    tot.stale - last.stale,
+                    tot.no_input - last.no_input,
+                    tot.oversize - last.oversize,
+                );
+                let errs = tot.errors;
                 log::warn!(
-                    "video stalled: {aus} AUs in, 0 frames out; stale {} no_input {} oversize {} errors {errs} au_drops {drops}",
-                    st - s0,
-                    ni - n0,
-                    ov - o0,
+                    "video stalled: {aus} AUs in, 0 frames out; stale {st} no_input {ni} oversize {ov} errors {errs} au_drops {drops}",
                 );
                 sh.event(
                     "video_stall",
-                    serde_json::json!({"aus_in": aus, "stale": st - s0, "no_input": ni - n0,
-                        "oversize": ov - o0, "dec_errors": errs, "au_drops": drops}),
+                    serde_json::json!({"aus_in": aus, "stale": st, "no_input": ni,
+                        "oversize": ov, "dec_errors": errs, "au_drops": drops}),
                 );
-            } else if aus == 0 && sh.frames.load(Ordering::Relaxed) > 0 && starved.is_none() {
+            } else if aus == 0 && tot.frames > 0 && starved.is_none() {
                 log::warn!("video stalled: no AUs from the core for 1 s");
                 sh.event("video_stall", serde_json::json!({"aus_in": 0}));
                 starved = Some(t);
@@ -386,8 +519,9 @@ fn decode_loop(mut dec: MediaCodecDecoder, au_rx: Receiver<(u64, u64, Vec<u8>)>,
                     sh.event("video_back", serde_json::json!({ "after_ms": ms }));
                 }
             }
-            (t, aus, f0, s0, n0, o0) = (Instant::now(), 0, f, st, ni, ov);
+            (t, aus, last) = (Instant::now(), 0, tot);
         }
     }
-    log::info!("decode loop ended ({} stale frames dropped)", dec.stale());
+    let tot = dec.as_ref().map_or(gone, |d| gone.plus(DecTotals::of(d)));
+    log::info!("decode loop ended ({} stale frames dropped)", tot.stale);
 }
