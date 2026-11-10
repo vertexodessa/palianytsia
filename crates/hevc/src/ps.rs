@@ -53,15 +53,17 @@ impl Default for Sps {
     }
 }
 
+// The picture size in CTBs is C++ u32 arithmetic: an SPS may carry any
+// width a ue() spells, and the sums wrap there as they do here.
 impl Sps {
     pub fn pic_w_ctbs(&self) -> u32 {
-        (self.width + (1 << self.log2_ctb) - 1) >> self.log2_ctb
+        self.width.wrapping_add((1 << self.log2_ctb) - 1) >> self.log2_ctb
     }
     pub fn pic_h_ctbs(&self) -> u32 {
-        (self.height + (1 << self.log2_ctb) - 1) >> self.log2_ctb
+        self.height.wrapping_add((1 << self.log2_ctb) - 1) >> self.log2_ctb
     }
     pub fn addr_bits(&self) -> u32 {
-        ceil_log2(self.pic_w_ctbs() * self.pic_h_ctbs())
+        ceil_log2(self.pic_w_ctbs().wrapping_mul(self.pic_h_ctbs()))
     }
 }
 

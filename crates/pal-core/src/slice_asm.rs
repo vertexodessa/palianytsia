@@ -227,7 +227,7 @@ impl SliceAssembler {
         let n = usize::from(self.n);
         let mut slices: Vec<Option<Slice>> = (0..n).map(|_| None).collect();
         let mut prefix_nonvcl: Vec<(usize, Vec<u8>)> = Vec::new();
-        let span = u32::from(self.slice_rows) * self.sps.pic_w_ctbs();
+        let span = u32::from(self.slice_rows).wrapping_mul(self.sps.pic_w_ctbs());
         let mut seen_vcl = false;
         for (r, (roff, rb)) in runs.iter().enumerate() {
             let mut codes = Vec::new();
@@ -267,6 +267,11 @@ impl SliceAssembler {
                     Err(_) => return F::Geometry,
                 };
                 let addr = if h.first { 0 } else { h.address };
+                // A picture wider than u32 CTBs wraps the span to 0 (mabur
+                // divides by it and dies): no slice geometry fits.
+                if span == 0 {
+                    return F::Geometry;
+                }
                 if h.first != (addr == 0)
                     || addr % span != 0
                     || (addr / span) as usize >= n
@@ -312,7 +317,7 @@ impl SliceAssembler {
                 }
             }
         }
-        let total = self.sps.pic_w_ctbs() * self.sps.pic_h_ctbs();
+        let total = self.sps.pic_w_ctbs().wrapping_mul(self.sps.pic_h_ctbs());
         let mut kept = 0u8;
         let mut kept_after_hole = 0u8;
         for (k, s) in slices.iter_mut().enumerate() {
@@ -333,8 +338,8 @@ impl SliceAssembler {
                         &self.sps,
                         &self.pps,
                         &tmpl,
-                        k * span,
-                        ((k + 1) * span).min(total),
+                        k.wrapping_mul(span),
+                        (k + 1).wrapping_mul(span).min(total),
                     ) else {
                         return F::Geometry;
                     };

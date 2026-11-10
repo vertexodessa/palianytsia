@@ -174,7 +174,7 @@ pub fn make_skip_slice(
     if tmpl.slice_type == 2 {
         return None;
     }
-    let total = sps.pic_w_ctbs() * sps.pic_h_ctbs();
+    let total = sps.pic_w_ctbs().wrapping_mul(sps.pic_h_ctbs());
     if first_ctb >= end_ctb || end_ctb > total {
         return None;
     }
