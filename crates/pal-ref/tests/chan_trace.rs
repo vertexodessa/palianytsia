@@ -858,6 +858,43 @@ fn auto_boot_hop_relocates_to_the_pick() {
     assert!(d.has("(relocated)"));
 }
 
+/// A drone another GS left on 100, outside the set: past two passes the
+/// scout bursts on the grid, the link forms on 100 and the boot pick's
+/// relocation brings it back to a member.
+#[test]
+fn grid_search_finds_a_drone_off_the_set_and_brings_it_back() {
+    let mut d = Duo::new(2, None, 40);
+    for _ in 0..6000 {
+        if d.tr
+            .iter()
+            .any(|l| l.starts_with("D ") && l.contains(" ch=100 "))
+        {
+            break;
+        }
+        d.tick(false);
+    }
+    assert!(d
+        .tr
+        .iter()
+        .any(|l| l.starts_with("D ") && l.contains(" ch=100 ")));
+    d.session_opened_on(100, 100);
+    assert!(d.has("(outside the set)"));
+    d.link_up();
+    d.until(6000, true, "relocate 100 -> ");
+    let target = d.core.hop_target();
+    assert!(d.cfg.radio.channels.contains(&target));
+    assert_eq!(d.pump_rcf().unwrap().hop_ch, target);
+    d.note_video(target);
+    d.tick(true);
+    d.verify_window();
+    for _ in 0..120 {
+        d.tick(true);
+    }
+    d.snapshot(0);
+    assert!(d.has("verify_pass"));
+    assert_eq!(d.core.op(), target);
+}
+
 #[test]
 fn sampled_record_span() {
     let mut d = Duo::new(1, Some(40), 40);
@@ -895,7 +932,7 @@ fn disc_for_card_matches() {
         },
         &d.cfg.link.key,
     );
-    for ch in [64u8, 60, 40, 144] {
+    for ch in [64u8, 60, 40, 144, 100, 68] {
         d.card(1, |s| s.ch = ch);
         assert_eq!(
             d.core.disc_for_card(&frame, 1),
@@ -974,7 +1011,8 @@ fn random_scripts() {
                 67..=69 => {
                     if !session {
                         if r.below(3) == 0 {
-                            let x = set[r.below(4) as usize];
+                            // 100: found off the set by the grid search.
+                            let x = [40u8, 64, 112, 144, 100][r.below(5) as usize];
                             d.session_opened_on(x, x);
                         }
                         d.link_up();

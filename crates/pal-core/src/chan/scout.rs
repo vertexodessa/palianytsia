@@ -24,6 +24,7 @@ use super::pair::{all_pairs_ranked, any_pair_ranked, pair_proposal, pair_ranking
 use super::radio::{nhm_busy_pct, nhm_period_4us, NhmBusyRead, ScoutRadio};
 use super::ranker::{ChannelRanker, RankEntry, RankSample};
 use crate::config::ht40_offset;
+use pal_wire::ht40::grid_5g;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScoutCfg {
@@ -53,6 +54,11 @@ pub struct ScoutCfg {
     pub blocked_pct: f64,
     /// RankSample::leak per TX-card frame sent during an observe.
     pub leak_per_frame: f64,
+    /// Search: after this many full passes over the set with no link,
+    /// every other dwell is a DISC burst on a 5 GHz grid channel outside
+    /// the set, where a GS that moved the drone off the set left it. 0 =
+    /// the set only.
+    pub grid_after_rounds: i32,
 }
 
 impl Default for ScoutCfg {
@@ -74,6 +80,7 @@ impl Default for ScoutCfg {
             busy_dbm: -83,
             blocked_pct: 1e9,
             leak_per_frame: 1.0,
+            grid_after_rounds: 0,
         }
     }
 }
@@ -198,6 +205,13 @@ struct RunState {
     seq: u64,
     /// First run_once() (the one-card prelude start).
     t0: Option<i64>,
+    /// The grid search: `search_round0` is the rounds count when the search
+    /// last started; `grid_turn` alternates set and grid dwells; `grid_i`
+    /// walks the grid channels.
+    searching: bool,
+    search_round0: u64,
+    grid_turn: bool,
+    grid_i: usize,
 }
 
 pub struct ChannelScout<R: ScoutRadio + ?Sized> {
@@ -256,6 +270,10 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
                 sched: FlatScheduler::new(&dc),
                 seq: 0,
                 t0: None,
+                searching: false,
+                search_round0: 0,
+                grid_turn: false,
+                grid_i: 0,
             }),
             proposal: AtomicU8::new(first),
             op: AtomicU8::new(first),
@@ -524,6 +542,12 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     pub fn run_once(&self) -> bool {
         let mut rs = self.run.lock().unwrap();
         let t0 = *rs.t0.get_or_insert_with(|| (self.now)());
+        // The grid waits grid_after_rounds passes from the search's start.
+        let search = self.search.load(Acquire);
+        if (search && !rs.searching) || rs.sched.rounds < rs.search_round0 {
+            rs.search_round0 = rs.sched.rounds;
+        }
+        rs.searching = search;
         if !self.has_work() {
             if self.working.load(Acquire) {
                 self.park();
@@ -561,8 +585,46 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
                 return true;
             }
         }
+        if rs.grid_turn && self.grid_due(&rs) {
+            rs.grid_turn = false;
+            return self.grid_dwell(&mut rs);
+        }
+        rs.grid_turn = true;
         let observe = self.measuring();
         self.step_dwell(&mut rs, true, observe)
+    }
+
+    fn grid_due(&self, rs: &RunState) -> bool {
+        self.cfg.grid_after_rounds > 0
+            && self.search.load(Acquire)
+            && rs.sched.rounds >= rs.search_round0 + self.cfg.grid_after_rounds as u64
+    }
+
+    /// The 5 GHz grid channels the card can sit on at its width (at 40
+    /// those with a pair), minus the set and op.
+    fn grid_channels(&self) -> Vec<u8> {
+        let op = self.op.load(Acquire);
+        grid_5g(self.link_width_mhz())
+            .into_iter()
+            .filter(|&ch| !self.member(ch) && ch != op)
+            .collect()
+    }
+
+    /// One grid dwell: retune, settle, DISC burst, gap. Its DISC proposes
+    /// the channel it is sent on, so a drone there acks to stay and the link
+    /// forms there (`ChannelPlan::link_found`); the boot pick's relocation
+    /// brings it back to the set.
+    fn grid_dwell(&self, rs: &mut RunState) -> bool {
+        let grid = self.grid_channels();
+        if grid.is_empty() {
+            let observe = self.measuring();
+            return self.step_dwell(rs, true, observe);
+        }
+        let ch = grid[rs.grid_i % grid.len()];
+        rs.grid_i += 1;
+        let round = rs.sched.rounds;
+        let _ = self.dwell(rs, ch, round, true, false);
+        true
     }
 
     fn push_dwell(&self, d: ScoutDwell) {
@@ -1027,6 +1089,54 @@ mod tests {
             assert!(!c.starts_with("read") && !c.contains("132") && !c.contains("140"));
         }
         assert_eq!(g.s.rounds(), 2);
+    }
+
+    /// Past grid_after_rounds passes with the search on, every other dwell
+    /// is a burst on a grid channel outside the set (at 40: those with a
+    /// pair), never read; a restarted search waits the passes again.
+    #[test]
+    fn grid_search_bursts_outside_the_set_every_other_dwell_after_the_passes() {
+        let mut c = two(false);
+        c.grid_after_rounds = 2;
+        let g = Rig::new(c);
+        g.s.set_op(136);
+        g.s.set_search(true);
+        g.steps(4);
+        assert_eq!(g.s.rounds(), 2);
+        assert!(g
+            .r
+            .calls()
+            .iter()
+            .all(|c| c == "retune 136" || c == "retune 144"));
+        g.clear();
+        g.s.run_once();
+        assert_eq!(g.r.calls().last().unwrap(), "retune 36");
+        let p = g.phases();
+        assert_eq!(p.len(), 3);
+        assert!(ph(&p[1], "BW", 100));
+        g.s.run_once();
+        assert_eq!(g.r.st().ch, 136);
+        g.s.run_once();
+        assert_eq!(g.r.calls().last().unwrap(), "retune 40");
+        let mut grid: Vec<u8> = Vec::new();
+        for _ in 0..60 {
+            g.s.run_once();
+            let ch = g.r.st().ch;
+            if ch != 136 && ch != 144 && !grid.contains(&ch) {
+                grid.push(ch);
+            }
+        }
+        assert!(!grid.contains(&165) && grid.contains(&100));
+        assert_eq!(grid.len(), 22);
+        assert!(g.r.calls().iter().all(|c| !c.starts_with("read")));
+        g.s.set_search(false);
+        g.s.run_once();
+        g.s.set_search(true);
+        let n = g.r.calls().len();
+        g.steps(3);
+        assert!(g.r.calls()[n..]
+            .iter()
+            .all(|c| c == "retune 136" || c == "retune 144"));
     }
 
     #[test]

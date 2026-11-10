@@ -5,6 +5,8 @@
 //! only by a hop order: one card leads onto the target, the other keeps the
 //! link on `op` until confirm (video on the target) or withdraw.
 
+use pal_wire::ht40::GRID_5G;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveReason {
     Commit,
@@ -164,9 +166,12 @@ impl ChannelPlan {
     }
 
     /// The ack that opened the session was heard on `x`: the link forms there.
+    /// `x` may be a 5 GHz grid channel outside the set (the scout's grid
+    /// search found the drone there; relocate_due() then brings the link
+    /// back to want).
     pub fn link_found(&mut self, now_ms: f64, x: u8) {
         self.now_ms = now_ms;
-        if self.hopping || x == self.op || !self.member(x) {
+        if self.hopping || x == self.op || !(self.member(x) || GRID_5G.contains(&x)) {
             return;
         }
         self.push(None, self.op, x, MoveReason::LinkFound);
@@ -504,8 +509,24 @@ mod tests {
                 && ev[0].to == 149
         );
         p.link_found(20.0, 149);
-        p.link_found(20.0, 112);
+        p.link_found(20.0, 68); // neither a member nor a grid channel
         assert!(p.op() == 149 && p.take_events().is_empty());
+    }
+
+    #[test]
+    fn link_found_takes_a_grid_channel_outside_the_set_and_relocation_is_due() {
+        let mut p = p(2);
+        p.tick(0.0, false);
+        p.link_found(10.0, 100);
+        assert!(p.op() == 100 && p.desired(0) == 100 && p.desired(1) == 100);
+        assert_eq!(p.want(), 136);
+        p.tick(20.0, true);
+        assert!(p.relocate_due());
+        p.set_want(30.0, 100); // a failed relocation cannot adopt it
+        assert_eq!(p.want(), 136);
+        p.hop_order(40.0, 136, Some(1));
+        p.hop_confirmed(200.0);
+        assert!(p.op() == 136 && !p.relocate_due());
     }
 
     #[test]

@@ -24,6 +24,7 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
+use pal_wire::ht40::GRID_5G;
 use pal_wire::rc::{self, DiscAck, LinkKey};
 
 use super::boot::{BootPick, BootPickIn, BootPickOut};
@@ -658,6 +659,9 @@ impl ChannelCore {
                 busy_dbm: scan.busy.busy_dbm,
                 blocked_pct: scan.busy.blocked_pct,
                 leak_per_frame: cfg.leak_per_frame,
+                // Two passes over the set find a drone on it; past that the
+                // search also bursts on the rest of the 5 GHz grid.
+                grid_after_rounds: 2,
             };
             let (nm, sl) = (now_ms.clone(), sleep_ms.clone());
             let s = Arc::new(Scout::new(
@@ -954,12 +958,17 @@ impl ChannelCore {
             && ack.flags & rc::ACK_KEY_MISMATCH == 0
             && x != 0
             && x != self.plan.op()
-            && self.plan.member(x)
+            && (self.plan.member(x) || GRID_5G.contains(&x))
             && !self.plan.hopping()
         {
             let op = self.plan.op();
+            let off = if self.plan.member(x) {
+                ""
+            } else {
+                " (outside the set)"
+            };
             self.log(format!(
-                "maburgs channel: drone found on {x} (op {op}): the link forms there"
+                "maburgs channel: drone found on {x} (op {op}): the link forms there{off}"
             ));
             self.plan.link_found(now_ms, x);
             // A DISC proposes the channel it is sent on: stay.
@@ -1046,7 +1055,7 @@ impl ChannelCore {
     /// A DISC proposes the channel it is sent on.
     pub fn disc_for_card(&self, frame: &[u8], card: usize) -> Vec<u8> {
         let ch = self.live.cards[card].channel();
-        if self.plan.member(ch) {
+        if self.plan.member(ch) || GRID_5G.contains(&ch) {
             disc_for_channel(frame, ch, &self.cfg.key)
         } else {
             frame.to_vec()
@@ -1458,7 +1467,10 @@ impl ChannelCore {
             scout_owns: self.scout_owns(),
             op: self.plan.op(),
             want: self.plan.want(),
-            op_usable: self.cfg.radio.usable().contains(&self.plan.op()),
+            // Only radio.use (Rust only) narrows it: a link the grid search
+            // found outside the set relocates as in mabur (relocate_due).
+            op_usable: self.cfg.radio.use_.is_empty()
+                || self.cfg.radio.use_.contains(&self.plan.op()),
             relocate_due: self.plan.relocate_due(),
             plan_hopping: self.plan.hopping(),
             hop_active: hop_active(inp.in_session, inp.cal_running),
@@ -2174,7 +2186,7 @@ impl ChannelCore {
         ) {
             let proposed = vrx.proposal();
             let agreed = vrx.agreed_channel();
-            if !self.plan.member(agreed) {
+            if !self.plan.member(agreed) && agreed != self.plan.op() {
                 self.log(format!(
                     "maburgs channel: drone acked {agreed}, not in our set; ignored"
                 ));

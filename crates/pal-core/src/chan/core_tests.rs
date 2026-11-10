@@ -487,7 +487,7 @@ fn disc_targets_follow_scan_disc_targets_while_scout_owns() {
 }
 
 #[test]
-fn disc_for_card_retags_only_members() {
+fn disc_for_card_retags_members_and_grid_channels() {
     let g = Rig::auto(2);
     let d = rc::Disc {
         vrx_nonce: 7,
@@ -502,8 +502,21 @@ fn disc_for_card_retags_only_members() {
     assert_eq!(rc::parse_disc(&f1).unwrap().op_channel, 64);
     let ok = |f: &[u8]| rc::verify_control(f, &g.cfg.link.key, &rc::TagCtx::default());
     assert_eq!(ok(&f1), ok(&frame)); // re-tagged, not just patched
-    g.cards[1].s().ch = 60; // a 20 MHz half, not a member
+    g.cards[1].s().ch = 60; // a grid channel outside the set
+    let f2 = g.core.disc_for_card(&frame, 1);
+    assert_eq!(rc::parse_disc(&f2).unwrap().op_channel, 60);
+    g.cards[1].s().ch = 68; // off the grid
     assert_eq!(g.core.disc_for_card(&frame, 1), frame);
+}
+
+/// The grid search found the drone outside the set: the link forms there.
+#[test]
+fn session_opened_on_a_grid_channel_outside_the_set_moves_op_there() {
+    let mut g = Rig::auto(2);
+    g.session_opened_on(100, 100);
+    assert_eq!(g.core.op(), 100);
+    assert_eq!(g.vrx.proposal(), 100);
+    assert!(g.has_line("drone found on 100 (op 40): the link forms there (outside the set)"));
 }
 
 #[test]
@@ -529,7 +542,7 @@ fn session_opened_with_key_mismatch_or_foreign_nonce_is_ignored() {
     ack.vrx_nonce = g.vrx.rz_nonce().wrapping_add(1);
     g.core.on_session_opened(&ack, 1000.0, &mut g.vrx);
     assert_eq!(g.core.op(), 40);
-    g.core.on_rc_body(60); // not a member
+    g.core.on_rc_body(68); // off the grid
     ack.vrx_nonce = g.vrx.rz_nonce();
     g.core.on_session_opened(&ack, 1000.0, &mut g.vrx);
     assert_eq!(g.core.op(), 40);
