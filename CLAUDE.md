@@ -104,6 +104,11 @@ pairing key.
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
+- Capture analysis (`tools/palcap.py` reads `palcap 1` + SBI/FEC envelopes): `tools/losstrace.py bodies.bin [--json f]`
+  union loss from the drone's 802.11 sequence numbers (runs, loss by MCS / RSSI, window-budget check; FCS-failed
+  records are mostly foreign frames, see its docstring), `tools/truncwhy.py <session> <losstrace json>` the air before
+  each truncated AU, `tools/idrwhy.py <session>` keyframes against air time and drone queue, `tools/sessions.py <root>`
+  one TSV row per session. Test: `crates/flightlog/tests/losstrace.rs`.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.
 
 ## Finding code
