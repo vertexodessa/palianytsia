@@ -236,7 +236,7 @@ pub struct CoreLoop {
     /// Per-card deaf/hearing flips for the flight log.
     deaf: pal_osd::DeafWatch,
     /// Core time (ms) of the last ladder transition logged as rung_reason.
-    rung_seen_ms: i64,
+    rung_seen_ms: Option<i64>,
     /// The flight log's write error has been reported.
     log_err_told: bool,
     /// The cards the core drives, in card order (`watch_cards`).
@@ -279,7 +279,7 @@ impl CoreLoop {
             last_log_us: 0,
             cal: CalUi::default(),
             deaf: pal_osd::DeafWatch::default(),
-            rung_seen_ms: i64::MIN,
+            rung_seen_ms: None,
             log_err_told: false,
             taps: Vec::new(),
         }
@@ -330,12 +330,15 @@ impl CoreLoop {
         ) else {
             return;
         };
-        let at_ms = (now_us / 1000) as i64 - age;
+        let at_ms = ((now_us / 1000) as i64).saturating_sub(age);
         // The age is rounded: the same transition reads up to 1 ms apart.
-        if (at_ms - self.rung_seen_ms).abs() <= 2 {
+        if self
+            .rung_seen_ms
+            .is_some_and(|seen| at_ms.abs_diff(seen) <= 2)
+        {
             return;
         }
-        self.rung_seen_ms = at_ms;
+        self.rung_seen_ms = Some(at_ms);
         let g = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
         self.sink.shared.event(
             "rung_reason",
@@ -1292,6 +1295,104 @@ mod tests {
         }
     }
 
+    /// A CoreLoop with every port's far end held, so sends land.
+    struct Rig {
+        cl: CoreLoop,
+        shared: Arc<Shared>,
+        stats_rx: mpsc::Receiver<String>,
+        _far: Box<dyn std::any::Any>,
+    }
+
+    fn rig(core: Box<dyn GsCore>, log: Option<Session>) -> Rig {
+        let (au_tx, au_rx) = mpsc::sync_channel(1 << 16);
+        let (mav_tx, mav_rx) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared::default());
+        let sink = Sink {
+            au_tx,
+            pts_off_us: None,
+            mav_tx,
+            udp: None,
+            card: None,
+            log,
+            now_us: 0,
+            shared: shared.clone(),
+            idr: None,
+            cam_fps: Default::default(),
+        };
+        let (stats_tx, stats_rx) = mpsc::sync_channel(1 << 12);
+        let (params_tx, params_rx) = mpsc::sync_channel(1 << 12);
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel(1);
+        let (set_res_tx, set_res_rx) = mpsc::sync_channel(1);
+        let ports = LoopPorts {
+            stats_tx,
+            params_tx,
+            cmd_rx,
+            set_res_tx,
+        };
+        Rig {
+            cl: CoreLoop::new(core, sink, ports, false),
+            shared,
+            stats_rx,
+            _far: Box::new((au_rx, mav_rx, params_rx, cmd_tx, set_res_rx)),
+        }
+    }
+
+    /// A core whose ladder moved at each of `moves` (core ms). The age it
+    /// reports wobbles by 1 ms, as the rounded age of the real core does.
+    struct LadderCore {
+        now_ms: i64,
+        moves: Vec<i64>,
+    }
+
+    impl GsCore for LadderCore {
+        fn on_rx(&mut self, _: &RxBody, _: &mut dyn CoreIo) {}
+        fn tick(&mut self, now_us: u64, _: &mut dyn CoreIo) {
+            self.now_ms = (now_us / 1000) as i64;
+        }
+        fn stats_json(&self) -> String {
+            r#"{"session":true,"rung":0}"#.into()
+        }
+        fn link_op(&self) -> (i32, i32) {
+            (0, 20)
+        }
+        fn ladder_json(&self) -> Option<String> {
+            let Some(at) = self.moves.iter().rev().find(|&&m| m <= self.now_ms) else {
+                return Some(r#"{"rung":0,"top":4}"#.into());
+            };
+            let age = self.now_ms - at + (self.now_ms / 100) % 2;
+            Some(format!(
+                r#"{{"rung":1,"top":4,"last_reason":"demote_loss","last_from":2,"last_to":1,"last_age_ms":{age}}}"#
+            ))
+        }
+    }
+
+    #[test]
+    fn each_ladder_transition_is_logged_once() {
+        let Rig { mut cl, shared, .. } = rig(
+            Box::new(LadderCore {
+                now_ms: 0,
+                moves: vec![1530, 3270],
+            }),
+            None,
+        );
+        let mut told = Vec::new();
+        let mut t = 1_000_000;
+        while t < 5_000_000 {
+            cl.tick(t);
+            told.extend(shared.events.lock().unwrap().drain(..));
+            t += TICK_US;
+        }
+        let ages: Vec<_> = told
+            .iter()
+            .filter(|(ev, _)| *ev == "rung_reason")
+            .map(|(_, v)| v["age_ms"].as_i64().unwrap())
+            .collect();
+        // Seen with the first 10 Hz stats line after each move, at 1.6 s
+        // and 3.3 s; the odd tenth carries the wobble's 1 ms. Every later
+        // line reads the same move 1 ms earlier or not, and stays quiet.
+        assert_eq!(ages, [70, 31], "{told:?}");
+    }
+
     #[test]
     fn free_space_reads_the_volume_or_nothing() {
         assert!(free_bytes(&std::env::temp_dir()).is_some_and(|b| b > 0));
@@ -1314,32 +1415,12 @@ mod tests {
             ..Disk::default()
         }));
         log.wrap_writers(|_, w| Box::new(FailAfter(disk.clone(), w)));
-        let (au_tx, _au_rx) = mpsc::sync_channel(1 << 16);
-        let (mav_tx, _mav_rx) = mpsc::sync_channel(1);
-        let shared = Arc::new(Shared::default());
-        let sink = Sink {
-            au_tx,
-            pts_off_us: None,
-            mav_tx,
-            udp: None,
-            card: None,
-            log: Some(log),
-            now_us: 0,
-            shared: shared.clone(),
-            idr: None,
-            cam_fps: Default::default(),
-        };
-        let (stats_tx, stats_rx) = mpsc::sync_channel(1 << 12);
-        let (params_tx, _params_rx) = mpsc::sync_channel(1 << 12);
-        let (_cmd_tx, cmd_rx) = mpsc::sync_channel(1);
-        let (set_res_tx, _set_res_rx) = mpsc::sync_channel(1);
-        let ports = LoopPorts {
-            stats_tx,
-            params_tx,
-            cmd_rx,
-            set_res_tx,
-        };
-        let mut cl = CoreLoop::new(Box::new(AuCore), sink, ports, false);
+        let Rig {
+            mut cl,
+            shared,
+            stats_rx,
+            ..
+        } = rig(Box::new(AuCore), Some(log));
         let mut told = Vec::new();
         let mut t = 1_000_000;
         // 5 s of ticks: the au.log lines alone pass 4000 bytes in well
