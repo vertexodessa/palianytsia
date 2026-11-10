@@ -532,6 +532,8 @@ pub struct Summary {
     /// fec.log's episodes per layer; None for a session written before it.
     pub fec: Option<[FecTotals; 2]>,
     pub keyframes: crate::keyframes::Keyframes,
+    /// The Android decode loop's per-second `decoder` records.
+    pub decoder: crate::decoder::DecoderTotals,
 }
 
 /// One layer's loss episodes in fec.log.
@@ -678,6 +680,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             .unwrap_or("?")
             .to_string();
         s.keyframes.event(&ev, &v);
+        s.decoder.event(&ev, &v);
         match ev.as_str() {
             "build" if s.build.is_none() => s.build = Some(v.clone()),
             "cards" => s
@@ -715,6 +718,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
     s.events = counts;
     s.fec = read_fec(&dir.join(FEC_FILE))?;
     s.keyframes.finish();
+    s.decoder.finish();
     if t_max >= t_min && t_min != u64::MAX {
         s.span_s = (t_max - t_min) as f64 / 1e6;
     }

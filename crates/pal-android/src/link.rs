@@ -412,6 +412,40 @@ fn note_restart(sh: &Shared, v: Verdict, now_ms: u64, last: DecTotals, open_err:
 /// exactly one per rebuild, tagged with the AU at hand: the new codec has no
 /// reference until an IRAP, and one rise arms one keyframe request (its
 /// retries until the IRAP are the requester's). The dying codec's errors are
+/// One second of decoder health for the flight log (pal log sums them up):
+/// AUs in, frames shown, stale and refused AUs, decode errors and AU drops
+/// in the second, the longest channel wait and the queue-to-output
+/// percentiles. None for an idle second, so a parked link writes nothing.
+fn decoder_record(
+    aus: u64,
+    tot: DecTotals,
+    last: DecTotals,
+    au_drops: u64,
+    wait_max_us: u64,
+    mut ages: Vec<u64>,
+) -> Option<serde_json::Value> {
+    let d = |f: fn(&DecTotals) -> u64| f(&tot).saturating_sub(f(&last));
+    if aus == 0 && ages.is_empty() && au_drops == 0 {
+        return None;
+    }
+    ages.sort_unstable();
+    let pct = |q| flightlog::keyframes::pct(&ages, q);
+    Some(serde_json::json!({
+        "aus_in": aus,
+        "frames": d(|x| x.frames),
+        "stale": d(|x| x.stale),
+        "no_input": d(|x| x.no_input),
+        "oversize": d(|x| x.oversize),
+        "errors": d(|x| x.errors),
+        "au_drops": au_drops,
+        "wait_max_us": wait_max_us,
+        "q_n": ages.len(),
+        "q_p50_us": pct(50),
+        "q_p99_us": pct(99),
+        "q_max_us": pct(100),
+    }))
+}
+
 /// held back while its run of refused AUs lasts and dropped with it, so they
 /// arm nothing.
 fn decode_loop(
@@ -435,6 +469,9 @@ fn decode_loop(
     // Once a second: a line when AUs came in but no frame came out, so a
     // stall on the glass leaves its cause in logcat.
     let (mut t, mut aus, mut last) = (Instant::now(), 0u64, DecTotals::default());
+    // The decoder record's own window: the longest an AU waited in the
+    // channel, and the AU drops at the last record.
+    let (mut wait_max_us, mut last_drops) = (0u64, 0u64);
     // Since when no AU has come (after video once flowed): one line and one
     // event per outage, not one a second (60 a minute with the drone off).
     let mut starved: Option<Instant> = None;
@@ -444,8 +481,9 @@ fn decode_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if let Some((n, _t, au)) = got {
+        if let Some((n, t_enq, au)) = got {
             aus += 1;
+            wait_max_us = wait_max_us.max(runtime::lat_us().saturating_sub(t_enq));
             let now = ms();
             if dec.is_none() && rebuild_at.is_some_and(|r| now >= r) {
                 match MediaCodecDecoder::new(win.clone(), DEC_HINT.0, DEC_HINT.1) {
@@ -512,6 +550,12 @@ fn decode_loop(
                 sh.event("video_stall", serde_json::json!({"aus_in": 0}));
                 starved = Some(t);
             }
+            let drops = sh.au_dropped.load(Ordering::Relaxed);
+            let ages = dec.as_ref().map(|d| d.take_ages()).unwrap_or_default();
+            if let Some(r) = decoder_record(aus, tot, last, drops - last_drops, wait_max_us, ages) {
+                sh.event("decoder", r);
+            }
+            (wait_max_us, last_drops) = (0, drops);
             if aus > 0 {
                 if let Some(s) = starved.take() {
                     let ms = s.elapsed().as_millis() as u64;

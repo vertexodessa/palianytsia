@@ -47,6 +47,8 @@ use crate::watchdog::{Fed, LogEvery};
 const STALE_US: u64 = 150_000;
 /// Frames per latency line in the log (~5 s at 60 fps).
 const LAT_WINDOW: usize = 300;
+/// Ages kept for `take_ages`: several seconds at 120 fps.
+const AGES_CAP: usize = 1024;
 const DECODER_PROP: &std::ffi::CStr = c"debug.pal.decoder";
 const STARVE_PROP: &std::ffi::CStr = c"debug.pal.dec_starve";
 const BREAK_PROP: &std::ffi::CStr = c"debug.pal.dec_break";
@@ -121,6 +123,9 @@ struct Shared {
     oversize: AtomicU64,
     /// (pts, queued at) of AUs in flight, oldest first.
     queued: Mutex<VecDeque<(u64, Instant)>>,
+    /// Queue-to-output ages (µs) since the last `take_ages`, for the
+    /// flight log's decoder record; capped so an unread one stays small.
+    ages: Mutex<Vec<u64>>,
     /// The output surface, to log the buffer size the codec gave it.
     win: NativeWindow,
     /// Clock of the warning limits.
@@ -215,6 +220,7 @@ impl MediaCodecDecoder {
             no_input: AtomicU64::new(0),
             oversize: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
+            ages: Mutex::new(Vec::new()),
             win,
             t0: Instant::now(),
         });
@@ -275,6 +281,11 @@ impl MediaCodecDecoder {
     pub fn stale(&self) -> u64 {
         self.sh.stale.load(Ordering::Relaxed)
     }
+
+    /// Queue-to-output ages (µs) of the frames out since the last call.
+    pub fn take_ages(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.sh.ages.lock().unwrap_or_else(|p| p.into_inner()))
+    }
 }
 
 /// Queue-to-output microseconds of the frames in one window.
@@ -311,6 +322,12 @@ fn output_loop(sh: &Shared) {
                         .map(|(_, t)| t.elapsed().as_micros() as u64)
                 };
                 if let Some(a) = age {
+                    {
+                        let mut w = sh.ages.lock().unwrap_or_else(|p| p.into_inner());
+                        if w.len() < AGES_CAP {
+                            w.push(a);
+                        }
+                    }
                     ages.push(a);
                     if ages.len() == LAT_WINDOW {
                         log_latency(&sh.name, &mut ages);

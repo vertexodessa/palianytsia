@@ -709,6 +709,25 @@ fn log_summary(o: Opts) {
         print_fec(fec);
     }
     print_keyframes(&s.keyframes, s.span_s);
+    let d = &s.decoder;
+    if d.seconds > 0 {
+        let ms = |us: u64| us as f64 / 1000.0;
+        println!(
+            "  decoder {} s: {} AUs in, {} frames, stale {}, no input {}, oversize {}, errors {}, AU drops {}; queue->out p50 {:.1} ms, worst p99 {:.1} ms, max {:.1} ms; longest AU wait {:.1} ms",
+            d.seconds,
+            d.aus_in,
+            d.frames,
+            d.stale,
+            d.no_input,
+            d.oversize,
+            d.errors,
+            d.au_drops,
+            ms(d.q_p50_us),
+            ms(d.q_p99_max_us),
+            ms(d.q_max_us),
+            ms(d.wait_max_us)
+        );
+    }
     if let Some((t, values)) = &s.params {
         print_params(*t, values);
     }
