@@ -648,7 +648,8 @@ fn merge_overlay(base: &mut Table, ov: &Table) {
 }
 
 pub fn parse_key_hex(hex: &str) -> Option<LinkKey> {
-    if hex.len() != 32 || !hex.is_ascii() {
+    // Digits only: from_str_radix alone would take a leading '+'.
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut k = [0u8; 16];
@@ -661,16 +662,31 @@ pub fn parse_key_hex(hex: &str) -> Option<LinkKey> {
 /// mabur `load_key_file`: missing file = the default key; one 32-hex token
 /// per file, `#` comments allowed.
 pub fn load_key_file(path: &str) -> Result<(LinkKey, bool, String), String> {
-    let text = match std::fs::read_to_string(path) {
+    let bytes = match std::fs::read(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok((DEFAULT_LINK_KEY, true, "default".into()))
         }
-        Err(e) => return Err(format!("{path}: {e}")),
+        Err(e) => {
+            // strerror's text, as mabur prints it: without Rust's suffix.
+            let s = e.to_string();
+            let s = match e.raw_os_error() {
+                Some(code) => s
+                    .strip_suffix(&format!(" (os error {code})"))
+                    .unwrap_or(&s)
+                    .to_string(),
+                None => s,
+            };
+            return Err(format!("{path}: {s}"));
+        }
     };
+    // Bytes, not UTF-8: a stray byte is a malformed key, not a read error.
+    let text = String::from_utf8_lossy(&bytes);
+    // C isspace(): mabur's trim, which leaves Unicode spaces in the token.
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
     let toks: Vec<&str> = text
-        .lines()
-        .map(str::trim)
+        .split('\n')
+        .map(|l| l.trim_matches(space))
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
     match toks.as_slice() {
