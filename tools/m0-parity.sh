@@ -82,6 +82,51 @@ for spec in "0 1" "10 7" "20 3" "30 11"; do
   grep -o '"salvaged":[0-9]*' "$TMP/pal.err" | sed 's/^/     /'
 done
 
+# Differential fuzzing: the slice frames with bodies bent on the air (bit
+# flips, truncation, a byte overwritten; the replay marks every body
+# FCS-good, so this is a transmitter that sends broken bodies). mabur's
+# core is the oracle for what to do with garbage: webgs, pal-ref and the
+# Rust core must still agree on AUs and sends.
+mutate_frames() {  # in out pct seed
+  python3 - "$@" <<'PY'
+import struct, sys
+src, dst, pct, seed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+s = seed & 0xFFFFFFFF
+def rnd(n):
+    global s
+    s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
+    return (s >> 8) % n
+d = open(src, "rb").read()
+out, i = bytearray(), 0
+while i + 4 <= len(d):
+    n = struct.unpack_from("<I", d, i)[0]
+    f = bytearray(d[i + 4:i + 4 + n])
+    i += 4 + n
+    rl = f[2] | f[3] << 8 if len(f) >= 4 else 0
+    off = rl + (26 if rl < len(f) and f[rl] == 0x88 else 24)
+    if off < len(f) and rnd(100) < pct:
+        k = rnd(3)
+        if k == 0:
+            for _ in range(1 + rnd(3)):
+                f[off + rnd(len(f) - off)] ^= 1 << rnd(8)
+        elif k == 1:
+            del f[off + 1 + rnd(len(f) - off):]
+        else:
+            f[off + rnd(min(16, len(f) - off))] = rnd(256)
+    out += struct.pack("<I", len(f)) + f
+open(dst, "wb").write(out)
+PY
+}
+cp "$TMP/frames.bin" "$TMP/clean.bin"
+for spec in "5 1" "10 7" "20 3"; do
+  set -- $spec
+  mutate_frames "$TMP/clean.bin" "$TMP/frames.bin" "$1" "$2"
+  run_case "mutated ref     pct=$1 seed=$2" --mode spotter --fixed-gap
+  run_case "mutated rust    pct=$1 seed=$2" --mode spotter --fixed-gap --core rust
+  run_case "mutated rust gs pct=$1 seed=$2" --mode gs --fake-ack --fixed-gap --core rust
+  sends_case "mutated sends ref==rust pct=$1 seed=$2" --mode gs --fake-ack
+done
+
 # A repair window that changes per frame: bursts of large frames between long
 # runs of small ones (tools/window-frames.py), so the GS's recent window
 # (repair_window_recent) falls back between bursts and the next burst opens

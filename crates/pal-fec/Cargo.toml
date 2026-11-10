@@ -11,3 +11,4 @@ pal-wire.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+proptest = { version = "1.12", default-features = false, features = ["std"] }
