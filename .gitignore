@@ -7,3 +7,4 @@
 /dist/
 /captures/
 /drone-backup-*/
+__pycache__/
