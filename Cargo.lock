@@ -1952,6 +1952,7 @@ dependencies = [
  "pal-core",
  "pal-wire",
  "runtime",
+ "toml",
 ]
 
 [[package]]

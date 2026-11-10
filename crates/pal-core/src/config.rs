@@ -1004,32 +1004,570 @@ pub fn parse_config_str(text: &str) -> R<Config> {
     parse_config(&j)
 }
 
+const TOP_KEYS: &[&str] = &[
+    "radio",
+    "fec",
+    "link",
+    "video",
+    "msp",
+    "stats",
+    "au_ring",
+    "debug_log",
+    "hop",
+    "mavlink",
+];
+const RADIO_KEYS: &[&str] = &[
+    "channel", "channels", "use", "cards", "tx_card", "scan", "relays",
+];
+const CARD_KEYS: &[&str] = &["usb_vid", "usb_pid", "index"];
+const SCAN_KEYS: &[&str] = &[
+    "dwell_ms",
+    "settle_ms",
+    "min_rounds",
+    "search_ms",
+    "op_window_ms",
+    "search_after_ms",
+    "pick_margin_pct",
+    "one_card_ms",
+    "max_ms",
+    "busy_dbm",
+    "blocked_pct",
+];
+const HOP_KEYS: &[&str] = &[
+    "window_ms",
+    "persist",
+    "dwell_observe_ms",
+    "dwell_period_ms",
+    "burst_period_ms",
+    "rank_visits",
+    "rank_max_age_ms",
+    "confirm_ms",
+    "confirm_extend_ms",
+    "verify_ms",
+    "cooldown_ms",
+    "max_hops_per_min",
+    "backoff_ms",
+    "one_card_repeats",
+    "relay_burst_period_ms",
+    "verdict",
+];
+const VERDICT_KEYS: &[&str] = &[
+    "loss_pct",
+    "recovered_x",
+    "weak_rssi_dbm",
+    "weak_snr_db",
+    "recovered_min",
+    "occupied_windows",
+    "detect_pct",
+    "detect_windows",
+    "detect_impaired",
+];
+const FEC_KEYS: &[&str] = &["symbol_size", "seq_horizon"];
+const LINK_KEYS: &[&str] = &[
+    "feedback_ms",
+    "beacon_keepalive_ms",
+    "static_mcs",
+    "static_overhead_base",
+    "static_overhead_enh",
+    "static_bw",
+    "ladder",
+    "max_mcs",
+    "down_util",
+    "up_util",
+    "confirm_ms",
+    "clean_ms",
+    "probation_ms",
+    "penalty_base_ms",
+    "penalty_max_ms",
+    "hold_after_down_ms",
+    "min_between_changes_ms",
+    "feedback_timeout_ms",
+    "starved_confirm_ms",
+    "s3_demote",
+    "s3_down_util",
+    "s3_settle_ms",
+    "s3_min_syms",
+    "rung_stats",
+    "fade",
+    "probe",
+    "rcf_slot_hold_ms",
+    "arrival_guard_syms",
+    "nack",
+    "key_file",
+    "key",
+];
+const RUNG_KEYS: &[&str] = &["mcs", "bw", "overhead_base", "overhead_enh"];
+const PROBE_KEYS: &[&str] = &[
+    "enable",
+    "rung_offset",
+    "clean_bodies",
+    "max_util",
+    "min_syms",
+    "silence_ms",
+    "pin_mcs",
+];
+const FADE_KEYS: &[&str] = &[
+    "cascade",
+    "predict",
+    "hold_ms",
+    "confirm_ms",
+    "rssi_db",
+    "snr_db",
+    "trigger_ms",
+    "min_rung",
+];
+const NACK_KEYS: &[&str] = &[
+    "enable",
+    "lookback",
+    "repeat_ms",
+    "max_tries",
+    "min_lead_ms",
+];
+const RUNG_STATS_KEYS: &[&str] = &["half_life_samples"];
+const VIDEO_KEYS: &[&str] = &[
+    "frame_gap_timeout_ms",
+    "frame_gap_timeout_max_ms",
+    "frame_lookahead",
+];
+const MSP_KEYS: &[&str] = &["enable", "out", "symbol_size", "window"];
+const MSP_OUT_KEYS: &[&str] = &["host", "port"];
+const STATS_KEYS: &[&str] = &["enable", "host", "port", "interval_ms", "out"];
+const STATS_OUT_KEYS: &[&str] = &["host", "port"];
+const AU_RING_KEYS: &[&str] = &["enable", "path", "socket", "slot_kb", "slot_count"];
+const DEBUG_LOG_KEYS: &[&str] = &["enable", "dir", "ctl_period_ms", "rung_period_s"];
+const MAVLINK_KEYS: &[&str] = &["enable", "bind", "port"];
+
+/// Every table the parser reads and the keys it accepts there, as the
+/// parser's own `check_keys` lists: the input of pal-ref's differential test
+/// against mabur's `load_config`. `[]` marks an array of tables (its
+/// element's keys).
+#[doc(hidden)]
+pub const KEY_TABLE: &[(&str, &[&str])] = &[
+    ("", TOP_KEYS),
+    ("radio", RADIO_KEYS),
+    ("radio.cards[]", CARD_KEYS),
+    ("radio.scan", SCAN_KEYS),
+    ("hop", HOP_KEYS),
+    ("hop.verdict", VERDICT_KEYS),
+    ("fec", FEC_KEYS),
+    ("link", LINK_KEYS),
+    ("link.ladder[]", RUNG_KEYS),
+    ("link.probe", PROBE_KEYS),
+    ("link.fade", FADE_KEYS),
+    ("link.nack", NACK_KEYS),
+    ("link.rung_stats", RUNG_STATS_KEYS),
+    ("video", VIDEO_KEYS),
+    ("msp", MSP_KEYS),
+    ("msp.out", MSP_OUT_KEYS),
+    ("stats", STATS_KEYS),
+    ("stats.out[]", STATS_OUT_KEYS),
+    ("au_ring", AU_RING_KEYS),
+    ("debug_log", DEBUG_LOG_KEYS),
+    ("mavlink", MAVLINK_KEYS),
+];
+
+/// The loaded config as one `key=value` line per field, named and formatted
+/// as pal-ref's `pal_ref_config_check` prints mabur's `Config` (doubles by
+/// their bits), plus the derived receiver width and decode layers. Every
+/// struct is destructured without `..`, so a field added here fails to
+/// compile until the dump carries it.
+#[doc(hidden)]
+pub fn dump(c: &Config) -> String {
+    use std::fmt::Write;
+    let mut o = String::new();
+    let mut put = |k: &str, v: String| {
+        let _ = writeln!(o, "{k}={v}");
+    };
+    let f = |v: f64| format!("f64:{:016x}", v.to_bits());
+    let list = |v: &[u8]| v.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+    let Config {
+        radio,
+        fec,
+        link,
+        video,
+        msp,
+        stats,
+        au_ring,
+        debug_log,
+        hop,
+        mavlink,
+    } = c;
+
+    let RadioCfg {
+        channels,
+        use_,
+        pin,
+        cards,
+        auto_scan,
+        tx_card,
+        relays,
+        scan,
+    } = radio;
+    put("radio.channels", list(channels));
+    put("radio.use", list(use_));
+    put("radio.pin", pin.map_or("none".into(), |p| p.to_string()));
+    put("radio.cards.len", cards.len().to_string());
+    for (n, card) in cards.iter().enumerate() {
+        let CardCfg {
+            usb_vid,
+            usb_pid,
+            index,
+        } = card;
+        put(&format!("radio.cards[{n}].usb_vid"), usb_vid.to_string());
+        put(&format!("radio.cards[{n}].usb_pid"), usb_pid.to_string());
+        put(&format!("radio.cards[{n}].index"), index.to_string());
+    }
+    put("radio.auto_scan", auto_scan.to_string());
+    put("radio.tx_card", tx_card.to_string());
+    put("radio.relays.len", relays.len().to_string());
+    for (n, r) in relays.iter().enumerate() {
+        put(&format!("radio.relays[{n}]"), r.clone());
+    }
+    let ScanCfg {
+        dwell_ms,
+        settle_ms,
+        min_rounds,
+        search_ms,
+        op_window_ms,
+        search_after_ms,
+        pick_margin_pct,
+        one_card_ms,
+        max_ms,
+        busy,
+    } = scan;
+    put("radio.scan.dwell_ms", dwell_ms.to_string());
+    put("radio.scan.settle_ms", settle_ms.to_string());
+    put("radio.scan.min_rounds", min_rounds.to_string());
+    put("radio.scan.search_ms", search_ms.to_string());
+    put("radio.scan.op_window_ms", op_window_ms.to_string());
+    put("radio.scan.search_after_ms", search_after_ms.to_string());
+    put("radio.scan.pick_margin_pct", pick_margin_pct.to_string());
+    put("radio.scan.one_card_ms", one_card_ms.to_string());
+    put("radio.scan.max_ms", max_ms.to_string());
+    let BusyCfg {
+        busy_dbm,
+        blocked_pct,
+    } = busy;
+    put("radio.scan.busy.busy_dbm", busy_dbm.to_string());
+    put("radio.scan.busy.blocked_pct", f(*blocked_pct));
+
+    let FecCfg {
+        symbol_size,
+        seq_horizon,
+    } = fec;
+    put("fec.symbol_size[0]", symbol_size[0].to_string());
+    put("fec.symbol_size[1]", symbol_size[1].to_string());
+    put("fec.seq_horizon", seq_horizon.to_string());
+
+    let LinkCfg {
+        feedback_ms,
+        beacon_keepalive_ms,
+        rcf_slot_hold_ms,
+        arrival_guard_syms,
+        nack,
+        static_mcs,
+        static_overhead_base,
+        static_overhead_enh,
+        static_bw,
+        ladder_cfg,
+        key_file,
+        key,
+        key_is_default,
+        key_source,
+    } = link;
+    put("link.feedback_ms", feedback_ms.to_string());
+    put("link.beacon_keepalive_ms", beacon_keepalive_ms.to_string());
+    put("link.rcf_slot_hold_ms", rcf_slot_hold_ms.to_string());
+    put("link.arrival_guard_syms", arrival_guard_syms.to_string());
+    let NackCfg {
+        enable,
+        lookback,
+        repeat_ms,
+        max_tries,
+        min_lead_ms,
+        settle_min_ms,
+        settle_max_ms,
+        settle_seed_ms,
+        settle_window_ms,
+        settle_min_samples,
+    } = nack;
+    put("link.nack.enable", enable.to_string());
+    put("link.nack.lookback", lookback.to_string());
+    put("link.nack.repeat_ms", repeat_ms.to_string());
+    put("link.nack.max_tries", max_tries.to_string());
+    put("link.nack.min_lead_ms", min_lead_ms.to_string());
+    put("link.nack.settle_min_ms", settle_min_ms.to_string());
+    put("link.nack.settle_max_ms", settle_max_ms.to_string());
+    put("link.nack.settle_seed_ms", settle_seed_ms.to_string());
+    put("link.nack.settle_window_ms", settle_window_ms.to_string());
+    put(
+        "link.nack.settle_min_samples",
+        settle_min_samples.to_string(),
+    );
+    put("link.static_mcs", static_mcs.to_string());
+    put("link.static_overhead_base", f(*static_overhead_base));
+    put("link.static_overhead_enh", f(*static_overhead_enh));
+    put("link.static_bw", static_bw.to_string());
+    let LadderCfg {
+        ladder,
+        down_util,
+        up_util,
+        confirm_ms,
+        clean_ms,
+        probation_ms,
+        penalty_base_ms,
+        penalty_max_ms,
+        hold_after_down_ms,
+        min_between_changes_ms,
+        feedback_timeout_ms,
+        starved_confirm_ms,
+        probe,
+        s3_demote,
+        s3_down_util,
+        s3_min_syms,
+        s3_settle_ms,
+        fade,
+        rung_stats_half_life_samples,
+    } = ladder_cfg;
+    let p = "link.ladder_cfg.";
+    put(&format!("{p}ladder.len"), ladder.len().to_string());
+    for (n, r) in ladder.iter().enumerate() {
+        let Rung {
+            mcs,
+            overhead_base,
+            overhead_enh,
+            bw,
+        } = r;
+        put(&format!("{p}ladder[{n}].mcs"), mcs.to_string());
+        put(&format!("{p}ladder[{n}].overhead_base"), f(*overhead_base));
+        put(&format!("{p}ladder[{n}].overhead_enh"), f(*overhead_enh));
+        put(&format!("{p}ladder[{n}].bw"), bw.to_string());
+    }
+    put(&format!("{p}down_util"), f(*down_util));
+    put(&format!("{p}up_util"), f(*up_util));
+    put(&format!("{p}confirm_ms"), confirm_ms.to_string());
+    put(&format!("{p}clean_ms"), clean_ms.to_string());
+    put(&format!("{p}probation_ms"), probation_ms.to_string());
+    put(&format!("{p}penalty_base_ms"), penalty_base_ms.to_string());
+    put(&format!("{p}penalty_max_ms"), penalty_max_ms.to_string());
+    put(
+        &format!("{p}hold_after_down_ms"),
+        hold_after_down_ms.to_string(),
+    );
+    put(
+        &format!("{p}min_between_changes_ms"),
+        min_between_changes_ms.to_string(),
+    );
+    put(
+        &format!("{p}feedback_timeout_ms"),
+        feedback_timeout_ms.to_string(),
+    );
+    put(
+        &format!("{p}starved_confirm_ms"),
+        starved_confirm_ms.to_string(),
+    );
+    let ProbeCfg {
+        enable,
+        rung_offset,
+        clean_bodies,
+        max_util,
+        min_syms,
+        silence_ms,
+        pin_mcs,
+    } = probe;
+    put(&format!("{p}probe.enable"), enable.to_string());
+    put(&format!("{p}probe.rung_offset"), rung_offset.to_string());
+    put(&format!("{p}probe.clean_bodies"), clean_bodies.to_string());
+    put(&format!("{p}probe.max_util"), f(*max_util));
+    put(&format!("{p}probe.min_syms"), min_syms.to_string());
+    put(&format!("{p}probe.silence_ms"), silence_ms.to_string());
+    put(&format!("{p}probe.pin_mcs"), pin_mcs.to_string());
+    put(&format!("{p}s3_demote"), s3_demote.to_string());
+    put(&format!("{p}s3_down_util"), f(*s3_down_util));
+    put(&format!("{p}s3_min_syms"), s3_min_syms.to_string());
+    put(&format!("{p}s3_settle_ms"), s3_settle_ms.to_string());
+    put(
+        &format!("{p}rung_stats.half_life_samples"),
+        rung_stats_half_life_samples.to_string(),
+    );
+    let FadeCfg {
+        cascade,
+        predict,
+        hold_ms,
+        confirm_ms,
+        rssi_db,
+        snr_db,
+        trigger_ms,
+        min_rung,
+    } = fade;
+    put(&format!("{p}fade.cascade"), cascade.to_string());
+    put(&format!("{p}fade.predict"), predict.to_string());
+    put(&format!("{p}fade.hold_ms"), hold_ms.to_string());
+    put(&format!("{p}fade.confirm_ms"), confirm_ms.to_string());
+    put(&format!("{p}fade.rssi_db"), f(*rssi_db));
+    put(&format!("{p}fade.snr_db"), f(*snr_db));
+    put(&format!("{p}fade.trigger_ms"), trigger_ms.to_string());
+    put(&format!("{p}fade.min_rung"), min_rung.to_string());
+    put("link.key_file", key_file.clone());
+    put(
+        "link.key",
+        key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+    );
+    put("link.key_is_default", key_is_default.to_string());
+    put("link.key_source", key_source.clone());
+
+    let VideoCfg {
+        frame_gap_timeout_ms,
+        frame_gap_timeout_max_ms,
+        frame_lookahead,
+    } = video;
+    put(
+        "video.frame_gap_timeout_ms",
+        frame_gap_timeout_ms.to_string(),
+    );
+    put(
+        "video.frame_gap_timeout_max_ms",
+        frame_gap_timeout_max_ms.to_string(),
+    );
+    put("video.frame_lookahead", frame_lookahead.to_string());
+
+    let MspCfg {
+        enable,
+        out_host,
+        out_port,
+        symbol_size,
+        window,
+    } = msp;
+    put("msp.enable", enable.to_string());
+    put("msp.out_host", out_host.clone());
+    put("msp.out_port", out_port.to_string());
+    put("msp.symbol_size", symbol_size.to_string());
+    put("msp.window", window.to_string());
+
+    let StatsCfg {
+        enable,
+        interval_ms,
+        out,
+    } = stats;
+    put("stats.enable", enable.to_string());
+    put("stats.interval_ms", interval_ms.to_string());
+    put("stats.out.len", out.len().to_string());
+    for (n, s) in out.iter().enumerate() {
+        let StatsOut { host, port } = s;
+        put(&format!("stats.out[{n}].host"), host.clone());
+        put(&format!("stats.out[{n}].port"), port.to_string());
+    }
+
+    let AuRingOutCfg {
+        enable,
+        path,
+        socket,
+        slot_kb,
+        slot_count,
+    } = au_ring;
+    put("au_ring.enable", enable.to_string());
+    put("au_ring.path", path.clone());
+    put("au_ring.socket", socket.clone());
+    put("au_ring.slot_kb", slot_kb.to_string());
+    put("au_ring.slot_count", slot_count.to_string());
+
+    let DebugLogCfg {
+        enable,
+        dir,
+        ctl_period_ms,
+        rung_period_s,
+    } = debug_log;
+    put("debug_log.enable", enable.to_string());
+    put("debug_log.dir", dir.clone());
+    put("debug_log.ctl_period_ms", ctl_period_ms.to_string());
+    put("debug_log.rung_period_s", rung_period_s.to_string());
+
+    let HopCfg {
+        window_ms,
+        persist,
+        dwell_observe_ms,
+        dwell_period_ms,
+        burst_period_ms,
+        rank_visits,
+        rank_max_age_ms,
+        confirm_ms,
+        confirm_extend_ms,
+        verify_ms,
+        cooldown_ms,
+        max_hops_per_min,
+        backoff_ms,
+        one_card_repeats,
+        relay_burst_period_ms,
+        verdict,
+    } = hop;
+    put("hop.window_ms", window_ms.to_string());
+    put("hop.persist", persist.to_string());
+    put("hop.dwell_observe_ms", dwell_observe_ms.to_string());
+    put("hop.dwell_period_ms", dwell_period_ms.to_string());
+    put("hop.burst_period_ms", burst_period_ms.to_string());
+    put("hop.rank_visits", rank_visits.to_string());
+    put("hop.rank_max_age_ms", rank_max_age_ms.to_string());
+    put("hop.confirm_ms", confirm_ms.to_string());
+    put("hop.confirm_extend_ms", confirm_extend_ms.to_string());
+    put("hop.verify_ms", verify_ms.to_string());
+    put("hop.cooldown_ms", cooldown_ms.to_string());
+    put("hop.max_hops_per_min", max_hops_per_min.to_string());
+    put("hop.backoff_ms", backoff_ms.to_string());
+    put("hop.one_card_repeats", one_card_repeats.to_string());
+    put(
+        "hop.relay_burst_period_ms",
+        relay_burst_period_ms.to_string(),
+    );
+    let HopVerdictCfg {
+        loss_pct,
+        recovered_x,
+        recovered_min,
+        weak_rssi_dbm,
+        weak_snr_db,
+        occupied_windows,
+        detect_pct,
+        detect_windows,
+        detect_impaired,
+    } = verdict;
+    put("hop.verdict.loss_pct", f(*loss_pct));
+    put("hop.verdict.recovered_x", f(*recovered_x));
+    put("hop.verdict.recovered_min", recovered_min.to_string());
+    put("hop.verdict.weak_rssi_dbm", weak_rssi_dbm.to_string());
+    put("hop.verdict.weak_snr_db", weak_snr_db.to_string());
+    put("hop.verdict.occupied_windows", occupied_windows.to_string());
+    put("hop.verdict.detect_pct", f(*detect_pct));
+    put("hop.verdict.detect_windows", detect_windows.to_string());
+    put("hop.verdict.detect_impaired", detect_impaired.to_string());
+
+    let MavlinkCfg { enable, bind, port } = mavlink;
+    put("mavlink.enable", enable.to_string());
+    put("mavlink.bind", bind.clone());
+    put("mavlink.port", port.to_string());
+
+    put("derived.rx_width", c.rx_width().to_string());
+    put("derived.rx_width_reason", derived_width_reason(&c.link));
+    for (n, l) in c.uep_layers().iter().enumerate() {
+        let UepLayerCfg {
+            symbol_size,
+            window,
+        } = l;
+        put(
+            &format!("derived.uep_layers[{n}].fec.symbol_size"),
+            symbol_size.to_string(),
+        );
+        put(
+            &format!("derived.uep_layers[{n}].fec.window"),
+            window.to_string(),
+        );
+    }
+    o
+}
+
 fn parse_config(j: &Table) -> R<Config> {
-    check_keys(
-        j,
-        "",
-        &[
-            "radio",
-            "fec",
-            "link",
-            "video",
-            "msp",
-            "stats",
-            "au_ring",
-            "debug_log",
-            "hop",
-            "mavlink",
-        ],
-    )?;
+    check_keys(j, "", TOP_KEYS)?;
     let mut c = Config::default();
     if let Some(r) = section(j, "radio")? {
-        check_keys(
-            r,
-            "radio",
-            &[
-                "channel", "channels", "use", "cards", "tx_card", "scan", "relays",
-            ],
-        )?;
+        check_keys(r, "radio", RADIO_KEYS)?;
         if let Some(v) = r.get("channels") {
             let Value::Array(a) = v else {
                 return fail("radio.channels", "not an array");
@@ -1145,7 +1683,7 @@ fn parse_config(j: &Table) -> R<Config> {
             for (i, x) in a.iter().enumerate() {
                 let w = format!("radio.cards[{i}]");
                 let t = table(x, &w)?;
-                check_keys(t, &w, &["usb_vid", "usb_pid", "index"])?;
+                check_keys(t, &w, CARD_KEYS)?;
                 c.radio.cards.push(CardCfg {
                     usb_vid: get_int(t, "usb_vid", 0x0bda, 0, 0xFFFF, &w)? as u16,
                     usb_pid: get_int(t, "usb_pid", 0, 0, 0xFFFF, &w)? as u16,
@@ -1155,23 +1693,7 @@ fn parse_config(j: &Table) -> R<Config> {
         }
         if let Some(s) = section(r, "scan")? {
             let w = "radio.scan";
-            check_keys(
-                s,
-                w,
-                &[
-                    "dwell_ms",
-                    "settle_ms",
-                    "min_rounds",
-                    "search_ms",
-                    "op_window_ms",
-                    "search_after_ms",
-                    "pick_margin_pct",
-                    "one_card_ms",
-                    "max_ms",
-                    "busy_dbm",
-                    "blocked_pct",
-                ],
-            )?;
+            check_keys(s, w, SCAN_KEYS)?;
             let sc = &mut c.radio.scan;
             sc.dwell_ms = get_i32(s, "dwell_ms", 250, 50, 10000, w)?;
             sc.settle_ms = get_i32(s, "settle_ms", 30, 0, 1000, w)?;
@@ -1198,28 +1720,7 @@ fn parse_config(j: &Table) -> R<Config> {
         return fail("radio.tx_card", "no such card");
     }
     if let Some(h) = section(j, "hop")? {
-        check_keys(
-            h,
-            "hop",
-            &[
-                "window_ms",
-                "persist",
-                "dwell_observe_ms",
-                "dwell_period_ms",
-                "burst_period_ms",
-                "rank_visits",
-                "rank_max_age_ms",
-                "confirm_ms",
-                "confirm_extend_ms",
-                "verify_ms",
-                "cooldown_ms",
-                "max_hops_per_min",
-                "backoff_ms",
-                "one_card_repeats",
-                "relay_burst_period_ms",
-                "verdict",
-            ],
-        )?;
+        check_keys(h, "hop", HOP_KEYS)?;
         let hc = &mut c.hop;
         hc.window_ms = get_i32(h, "window_ms", 150, 50, 2000, "hop")?;
         hc.persist = get_i32(h, "persist", 2, 1, 3, "hop")?;
@@ -1238,21 +1739,7 @@ fn parse_config(j: &Table) -> R<Config> {
         hc.relay_burst_period_ms = get_i32(h, "relay_burst_period_ms", 1000, 500, 60000, "hop")?;
         if let Some(v) = section(h, "verdict")? {
             let w = "hop.verdict";
-            check_keys(
-                v,
-                w,
-                &[
-                    "loss_pct",
-                    "recovered_x",
-                    "weak_rssi_dbm",
-                    "weak_snr_db",
-                    "recovered_min",
-                    "occupied_windows",
-                    "detect_pct",
-                    "detect_windows",
-                    "detect_impaired",
-                ],
-            )?;
+            check_keys(v, w, VERDICT_KEYS)?;
             let vc = &mut hc.verdict;
             vc.loss_pct = get_num(v, "loss_pct", 3.0, 0.1, 100.0, w)?;
             vc.recovered_x = get_num(v, "recovered_x", 3.0, 1.0, 100.0, w)?;
@@ -1279,7 +1766,7 @@ fn parse_config(j: &Table) -> R<Config> {
         );
     }
     if let Some(r) = section(j, "fec")? {
-        check_keys(r, "fec", &["symbol_size", "seq_horizon"])?;
+        check_keys(r, "fec", FEC_KEYS)?;
         match r.get("symbol_size") {
             None => {}
             Some(Value::Array(a)) => {
@@ -1303,43 +1790,7 @@ fn parse_config(j: &Table) -> R<Config> {
     }
     let mut inline_key = String::new();
     if let Some(r) = section(j, "link")? {
-        check_keys(
-            r,
-            "link",
-            &[
-                "feedback_ms",
-                "beacon_keepalive_ms",
-                "static_mcs",
-                "static_overhead_base",
-                "static_overhead_enh",
-                "static_bw",
-                "ladder",
-                "max_mcs",
-                "down_util",
-                "up_util",
-                "confirm_ms",
-                "clean_ms",
-                "probation_ms",
-                "penalty_base_ms",
-                "penalty_max_ms",
-                "hold_after_down_ms",
-                "min_between_changes_ms",
-                "feedback_timeout_ms",
-                "starved_confirm_ms",
-                "s3_demote",
-                "s3_down_util",
-                "s3_settle_ms",
-                "s3_min_syms",
-                "rung_stats",
-                "fade",
-                "probe",
-                "rcf_slot_hold_ms",
-                "arrival_guard_syms",
-                "nack",
-                "key_file",
-                "key",
-            ],
-        )?;
+        check_keys(r, "link", LINK_KEYS)?;
         let l = &mut c.link;
         l.key_file = get_str(r, "key_file", "/etc/mabur.key", "link")?;
         if r.contains_key("key") {
@@ -1369,7 +1820,7 @@ fn parse_config(j: &Table) -> R<Config> {
             for (i, x) in a.iter().enumerate() {
                 let w = format!("link.ladder[{i}]");
                 let t = table(x, &w)?;
-                check_keys(t, &w, &["mcs", "bw", "overhead_base", "overhead_enh"])?;
+                check_keys(t, &w, RUNG_KEYS)?;
                 let mcs = get_i32(t, "mcs", 0, 0, 7, &w)?;
                 if !t.contains_key("bw") {
                     return fail(&format!("{w}.bw"), "required: 20 or 40 (per-rung width)");
@@ -1417,19 +1868,7 @@ fn parse_config(j: &Table) -> R<Config> {
         lc.s3_min_syms = get_i32(r, "s3_min_syms", 50, 1, 100000, "link")?;
         if let Some(p) = section(r, "probe")? {
             let w = "link.probe";
-            check_keys(
-                p,
-                w,
-                &[
-                    "enable",
-                    "rung_offset",
-                    "clean_bodies",
-                    "max_util",
-                    "min_syms",
-                    "silence_ms",
-                    "pin_mcs",
-                ],
-            )?;
+            check_keys(p, w, PROBE_KEYS)?;
             let pc = &mut lc.probe;
             pc.enable = get_bool(p, "enable", pc.enable, w)?;
             pc.rung_offset = get_i32(p, "rung_offset", 1, 1, 7, w)?;
@@ -1448,20 +1887,7 @@ fn parse_config(j: &Table) -> R<Config> {
         lc.s3_settle_ms = get_i32(r, "s3_settle_ms", 300, 0, 5000, "link")?;
         if let Some(f) = section(r, "fade")? {
             let w = "link.fade";
-            check_keys(
-                f,
-                w,
-                &[
-                    "cascade",
-                    "predict",
-                    "hold_ms",
-                    "confirm_ms",
-                    "rssi_db",
-                    "snr_db",
-                    "trigger_ms",
-                    "min_rung",
-                ],
-            )?;
+            check_keys(f, w, FADE_KEYS)?;
             let fc = &mut lc.fade;
             fc.cascade = get_bool(f, "cascade", fc.cascade, w)?;
             fc.predict = get_bool(f, "predict", fc.predict, w)?;
@@ -1474,17 +1900,7 @@ fn parse_config(j: &Table) -> R<Config> {
         }
         if let Some(n) = section(r, "nack")? {
             let w = "link.nack";
-            check_keys(
-                n,
-                w,
-                &[
-                    "enable",
-                    "lookback",
-                    "repeat_ms",
-                    "max_tries",
-                    "min_lead_ms",
-                ],
-            )?;
+            check_keys(n, w, NACK_KEYS)?;
             let nc = &mut l.nack;
             nc.enable = get_bool(n, "enable", nc.enable, w)?;
             nc.lookback = get_i32(n, "lookback", 256, 8, 4096, w)?;
@@ -1499,7 +1915,7 @@ fn parse_config(j: &Table) -> R<Config> {
             );
         }
         if let Some(rs) = section(r, "rung_stats")? {
-            check_keys(rs, "link.rung_stats", &["half_life_samples"])?;
+            check_keys(rs, "link.rung_stats", RUNG_STATS_KEYS)?;
             l.ladder_cfg.rung_stats_half_life_samples =
                 get_i32(rs, "half_life_samples", 600, 10, 100000, "link.rung_stats")?;
         }
@@ -1541,15 +1957,7 @@ fn parse_config(j: &Table) -> R<Config> {
         }
     }
     if let Some(r) = section(j, "video")? {
-        check_keys(
-            r,
-            "video",
-            &[
-                "frame_gap_timeout_ms",
-                "frame_gap_timeout_max_ms",
-                "frame_lookahead",
-            ],
-        )?;
+        check_keys(r, "video", VIDEO_KEYS)?;
         c.video.frame_gap_timeout_ms =
             get_int(r, "frame_gap_timeout_ms", 50, 10, 1000, "video")? as u64;
         c.video.frame_gap_timeout_max_ms =
@@ -1557,10 +1965,10 @@ fn parse_config(j: &Table) -> R<Config> {
         c.video.frame_lookahead = get_int(r, "frame_lookahead", 8, 2, 64, "video")? as u64;
     }
     if let Some(r) = section(j, "msp")? {
-        check_keys(r, "msp", &["enable", "out", "symbol_size", "window"])?;
+        check_keys(r, "msp", MSP_KEYS)?;
         c.msp.enable = get_bool(r, "enable", c.msp.enable, "msp")?;
         if let Some(o) = section(r, "out")? {
-            check_keys(o, "msp.out", &["host", "port"])?;
+            check_keys(o, "msp.out", MSP_OUT_KEYS)?;
             c.msp.out_host = get_str(o, "host", "127.0.0.1", "msp.out")?;
             c.msp.out_port = get_i32(o, "port", 14560, 1, 65535, "msp.out")?;
         }
@@ -1568,11 +1976,7 @@ fn parse_config(j: &Table) -> R<Config> {
         c.msp.window = get_int(r, "window", 16, 2, 255, "msp")? as usize;
     }
     if let Some(r) = section(j, "stats")? {
-        check_keys(
-            r,
-            "stats",
-            &["enable", "host", "port", "interval_ms", "out"],
-        )?;
+        check_keys(r, "stats", STATS_KEYS)?;
         c.stats.enable = get_bool(r, "enable", c.stats.enable, "stats")?;
         c.stats.interval_ms = get_i32(r, "interval_ms", 500, 100, 10000, "stats")?;
         let legacy = r.contains_key("host") || r.contains_key("port");
@@ -1594,7 +1998,7 @@ fn parse_config(j: &Table) -> R<Config> {
                 let Value::Table(t) = e else {
                     return fail("stats.out[]", "not an object");
                 };
-                check_keys(t, "stats.out[]", &["host", "port"])?;
+                check_keys(t, "stats.out[]", STATS_OUT_KEYS)?;
                 if !t.contains_key("port") {
                     return fail("stats.out[].port", "missing");
                 }
@@ -1611,11 +2015,7 @@ fn parse_config(j: &Table) -> R<Config> {
         }
     }
     if let Some(r) = section(j, "au_ring")? {
-        check_keys(
-            r,
-            "au_ring",
-            &["enable", "path", "socket", "slot_kb", "slot_count"],
-        )?;
+        check_keys(r, "au_ring", AU_RING_KEYS)?;
         let a = &mut c.au_ring;
         a.enable = get_bool(r, "enable", a.enable, "au_ring")?;
         a.path = get_str(r, "path", "/dev/shm/mabur-au", "au_ring")?;
@@ -1624,11 +2024,7 @@ fn parse_config(j: &Table) -> R<Config> {
         a.slot_count = get_i32(r, "slot_count", 16, 4, 256, "au_ring")?;
     }
     if let Some(r) = section(j, "debug_log")? {
-        check_keys(
-            r,
-            "debug_log",
-            &["enable", "dir", "ctl_period_ms", "rung_period_s"],
-        )?;
+        check_keys(r, "debug_log", DEBUG_LOG_KEYS)?;
         let d = &mut c.debug_log;
         d.enable = get_bool(r, "enable", d.enable, "debug_log")?;
         d.dir = get_str(r, "dir", "/media/dvr/log", "debug_log")?;
@@ -1636,7 +2032,7 @@ fn parse_config(j: &Table) -> R<Config> {
         d.rung_period_s = get_i32(r, "rung_period_s", 10, 1, 600, "debug_log")?;
     }
     if let Some(r) = section(j, "mavlink")? {
-        check_keys(r, "mavlink", &["enable", "bind", "port"])?;
+        check_keys(r, "mavlink", MAVLINK_KEYS)?;
         c.mavlink.enable = get_bool(r, "enable", c.mavlink.enable, "mavlink")?;
         c.mavlink.bind = get_str(r, "bind", "127.0.0.1", "mavlink")?;
         if !is_ipv4(&c.mavlink.bind) {

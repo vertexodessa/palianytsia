@@ -104,6 +104,22 @@ uint8_t pal_card_channel(const pal_card* c);
 pal_ref* pal_ref_new_with_card(const char* config_path, pal_card* card, void* user,
                                pal_au_cb on_au, char* err, size_t err_cap);
 uint64_t pal_ref_now_us(void);
+
+// maburgs::load_config on a TOML text: the oracle for pal-core's config
+// parser (tests/config_diff.rs). ok = 1: text is the loaded Config as one
+// "key=value" line per field (doubles as f64:<bits in hex>), plus the
+// derived receiver width and decode layers. ok = 0: text is the error with
+// its "<file>:<line>: " part removed. defaulted: the keys load_config
+// reported as defaulted, one per line. All three strings are malloc'd; free
+// them with pal_ref_config_check_free.
+typedef struct pal_config_check {
+  int ok;
+  char* text;
+  char* defaulted;
+} pal_config_check;
+void pal_ref_config_check(const char* toml_text, pal_config_check* out);
+void pal_ref_config_check_free(pal_config_check* out);
+
 // maburd --dry-run --out frame file as N virtual cards with deterministic loss.
 typedef struct pal_ffs pal_ffs;
 pal_ffs* pal_ffs_open(const char* path, int drop_pct, uint32_t seed);

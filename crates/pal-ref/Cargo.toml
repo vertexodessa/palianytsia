@@ -21,6 +21,7 @@ live = ["dep:runtime", "dep:devourer-sys", "dep:pal-wire"]
 [dev-dependencies]
 pal-core = { workspace = true, features = ["fake"] }
 pal-wire.workspace = true
+toml = "0.8"
 
 [build-dependencies]
 cmake = "0.1"
