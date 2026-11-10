@@ -4,8 +4,9 @@
 #   2. release/MABUR_RELEASE is the tip of a mabur release/v* branch (a GS-only patch release
 #      reuses the previous one's);
 #   3. every `RC_VERSION N` in README.md, CLAUDE.md and release/README.md equals rc_proto.h;
-#   4. the latest release/notes tag heads release/README.md, is both APKs' versionName
-#      and is named in docs/spec.md Status and CLAUDE.md;
+#   4. the latest release/notes tag heads release/README.md, is release/VERSION (the one
+#      version: both APKs' versionName and the native builds read it, no other copy) and is
+#      named in docs/spec.md Status and CLAUDE.md;
 #   5. every repo path in backticks in the docs exists, here or in third_party/mabur (the spec
 #      quotes mabur's own docs/ and tools/ by their mabur paths).
 # Checks 1-2 need the fork remotes. Offline they warn; with CI set they fail.
@@ -65,11 +66,14 @@ if tag:
     if head != f"# Palianytsia {tag}":
         bad.append(f"release/README.md heading is '{head}', latest notes are {tag}")
     ver = tag[1:] if tag.count(".") == 2 else tag[1:] + ".0"
+    have = read("release/VERSION").strip()
+    if have != ver:
+        bad.append(f"release/VERSION is {have}, latest notes are {tag} ({ver})")
     for app in ["phone", "quest"]:
         g = f"apps/{app}/android/app/build.gradle"
-        m = re.search(r'versionName\s+"([^"]+)"', read(g))
-        if not m or m.group(1) != ver:
-            bad.append(f"{g}: versionName {m and m.group(1)}, latest notes are {tag} ({ver})")
+        m = re.search(r"^\s*versionName\s+(.*)$", read(g), re.M)
+        if not m or "release/VERSION" not in m.group(1):
+            bad.append(f"{g}: versionName does not read release/VERSION: {m and m.group(1)}")
     spec = read("docs/spec.md")
     status = spec.split("## Status", 1)[-1].split("\n---", 1)[0]
     if not re.search(rf"{re.escape(tag)}\b", status):

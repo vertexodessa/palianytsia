@@ -9,3 +9,5 @@ publish.workspace = true
 [dependencies]
 pal-core.workspace = true
 serde_json.workspace = true
+pal-build.workspace = true
+sha2 = "0.10"

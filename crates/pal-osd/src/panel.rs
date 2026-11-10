@@ -573,6 +573,11 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                             }
                             Tab::Logs => {
                                 ui.label(&i.log_info);
+                                ui.label(
+                                    RichText::new(format!("Palianytsia {}", pal_build::ID))
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
                             }
                         }
                     });

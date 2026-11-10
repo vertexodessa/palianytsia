@@ -877,7 +877,7 @@ impl CardSet {
         &self.chips
     }
 
-    /// Starts a session: its skipped-card events, the cards on (`ch`,
+    /// Starts a session: its card chips and skipped-card events, the cards on (`ch`,
     /// `width`) when an earlier session left them elsewhere, and the RX
     /// threads delivering to `tx` as `stamp` says until the guard drops.
     pub fn begin(
@@ -888,6 +888,7 @@ impl CardSet {
         tx: SyncSender<RxBody>,
         shared: &Arc<Shared>,
     ) -> Result<SessionRoute<'_>, String> {
+        shared.event("cards", serde_json::json!({"chips": self.chips}));
         for (i, e) in &self.skipped {
             shared.event("card_skipped", serde_json::json!({"card": i, "err": e}));
         }

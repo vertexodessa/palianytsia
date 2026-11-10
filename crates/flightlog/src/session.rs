@@ -7,6 +7,10 @@
 //! width, channel, key mismatch, drone state, video resets), so both cores
 //! produce them without a hook into either; the host adds its own (USB
 //! detach, capture cap) through `event`.
+//!
+//! The first event, `build`, says what wrote the session: version, commit,
+//! pins, app, core, mode and the config's sha256. Card chips follow as a
+//! `cards` event once the cards are open.
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -15,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pal_core::{Au, RxBody};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::capture;
 
@@ -22,6 +27,50 @@ pub const STATS_FORMAT: &str = "pal-stats";
 pub const EVENTS_FORMAT: &str = "pal-events";
 pub const AULOG_MARKER: &str = "aulog 1";
 pub const VERSION: u32 = 1;
+/// Events a session writes whether or not a drone was ever heard.
+pub const BOOKKEEPING: &[&str] = &["build", "cards"];
+
+/// What runs the session, for its `build` event.
+pub struct Run<'a> {
+    /// "pal", "pal-desktop", "pal-phone", "pal-quest".
+    pub app: &'a str,
+    /// "rust" or "ref".
+    pub core: &'a str,
+    /// "gs" or "spotter".
+    pub mode: &'a str,
+    /// The config text the core was built from.
+    pub config: Option<&'a [u8]>,
+}
+
+pub fn sha256_hex(b: &[u8]) -> String {
+    Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
+}
+
+/// The `build` event's fields.
+pub fn build_record(run: &Run) -> Value {
+    json!({
+        "version": pal_build::VERSION,
+        "commit": pal_build::GIT_SHA,
+        "dirty": pal_build::GIT_DIRTY,
+        "mabur": pal_build::MABUR_PIN,
+        "devourer": pal_build::DEVOURER_PIN,
+        "app": run.app,
+        "core": run.core,
+        "mode": run.mode,
+        "config_sha256": run.config.map(sha256_hex),
+    })
+}
+
+/// A line of events.jsonl holding one of the BOOKKEEPING events.
+pub fn is_bookkeeping(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v.get("ev").and_then(Value::as_str).map(str::to_string))
+        .is_some_and(|e| BOOKKEEPING.contains(&e.as_str()))
+}
 
 pub(crate) const CAPTURE_FILE: &str = "bodies.bin";
 pub(crate) const AU_FILE: &str = "au.log";
@@ -93,6 +142,16 @@ pub struct Session {
     channel_seen: Option<Value>,
 }
 
+fn write_event(w: &mut impl Write, t_us: u64, ev: &str, detail: Value) -> io::Result<()> {
+    let mut m = Map::new();
+    m.insert("t_us".into(), json!(t_us));
+    m.insert("ev".into(), json!(ev));
+    if let Value::Object(d) = detail {
+        m.extend(d);
+    }
+    writeln!(w, "{}", Value::Object(m))
+}
+
 fn create(dir: &Path, name: &str) -> io::Result<BufWriter<File>> {
     Ok(BufWriter::with_capacity(
         1 << 16,
@@ -102,7 +161,7 @@ fn create(dir: &Path, name: &str) -> io::Result<BufWriter<File>> {
 
 impl Session {
     /// `capture_cap`: bodies.bin byte cap, 0 = no capture.
-    pub fn create(root: &Path, now: SystemTime, capture_cap: u64) -> io::Result<Self> {
+    pub fn create(root: &Path, now: SystemTime, capture_cap: u64, run: &Run) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let dir = root.join(format!("fl-{:04}_{}", next_index(root), stamp(now)));
         fs::create_dir(&dir)?;
@@ -110,6 +169,7 @@ impl Session {
         writeln!(stats, "{}", json!({"format": STATS_FORMAT, "v": VERSION}))?;
         let mut events = create(&dir, EVENTS_FILE)?;
         writeln!(events, "{}", json!({"format": EVENTS_FORMAT, "v": VERSION}))?;
+        write_event(&mut events, 0, "build", build_record(run))?;
         let mut au = create(&dir, AU_FILE)?;
         writeln!(au, "{AULOG_MARKER}")?;
         writeln!(au, "# t_us sid bytes flags complete salvaged pts_us")?;
@@ -172,13 +232,7 @@ impl Session {
     }
 
     pub fn event(&mut self, t_us: u64, ev: &str, detail: Value) -> io::Result<()> {
-        let mut m = Map::new();
-        m.insert("t_us".into(), json!(t_us));
-        m.insert("ev".into(), json!(ev));
-        if let Value::Object(d) = detail {
-            m.extend(d);
-        }
-        writeln!(self.events, "{}", Value::Object(m))
+        write_event(&mut self.events, t_us, ev, detail)
     }
 
     /// IDR request path: `idr_req` per epoch bump, `idr_heal` per clearing IRAP.
@@ -283,6 +337,10 @@ pub struct Summary {
     pub last_stats: Option<Value>,
     pub session_edges: Vec<(u64, Value)>,
     pub has_capture: bool,
+    /// The `build` event; None in a session written before it existed.
+    pub build: Option<Value>,
+    /// Each `cards` event's chips, in order.
+    pub cards: Vec<String>,
 }
 
 fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io::Result<()> {
@@ -361,10 +419,20 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             .and_then(Value::as_str)
             .unwrap_or("?")
             .to_string();
+        match ev.as_str() {
+            "build" if s.build.is_none() => s.build = Some(v.clone()),
+            "cards" => s
+                .cards
+                .push(v.get("chips").and_then(Value::as_str).unwrap_or("?").into()),
+            _ => {}
+        }
         if ev == "session" {
             let t = v.get("t_us").and_then(Value::as_u64).unwrap_or(0);
             s.session_edges
                 .push((t, v.get("to").cloned().unwrap_or(Value::Null)));
+        }
+        if BOOKKEEPING.contains(&ev.as_str()) {
+            continue;
         }
         match counts.iter_mut().find(|(k, _)| *k == ev) {
             Some((_, n)) => *n += 1,
@@ -382,11 +450,49 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
 mod tests {
     use super::*;
 
+    const TEST_RUN: Run = Run {
+        app: "test",
+        core: "rust",
+        mode: "gs",
+        config: Some(b"abc"),
+    };
+
+    #[test]
+    fn the_first_event_names_the_build() {
+        let root = std::env::temp_dir().join(format!("pal-fl-build-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let dir = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN)
+            .expect("create")
+            .dir()
+            .to_path_buf();
+        let ev = fs::read_to_string(dir.join("events.jsonl")).expect("events");
+        let first: Value = serde_json::from_str(ev.lines().nth(1).expect("line 2")).expect("json");
+        assert_eq!(first["ev"], "build");
+        assert_eq!(first["version"], pal_build::VERSION);
+        assert_eq!(first["core"], "rust");
+        // FIPS 180-2 example: sha256("abc").
+        assert_eq!(
+            first["config_sha256"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let sum = summarize(&dir).expect("summary");
+        assert_eq!(sum.build.as_ref().map(|b| &b["app"]), Some(&json!("test")));
+        assert!(sum.events.is_empty(), "{:?}", sum.events);
+        // A session from before the build event still reads.
+        fs::write(
+            dir.join("events.jsonl"),
+            "{\"format\":\"pal-events\",\"v\":1}\n",
+        )
+        .expect("w");
+        assert!(summarize(&dir).expect("old summary").build.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn ticks_alone_reach_the_cap_and_the_event_has_the_file_size() {
         let root = std::env::temp_dir().join(format!("pal-fl-cap-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let mut s = Session::create(&root, SystemTime::now(), 100).unwrap();
+        let mut s = Session::create(&root, SystemTime::now(), 100, &TEST_RUN).unwrap();
         for t in 0..1000 {
             s.tick(t).unwrap();
         }
@@ -431,7 +537,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pal-fl-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let dir = {
-            let mut s = Session::create(&root, UNIX_EPOCH, 0).expect("create");
+            let mut s = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
             s.stats(1_000_000, r#"{"session":false,"rung":-1,"resets":0}"#)
                 .expect("stats");
             s.stats(2_000_000, r#"{"session":true,"rung":0,"resets":1}"#)
@@ -466,7 +572,7 @@ mod tests {
         assert!(sum.events.iter().any(|(k, n)| k == "rung" && *n == 1));
         assert!(!sum.events.iter().any(|(k, _)| k == "channel"));
         assert!((sum.span_s - 1.0).abs() < 1e-9);
-        let second = Session::create(&root, UNIX_EPOCH, 0).expect("create");
+        let second = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
         assert!(second.dir().to_string_lossy().contains("fl-0002_"));
         drop(second);
         let _ = fs::remove_dir_all(&root);
@@ -477,7 +583,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pal-fl-chan-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let dir = {
-            let mut s = Session::create(&root, UNIX_EPOCH, 0).expect("create");
+            let mut s = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
             // 36, a scout dwell on 149 for one line, then a real hop to 149.
             for (i, ch) in [36, 36, 149, 36, 36, 149, 149, 149].iter().enumerate() {
                 s.stats(i as u64 * 1_000_000, &format!(r#"{{"channel":{ch}}}"#))

@@ -21,3 +21,4 @@ pal-osd = { workspace = true, features = ["ui"] }
 runtime.workspace = true
 eframe.workspace = true
 egui.workspace = true
+pal-build.workspace = true

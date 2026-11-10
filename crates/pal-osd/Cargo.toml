@@ -10,6 +10,7 @@ publish.workspace = true
 egui = { workspace = true, optional = true }
 serde_json.workspace = true
 pal-wire.workspace = true
+pal-build.workspace = true
 
 [features]
 default = ["ui"]

@@ -20,6 +20,7 @@
 //!           [--cpu-rgba]            RGBA via swscale instead of the YUV shader
 //!           [--lat]                 per-second latency breakdown on stderr (printed
 //!                                   anyway while a stage is over its threshold)
+//!   pal-desktop --version           version, commit, mabur and devourer pins
 //!
 //! `--snapshot` saves one rendered window after N seconds and quits: the
 //! headless check that video and OSD actually draw.
@@ -32,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flightlog::capture::{self, Record};
-use flightlog::session::Session;
+use flightlog::session::{Run, Session};
 use pal_core::refresh::IdrDriver;
 use pal_core::rust_core::RustCore;
 use pal_core::CoreOpts;
@@ -60,6 +61,8 @@ struct Opts {
     /// The generated copy `config` points at for mabur's core, which only
     /// reads paths; removed at exit.
     ref_toml: Option<PathBuf>,
+    /// The text `cfg` was parsed from, for the flight log's config sha256.
+    config_text: String,
     card: i32,
     /// A second card (scan index) for the channel core: receives too, and
     /// the core scouts on it. Only with an attached core (auto config).
@@ -145,6 +148,10 @@ fn parse() -> Opts {
             "--params" => o.params = true,
             "--lat" => o.lat = true,
             "--cpu-rgba" => o.cpu_rgba = true,
+            "--version" | "-V" => {
+                println!("{}", pal_build::version_text("pal-desktop"));
+                std::process::exit(0)
+            }
             s => die(&format!("unknown argument {s}")),
         }
     }
@@ -231,6 +238,7 @@ fn resolve_config(o: &mut Opts) {
     }
     o.cfg = pal_core::config::parse_config_str(&text)
         .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+    o.config_text = text;
 }
 
 /// Who tunes the card(s) on a live run: on an auto config a GS hands the
@@ -667,7 +675,16 @@ fn main() {
         (!o.cpu_rgba).then(|| Arc::new(Mutex::new(None)));
     let log = o.log_dir.as_ref().map(|d| {
         let cap = if o.live() { 512 << 20 } else { 0 };
-        let s = Session::create(d, std::time::SystemTime::now(), cap)
+        let run = Run {
+            app: "pal-desktop",
+            core: if o.rust { "rust" } else { "ref" },
+            mode: match o.mode {
+                Mode::Gs => "gs",
+                Mode::Spotter => "spotter",
+            },
+            config: Some(o.config_text.as_bytes()),
+        };
+        let s = Session::create(d, std::time::SystemTime::now(), cap, &run)
             .unwrap_or_else(|e| die(&format!("{}: {e}", d.display())));
         eprintln!("pal-desktop: flight log {}", s.dir().display());
         s

@@ -11,6 +11,7 @@
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
 //!              [--param-set T_S,ROW,TEXT ...]   F18 sets; prints `param` results and `params`
 //!   pal log    <fl-NNNN_...>   summarise one flight-log directory
+//!   pal --version             version, commit, mabur and devourer pins
 //!
 //! Gs mode transmits: the core's RC frames (DISC, RCF, NACK, refresh) go out
 //! on the same card, and the drone follows this host.
@@ -171,7 +172,17 @@ impl Sink {
             mav_file: mk(&o.mav),
             mav: 0,
             log: o.log_dir.as_ref().map(|d| {
-                let s = Session::create(d, std::time::SystemTime::now(), o.capture_mb << 20)
+                let config = o.config.as_ref().and_then(|c| std::fs::read(c).ok());
+                let run = session::Run {
+                    app: "pal",
+                    core: if o.rust { "rust" } else { "ref" },
+                    mode: match o.mode.unwrap_or(Mode::Spotter) {
+                        Mode::Gs => "gs",
+                        Mode::Spotter => "spotter",
+                    },
+                    config: config.as_deref(),
+                };
+                let s = Session::create(d, std::time::SystemTime::now(), o.capture_mb << 20, &run)
                     .unwrap_or_else(|e| die(&format!("{}: {e}", d.display())));
                 eprintln!("pal: flight log {}", s.dir().display());
                 s
@@ -399,6 +410,10 @@ fn live(o: Opts) {
     )
     .unwrap_or_else(|e| die(&e));
     eprintln!("pal: card {} on ch {} / {} MHz", set.chips(), o.ch, o.width);
+    if let Some(l) = sink.log.as_mut() {
+        l.event(0, "cards", serde_json::json!({ "chips": set.chips() }))
+            .unwrap();
+    }
 
     let t0 = Instant::now();
     let clock = runtime::mono_default;
@@ -598,6 +613,30 @@ fn log_summary(o: Opts) {
         .unwrap_or_else(|_| die("log needs one fl-NNNN_... directory"));
     let s = session::summarize(&dir).unwrap_or_else(|e| die(&format!("{}: {e}", dir.display())));
     println!("{}", dir.display());
+    match &s.build {
+        Some(b) => {
+            let f = |k: &str| b.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let dirty = if f("dirty") == "1" { " (dirty)" } else { "" };
+            println!(
+                "  build: {} {} {}{dirty}, core {}, mode {}",
+                f("app"),
+                f("version"),
+                f("commit"),
+                f("core"),
+                f("mode")
+            );
+            println!(
+                "  pins: mabur {}, devourer {}; config sha256 {}",
+                f("mabur"),
+                f("devourer"),
+                f("config_sha256")
+            );
+        }
+        None => println!("  build: not recorded"),
+    }
+    if !s.cards.is_empty() {
+        println!("  cards: {}", s.cards.join("; "));
+    }
     println!(
         "  span {:.1} s, {} stats lines, capture {}",
         s.span_s,
@@ -644,6 +683,7 @@ fn main() {
         Some("live") => live(parse(args)),
         Some("replay") => replay(parse(args)),
         Some("log") => log_summary(parse(args)),
+        Some("--version" | "-V") => println!("{}", pal_build::version_text("pal")),
         _ => die("usage: pal live|replay|log ... (see src/main.rs)"),
     }
 }

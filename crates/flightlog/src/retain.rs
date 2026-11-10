@@ -13,7 +13,8 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use crate::session::{
-    AU_FILE, AU_HEADER_LINES, CAPTURE_FILE, EVENTS_FILE, EVENTS_HEADER_LINES, STATS_FILE,
+    is_bookkeeping, AU_FILE, AU_HEADER_LINES, BOOKKEEPING, CAPTURE_FILE, EVENTS_FILE,
+    EVENTS_HEADER_LINES, STATS_FILE,
 };
 
 pub const KEEP_FILE: &str = "keep";
@@ -69,11 +70,22 @@ fn is_empty(dir: &Path) -> bool {
     let lines = |f: &str, max: usize| {
         fs::File::open(dir.join(f)).map(|h| io::BufReader::new(h).lines().take(max + 1).count())
     };
+    // Events past the format line other than the ones every session writes
+    // (its build, its cards): those say nothing about the link.
+    let events = fs::File::open(dir.join(EVENTS_FILE)).map(|h| {
+        io::BufReader::new(h)
+            .lines()
+            .skip(EVENTS_HEADER_LINES)
+            .take(BOOKKEEPING.len() + 1)
+            .map_while(Result::ok)
+            .filter(|l| !is_bookkeeping(l))
+            .count()
+    });
     // Each file's header: au.log marker + column comment, one format line in
-    // the others; stats come at 1 Hz.
+    // stats.jsonl; stats come at 1 Hz.
     matches!(
-        (lines(AU_FILE, AU_HEADER_LINES), lines(EVENTS_FILE, EVENTS_HEADER_LINES), lines(STATS_FILE, 6)),
-        (Ok(a), Ok(e), Ok(s)) if a <= AU_HEADER_LINES && e <= EVENTS_HEADER_LINES && s <= 6
+        (lines(AU_FILE, AU_HEADER_LINES), events, lines(STATS_FILE, 6)),
+        (Ok(a), Ok(e), Ok(s)) if a <= AU_HEADER_LINES && e == 0 && s <= 6
     )
 }
 
@@ -186,10 +198,18 @@ mod tests {
         let d = session(&r, 4, 0, 1, 0);
         // Long, with frames but no AU and no event: every frame CRC-failed.
         let f = session_n(&r, 5, 0, 0, 100, 2494);
-        let e = session(&r, 6, 0, 0, 0);
+        // Only the events every session writes: still empty.
+        let g = session(&r, 6, 0, 0, 0);
+        fs::write(
+            g.join("events.jsonl"),
+            "{\"format\":\"pal-events\",\"v\":1}\n{\"ev\":\"build\",\"t_us\":0}\n\
+             {\"chips\":\"8812a\",\"ev\":\"cards\",\"t_us\":5}\n",
+        )
+        .unwrap();
+        let e = session(&r, 7, 0, 0, 0);
         let p = prune(&r, ROOMY).unwrap();
-        assert_eq!(p.empty_sessions, 1);
-        assert!(!a.exists());
+        assert_eq!(p.empty_sessions, 2);
+        assert!(!a.exists() && !g.exists());
         assert!(b.exists() && c.exists() && d.exists() && e.exists() && f.exists());
         let _ = fs::remove_dir_all(&r);
     }

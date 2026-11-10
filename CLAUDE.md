@@ -12,6 +12,7 @@ status: `docs/spec.md`; read its "Status (2026-11-07)" section first; the dated 
 | `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle (desktop/host only); `RefCard` (`cpp/pal_card.cpp`) lends the devourer-sys card to it as a `maburgs::LinkCard`, so it runs mabur's ChannelCore live; `tests/chan_trace.rs` checks the Rust ChannelCore against it record by record |
 | `crates/devourer-sys` | devourer through a C shim (USB cards) |
 | `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
+| `crates/pal-build` | which build this is (`release/VERSION`, commit + dirty flag, mabur/devourer pins) for `--version`, the flight log's `build` event and the panel |
 | `crates/runtime` | shared by the apps: devourer RX thread, core loop (`CoreLoop`: GsCore + IdrDriver + log + stats/params), `run_live` |
 | `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |
 | `apps/phone` | phone app (M3): `rust/` = `pal-phone` cdylib (JNI start/stats/lastError/stop over `runtime`, MediaCodec into the Surface), `android/` = Java shell (USB permission, SurfaceView, text OSD). `tools/phone-apk.sh [cfg]` builds the APK |
@@ -94,7 +95,7 @@ pairing key.
   v0.11 = maburd from mabur `release/v0.11` (`release/v0.10` + rung change hold, air clock bound, `VENC_MIN_IQP`), the matching Rust core, Quest window mode, APKs 0.11.0; parameter table gains a row, so GS and drone update together (video stays wire compatible with v0.10).
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
-  `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally (CI has no captures and never will: no recordings on GitHub), bump both APK `versionName`, head `release/README.md` with `# Palianytsia <tag>`, write the
+  `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally (CI has no captures and never will: no recordings on GitHub), bump `release/VERSION` (the one version: both APKs' versionName, `pal --version` and each flight log's `build` event read it) and both APKs' `versionCode`, head `release/README.md` with `# Palianytsia <tag>`, write the
   notes, pin the fork commit. The IMX415 driver is an asset of the `deps` release (sha in `release/`). Run workflow_dispatch with a tag
   for a dry run (package as an artifact, nothing published).
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.

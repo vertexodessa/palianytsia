@@ -165,10 +165,24 @@ impl Link {
         }
         // Same layout as pal-desktop --log-dir (pal log reads it), bodies
         // capped at 256 MB per session so a replay can rerun a bad flight.
+        // The process name tells the phone app from the Quest app.
+        let app = std::fs::read("/proc/self/cmdline").ok().and_then(|b| {
+            let n = b.split(|&x| x == 0).next()?;
+            String::from_utf8(n.to_vec()).ok()
+        });
+        // The text the core parsed: the config with the operator's picks.
+        let (picked, _) = pal_core::config::with_link_pick(&c.toml, c.pick.clone());
+        let run = flightlog::session::Run {
+            app: app.as_deref().unwrap_or("pal-android"),
+            core: "rust",
+            mode: "gs",
+            config: Some(picked.as_bytes()),
+        };
         let (log, log_info) = match flightlog::session::Session::create(
             &c.log_dir,
             std::time::SystemTime::now(),
             256 << 20,
+            &run,
         ) {
             Ok(s) => {
                 let info = format!("flight log {}", s.dir().display());
