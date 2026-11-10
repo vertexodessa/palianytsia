@@ -28,6 +28,7 @@ cargo test --workspace
 tools/m0-parity.sh     # pal-ref == mabur's webgs replay on maburd dry-run files
 tools/m1-replay.sh     # ref == rust: AUs, sent RC bytes, final stats line, --idr path
 tools/doc-check.sh     # docs vs tree: .gitmodules branches, MABUR_RELEASE, RC_VERSION, release tag, paths
+python3 tools/tests/drone_install_test.py   # drone-install.py against fake drones: exit code, mabur.toml, changed paths, backup
 ```
 Docs: do not copy shas or versions into README/spec; point at the tree (`git submodule status`,
 `release/MABUR_RELEASE`). A commit that bumps a pin, cuts a release or closes a Status item updates

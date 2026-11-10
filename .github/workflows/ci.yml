@@ -29,6 +29,8 @@ jobs:
           elif [ "$rc" != 0 ]; then exit "$rc"; fi
       - name: M0 parity (pal-ref vs webgs replay)
         run: tools/m0-parity.sh
+      - name: Drone installer against fake drones
+        run: python3 tools/tests/drone_install_test.py
 
   maburd:
     # Two independent builds of the same commit; the compare job below
