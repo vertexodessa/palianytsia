@@ -211,7 +211,9 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps, PsStatus> {
     }
     r.ue();
     r.ue();
-    s.log2_max_poc_lsb = r.ue() + 4;
+    // The size fields are C++ unsigned sums: a hostile ue() wraps them
+    // there, and the range checks below see the wrapped value.
+    s.log2_max_poc_lsb = r.ue().wrapping_add(4);
     let sub_info = r.u(1);
     let start = if sub_info != 0 { 0 } else { max_sub };
     for _ in start..=max_sub {
@@ -219,8 +221,8 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps, PsStatus> {
         r.ue();
         r.ue();
     }
-    s.log2_min_cb = r.ue() + 3;
-    s.log2_ctb = s.log2_min_cb + r.ue();
+    s.log2_min_cb = r.ue().wrapping_add(3);
+    s.log2_ctb = s.log2_min_cb.wrapping_add(r.ue());
     r.ue();
     r.ue();
     r.ue();
@@ -259,6 +261,11 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps, PsStatus> {
         }
     }
     s.tmvp = r.flag();
+    // A hostile ue() can put log2_min_cb past 31, where the C++ shift is
+    // undefined; no such SPS describes a picture.
+    if s.log2_min_cb >= u32::BITS {
+        return Err(PsStatus::Malformed);
+    }
     let m = (1u32 << s.log2_min_cb) - 1;
     if r.bad()
         || s.width == 0
