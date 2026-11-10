@@ -82,4 +82,35 @@ for spec in "0 1" "10 7" "20 3" "30 11"; do
   grep -o '"salvaged":[0-9]*' "$TMP/pal.err" | sed 's/^/     /'
 done
 
+# A repair window that changes per frame: bursts of large frames between long
+# runs of small ones (tools/window-frames.py), so the GS's recent window
+# (repair_window_recent) falls back between bursts and the next burst opens
+# with a hole timeout shorter than its repairs' reach. The drone config is the
+# bundle's with window 32, so the small frames keep a narrow window while the
+# large ones widen theirs, and one block per body, so at the replay clock (900
+# us per body) a window spans longer than the 50 ms gap floor. Only the
+# adaptive-gap cases reach the rule.
+python3 "$ROOT/tools/window-frames.py" "$MABUR/tests/fixtures/slices4_1080p.h265" "$TMP/win.in" >/dev/null
+(cd "$MABUR" && BUILD=$BUILD bash tests/integration/web_frames_gen.sh "$TMP" "$TMP/win.in")
+sed -e '/^\[fec\]/,/^\[/ s|^window *= *[0-9]*|window = 32|' \
+    -e '/^\[fec\]/,/^\[/ s|^blocks_per_body *= *\[[0-9, ]*\]|blocks_per_body = [1, 1]|' \
+    "$MABUR/bundle/mabur.default.toml" >"$TMP/win-drone.toml"
+sed -n '/^\[fec\]/,/^\[/p' "$TMP/win-drone.toml" | grep -Eq '^window = 32( |$)' \
+  && sed -n '/^\[fec\]/,/^\[/p' "$TMP/win-drone.toml" | grep -Eq '^blocks_per_body = \[1, 1\]( |$)' \
+  || { echo "FAIL: [fec] window/blocks_per_body sed did not match -- bundle layout changed"; exit 1; }
+"$BUILD/drone/maburd" -c "$TMP/win-drone.toml" --dry-run --in "$TMP/win.in" --out "$TMP/frames.bin" \
+  --rc-in "$TMP/rc.bin" >/dev/null 2>&1
+# Without at least two windows on the base stream these cases test nothing.
+python3 "$ROOT/tools/fec-windows.py" "$TMP/frames.bin" --min-distinct 2 100 >"$TMP/windows.txt" \
+  || { cat "$TMP/windows.txt"; exit 1; }
+echo "     base-stream repair windows: $(awk '/^sid=0/ {sub(/window=/, "", $2); printf "%s ", $2}' "$TMP/windows.txt")"
+for spec in "0 1" "10 7" "20 3" "30 11"; do
+  set -- $spec
+  run_case "window ref adapt  drop=$1 seed=$2" --mode spotter --drop-pct "$1" --seed "$2"
+  run_case "window rust adapt drop=$1 seed=$2" --mode spotter --drop-pct "$1" --seed "$2" --core rust
+  run_case "window rust gs    drop=$1 seed=$2" --mode gs --fake-ack --drop-pct "$1" --seed "$2" --core rust
+  sends_case "window gs sends   drop=$1 seed=$2" --mode gs --fake-ack --drop-pct "$1" --seed "$2"
+  sends_case "window gs no-ack  drop=$1 seed=$2" --mode gs --drop-pct "$1" --seed "$2"
+done
+
 [ $fail -eq 0 ] && echo "== m0 parity passed ==" || { echo "== m0 parity FAILED =="; exit 1; }
