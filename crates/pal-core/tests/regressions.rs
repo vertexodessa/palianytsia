@@ -74,10 +74,10 @@ fn frame(fseq: u16, count: u16, frame_id: u16) -> Vec<u8> {
 
 /// Frame ids 0, 32768, 0, 65535: each step a delta of -32768 or -1, so the
 /// unwrapped id walks from 0x10000 to below zero and lands on u64::MAX; the
-/// emit cursor then overflows. A release build wraps instead, counts about
-/// u64::MAX dropped frames and parks the cursor at the top, so every later
-/// frame is late until the stall reset. Any transmitter that can put four
-/// FEC-valid frames on the air reaches it; no key is involved.
+/// emit cursor then overflows. A release build wraps instead: the dropped
+/// counter jumps by about 2^64 and the cursor wraps to 0, and the stream
+/// goes on with no gap. Any transmitter that can put four FEC-valid frames
+/// on the air reaches it; no key is involved.
 #[test]
 #[ignore = "open: a frame id walk below zero overflows the emit cursor (same in mabur)"]
 fn frame_id_walk_below_zero() {
