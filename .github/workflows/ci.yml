@@ -65,3 +65,24 @@ jobs:
           echo "run a: $a"; echo "run b: $b"
           cat maburd-a/PAIR.txt >> "$GITHUB_STEP_SUMMARY"
           [ "$a" = "$b" ] || { echo "maburd is not reproducible"; exit 1; }
+
+  aarch64-qemu:
+    # The phone and the Quest decode FEC with the NEON GF(256) kernel
+    # (pal-fec gf256::neon); every x86 job takes the scalar path, so these
+    # tests run the aarch64 build under qemu-user. Pure Rust crates only: no
+    # target sysroot beyond libc is needed.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - name: Cross packages
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: pal-fec, pal-wire, pal-core tests on aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+        run: cargo test --locked -p pal-fec -p pal-wire -p pal-core --target aarch64-unknown-linux-gnu

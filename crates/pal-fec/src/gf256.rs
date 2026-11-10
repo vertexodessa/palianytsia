@@ -181,4 +181,133 @@ mod tests {
             assert_eq!(acc, want);
         }
     }
+
+    // On aarch64 `lincomb` runs the NEON block loop and hands the tail to the
+    // scalar code; on x86 both sides are scalar and these tests pass
+    // trivially. They are the only check of the NEON kernel short of decoding
+    // video on a device, so they cover every coefficient, 0 to 4 whole blocks
+    // plus every tail length, and unaligned starts of both slices.
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u8 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u8
+        }
+        fn fill(&mut self, b: &mut [u8]) {
+            b.iter_mut().for_each(|x| *x = self.next());
+        }
+    }
+
+    // lincomb_scalar has no coefficient-0 shortcut (log[0] is 0, so it would
+    // add sym once); lincomb returns early instead.
+    fn reference(acc: &mut [u8], sym: &[u8], coeff: u8) {
+        if coeff != 0 {
+            let n = acc.len().min(sym.len());
+            lincomb_scalar(&mut acc[..n], &sym[..n], coeff);
+        }
+    }
+
+    const MAX_LEN: usize = 67;
+    const GUARD: usize = 16;
+
+    /// Runs lincomb on acc[oa..oa+la] with sym[os..os+ls] inside guarded
+    /// buffers and checks the whole acc buffer against the reference, so a
+    /// write past either end fails as well as a wrong product.
+    fn check_one(rng: &mut XorShift, coeff: u8, oa: usize, la: usize, os: usize, ls: usize) {
+        let mut acc = [0u8; GUARD + MAX_LEN + 32 + GUARD];
+        let mut sym = [0u8; GUARD + MAX_LEN + 32 + GUARD];
+        rng.fill(&mut acc);
+        rng.fill(&mut sym);
+        let sym_before = sym;
+        let mut want = acc;
+        reference(&mut want[oa..oa + la], &sym[os..os + ls], coeff);
+        lincomb(&mut acc[oa..oa + la], &sym[os..os + ls], coeff);
+        assert_eq!(
+            acc, want,
+            "coeff={coeff} acc off={oa} len={la} sym off={os} len={ls}"
+        );
+        assert_eq!(sym, sym_before, "sym written: coeff={coeff}");
+    }
+
+    #[test]
+    fn lincomb_equals_scalar_every_coeff_len_and_offset() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for coeff in 0..=255u8 {
+            for len in 0..=MAX_LEN {
+                // 16 offset pairs per (coeff, len): each slice takes every
+                // start 0..16 and the pair's relative misalignment varies.
+                for k in 0..16 {
+                    let oa = k;
+                    let os = (k * 7 + 3) % 16;
+                    check_one(&mut rng, coeff, oa, len, os, len);
+                }
+            }
+        }
+        // Every start pair, for a few coefficients.
+        for coeff in [1u8, 2, 0x1D, 0x80, 0xFF] {
+            for len in 0..=MAX_LEN {
+                for oa in 0..16 {
+                    for os in 0..16 {
+                        check_one(&mut rng, coeff, oa, len, os, len);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lincomb_unequal_lengths_stop_at_the_shorter() {
+        let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+        for coeff in [0u8, 1, 0x53, 0xFF] {
+            for len in 0..=MAX_LEN {
+                for extra in [1usize, 15, 16, 17, 32] {
+                    for k in 0..16 {
+                        let os = (k * 5 + 1) % 16;
+                        check_one(&mut rng, coeff, k, len, os, len + extra);
+                        check_one(&mut rng, coeff, k, len + extra, os, len);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lincomb_rows_equals_scalar() {
+        let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+        let mut pool = [0u8; 8 * (GUARD + MAX_LEN + 16)];
+        for n_rows in 0..=8usize {
+            for len in 0..=MAX_LEN {
+                for k in 0..16 {
+                    rng.fill(&mut pool);
+                    let stride = GUARD + MAX_LEN + 16;
+                    // Row lengths around len, so short rows only touch a
+                    // prefix of out; starts unaligned.
+                    let rows: Vec<&[u8]> = (0..n_rows)
+                        .map(|r| {
+                            let off = r * stride + (k + 3 * r) % 16;
+                            let rl = (len + r * 9) % (MAX_LEN + 16);
+                            &pool[off..off + rl]
+                        })
+                        .collect();
+                    let mut coeffs = [0u8; 8];
+                    rng.fill(&mut coeffs);
+                    coeffs[k % 8] = 0;
+
+                    let mut out = [0u8; GUARD + MAX_LEN + GUARD];
+                    rng.fill(&mut out);
+                    let mut want = out;
+                    want[k..k + len].fill(0);
+                    for (r, &c) in rows.iter().zip(&coeffs) {
+                        reference(&mut want[k..k + len], r, c);
+                    }
+                    lincomb_rows(&mut out[k..k + len], &rows, &coeffs[..n_rows]);
+                    assert_eq!(out, want, "rows={n_rows} len={len} off={k}");
+                }
+            }
+        }
+    }
 }
