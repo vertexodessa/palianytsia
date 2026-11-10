@@ -84,7 +84,7 @@ if tag:
 # A path is checked when it starts with one of the repo's top directories. Words with a
 # placeholder (<x>, *, $X, ...) are templates, not paths. git-ignored dirs are skipped.
 TOP = ("crates/", "apps/", "tools/", "docs/", "configs/", "release/", "third_party/",
-       "spikes/", ".github/")
+       ".github/")
 def expand(w):
     m = re.search(r"\{([^{}]*)\}", w)
     if not m: return [w]

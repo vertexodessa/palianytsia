@@ -8,7 +8,7 @@ android {
     defaultConfig {
         applicationId "org.palianytsia.quest"
         // Quest 3 runs Android 12L+; the surface swapchain path was proven
-        // on API 32 (spikes/quest-xr-probe).
+        // on API 32 (the quest-xr-probe spike, docs/spec.md).
         minSdk 32
         targetSdk 32
         versionCode 14

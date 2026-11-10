@@ -1,10 +1,11 @@
-//! The OpenXR side, grown from spikes/quest-xr-probe (whose findings it
-//! keeps: the ndk_context Activity swap, the zero fields of the surface
-//! swapchain, the vertical flip). Two quad layers: the video, decoded by
-//! MediaCodec straight into an XR_KHR_android_surface_swapchain, and the
-//! OSD above it. In goggle mode they sit in VIEW space, head-locked like
-//! real FPV goggles; in window mode they hang in LOCAL space over
-//! passthrough. The frame loop never waits for video.
+//! The OpenXR side, grown from the quest-xr-probe spike (docs/spec.md has
+//! its results), whose findings it keeps: the ndk_context Activity swap,
+//! the zero fields of the surface swapchain, the vertical flip. Two quad
+//! layers: the video, decoded by MediaCodec straight into an
+//! XR_KHR_android_surface_swapchain, and the OSD above it. In goggle mode
+//! they sit in VIEW space, head-locked like real FPV goggles; in window
+//! mode they hang in LOCAL space over passthrough. The frame loop never
+//! waits for video.
 use std::ffi::CString;
 use std::io::Read;
 use std::ptr;
