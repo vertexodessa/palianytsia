@@ -601,7 +601,9 @@ impl CoreLoop {
         self.stall_mark = (frames, au_drops);
         let full = l.rx_full.load(Ordering::Relaxed);
         let w = l.take_window();
+        let log_max = self.sink.log.as_mut().map_or(0, Session::take_call_max_us);
         let bad = w.body_lag_max > 200_000
+            || log_max > 20_000
             || w.cap_au_max > 500_000
             || w.au_dec_max > 300_000
             || w.show_max > 300_000
@@ -615,7 +617,7 @@ impl CoreLoop {
             l.rx_recv.load(Ordering::Relaxed),
         );
         eprintln!(
-            "lat: rx_queue={} rx_full={full} body_lag_max={}ms cap_au={}ms(max {}) au_to_frame_max={}ms dec_avg={:.1}ms dec_holds={} frame_to_screen_max={}ms shown/s={} au_drops={au_drops} rgba_skipped={}",
+            "lat: rx_queue={} rx_full={full} body_lag_max={}ms cap_au={}ms(max {}) au_to_frame_max={}ms dec_avg={:.1}ms dec_holds={} frame_to_screen_max={}ms shown/s={} au_drops={au_drops} rgba_skipped={} log_write_max={:.1}ms",
             sent.saturating_sub(recv + full),
             w.body_lag_max / 1000,
             l.cap_au_last.load(Ordering::Relaxed) / 1000,
@@ -626,6 +628,7 @@ impl CoreLoop {
             w.show_max / 1000,
             w.shown,
             l.skipped_rgba.load(Ordering::Relaxed),
+            log_max as f64 / 1000.0,
         );
     }
 }

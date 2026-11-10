@@ -678,6 +678,13 @@ fn log_summary(o: Opts) {
     for (t, to) in &s.session_edges {
         println!("  session -> {to} at {:.3} s", *t as f64 / 1e6);
     }
+    if let Some((us, t)) = s.log_max_us {
+        println!(
+            "  longest flight-log write: {:.1} ms (row at {:.1} s)",
+            us as f64 / 1000.0,
+            t as f64 / 1e6
+        );
+    }
     let ev: Vec<String> = s.events.iter().map(|(k, n)| format!("{k} {n}")).collect();
     println!(
         "  events: {}",

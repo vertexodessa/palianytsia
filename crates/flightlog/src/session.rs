@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use pal_core::{Au, RxBody};
 use serde_json::{json, Map, Value};
@@ -188,6 +188,14 @@ pub struct Session {
     /// that failed may hold half a record, and retrying it on every call
     /// would cost the core thread a syscall per AU on a full disk.
     failed: Option<io::Error>,
+    /// The longest single write call (a line, a capture record, a flush)
+    /// since the last stats row, in microseconds; the row carries it as
+    /// `log_max_us`. The calls run on the core thread, which also runs FEC,
+    /// AU delivery, NACKs and the uplink: a buffer flush into a busy
+    /// filesystem stalls all four, and this is what shows how long.
+    call_max_us: u64,
+    /// The same since the last `take_call_max_us` (the latency report).
+    lat_call_max_us: u64,
 }
 
 fn write_event(w: &mut impl Write, t_us: u64, ev: &str, detail: Value) -> io::Result<()> {
@@ -251,6 +259,8 @@ impl Session {
             channel: None,
             channel_seen: None,
             failed: None,
+            call_max_us: 0,
+            lat_call_max_us: 0,
         })
     }
 
@@ -281,12 +291,24 @@ impl Session {
         }
     }
 
-    /// Runs one write unless the log has stopped; latches its error.
+    /// The longest write call since the previous take, in microseconds.
+    pub fn take_call_max_us(&mut self) -> u64 {
+        std::mem::take(&mut self.lat_call_max_us)
+    }
+
+    /// Runs one write unless the log has stopped; latches its error and
+    /// times the call.
     fn guard(&mut self, w: impl FnOnce(&mut Self) -> io::Result<()>) -> io::Result<()> {
         if let Some(e) = &self.failed {
             return Err(e.kind().into());
         }
-        w(self).inspect_err(|e| self.failed = Some(io::Error::new(e.kind(), e.to_string())))
+        let t0 = Instant::now();
+        let r =
+            w(self).inspect_err(|e| self.failed = Some(io::Error::new(e.kind(), e.to_string())));
+        let us = t0.elapsed().as_micros() as u64;
+        self.call_max_us = self.call_max_us.max(us);
+        self.lat_call_max_us = self.lat_call_max_us.max(us);
+        r
     }
 
     /// One `stats_json` line, stamped; changes of the watched keys since
@@ -321,6 +343,11 @@ impl Session {
             }
         }
         m.insert("t_us".into(), json!(t_us));
+        // This row's own write counts towards the next one.
+        m.insert(
+            "log_max_us".into(),
+            json!(std::mem::take(&mut self.call_max_us)),
+        );
         writeln!(self.stats, "{}", serde_json::to_string(&m)?)?;
         self.last = Some(m); // t_us is not watched
         Ok(())
@@ -464,6 +491,9 @@ pub struct Summary {
     pub cards: Vec<String>,
     /// A `panic_prev` event's text: how the previous run ended.
     pub panic_prev: Option<String>,
+    /// The longest flight-log write call over the stats rows and the row
+    /// time it was reported at (µs); None when no row has `log_max_us`.
+    pub log_max_us: Option<(u64, u64)>,
 }
 
 fn check_marker(first: Option<io::Result<String>>, want: &str, file: &str) -> io::Result<()> {
@@ -524,6 +554,11 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             if let Some(t) = v.get("t_us").and_then(Value::as_u64) {
                 t_min = t_min.min(t);
                 t_max = t_max.max(t);
+                if let Some(us) = v.get("log_max_us").and_then(Value::as_u64) {
+                    if s.log_max_us.is_none_or(|(m, _)| us > m) {
+                        s.log_max_us = Some((us, t));
+                    }
+                }
             }
             s.stats_lines += 1;
             s.last_stats = Some(v);
@@ -573,6 +608,8 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     const TEST_RUN: Run = Run {
         app: "test",
@@ -725,6 +762,57 @@ mod tests {
         let second = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
         assert!(second.dir().to_string_lossy().contains("fl-0002_"));
         drop(second);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Writes into a file that blocks (flash GC, a full device) stall the
+    /// core thread; the stats row after such a call says how long.
+    #[test]
+    fn a_slow_write_shows_in_the_next_stats_row_and_the_summary() {
+        struct Slow(LineWriter, Arc<AtomicBool>);
+        impl Write for Slow {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                if self.1.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                }
+                self.0.write(b)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        let root = std::env::temp_dir().join(format!("pal-fl-slow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let slow = Arc::new(AtomicBool::new(false));
+        let mut s = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
+        s.wrap_writers(|name, w| {
+            if name == AU_FILE {
+                Box::new(Slow(w, slow.clone()))
+            } else {
+                w
+            }
+        });
+        s.stats(1_000_000, "{}").expect("stats");
+        slow.store(true, Ordering::Relaxed);
+        s.au(1_500_000, &Au::default()).expect("au");
+        slow.store(false, Ordering::Relaxed);
+        s.stats(2_000_000, "{}").expect("stats");
+        s.stats(3_000_000, "{}").expect("stats");
+        assert!(s.take_call_max_us() >= 30_000);
+        assert!(s.take_call_max_us() < 30_000, "taken");
+        let dir = s.dir().to_path_buf();
+        drop(s);
+        let rows: Vec<Value> = fs::read_to_string(dir.join(STATS_FILE))
+            .expect("stats")
+            .lines()
+            .skip(1)
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let max = |i: usize| rows[i]["log_max_us"].as_u64().expect("log_max_us");
+        assert!(max(1) >= 30_000, "{:?}", rows[1]);
+        assert!(max(2) < 30_000, "reset after the row: {:?}", rows[2]);
+        let sum = summarize(&dir).expect("summary");
+        assert_eq!(sum.log_max_us.map(|(_, t)| t), Some(2_000_000));
         let _ = fs::remove_dir_all(&root);
     }
 
