@@ -58,7 +58,7 @@ binning    = true          # true: full view, 2x2 binned. false: 1:1 pixels, a z
 gop_s      = 0             # seconds between refresh starts; 0 = none: the GS asks for an IDR when its picture is damaged
 qp_delta   = 4             # quality offset between keyframes and P-frames
 max_ipprop = 2             # keyframe may be at most this many times a P-frame's size
-min_iqp    = 34            # keyframe quality floor: higher = smaller keyframes
+min_iqp    = 42            # keyframe quality floor: higher = smaller keyframes. 34 gives keyframes of 200 kB and more at the faster link rates (a quarter of a second of air); 46 makes them smaller than an ordinary frame
 intra_refresh_frames = 0   # rolling-refresh sweep length; 0 = off (it only runs at a GOP start, so 0 whenever gop_s is 0)
 intra_refresh_qp   = 36    # requested QP of the refreshed areas; star6e CBR ignores it (coded at the RC's QP)
 ref_base    = 1            # temporal layering: a base layer every frame can decode from...
