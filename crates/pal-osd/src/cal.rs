@@ -164,7 +164,7 @@ fn abort_clicked(ui: &mut Ui, h: f32) -> bool {
 
 /// The warning and its two buttons: Some(true) on `action`, Some(false) on
 /// Cancel, None while neither is pressed.
-fn confirm_row(ui: &mut Ui, warning: &str, action: &str, h: f32) -> Option<bool> {
+pub(crate) fn confirm_row(ui: &mut Ui, warning: &str, action: &str, h: f32) -> Option<bool> {
     ui.label(RichText::new(warning).color(WARN));
     ui.horizontal(|ui| {
         let go = ui.add(btn(action, h)).clicked();

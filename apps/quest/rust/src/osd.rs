@@ -125,6 +125,7 @@ impl Osd {
                 Panel {
                     // Finger-sized rows suit a hand-held ray too.
                     look: pal_osd::panel::Look::TOUCH,
+                    xr: true,
                     ..Default::default()
                 },
             ),

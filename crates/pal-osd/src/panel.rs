@@ -18,33 +18,42 @@ pub(crate) fn btn(text: impl Into<egui::WidgetText>, h: f32) -> egui::Button<'st
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Tab {
+    /// What a pilot does in the air: recording, the view, the statistics.
     #[default]
-    Video,
-    Record,
+    Flight,
+    Picture,
     Link,
-    Osd,
-    Drone,
-    Logs,
+    Recording,
+    /// The HUD and how the video is shown.
+    Screen,
+    /// Versions, logs, rarely touched rows and the whole parameter table.
+    System,
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [
-        Tab::Video,
-        Tab::Record,
+    pub const ALL: [Tab; 6] = [
+        Tab::Flight,
+        Tab::Picture,
         Tab::Link,
-        Tab::Osd,
-        Tab::Drone,
-        Tab::Logs,
+        Tab::Recording,
+        Tab::Screen,
+        Tab::System,
     ];
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
-            Tab::Video => "Video",
-            Tab::Record => "Record",
+            Tab::Flight => "Flight",
+            Tab::Picture => "Picture",
             Tab::Link => "Link",
-            Tab::Osd => "OSD",
-            Tab::Drone => "Drone",
-            Tab::Logs => "Logs",
+            Tab::Recording => "Recording",
+            Tab::Screen => "Screen",
+            Tab::System => "System",
         }
+    }
+    /// By name, any case.
+    pub fn parse(s: &str) -> Option<Tab> {
+        Tab::ALL
+            .into_iter()
+            .find(|t| t.name().eq_ignore_ascii_case(s))
     }
 }
 
@@ -129,6 +138,13 @@ pub struct Panel {
     pub cal_confirm: crate::cal::Confirm,
     /// The Link tab shows the channel menu instead of its rows.
     pub chan_menu: bool,
+    /// The front end is a headset: the view and video filter rows apply.
+    pub xr: bool,
+    /// System shows the whole parameter table unfolded (desktop `--params`).
+    pub table_open: bool,
+    /// A set held back because the drone is armed and the row restarts the
+    /// video: row index and value, waiting for Apply or Cancel.
+    pub confirm: Option<(usize, String)>,
 }
 
 /// What the panel needs from the app, and the facts it shows read-only.
@@ -146,6 +162,11 @@ pub struct PanelIn<'a> {
     pub channels: &'a [u8],
     /// The latest channel scan, for the channel menu.
     pub scan: Option<&'a crate::channels::ScanView>,
+    /// A standing warning for the Flight tab and whether it is an error
+    /// (`widgets::key_warning`).
+    pub warning: Option<(String, bool)>,
+    /// The flight controller's arm state; None before any telemetry.
+    pub armed: Option<bool>,
 }
 
 #[derive(Default)]
@@ -164,19 +185,66 @@ const OK: Color32 = Color32::from_rgb(110, 220, 140);
 const WARN: Color32 = Color32::from_rgb(240, 190, 60);
 const BAD: Color32 = Color32::from_rgb(240, 80, 70);
 
-/// Rows per tab, by F18 id.
-const VIDEO: [&str; 8] = [
-    "VENC_MODE",
-    "ENC_BITRATE_MAX",
-    "ENC_AIRTIME",
-    "VENC_SLICES",
-    "VENC_MIN_IQP",
-    "LOWPWR_ENABLE",
-    "VENC_MIRROR",
-    "VENC_FLIP",
-];
-const RECORD: [&str; 4] = ["REC_ENABLE", "REC_BITRATE", "REC_FPS", "REC_SIZE"];
-const LINK: [&str; 2] = ["RADIO_WALL_MARGN", "RADIO_LDPC"];
+/// Drone rows per tab, by F18 id: the main part, then what folds under
+/// "Advanced". The whole table is under System.
+const FLIGHT: [&str; 1] = ["REC_ENABLE"];
+const PICTURE: [&str; 4] = ["VENC_MODE", "ENC_BITRATE_MAX", "VENC_MIRROR", "VENC_FLIP"];
+const PICTURE_ADV: [&str; 3] = ["ENC_AIRTIME", "VENC_SLICES", "VENC_MIN_IQP"];
+const LINK: [&str; 2] = ["RADIO_PWR_MODE", "RADIO_WALL_MARGN"];
+const LINK_ADV: [&str; 1] = ["RADIO_LDPC"];
+const RECORDING: [&str; 4] = ["REC_ENABLE", "REC_SIZE", "REC_FPS", "REC_BITRATE"];
+const SYSTEM: [&str; 2] = ["LOWPWR_ENABLE", "MSP_ENABLE"];
+
+/// A row's name for a pilot; the drone's `section.key` shows small under
+/// it. None for a row this build does not know: its key is the name.
+fn plain_name(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "VENC_MODE" => "Camera mode",
+        "ENC_BITRATE_MAX" => "Bitrate ceiling, kbps",
+        "ENC_AIRTIME" => "Share of the air the video may use",
+        "VENC_SLICES" => "Slices per frame",
+        "VENC_MIN_IQP" => "Keyframe quality floor",
+        "VENC_MIRROR" => "Mirror left-right",
+        "VENC_FLIP" => "Flip upside down",
+        "REC_ENABLE" => "Record on the drone",
+        "REC_SIZE" => "Recording size",
+        "REC_FPS" => "Recording frame rate",
+        "REC_BITRATE" => "Recording bitrate, kbps",
+        "RADIO_PWR_MODE" => "TX power table",
+        "RADIO_WALL_MARGN" => "TX power margin, dB",
+        "RADIO_LDPC" => "LDPC coding",
+        "LOWPWR_ENABLE" => "Low power while disarmed",
+        "MSP_ENABLE" => "Flight controller link (MSP)",
+        "VENC_MODES" => "Camera driver modes",
+        _ => return None,
+    })
+}
+
+/// The drone rebuilds its video pipeline to apply the row: the picture
+/// stops while it does.
+fn restarts_video(r: &Row) -> bool {
+    r.apply == "rebuild"
+}
+
+/// What becomes of the panel's command this frame. A set of a row that
+/// restarts the video is held in `held` while the drone is armed, and the
+/// panel asks; everything else goes out as it is.
+fn gate(
+    cmd: Option<Cmd>,
+    t: Option<&Table>,
+    armed: Option<bool>,
+    held: &mut Option<(usize, String)>,
+) -> Option<Cmd> {
+    match cmd {
+        Some(Cmd::Set(i, v))
+            if armed == Some(true) && t.and_then(|t| t.rows.get(i)).is_some_and(restarts_video) =>
+        {
+            *held = Some((i, v));
+            None
+        }
+        c => c,
+    }
+}
 
 /// Stepper increments for numeric rows on touch.
 fn step(id: &str) -> f64 {
@@ -339,8 +407,21 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, look: Look) 
     let mut cmd = None;
     let can = settable(r, t);
     let help = format!("{} ({}, applies by {})\n{}", r.id, r.ty, r.apply, r.help);
-    ui.label(RichText::new(format!("{}.{}", r.section, r.key)).strong())
-        .on_hover_text(&help);
+    let key = format!("{}.{}", r.section, r.key);
+    match plain_name(&r.id) {
+        Some(name) => {
+            ui.label(RichText::new(name).strong()).on_hover_text(&help);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(key).small().color(Color32::GRAY));
+                if restarts_video(r) {
+                    ui.label(RichText::new("restarts the video").small().color(WARN));
+                }
+            });
+        }
+        None => {
+            ui.label(RichText::new(key).strong()).on_hover_text(&help);
+        }
+    }
     ui.horizontal(|ui| {
         let v = r.value.clone().unwrap_or_else(|| "-".into());
         match r.ty.as_str() {
@@ -420,10 +501,12 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, look: Look) 
     cmd
 }
 
-fn rows_ui(ui: &mut Ui, ids: &[&str], t: Option<&Table>, e: &mut Edits, look: Look) -> Option<Cmd> {
+/// The state of the drone's table, once above a tab's drone rows: no
+/// table, not linked, a set on its way, the last refusal.
+fn table_status(ui: &mut Ui, t: Option<&Table>, e: &mut Edits) {
     let Some(t) = t else {
         ui.label(RichText::new("no drone settings yet (GS mode, linked)").color(WARN));
-        return None;
+        return;
     };
     if e.text.len() != t.rows.len() {
         e.text = vec![String::new(); t.rows.len()];
@@ -434,18 +517,48 @@ fn rows_ui(ui: &mut Ui, ids: &[&str], t: Option<&Table>, e: &mut Edits, look: Lo
         ui.label(RichText::new(format!("applying ({n} pending)")).color(WARN));
     }
     if let Some((row, Err(why))) = &e.last {
-        let id = t.rows.get(*row).map_or("?", |r| r.id.as_str());
-        ui.label(RichText::new(format!("{id}: refused, {why}")).color(BAD));
+        let name = t
+            .rows
+            .get(*row)
+            .map_or("?", |r| plain_name(&r.id).unwrap_or(r.id.as_str()));
+        ui.label(RichText::new(format!("{name}: refused, {why}")).color(BAD));
+    }
+}
+
+/// The rows named in `ids`, in that order (empty: the whole table in the
+/// drone's order). A row the drone does not have is left out.
+fn rows_ui(ui: &mut Ui, ids: &[&str], t: Option<&Table>, e: &mut Edits, look: Look) -> Option<Cmd> {
+    let t = t?;
+    if e.text.len() != t.rows.len() {
+        e.text = vec![String::new(); t.rows.len()];
     }
     let mut cmd = None;
-    for (i, r) in t.rows.iter().enumerate() {
-        if ids.is_empty() || ids.contains(&r.id.as_str()) {
-            if let Some(c) = row_ui(ui, i, r, t, e, look) {
-                cmd = Some(c);
+    let mut row = |ui: &mut Ui, i: usize, r: &Row| {
+        if let Some(c) = row_ui(ui, i, r, t, e, look) {
+            cmd = Some(c);
+        }
+    };
+    if ids.is_empty() {
+        for (i, r) in t.rows.iter().enumerate() {
+            row(ui, i, r);
+        }
+    } else {
+        for id in ids {
+            if let Some((i, r)) = t.rows.iter().enumerate().find(|(_, r)| r.id == *id) {
+                row(ui, i, r);
             }
         }
     }
     cmd
+}
+
+/// `ids` folded under an "Advanced" header, closed until asked for.
+fn advanced(ui: &mut Ui, salt: &str, add: impl FnOnce(&mut Ui) -> Option<Cmd>) -> Option<Cmd> {
+    egui::CollapsingHeader::new("Advanced")
+        .id_salt(salt)
+        .show(ui, add)
+        .body_returned
+        .flatten()
 }
 
 /// The small button that opens the panel; draw every frame.
@@ -534,27 +647,69 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
     let mut out = PanelOut::default();
     let look = p.look;
     let h = look.row_h;
+    // A held set first: it is answered before anything else is changed.
+    if let Some((row, value)) = p.confirm.clone() {
+        let name = i
+            .table
+            .and_then(|t| t.rows.get(row))
+            .map_or("?", |r| plain_name(&r.id).unwrap_or(r.id.as_str()));
+        let warning = format!(
+            "The drone is armed. {name} = {value} restarts the video: the picture stops \
+             while the drone rebuilds it."
+        );
+        if let Some(go) = crate::cal::confirm_row(ui, &warning, "Apply", h) {
+            if go {
+                out.cmd = Some(Cmd::Set(row, value));
+            }
+            p.confirm = None;
+        }
+        ui.separator();
+    }
+    // The tab's own command; a set may be held back by `gate` below.
+    let mut cmd = None;
     match p.tab {
-        Tab::Video => out.cmd = rows_ui(ui, &VIDEO, i.table, i.edits, look),
-        Tab::Record => {
-            ui.label("On the drone (microSD):");
-            out.cmd = rows_ui(ui, &RECORD, i.table, i.edits, look);
+        Tab::Flight => {
+            if let Some((text, bad)) = &i.warning {
+                ui.label(RichText::new(text).color(if *bad { BAD } else { WARN }));
+            }
+            ui.label(RichText::new(&i.link_info).monospace());
             ui.separator();
-            ui.label(RichText::new("Ground DVR: not implemented yet").color(Color32::GRAY));
+            table_status(ui, i.table, i.edits);
+            cmd = rows_ui(ui, &FLIGHT, i.table, i.edits, look);
+            ui.separator();
+            let before = i.prefs.clone();
+            if p.xr {
+                view_ui(ui, i.prefs);
+            }
+            ui.checkbox(&mut i.prefs.stats, "Link statistics over the video");
+            out.prefs_changed = *i.prefs != before;
+        }
+        Tab::Picture => {
+            table_status(ui, i.table, i.edits);
+            cmd = rows_ui(ui, &PICTURE, i.table, i.edits, look);
+            let (t, e) = (i.table, &mut *i.edits);
+            if let Some(c) = advanced(ui, "picture", |ui| rows_ui(ui, &PICTURE_ADV, t, e, look)) {
+                cmd = Some(c);
+            }
         }
         Tab::Link if p.chan_menu && !i.channels.is_empty() => {
             let m = channel_menu(ui, i.prefs, i.channels, i.scan, look);
             p.chan_menu = !m.back;
             if let Some(c) = m.choose {
                 out.prefs_changed = true;
-                out.cmd = Some(Cmd::Channels(c));
+                cmd = Some(Cmd::Channels(c));
             } else if let Some(set) = m.rescan {
-                out.cmd = Some(Cmd::ChannelScan(set));
+                cmd = Some(Cmd::ChannelScan(set));
             }
         }
         Tab::Link => {
             ui.label(RichText::new(&i.link_info).monospace());
-            ui.separator();
+            if !i.channels.is_empty() {
+                if let Some(set) = channels_button(ui, i.prefs, i.channels, h) {
+                    p.chan_menu = true;
+                    cmd = Some(Cmd::ChannelScan(set));
+                }
+            }
             ui.horizontal(|ui| {
                 ui.label("Video width");
                 for bw in [20u8, 40] {
@@ -569,47 +724,59 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             });
             ui.label(
                 RichText::new(
-                    "20 MHz reaches farther at the robust rungs (4-6 dB at \
-                                         MCS0); 40 MHz carries more per rung. Switching restarts \
-                                         the link for a few seconds; the drone needs no change.",
+                    "20 MHz reaches farther at the robust rungs (4-6 dB at MCS0); 40 MHz \
+                     carries more per rung. Switching restarts the link for a few seconds; \
+                     the drone needs no change.",
                 )
                 .small()
                 .color(Color32::GRAY),
             );
             ui.separator();
-            if ui
-                .checkbox(&mut i.prefs.s3_demote, "Step down on enhance-layer loss")
-                .changed()
-            {
+            table_status(ui, i.table, i.edits);
+            if let Some(c) = rows_ui(ui, &LINK, i.table, i.edits, look) {
+                cmd = Some(c);
+            }
+            ui.separator();
+            if let Some(c) = crate::cal::ui(ui, i.cal, i.table, &mut p.cal_confirm, h) {
+                cmd = Some(c);
+            }
+            let (t, e, prefs) = (i.table, &mut *i.edits, &mut *i.prefs);
+            let mut relink = false;
+            let adv = advanced(ui, "link", |ui| {
+                let c = rows_ui(ui, &LINK_ADV, t, e, look);
+                relink = ui
+                    .checkbox(&mut prefs.s3_demote, "Step down on enhance-layer loss")
+                    .changed();
+                ui.label(
+                    RichText::new(
+                        "On: any lost droppable frame steps the ladder down (early, \
+                         cautious). Off: only base-layer loss does, so the bitrate climbs \
+                         higher. Restarts the link.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                c
+            });
+            if let Some(c) = adv {
+                cmd = Some(c);
+            }
+            if relink {
                 out.prefs_changed = true;
                 out.relink = true;
             }
-            ui.label(
-                RichText::new(
-                    "On: any lost droppable frame steps the ladder down (early, \
-                                         cautious). Off: only base-layer loss does, so the bitrate \
-                                         climbs higher. Restarts the link.",
-                )
-                .small()
-                .color(Color32::GRAY),
-            );
-            if !i.channels.is_empty() {
-                ui.separator();
-                if let Some(set) = channels_button(ui, i.prefs, i.channels, h) {
-                    p.chan_menu = true;
-                    out.cmd = Some(Cmd::ChannelScan(set));
-                }
-            }
-            ui.separator();
-            if let Some(c) = rows_ui(ui, &LINK, i.table, i.edits, look) {
-                out.cmd = Some(c);
-            }
         }
-        Tab::Osd => out.prefs_changed = osd_ui(ui, i.prefs),
-        Tab::Drone => {
-            if let Some(c) = crate::cal::ui(ui, i.cal, i.table, &mut p.cal_confirm, h) {
-                out.cmd = Some(c);
-            }
+        Tab::Recording => {
+            ui.label("On the drone (microSD):");
+            table_status(ui, i.table, i.edits);
+            cmd = rows_ui(ui, &RECORDING, i.table, i.edits, look);
+            ui.separator();
+            ui.label(RichText::new("Ground DVR: not implemented yet").color(Color32::GRAY));
+        }
+        Tab::Screen => out.prefs_changed = screen_ui(ui, i.prefs, p.xr),
+        Tab::System => {
+            ui.label(format!("Palianytsia {}", pal_build::ID));
+            ui.label(RichText::new(&i.log_info).small().color(Color32::GRAY));
             ui.separator();
             if let Some(t) = i.table {
                 ui.horizontal(|ui| {
@@ -618,35 +785,49 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
                         Some(false) => "no heartbeat",
                         None => "waiting for heartbeat",
                     };
-                    ui.label(format!("list {}, {alive}", t.list));
-                    if ui
-                        .add_enabled(t.linked, egui::Button::new("refresh"))
-                        .clicked()
-                    {
-                        out.cmd = Some(Cmd::Refresh);
+                    ui.label(format!("drone parameters: list {}, {alive}", t.list));
+                    if ui.add_enabled(t.linked, btn("refresh", h)).clicked() {
+                        cmd = Some(Cmd::Refresh);
                     }
                 });
                 if t.mismatch {
                     ui.label(RichText::new("table mismatch: drone build differs").color(BAD));
                 }
             }
-            if let Some(c) = rows_ui(ui, &[], i.table, i.edits, look) {
-                out.cmd = Some(c);
+            table_status(ui, i.table, i.edits);
+            if let Some(c) = rows_ui(ui, &SYSTEM, i.table, i.edits, look) {
+                cmd = Some(c);
+            }
+            let (t, e) = (i.table, &mut *i.edits);
+            let all = egui::CollapsingHeader::new("All drone parameters")
+                .default_open(p.table_open)
+                .show(ui, |ui| rows_ui(ui, &[], t, e, look))
+                .body_returned
+                .flatten();
+            if let Some(c) = all {
+                cmd = Some(c);
             }
         }
-        Tab::Logs => {
-            ui.label(&i.log_info);
-            ui.label(
-                RichText::new(format!("Palianytsia {}", pal_build::ID))
-                    .small()
-                    .color(Color32::GRAY),
-            );
-        }
+    }
+    if let Some(c) = gate(cmd, i.table, i.armed, &mut p.confirm) {
+        out.cmd = Some(c);
     }
     out
 }
 
-fn osd_ui(ui: &mut Ui, p: &mut HudPrefs) -> bool {
+/// Goggle or window: the headset's two ways to show the video.
+fn view_ui(ui: &mut Ui, p: &mut HudPrefs) {
+    ui.horizontal(|ui| {
+        use crate::prefs::QuestView as V;
+        ui.label("View");
+        ui.radio_value(&mut p.quest_view, V::Goggle, "goggle");
+        ui.radio_value(&mut p.quest_view, V::Window, "window in the room");
+    });
+}
+
+/// The Screen tab: what the HUD shows and, on a headset, the video filter.
+/// True when a pref changed.
+fn screen_ui(ui: &mut Ui, p: &mut HudPrefs, xr: bool) -> bool {
     let before = p.clone();
     ui.checkbox(&mut p.dot, "Centre dot");
     ui.checkbox(&mut p.battery, "Battery");
@@ -654,23 +835,17 @@ fn osd_ui(ui: &mut Ui, p: &mut HudPrefs) -> bool {
     ui.checkbox(&mut p.nav, "Altitude, speed, home, satellites");
     ui.checkbox(&mut p.link, "Link readout (RSSI, MCS)");
     ui.checkbox(&mut p.messages, "Flight controller messages");
-    ui.separator();
-    ui.checkbox(&mut p.stats, "Link statistics (detailed)");
     ui.add(egui::Slider::new(&mut p.scale, 0.6..=2.0).text("text size"));
-    ui.separator();
-    ui.horizontal(|ui| {
-        use crate::prefs::VideoFilter as F;
-        ui.label("Video filter (Quest)");
-        ui.radio_value(&mut p.video_filter, F::Off, "off");
-        ui.radio_value(&mut p.video_filter, F::Sharpen, "sharpen");
-        ui.radio_value(&mut p.video_filter, F::Supersample, "supersample");
-    });
-    ui.horizontal(|ui| {
-        use crate::prefs::QuestView as V;
-        ui.label("View (Quest)");
-        ui.radio_value(&mut p.quest_view, V::Goggle, "goggle");
-        ui.radio_value(&mut p.quest_view, V::Window, "window in the room");
-    });
+    if xr {
+        ui.separator();
+        ui.horizontal(|ui| {
+            use crate::prefs::VideoFilter as F;
+            ui.label("Video filter");
+            ui.radio_value(&mut p.video_filter, F::Off, "off");
+            ui.radio_value(&mut p.video_filter, F::Sharpen, "sharpen");
+            ui.radio_value(&mut p.video_filter, F::Supersample, "supersample");
+        });
+    }
     *p != before
 }
 
@@ -858,6 +1033,86 @@ mod tests {
             .iter()
             .any(|s| s.starts_with("100@") || s.starts_with("90@2944")));
         assert!(m.contains(&"60@2560x1440/native".to_string()));
+    }
+
+    fn table_with(id: &str, apply: &str) -> Table {
+        Table {
+            linked: true,
+            rows: vec![Row {
+                id: id.into(),
+                apply: apply.into(),
+                value: Some("0".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn armed_holds_a_set_that_restarts_the_video() {
+        let t = table_with("REC_ENABLE", "rebuild");
+        let set = || Some(Cmd::Set(0, "1".into()));
+        let mut held = None;
+        // Disarmed, and before any telemetry: straight out.
+        assert_eq!(gate(set(), Some(&t), Some(false), &mut held), set());
+        assert_eq!(gate(set(), Some(&t), None, &mut held), set());
+        assert_eq!(held, None);
+        // Armed: held for the question, nothing sent.
+        assert_eq!(gate(set(), Some(&t), Some(true), &mut held), None);
+        assert_eq!(held, Some((0, "1".to_string())));
+    }
+
+    #[test]
+    fn armed_lets_through_what_does_not_stop_the_picture() {
+        let knob = table_with("ENC_BITRATE_MAX", "knob");
+        let mut held = None;
+        let set = || Some(Cmd::Set(0, "9000".into()));
+        assert_eq!(gate(set(), Some(&knob), Some(true), &mut held), set());
+        let refresh = gate(Some(Cmd::Refresh), Some(&knob), Some(true), &mut held);
+        assert_eq!(refresh, Some(Cmd::Refresh));
+        assert_eq!(held, None);
+    }
+
+    #[test]
+    fn each_tab_fits_the_quest_surface_and_names_known_rows() {
+        // 8 rows fit the Quest menu surface without scrolling (pal-ttb.30);
+        // the ground rows drawn beside the drone rows count too.
+        let ground = |t: Tab| match t {
+            Tab::Flight => 3,    // link line, view, statistics
+            Tab::Link => 4,      // link line, channels, width, calibration
+            Tab::Recording => 1, // ground DVR line
+            Tab::System => 3,    // version, table state, the folded table
+            Tab::Picture | Tab::Screen => 0,
+        };
+        let drone: [(Tab, &[&str]); 5] = [
+            (Tab::Flight, &FLIGHT),
+            (Tab::Picture, &PICTURE),
+            (Tab::Link, &LINK),
+            (Tab::Recording, &RECORDING),
+            (Tab::System, &SYSTEM),
+        ];
+        for (tab, ids) in drone {
+            assert!(ids.len() + ground(tab) <= 8, "{tab:?}");
+        }
+        let all = [
+            &FLIGHT[..],
+            &PICTURE,
+            &PICTURE_ADV,
+            &LINK,
+            &LINK_ADV,
+            &RECORDING,
+            &SYSTEM,
+        ];
+        for id in all.into_iter().flatten() {
+            assert!(plain_name(id).is_some(), "{id} has no plain name");
+        }
+    }
+
+    #[test]
+    fn tabs_parse_by_name() {
+        assert_eq!(Tab::parse("system"), Some(Tab::System));
+        assert_eq!(Tab::parse("Flight"), Some(Tab::Flight));
+        assert_eq!(Tab::parse("drone"), None);
     }
 
     #[test]

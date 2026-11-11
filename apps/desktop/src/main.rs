@@ -83,6 +83,8 @@ struct Opts {
     hwdec: String,
     /// Open the settings window at start (P toggles it).
     params: bool,
+    /// Open the settings window on this tab at start (headless checks).
+    panel: Option<pal_osd::panel::Tab>,
     /// Per-second latency breakdown on stderr (RX queue, capture->AU,
     /// decode, display).
     lat: bool,
@@ -149,6 +151,13 @@ fn parse() -> Opts {
             "--hwdec" => o.hwdec = val(),
             "--rf-sim" => runtime::rf_sim::install_spec(&val()).unwrap_or_else(|e| die(&e)),
             "--params" => o.params = true,
+            "--panel" => {
+                let name = val();
+                o.panel = Some(
+                    pal_osd::panel::Tab::parse(&name)
+                        .unwrap_or_else(|| die(&format!("--panel: no tab {name:?}"))),
+                );
+            }
             "--lat" => o.lat = true,
             "--cpu-rgba" => o.cpu_rgba = true,
             "--version" | "-V" => {
@@ -519,7 +528,8 @@ impl eframe::App for App {
         }
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::P)) {
             self.console.panel.open = !self.console.panel.open;
-            self.console.panel.tab = pal_osd::panel::Tab::Drone;
+            self.console.panel.tab = pal_osd::panel::Tab::System;
+            self.console.panel.table_open = true;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.console.panel.open = false;
@@ -793,12 +803,13 @@ fn main() {
                 console: pal_osd::console::Console::new(
                     prefs_path.clone(),
                     pal_osd::panel::Panel {
-                        open: o.params,
-                        tab: if o.params {
-                            pal_osd::panel::Tab::Drone
+                        open: o.params || o.panel.is_some(),
+                        tab: o.panel.unwrap_or(if o.params {
+                            pal_osd::panel::Tab::System
                         } else {
                             Default::default()
-                        },
+                        }),
+                        table_open: o.params,
                         look: pal_osd::panel::Look::DESKTOP,
                         ..Default::default()
                     },
