@@ -25,14 +25,14 @@ Update both ends to get the drone-side changes. The radio protocol and the drone
 - **Quest settings menu.** The menu is a panel of its own that opens in front of you and stays put in the room. Its tabs follow the task: Flight, Picture, Link, Recording, Screen, System. The right stick scrolls it.
 - **The picture recovers from a decoder failure** on the phone and the Quest: a dead decoder is rebuilt and one keyframe is requested. A frozen picture is marked on the screen.
 - **The ground station finds a drone on any 5 GHz channel**, not only on the channels of its set.
-- **A crafted video stream can no longer end the ground station**, and three faults in the frame reassembly are fixed.
+- **Faults a damaged or crafted video stream could trigger are fixed.** A forged picture size or slice layout could end the ground station, a forged or repeated frame number could freeze the picture, and a corrupted packet could put its data into the wrong stream.
 - **RTL8812AU ground cards at 40 MHz on channels 153 and 161** transmit on their channel again.
 - **Flight log.** `pal log` prints latency percentiles (capture on the drone to a complete frame on the ground) for the session and per rung, keyframe traffic, the decoder's loss episodes and the drone's parameters. A crash leaves `panic.txt`. `pal --version` and each session name the build.
 
 An updated drone keeps its `mabur.toml`, so it keeps its old values. To get the new defaults on such a drone, set `[venc] min_iqp = 42`, `[ampdu] max_num = 0` and the two `[air_clock] efficiency_` lines from the shipped `mabur.toml`. `radio.wide_tx_igi_floor` needs no edit: a config without it gets the default.
 
 On one bench (RTL8822E drone, 2944x1656 at 60 fps, 20 MHz, runs of 1 to 3 minutes per setting):
-- Rung changes: 250 to 500 per hour before, about 230 after, with the top rung held 91 % of the time.
+- Rung changes per hour: 254 and 507 in two runs of 150 s before, 234 in one run of 100 s after, with the top rung held 91 % of that run. With the re-sends switched off the same link changed rung 101 and 152 times per hour.
 - Keyframe on the top rung: 214 kB median (230 ms of air) at `VENC_MIN_IQP` 34, 40 kB (43 ms) at 42.
 - Latency, capture to complete frame: median 27 ms, 90 % under 31 ms, 99 % under 57 ms.
 - Aggregation off costs air capacity at the fast rates: 11 % at MCS 4, 16 % at MCS 5. The shipped ladder tops out at MCS 4.
