@@ -1,25 +1,25 @@
-//! The OSD layer (spec 5.6 "OSD and menus"): pal-osd's flight HUD (and the
-//! link statistics when enabled) drawn by egui into a GLES swapchain that
-//! the XR loop submits as a transparent quad over the video quad. Redrawn
-//! when a stats line arrives (10 Hz) or every 250 ms, never at video rate;
-//! between redraws the compositor keeps showing the last released image.
-//! The settings panel (pal-osd's, as on the phone) opens with B or Y and is
-//! driven by the controller ray; while it is open the layer redraws at
-//! 30 Hz so the cursor follows the hand.
-use std::num::NonZeroU32;
+//! What the headset draws with egui (spec 5.6 "OSD and menus"): pal-osd's
+//! flight HUD (and the link statistics when enabled) on a transparent
+//! surface the XR loop shows over the video quad. Redrawn when a stats line
+//! arrives (10 Hz) or every 250 ms, never at video rate. The settings panel
+//! (pal-osd's, as on the phone) opens with B or Y and is driven by the
+//! controller ray; while it is open the surface redraws at 30 Hz so the
+//! cursor follows the hand.
+//!
+//! The parts stand side by side: the `Console` holds the UI state and is
+//! fed once per tick, a `Surface` only draws what its closure says.
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glow::HasContext;
 use openxr as xr;
 use pal_osd::console::{Console, Feeds};
 use pal_osd::panel::Panel;
 use pal_osd::stall::Stall;
 
-use crate::input::Frame;
 use crate::supervisor::{Hub, LinkUi};
+use crate::surface::Surface;
 
 /// The OSD quad is SPAN times the video quad in each direction, centred
 /// on it, so stats chips can be parked beside the picture.
@@ -42,15 +42,20 @@ pub fn video_rect() -> egui::Rect {
     egui::Rect::from_center_size((p / 2.0).to_pos2(), p / SPAN)
 }
 
+/// What the frame loop tells the UI each frame.
+#[derive(Default)]
+pub struct UiIn {
+    /// Button edges: open or close the settings, toggle the statistics.
+    pub menu: bool,
+    pub stats: bool,
+    /// Trigger edge: Some(true) pressed, Some(false) released.
+    pub click: Option<bool>,
+    /// Where the ray meets the OSD surface, in its points.
+    pub on_osd: Option<egui::Pos2>,
+}
+
 pub struct Osd {
-    gl: Arc<glow::Context>,
-    painter: egui_glow::Painter,
-    ctx: egui::Context,
-    fbo: glow::Framebuffer,
-    pub sc: xr::Swapchain<xr::OpenGlEs>,
-    images: Vec<u32>,
-    /// A released image exists: the layer can be submitted.
-    pub ready: bool,
+    pub hud: Surface,
     link: Option<LinkUi>,
     console: Console,
     /// Last pointer position, for the cursor and the release event.
@@ -86,39 +91,8 @@ impl Osd {
         gl: Arc<glow::Context>,
         prefs_path: PathBuf,
     ) -> Result<Self, String> {
-        let sc = session
-            .create_swapchain(&xr::SwapchainCreateInfo {
-                create_flags: xr::SwapchainCreateFlags::EMPTY,
-                usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
-                    | xr::SwapchainUsageFlags::SAMPLED,
-                format: glow::RGBA8,
-                sample_count: 1,
-                width: W,
-                height: H,
-                face_count: 1,
-                array_size: 1,
-                mip_count: 1,
-            })
-            .map_err(|e| format!("OSD swapchain: {e}"))?;
-        let images = sc.enumerate_images().map_err(|e| e.to_string())?;
-        let painter = egui_glow::Painter::new(gl.clone(), "", None, false)
-            .map_err(|e| format!("OSD painter: {e}"))?;
-        // SAFETY: the XR session's GLES context is current on this thread.
-        let fbo = unsafe { gl.create_framebuffer() }?;
         Ok(Self {
-            gl,
-            painter,
-            ctx: {
-                let ctx = egui::Context::default();
-                // A held trigger is still a click: a ray press is slower
-                // than a tap (egui's 0.8 s is made for touch long-press).
-                ctx.options_mut(|o| o.input_options.max_click_duration = 3.0);
-                ctx
-            },
-            fbo,
-            sc,
-            images,
-            ready: false,
+            hud: Surface::new(session, gl, W, H, PPP)?,
             link: None,
             console: Console::new(
                 prefs_path,
@@ -138,9 +112,9 @@ impl Osd {
         })
     }
 
-    /// Drains the link's channels and applies the controller frame;
-    /// redraws when something changed or the last draw is old.
-    pub fn tick(&mut self, hub: &Hub, inp: Frame) {
+    /// Drains the link's channels and applies the frame's input; redraws
+    /// when something changed or the last draw is old.
+    pub fn tick(&mut self, hub: &Hub, inp: UiIn) {
         let mut changed = false;
         if inp.menu {
             self.console.panel.open = !self.console.panel.open;
@@ -187,7 +161,7 @@ impl Osd {
                 pressed,
                 modifiers: egui::Modifiers::default(),
             };
-            match (inp.pointer, self.pointer) {
+            match (inp.on_osd, self.pointer) {
                 (Some(p), _) => {
                     let p = self.lock.place(p, inp.click);
                     events.push(egui::Event::PointerMoved(p));
@@ -204,8 +178,8 @@ impl Osd {
                 }
                 (None, None) => {}
             }
-            changed |= inp.pointer != self.pointer || inp.click.is_some();
-            self.pointer = inp.pointer;
+            changed |= inp.on_osd != self.pointer || inp.click.is_some();
+            self.pointer = inp.on_osd;
         } else {
             self.pointer = None;
         }
@@ -247,12 +221,6 @@ impl Osd {
         status: &str,
         events: Vec<egui::Event>,
     ) -> Result<(), String> {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, points())),
-            events,
-            ..Default::default()
-        };
-        self.ctx.set_pixels_per_point(PPP);
         let fps = self.fps;
         let kbps = self.link.as_ref().map_or(0.0, |l| l.shared.rx_kbps());
         let console = &mut self.console;
@@ -280,7 +248,7 @@ impl Osd {
             .as_ref()
             .map_or(0, |l| l.shared.dec_errors.load(Ordering::Relaxed));
         let mut chips_moved = false;
-        let out = self.ctx.run(input, |ctx| {
+        self.hud.draw(events, |ctx| {
             pout = console.show_panel(ctx, link_info.clone(), log_info.clone(), channels);
             let c = &mut *console;
             egui::CentralPanel::default()
@@ -322,7 +290,7 @@ impl Osd {
                     egui::Stroke::new(2.0_f32, egui::Color32::BLACK),
                 );
             }
-        });
+        })?;
         self.console
             .settle(&mut pout, self.link.as_ref().map(|l| &l.ports.cmd_tx));
         if chips_moved && !pout.prefs_changed {
@@ -331,45 +299,6 @@ impl Osd {
         if pout.relink {
             hub.relink.store(true, Ordering::Relaxed);
         }
-        let prims = self.ctx.tessellate(out.shapes, out.pixels_per_point);
-        let idx = self.sc.acquire_image().map_err(|e| e.to_string())?;
-        self.sc
-            .wait_image(xr::Duration::INFINITE)
-            .map_err(|e| e.to_string())?;
-        let tex = NonZeroU32::new(self.images[idx as usize]).map(glow::NativeTexture);
-        // SAFETY: the session's GLES context is current on this thread and
-        // `tex` is a live swapchain image.
-        unsafe {
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
-            self.gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                tex,
-                0,
-            );
-        }
-        self.painter.clear([W, H], [0.0, 0.0, 0.0, 0.0]);
-        self.painter.paint_and_update_textures(
-            [W, H],
-            out.pixels_per_point,
-            &prims,
-            &out.textures_delta,
-        );
-        // SAFETY: as above.
-        unsafe {
-            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
-        self.sc.release_image().map_err(|e| e.to_string())?;
-        self.ready = true;
         Ok(())
-    }
-}
-
-impl Drop for Osd {
-    fn drop(&mut self) {
-        self.painter.destroy();
-        // SAFETY: as in draw().
-        unsafe { self.gl.delete_framebuffer(self.fbo) };
     }
 }

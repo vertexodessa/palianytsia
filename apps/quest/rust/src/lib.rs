@@ -15,14 +15,17 @@ mod input;
 mod osd;
 #[cfg(target_os = "android")]
 mod perf;
-// Called from xr (Android); host builds run its tests.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+// Called from xr (Android); host builds run its tests. The menu geometry
+// in it is not called yet (the menu quad is the next commit).
+#[allow(dead_code)]
 mod placement;
 // Called from xr (Android); host builds run its tests.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod rate;
 #[cfg(target_os = "android")]
 mod supervisor;
+#[cfg(target_os = "android")]
+mod surface;
 #[cfg(target_os = "android")]
 mod usb;
 #[cfg(target_os = "android")]

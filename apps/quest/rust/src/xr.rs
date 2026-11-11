@@ -20,8 +20,10 @@ use openxr::sys;
 
 use crate::background::Background;
 use crate::input::{locate, Input};
-use crate::osd::Osd;
-use crate::placement::{self, Grab, Placement, Pose, MAX_DIST_M, MIN_DIST_M};
+use crate::osd::{Osd, UiIn};
+use crate::placement::{
+    self, Grab, Placement, Pose, Ray, SpaceKind, Sticks, Target, MAX_DIST_M, MIN_DIST_M,
+};
 use crate::supervisor::Hub;
 use pal_osd::prefs::QuestView;
 
@@ -123,17 +125,42 @@ impl Screen {
     }
 }
 
-/// Where the video hangs now and whether that is in LOCAL space (else
-/// VIEW). A window not placed yet shows head-locked: no tracked head at the
-/// first frames must not mean no video.
-fn video_placement(view: QuestView, window: Option<Placement>, scr: &Screen) -> (bool, Placement) {
+/// Where the video hangs now and in which space. A window not placed yet
+/// shows head-locked: no tracked head at the first frames must not mean no
+/// video.
+fn video_placement(
+    view: QuestView,
+    window: Option<Placement>,
+    scr: &Screen,
+) -> (SpaceKind, Placement) {
     match window.filter(|_| view == QuestView::Window) {
-        Some(w) => (true, w),
+        Some(w) => (SpaceKind::Local, w),
         None => {
             let e = scr.extent(view);
-            (false, Placement::in_view(e.dist_m, e.width_m))
+            (SpaceKind::View, Placement::in_view(e.dist_m, e.width_m))
         }
     }
+}
+
+/// The surfaces the ray can point at.
+#[derive(Clone, Copy, PartialEq)]
+enum Surf {
+    Osd,
+}
+
+/// One quad layer of a frame, as data: where, in which space, which
+/// swapchain. The frame loop builds the list once, after input and
+/// steering; `Submit` only turns it into the runtime's structs.
+#[derive(Clone, Copy)]
+struct QuadSpec {
+    space: SpaceKind,
+    at: Placement,
+    sc: sys::Swapchain,
+    w: u32,
+    h: u32,
+    /// The decoder's surface: flipped, opaque, filtered as the pilot chose.
+    /// Else an egui surface, blended by its alpha.
+    video: bool,
 }
 
 /// The OSD quad, centred on the video.
@@ -428,34 +455,25 @@ impl WindowCtl {
         }
     }
 
-    /// Grip moves the window; returns the stick input it lets through.
-    fn step(
-        &mut self,
-        frame: &crate::input::Frame,
-        head: Option<Pose>,
-        video_at: &Placement,
-        scr: &mut Screen,
-    ) -> (f32, f32) {
+    /// Grip moves the window; `aim` is the ray in LOCAL, where it hangs.
+    fn step(&mut self, grip: bool, aim: Option<Ray>, head: Option<Pose>, scr: &mut Screen) {
         if let (Some(w), Some(h)) = (self.window.as_mut(), head) {
-            if frame.grip && !self.grip_was {
-                self.grab = frame.aim.and_then(|r| Grab::start(&r, w));
+            if grip && !self.grip_was {
+                self.grab = aim.and_then(|r| Grab::start(&r, w));
             }
-            if let (Some(g), Some(r)) = (&self.grab, &frame.aim) {
+            if let (Some(g), Some(r)) = (&self.grab, &aim) {
                 w.pose = g.moved(r, h.pos);
             }
-            if !frame.grip && self.grab.take().is_some() {
+            if !grip && self.grab.take().is_some() {
                 scr.window.dist_m = placement::distance(w.pose.pos, h.pos);
                 scr.dirty = true;
             }
         }
-        // Only the window under the ray listens: a thumb resting on
-        // a stick must not change it unasked in flight.
-        let aimed = frame.aim.is_some_and(|r| video_at.hit(&r).is_some());
-        if !aimed || self.grab.is_some() {
-            (0.0, 0.0)
-        } else {
-            (frame.size, frame.dist)
-        }
+        self.grip_was = grip;
+    }
+
+    fn carried(&self) -> bool {
+        self.grab.is_some()
     }
 
     /// After the sticks moved the screen's extent.
@@ -475,21 +493,19 @@ struct Submit<'a> {
     exts: &'a xr::ExtensionSet,
     space: &'a xr::Space,
     local: &'a xr::Space,
-    video: Option<sys::Swapchain>,
-    osd: Option<&'a Osd>,
     background: Option<&'a Background>,
-    view: QuestView,
-    window: Option<Placement>,
-    scr: &'a Screen,
+    /// The operator's filter for the video quad (Screen tab).
+    filter: pal_osd::prefs::VideoFilter,
+    /// Back to front.
+    quads: &'a [QuadSpec],
 }
 
 impl Submit<'_> {
     fn end_frame(&self, fs: &sys::FrameState) {
-        // The operator's filter for the video quad (OSD tab), chained
-        // after the flip.
+        // The filter is chained after the flip.
         use pal_osd::prefs::VideoFilter;
         use sys::CompositionLayerSettingsFlagsFB as LF;
-        let filter = self.osd.map_or(VideoFilter::Off, |o| o.video_filter());
+        let filter = self.filter;
         let settings = sys::CompositionLayerSettingsFB {
             ty: sys::CompositionLayerSettingsFB::TYPE,
             next: ptr::null(),
@@ -516,36 +532,25 @@ impl Submit<'_> {
         } else {
             settings_ptr
         };
-        // After this frame's grab and sticks.
-        let (in_local, video_at) = video_placement(self.view, self.window, self.scr);
-        let layer_space = if in_local {
-            self.local.as_raw()
-        } else {
-            self.space.as_raw()
-        };
-        let mut quads = Vec::with_capacity(2);
-        if let Some(sc) = self.video {
-            quads.push(quad(
-                &video_at,
-                layer_space,
-                sc,
-                VW,
-                VH,
-                sys::CompositionLayerFlags::EMPTY,
-                flip_ptr,
-            ));
-        }
-        if let Some(o) = self.osd.filter(|o| o.ready) {
-            quads.push(quad(
-                &osd_placement(&video_at, self.view, o.panel_open(), self.scr),
-                layer_space,
-                o.sc.as_raw(),
-                crate::osd::W,
-                crate::osd::H,
-                sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA,
-                ptr::null(),
-            ));
-        }
+        let quads: Vec<sys::CompositionLayerQuad> = self
+            .quads
+            .iter()
+            .map(|q| {
+                let space = match q.space {
+                    SpaceKind::Local => self.local.as_raw(),
+                    SpaceKind::View => self.space.as_raw(),
+                };
+                let (flags, next) = if q.video {
+                    (sys::CompositionLayerFlags::EMPTY, flip_ptr)
+                } else {
+                    (
+                        sys::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA,
+                        ptr::null(),
+                    )
+                };
+                quad(&q.at, space, q.sc, q.w, q.h, flags, next)
+            })
+            .collect();
         let room = self.background.map(Background::layer);
         // The room first: layers are composited in order.
         let layers: Vec<*const sys::CompositionLayerBaseHeader> = room
@@ -806,38 +811,79 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             win.place(head, &scr);
         }
         let menu = osd.as_ref().is_some_and(Osd::panel_open);
-        let (in_local, video_at) = video_placement(view, win.window, &scr);
-        let xr_space = if in_local { &local } else { &space };
+        let (v_space, video_at) = video_placement(view, win.window, &scr);
         // Input at the predicted display time, so the ray matches the
         // frame it is drawn into.
-        let frame = input.as_ref().map_or_else(Default::default, |i| {
-            i.poll(
-                &session,
-                xr_space,
-                t,
-                &osd_placement(&video_at, view, menu, &scr),
-                crate::osd::points(),
-            )
-        });
+        let frame = input
+            .as_ref()
+            .map_or_else(Default::default, |i| i.poll(&session, &space, &local, t));
+        // What the ray points at, front to back.
+        let targets = [Target {
+            id: Surf::Osd,
+            space: v_space,
+            at: osd_placement(&video_at, view, menu, &scr),
+            size: crate::osd::points().into(),
+        }];
+        let hit = placement::route(&frame.aim, &targets);
         let dt = t_frame.elapsed().as_secs_f32().min(0.1);
         t_frame = Instant::now();
-        let (size, dist) = if view == QuestView::Window {
-            win.step(&frame, head, &video_at, &mut scr)
-        } else {
-            (frame.size, frame.dist)
-        };
+        let window = (view == QuestView::Window).then(|| {
+            win.step(frame.grip, frame.aim.local, head, &mut scr);
+            let aimed = frame
+                .aim
+                .in_space(v_space)
+                .is_some_and(|r| video_at.hit(&r).is_some());
+            (aimed, win.carried())
+        });
         win.grip_was = frame.grip;
+        let (size, dist) = match placement::sticks(false, window, frame.right_y, frame.left_y) {
+            Sticks::Screen { size, dist } => (size, dist),
+            Sticks::Scroll(_) | Sticks::Idle => (0.0, 0.0),
+        };
         let before = scr.extent(view).dist_m;
         scr.steer(view, size, dist, dt);
         if view == QuestView::Window {
             win.follow(before, &scr);
         }
         if let Some(o) = osd.as_mut() {
-            o.tick(&hub, frame);
+            o.tick(
+                &hub,
+                UiIn {
+                    menu: frame.menu,
+                    stats: frame.stats,
+                    click: frame.click,
+                    on_osd: hit
+                        .filter(|h| h.id == Surf::Osd)
+                        .map(|h| egui::pos2(h.pos[0], h.pos[1])),
+                },
+            );
         }
         // SAFETY: as above.
         unsafe {
             (fp.begin_frame)(session.as_raw(), &bi);
+        }
+        // The frame's quads, back to front, after its grab and sticks.
+        let (v_space, video_at) = video_placement(view, win.window, &scr);
+        let mut quads = Vec::with_capacity(2);
+        if let Some(sc) = video {
+            quads.push(QuadSpec {
+                space: v_space,
+                at: video_at,
+                sc,
+                w: VW,
+                h: VH,
+                video: true,
+            });
+        }
+        if let Some(o) = osd.as_ref().filter(|o| o.hud.ready) {
+            quads.push(QuadSpec {
+                space: v_space,
+                at: osd_placement(&video_at, view, o.panel_open(), &scr),
+                sc: o.hud.sc.as_raw(),
+                w: o.hud.w,
+                h: o.hud.h,
+                video: false,
+            });
         }
         Submit {
             fp,
@@ -845,12 +891,11 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             exts: &exts,
             space: &space,
             local: &local,
-            video,
-            osd: osd.as_ref(),
             background: background.as_ref(),
-            view,
-            window: win.window,
-            scr: &scr,
+            filter: osd
+                .as_ref()
+                .map_or(Default::default(), |o| o.video_filter()),
+            quads: &quads,
         }
         .end_frame(&fs);
         frames += 1;
