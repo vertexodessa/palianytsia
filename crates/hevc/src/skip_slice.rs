@@ -164,6 +164,11 @@ pub fn skip_fill_steps(
 
 /// Annex-B fill NAL (00 00 00 01 + tmpl's NAL header + escaped RBSP); None
 /// for an I-slice template or an empty / out-of-picture range.
+/// Level 6.2 of H.265 (Table A.8): MaxLumaPs, and the longest side it
+/// permits, sqrt(8 * MaxLumaPs).
+const MAX_LUMA_PS: u64 = 35_651_584;
+const MAX_PIC_SIDE: u32 = 16_888;
+
 pub fn make_skip_slice(
     sps: &Sps,
     pps: &Pps,
@@ -172,6 +177,17 @@ pub fn make_skip_slice(
     end_ctb: u32,
 ) -> Option<Vec<u8>> {
     if tmpl.slice_type == 2 {
+        return None;
+    }
+    // The grid below is sized by the SPS, and the SPS is whatever the stream
+    // delivered (video bodies carry no key tag): a forged 2^20 x 2^20 picture
+    // asks for three vectors of 17 GB and the failed allocation ends the
+    // process. Nothing above the largest picture an HEVC level allows gets a
+    // fill.
+    if sps.width > MAX_PIC_SIDE
+        || sps.height > MAX_PIC_SIDE
+        || u64::from(sps.width) * u64::from(sps.height) > MAX_LUMA_PS
+    {
         return None;
     }
     let total = sps.pic_w_ctbs().wrapping_mul(sps.pic_h_ctbs());

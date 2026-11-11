@@ -123,3 +123,30 @@ fn fill_steps_and_slices() {
     let idr = parse_slice_header(pics[0][0], t.sps(), t.pps()).unwrap();
     assert!(make_skip_slice(t.sps(), t.pps(), &idr, 0, 150).is_none());
 }
+
+/// The fill's work grid is sized by the SPS, and the SPS is whatever the
+/// stream delivered: a picture no HEVC level allows is refused before
+/// anything is allocated by it (1 048 576 x 1 044 480 would ask for three
+/// vectors of 17 GB).
+#[test]
+fn a_picture_no_level_allows_is_refused() {
+    let b = fixture();
+    let mut t = ParamTracker::default();
+    t.feed(&b);
+    let pics = pictures(&b);
+    let tmpl = parse_slice_header(pics[5][1], t.sps(), t.pps()).unwrap();
+    let mut forged = t.sps().clone();
+    forged.width = 1 << 20;
+    forged.height = 64 * 255 * 64;
+    assert!(make_skip_slice(&forged, t.pps(), &tmpl, 0, 1).is_none());
+    // One side over the limit is enough.
+    let mut wide = t.sps().clone();
+    wide.width = 16_896;
+    wide.height = 64;
+    assert!(make_skip_slice(&wide, t.pps(), &tmpl, 0, 1).is_none());
+    // The largest common picture, 8192 x 4320, still gets its fill.
+    let mut big = t.sps().clone();
+    big.width = 8192;
+    big.height = 4320;
+    assert!(make_skip_slice(&big, t.pps(), &tmpl, 0, 1).is_some());
+}
