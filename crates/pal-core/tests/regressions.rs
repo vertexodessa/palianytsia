@@ -44,11 +44,13 @@ struct Out {
     open: bool,
     nested: u32,
     ends: u32,
+    begins_off_sid0: u32,
 }
 
 impl FrameOut for Out {
-    fn begin(&mut self, _: &FrameHdr, _: u8, _: u8) {
+    fn begin(&mut self, _: &FrameHdr, sid: u8, _: u8) {
         self.nested += u32::from(self.open);
+        self.begins_off_sid0 += u32::from(sid != 0);
         self.open = true;
     }
     fn data(&mut self, _: &[u8]) {}
@@ -106,4 +108,53 @@ fn two_slots_one_frame_id_nest() {
     fs.push_fragment(0, &frame(3, 2, 5), 10, &FragArrival::default(), &mut out);
     fs.poll(1000, &mut out);
     assert_eq!(out.nested, 0);
+}
+
+/// A 120 fps stream; one frame with an id 200 ahead arrives on the other
+/// layer every 240 ms. Skipping to it would make every real frame late, and
+/// each emitted forged frame would disarm the stall watchdog, so the picture
+/// would not come back. The lone frame is dropped instead.
+#[test]
+fn forged_frame_ahead_does_not_freeze_the_stream() {
+    let mut fs = FrameStream::new(FrameStreamCfg::default());
+    let mut out = Out::default();
+    let a = FragArrival::default();
+    let mut forged = 0u64;
+    for id in 0u16..600 {
+        let t = 10 + 8 * u64::from(id);
+        fs.push_fragment(0, &frame(id, 1, id), t, &a, &mut out);
+        if id % 30 == 5 {
+            fs.push_fragment(1, &frame(id, 1, id + 200), t + 1, &a, &mut out);
+            forged += 1;
+        }
+        fs.poll(t + 4, &mut out);
+    }
+    let st = fs.stats();
+    assert_eq!(st.clean, 600, "{st:?}");
+    assert_eq!(st.stall_resets, 0);
+    assert_eq!(st.dropped, forged);
+    assert_eq!(out.begins_off_sid0, 0);
+}
+
+/// After an outage longer than the lookahead the first frame waits for a
+/// second one to confirm the new id range, or for the gap timeout when
+/// nothing was emitted after it arrived.
+#[test]
+fn outage_jump_waits_for_a_second_frame_or_the_gap_timeout() {
+    let mut fs = FrameStream::new(FrameStreamCfg::default());
+    let mut out = Out::default();
+    let a = FragArrival::default();
+    for id in 0u16..10 {
+        fs.push_fragment(0, &frame(id, 1, id), 10 + u64::from(id), &a, &mut out);
+    }
+    fs.push_fragment(0, &frame(10, 1, 200), 400, &a, &mut out);
+    assert_eq!(fs.stats().clean, 10);
+    fs.push_fragment(0, &frame(11, 1, 201), 408, &a, &mut out);
+    assert_eq!(fs.stats().clean, 12);
+    assert_eq!(fs.stats().dropped, 190);
+    fs.push_fragment(0, &frame(12, 1, 400), 800, &a, &mut out);
+    fs.poll(840, &mut out);
+    assert_eq!(fs.stats().clean, 12);
+    fs.poll(851, &mut out);
+    assert_eq!(fs.stats().clean, 13);
 }

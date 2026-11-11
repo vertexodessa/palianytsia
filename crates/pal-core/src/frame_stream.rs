@@ -92,6 +92,8 @@ struct Slot {
     have_seq_at_max: bool,
     began: bool,
     discont: bool,
+    /// Frames emitted when the header arrived.
+    emits_at_hdr: u64,
     lat: AuLat,
     sa: Option<SliceAssembler>,
 }
@@ -280,6 +282,7 @@ impl FrameStream {
             let s = self.slots.get_mut(&k).expect("slot");
             s.id64 = id64;
             s.discont = rebased;
+            s.emits_at_hdr = self.st.clean + self.st.truncated;
             if rebased {
                 self.params.reset(); // a producer restart may change resolution
             }
@@ -335,18 +338,23 @@ impl FrameStream {
             // forged, or a corrupt header the block CRC let through) the one
             // already begun stays the head, so a second frame never begins
             // inside an open one; the other is late once the head finishes.
+            // Lone frames (see `lone`) do not count as the stream having run
+            // ahead.
             let mut head: Option<(u32, u64)> = None;
             let mut max_known = 0u64;
             for (k, s) in &self.slots {
                 if !s.have_hdr {
                     continue;
                 }
-                max_known = max_known.max(s.id64);
+                if s.id64 > max_known && !self.lone(s) {
+                    max_known = s.id64;
+                }
                 if head.is_none_or(|(_, id)| s.id64 < id || (s.id64 == id && s.began)) {
                     head = Some((*k, s.id64));
                 }
             }
             let Some((hk, _)) = head else { return };
+            let head_lone = self.lone(&self.slots[&hk]);
             let mut h = self.slots.remove(&hk).expect("head");
             if self.have_next_emit && h.id64 > self.next_emit_id64 {
                 if h.discont {
@@ -354,10 +362,26 @@ impl FrameStream {
                     self.next_emit_id64 = h.id64;
                 } else {
                     let stale = now_ms >= h.first_ms + self.gap_ms_max();
-                    let ahead = max_known >= self.next_emit_id64 + self.cfg.lookahead;
-                    if !stale && !ahead {
-                        self.slots.insert(hk, h);
-                        return;
+                    if head_lone {
+                        if !stale {
+                            self.slots.insert(hk, h);
+                            return;
+                        }
+                        // Frames were emitted after this one arrived, so the
+                        // stream is alive below it: the far id is forged or
+                        // corrupt, not the next frame after an outage.
+                        // Skipping to it would make every real frame late
+                        // until the stall watchdog fired.
+                        if self.st.clean + self.st.truncated != h.emits_at_hdr {
+                            self.st.dropped += 1;
+                            continue;
+                        }
+                    } else {
+                        let ahead = max_known >= self.next_emit_id64 + self.cfg.lookahead;
+                        if !stale && !ahead {
+                            self.slots.insert(hk, h);
+                            return;
+                        }
                     }
                     self.st.dropped += h.id64 - self.next_emit_id64;
                     h.lat.skipped_before += (h.id64 - self.next_emit_id64) as u32;
@@ -409,6 +433,22 @@ impl FrameStream {
             self.slots.insert(hk, h);
             return;
         }
+    }
+
+    /// A frame at least lookahead ids past the emit cursor, without the
+    /// discont flag, with no other known frame within lookahead ids of it.
+    /// Video carries no key tag, so one forged or corrupt header can name any
+    /// id; a real stream that resumes after an outage confirms the jump with
+    /// its next frame.
+    fn lone(&self, s: &Slot) -> bool {
+        let la = self.cfg.lookahead;
+        if !self.have_next_emit || s.discont || la == 0 || s.id64 < self.next_emit_id64 + la {
+            return false;
+        }
+        !self
+            .slots
+            .values()
+            .any(|t| t.have_hdr && t.id64 != s.id64 && t.id64.abs_diff(s.id64) <= la)
     }
 
     fn finish(&mut self, mut s: Slot, complete: bool, out: &mut dyn FrameOut) {
