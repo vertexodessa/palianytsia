@@ -117,3 +117,6 @@ pairing key.
 ## Rules
 - Commit with `git -c user.email=ivlev.igor@gmail.com commit`; no AI attribution.
 - Do not push while the GitHub repo is being recreated (2026-11-01); ask first.
+- Keep the beads board current without being asked: `bd update <id> --status in_progress` before the first
+  edit or measurement, `--append-notes` with the numbers as each step lands, `bd close` only when proven,
+  back to open with a note when stopped or blocked.
