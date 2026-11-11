@@ -8,6 +8,15 @@ use crate::RxBody;
 use pal_wire::{rc, sbi};
 
 const MAX_SEQ_GAP: u16 = 512;
+/// How recently a stream must have been heard FCS-good for an FCS-bad body
+/// naming it to be routed: ten probe periods, a few hundred video bodies.
+const CLEAN_STREAM_US: u64 = 500_000;
+
+/// True when the last FCS-good body (stamp + 1, 0 = never) is within
+/// CLEAN_STREAM_US of now.
+fn heard_within(stamp: u64, now_us: u64) -> bool {
+    stamp != 0 && now_us + 1 >= stamp && now_us + 1 - stamp <= CLEAN_STREAM_US
+}
 const EMA_ALPHA: f64 = 0.1;
 
 pub const RF_S0: usize = 0;
@@ -121,7 +130,8 @@ pub struct CardTrack {
 }
 
 pub enum Route {
-    /// Unknown card.
+    /// Unknown card, or an FCS-bad body of a stream not heard FCS-good
+    /// recently while others were.
     Dropped,
     /// An RC frame (CRC not checked for foreign frames; own RCF/DISC only
     /// when CRC-good, as mabur).
@@ -137,6 +147,10 @@ pub struct Aggregator {
     bad_card_msgs: u64,
     last_video_us: u64,
     last_video_seq: u16,
+    /// mono_us + 1 of the last FCS-good SBI body, per stream id and of any
+    /// stream, on any card (0 = never): the routing gate for FCS-bad bodies.
+    sid_clean_us: [u64; 128],
+    any_clean_us: u64,
 }
 
 impl Aggregator {
@@ -152,6 +166,8 @@ impl Aggregator {
             bad_card_msgs: 0,
             last_video_us: 0,
             last_video_seq: 0,
+            sid_clean_us: [0; 128],
+            any_clean_us: 0,
         }
     }
     pub fn decoder(&self) -> &UepDecoder {
@@ -203,6 +219,10 @@ impl Aggregator {
         if !m.crc_ok {
             c.crc_fail += 1;
         } else {
+            if let Some(sid) = stream_id {
+                self.sid_clean_us[usize::from(sid)] = m.mono_us + 1;
+                self.any_clean_us = m.mono_us + 1;
+            }
             c.agg_pos = if m.phy_valid { 0 } else { c.agg_pos + 1 };
             if c.has_seq {
                 let adv = m.mac_seq.wrapping_sub(c.last_seq) & 0x0FFF;
@@ -248,6 +268,20 @@ impl Aggregator {
         if rc_t.is_some() {
             c.rc_frames += 1;
             return Route::Rc;
+        }
+        // The SBI header has no CRC of its own and the sub-blocks keep
+        // theirs, so one bit error in the stream id byte of an FCS-bad body
+        // would move its CRC-good blocks to another stream. Such a body is
+        // routed only to a stream some card heard FCS-good within
+        // CLEAN_STREAM_US; otherwise it stays a crc_fail and goes nowhere. In
+        // a fade with no FCS-good SBI body at all for that long, salvage is
+        // the only source left, so every FCS-bad body is routed by its
+        // peeked id as before.
+        if !m.crc_ok && heard_within(self.any_clean_us, m.mono_us) {
+            let seen = stream_id.map_or(0, |sid| self.sid_clean_us[usize::from(sid)]);
+            if !heard_within(seen, m.mono_us) {
+                return Route::Dropped;
+            }
         }
         match stream_id {
             Some(sbi::MSP_STREAM_ID) => return Route::Msp,

@@ -412,14 +412,7 @@ fn channel(bodies: Vec<Vec<u8>>, hits: &[Hit]) -> Vec<(Vec<u8>, bool)> {
                 let mut b = b;
                 for (p, bit) in fs {
                     let n = b.len();
-                    // The SBI stream byte has no CRC: a flip there moves the
-                    // body's CRC-good blocks to another stream, the open
-                    // finding stream_byte_flip_on_a_bad_fcs_body pins.
-                    let p = match p % n {
-                        3 => 4,
-                        q => q,
-                    };
-                    b[p] ^= 1 << bit;
+                    b[p % n] ^= 1 << bit;
                 }
                 out.push((b, false));
             }
@@ -979,15 +972,13 @@ proptest! {
     }
 }
 
-/// Open finding (same in mabur): a body kept with a bad FCS has its
-/// sub-blocks salvaged by their own CRC, and the SBI header that names the
-/// stream has none. One bit error in the stream byte moves every CRC-good
-/// block of the body to stream 1, whose decoder and FrameStream then emit
-/// an AU the drone never sent there. The channel of
-/// `impaired_air_keeps_the_au_contract` keeps its flips off that byte for
-/// this reason; this vector puts the flip there, on every fifth body.
+/// A body kept with a bad FCS has its sub-blocks salvaged by their own CRC,
+/// and the SBI header that names the stream has none. One bit error in the
+/// stream byte would move every CRC-good block of the body to stream 1,
+/// whose decoder and FrameStream would emit an AU the drone never sent
+/// there; the aggregator routes an FCS-bad body only to a stream the card
+/// heard FCS-good recently. The flip lands on every fifth body.
 #[test]
-#[ignore = "open: a bit error in the SBI stream byte of an FCS-bad body moves its blocks to stream 1 (same in mabur)"]
 fn stream_byte_flip_on_a_bad_fcs_body() {
     let s = Stream {
         frames: 32,
