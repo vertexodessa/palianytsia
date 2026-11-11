@@ -599,11 +599,13 @@ impl eframe::App for App {
                         egui::Color32::WHITE,
                     );
                 }
+                let hud = pal_osd::panel::hud_rect(ui.ctx(), &self.console.panel, vr);
                 chips_moved = self.console.overlay(
                     ui,
                     now,
                     pal_osd::console::OverlayIn {
                         video: vr,
+                        hud,
                         chips_in_hud: false,
                         top_offset: 40.0,
                         status: None,
@@ -797,7 +799,7 @@ fn main() {
                         } else {
                             Default::default()
                         },
-                        touch: false,
+                        look: pal_osd::panel::Look::DESKTOP,
                         ..Default::default()
                     },
                 ),

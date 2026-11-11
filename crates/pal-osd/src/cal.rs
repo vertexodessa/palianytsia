@@ -180,10 +180,9 @@ pub fn ui(
     v: Option<&CalView>,
     table: Option<&Table>,
     confirm: &mut Confirm,
-    touch: bool,
+    h: f32,
 ) -> Option<Cmd> {
     let mut cmd = None;
-    let h = if touch { 40.0 } else { 0.0 };
     ui.label(RichText::new("TX power calibration").strong());
     let Some(v) = v else {
         ui.label(RichText::new("not available on this core").color(Color32::GRAY));
@@ -409,7 +408,7 @@ mod tests {
         let mut cmd = None;
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                cmd = super::ui(ui, v, t, confirm, true);
+                cmd = super::ui(ui, v, t, confirm, 40.0);
             });
         });
         cmd

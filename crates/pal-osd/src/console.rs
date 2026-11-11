@@ -27,6 +27,10 @@ pub struct Feeds<'a> {
 pub struct OverlayIn {
     /// Where the video is on the surface.
     pub video: egui::Rect,
+    /// The part of it the HUD may use: all of it, or what a docked panel
+    /// leaves free ([`crate::panel::hud_rect`]). The front end knows where
+    /// its panel is; the HUD does not ask.
+    pub hud: egui::Rect,
     /// Anchor the chips in the HUD's rect; false: in the video's.
     pub chips_in_hud: bool,
     pub top_offset: f32,
@@ -155,7 +159,7 @@ impl Console {
     /// The flight overlay: HUD, stall marker, status line, stats chips and
     /// the key banner. True when the operator moved a chip.
     pub fn overlay(&mut self, ui: &mut egui::Ui, now: f64, o: OverlayIn) -> bool {
-        let r = crate::panel::hud_rect(ui.ctx(), &self.panel, o.video);
+        let r = o.hud;
         crate::hud::hud(
             ui,
             r,
@@ -212,8 +216,20 @@ impl Console {
         log_info: String,
         channels: &[u8],
     ) -> PanelOut {
-        crate::panel::show(
-            ctx,
+        let (panel, i) = self.panel_parts(link_info, log_info, channels);
+        crate::panel::docked(ctx, panel, i)
+    }
+
+    /// The panel and what it reads this frame, for a front end that draws
+    /// [`crate::panel::tabs`] and [`crate::panel::body`] in a container of
+    /// its own (the Quest's menu surface).
+    pub fn panel_parts<'a>(
+        &'a mut self,
+        link_info: String,
+        log_info: String,
+        channels: &'a [u8],
+    ) -> (&'a mut Panel, PanelIn<'a>) {
+        (
             &mut self.panel,
             PanelIn {
                 table: self.table.as_ref(),
@@ -310,6 +326,7 @@ mod tests {
             cmd: Some(Cmd::Refresh),
             prefs_changed: true,
             relink: true,
+            close: false,
         };
         c.settle(&mut out, Some(&tx));
         assert_eq!(rx.try_recv(), Ok(Cmd::Refresh));

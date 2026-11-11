@@ -124,7 +124,7 @@ impl Osd {
                 prefs_path,
                 Panel {
                     // Finger-sized rows suit a hand-held ray too.
-                    touch: true,
+                    look: pal_osd::panel::Look::TOUCH,
                     ..Default::default()
                 },
             ),
@@ -291,11 +291,13 @@ impl Osd {
                             .color(egui::Color32::from_rgb(240, 190, 60))
                             .background_color(egui::Color32::from_black_alpha(160))
                     });
+                    let hud = pal_osd::panel::hud_rect(ui.ctx(), &c.panel, video_rect());
                     chips_moved = c.overlay(
                         ui,
                         now,
                         pal_osd::console::OverlayIn {
                             video: video_rect(),
+                            hud,
                             chips_in_hud: true,
                             top_offset: 36.0,
                             status,

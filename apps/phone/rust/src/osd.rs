@@ -140,7 +140,7 @@ pub fn run(o: OsdIn) {
     let mut console = Console::new(
         o.prefs_path.clone(),
         Panel {
-            touch: true,
+            look: pal_osd::panel::Look::TOUCH,
             open: reopen.is_some(),
             tab: reopen.unwrap_or_default(),
             ..Default::default()
@@ -217,11 +217,13 @@ pub fn run(o: OsdIn) {
                             .size(20.0)
                             .color(egui::Color32::YELLOW)
                     });
+                    let hud = pal_osd::panel::hud_rect(ui.ctx(), &c.panel, ui.max_rect());
                     chips_moved = c.overlay(
                         ui,
                         now,
                         pal_osd::console::OverlayIn {
                             video: ui.max_rect(),
+                            hud,
                             chips_in_hud: true,
                             top_offset: 36.0,
                             status,

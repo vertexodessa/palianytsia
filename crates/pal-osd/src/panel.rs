@@ -1,9 +1,11 @@
 //! Settings while flying: a panel that slides over the right side of the
 //! video, which keeps playing. Every row shows its live value and state
 //! and applies on change (drone rows through F18, `params::Cmd::Set`;
-//! ground rows to `HudPrefs`); there is no save button. Desktop and phone
-//! draw the same panel; `touch` swaps text fields for steppers and presets,
-//! since the phone has no keyboard path into egui yet.
+//! ground rows to `HudPrefs`); there is no save button. The parts stand
+//! apart so a front end can put them on its own surface: [`tabs`] chooses,
+//! [`body`] draws the chosen tab, [`docked`] is the container desktop and
+//! phone use, and a [`Look`] says how big the rows are and whether they
+//! use steppers (no keyboard) or text fields.
 use egui::{Color32, RichText, Ui};
 
 use crate::params::{Cmd, Edits, Row, Table};
@@ -46,12 +48,83 @@ impl Tab {
     }
 }
 
+/// Widget spacing of a [`Look`], in points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spacing {
+    pub interact: egui::Vec2,
+    pub button_padding: egui::Vec2,
+    pub item: egui::Vec2,
+    pub icon: f32,
+}
+
+/// How big the panel's rows are and which controls they use: one value the
+/// front end picks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Look {
+    /// Least height of a button (0: sized by its text).
+    pub row_h: f32,
+    /// Factor on every text style.
+    pub text: f32,
+    /// Steppers and presets instead of text fields: no keyboard.
+    pub steppers: bool,
+    /// None: egui's own.
+    pub spacing: Option<Spacing>,
+    /// Row gap of the channel grid.
+    pub grid_gap: f32,
+}
+
+impl Look {
+    /// Mouse and keyboard.
+    pub const DESKTOP: Look = Look {
+        row_h: 0.0,
+        text: 1.0,
+        steppers: false,
+        spacing: None,
+        grid_gap: 2.0,
+    };
+    /// Finger-sized targets: ~44 pt rows (Android's 48 dp guideline, minus
+    /// the row spacing).
+    pub const TOUCH: Look = Look {
+        row_h: 40.0,
+        text: 1.2,
+        steppers: true,
+        spacing: Some(Spacing {
+            interact: egui::vec2(44.0, 40.0),
+            button_padding: egui::vec2(14.0, 8.0),
+            item: egui::vec2(10.0, 8.0),
+            icon: 26.0,
+        }),
+        grid_gap: 6.0,
+    };
+
+    /// Onto `ui` and everything drawn in it after this.
+    pub fn apply(&self, ui: &mut Ui) {
+        let st = ui.style_mut();
+        if let Some(s) = self.spacing {
+            st.spacing.interact_size = s.interact;
+            st.spacing.button_padding = s.button_padding;
+            st.spacing.item_spacing = s.item;
+            st.spacing.icon_width = s.icon;
+        }
+        if self.text != 1.0 {
+            for f in st.text_styles.values_mut() {
+                f.size *= self.text;
+            }
+        }
+    }
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self::DESKTOP
+    }
+}
+
 #[derive(Default)]
 pub struct Panel {
     pub open: bool,
     pub tab: Tab,
-    /// Phone: steppers and presets instead of text fields.
-    pub touch: bool,
+    pub look: Look,
     /// Calibrate or Reset calibration pressed, waiting for the confirm.
     pub cal_confirm: crate::cal::Confirm,
     /// The Link tab shows the channel menu instead of its rows.
@@ -82,6 +155,9 @@ pub struct PanelOut {
     /// `prefs.link_bw` changed: restart the link so the core picks it up.
     /// (A channel choice goes to the live link as `Cmd::Channels`.)
     pub relink: bool,
+    /// The close button was pressed. [`docked`] has closed the panel
+    /// already; a front end with its own container acts on it.
+    pub close: bool,
 }
 
 const OK: Color32 = Color32::from_rgb(110, 220, 140);
@@ -259,7 +335,7 @@ fn settable(r: &Row, t: &Table) -> bool {
     t.linked && t.pending.is_none() && r.value.is_some() && r.apply != "read-only"
 }
 
-fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool) -> Option<Cmd> {
+fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, look: Look) -> Option<Cmd> {
     let mut cmd = None;
     let can = settable(r, t);
     let help = format!("{} ({}, applies by {})\n{}", r.id, r.ty, r.apply, r.help);
@@ -277,7 +353,7 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool)
                     cmd = Some(Cmd::Set(i, if on { "1" } else { "0" }.into()));
                 }
             }
-            "int" | "real" if touch => {
+            "int" | "real" if look.steppers => {
                 let x: f64 = v.parse().unwrap_or(0.0);
                 let s = step(&r.id);
                 let fmt = |y: f64| {
@@ -295,7 +371,7 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool)
                     cmd = Some(Cmd::Set(i, fmt(x + s)));
                 }
             }
-            "str" if touch && !presets(&r.id, t).is_empty() => {
+            "str" if look.steppers && !presets(&r.id, t).is_empty() => {
                 egui::ComboBox::from_id_salt(&r.id)
                     .selected_text(&v)
                     .show_ui(ui, |ui| {
@@ -308,7 +384,7 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool)
             }
             _ => {
                 ui.label(RichText::new(&v).monospace());
-                if !touch && r.apply != "read-only" {
+                if !look.steppers && r.apply != "read-only" {
                     ui.add(
                         egui::TextEdit::singleline(&mut e.text[i])
                             .hint_text("new")
@@ -344,13 +420,7 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, touch: bool)
     cmd
 }
 
-fn rows_ui(
-    ui: &mut Ui,
-    ids: &[&str],
-    t: Option<&Table>,
-    e: &mut Edits,
-    touch: bool,
-) -> Option<Cmd> {
+fn rows_ui(ui: &mut Ui, ids: &[&str], t: Option<&Table>, e: &mut Edits, look: Look) -> Option<Cmd> {
     let Some(t) = t else {
         ui.label(RichText::new("no drone settings yet (GS mode, linked)").color(WARN));
         return None;
@@ -370,7 +440,7 @@ fn rows_ui(
     let mut cmd = None;
     for (i, r) in t.rows.iter().enumerate() {
         if ids.is_empty() || ids.contains(&r.id.as_str()) {
-            if let Some(c) = row_ui(ui, i, r, t, e, touch) {
+            if let Some(c) = row_ui(ui, i, r, t, e, look) {
                 cmd = Some(c);
             }
         }
@@ -414,8 +484,20 @@ pub fn hud_rect(ctx: &egui::Context, p: &Panel, r: egui::Rect) -> egui::Rect {
     egui::Rect::from_min_max(r.min, egui::pos2(r.right().min(left), r.bottom()))
 }
 
-/// The panel itself (no-op while closed).
-pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
+/// The tab chooser, laid out by the caller (a wrapped row, a column).
+/// True when its close button was pressed.
+pub fn tabs(ui: &mut Ui, p: &mut Panel) -> bool {
+    for t in Tab::ALL {
+        if ui.selectable_label(p.tab == t, t.name()).clicked() {
+            p.tab = t;
+        }
+    }
+    ui.button("close").clicked()
+}
+
+/// The container desktop and phone use: the right side of the screen, the
+/// tabs in a row above the scrolling body (no-op while closed).
+pub fn docked(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
     let mut out = PanelOut::default();
     if !p.open {
         return out;
@@ -432,157 +514,135 @@ pub fn show(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
                 .show(ui, |ui| {
                     ui.set_width(w);
                     ui.set_height(screen.height() - 2.0 * MARGIN);
-                    if p.touch {
-                        // Finger-sized targets: ~44 pt rows (Android's
-                        // 48 dp guideline, minus the row spacing).
-                        let st = ui.style_mut();
-                        st.spacing.interact_size = egui::vec2(44.0, 40.0);
-                        st.spacing.button_padding = egui::vec2(14.0, 8.0);
-                        st.spacing.item_spacing = egui::vec2(10.0, 8.0);
-                        st.spacing.icon_width = 26.0;
-                        for f in st.text_styles.values_mut() {
-                            f.size *= 1.2;
-                        }
-                    }
-                    ui.horizontal_wrapped(|ui| {
-                        for t in Tab::ALL {
-                            if ui.selectable_label(p.tab == t, t.name()).clicked() {
-                                p.tab = t;
-                            }
-                        }
-                        if ui.button("close").clicked() {
-                            p.open = false;
-                        }
-                    });
+                    p.look.apply(ui);
+                    let close = ui.horizontal_wrapped(|ui| tabs(ui, p)).inner;
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let touch = p.touch;
-                        match p.tab {
-                            Tab::Video => out.cmd = rows_ui(ui, &VIDEO, i.table, i.edits, touch),
-                            Tab::Record => {
-                                ui.label("On the drone (microSD):");
-                                out.cmd = rows_ui(ui, &RECORD, i.table, i.edits, touch);
-                                ui.separator();
-                                ui.label(
-                                    RichText::new("Ground DVR: not implemented yet")
-                                        .color(Color32::GRAY),
-                                );
-                            }
-                            Tab::Link if p.chan_menu && !i.channels.is_empty() => {
-                                let m = channel_menu(ui, i.prefs, i.channels, i.scan, touch);
-                                p.chan_menu = !m.back;
-                                if let Some(c) = m.choose {
-                                    out.prefs_changed = true;
-                                    out.cmd = Some(Cmd::Channels(c));
-                                } else if let Some(set) = m.rescan {
-                                    out.cmd = Some(Cmd::ChannelScan(set));
-                                }
-                            }
-                            Tab::Link => {
-                                ui.label(RichText::new(&i.link_info).monospace());
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label("Video width");
-                                    for bw in [20u8, 40] {
-                                        let on = i.prefs.link_bw == bw;
-                                        let h = if touch { 40.0 } else { 0.0 };
-                                        let b = btn(format!("{bw} MHz"), h).selected(on);
-                                        if ui.add(b).clicked() && !on {
-                                            i.prefs.link_bw = bw;
-                                            out.prefs_changed = true;
-                                            out.relink = true;
-                                        }
-                                    }
-                                });
-                                ui.label(
-                                    RichText::new(
-                                        "20 MHz reaches farther at the robust rungs (4-6 dB at \
-                                         MCS0); 40 MHz carries more per rung. Switching restarts \
-                                         the link for a few seconds; the drone needs no change.",
-                                    )
-                                    .small()
-                                    .color(Color32::GRAY),
-                                );
-                                ui.separator();
-                                if ui
-                                    .checkbox(
-                                        &mut i.prefs.s3_demote,
-                                        "Step down on enhance-layer loss",
-                                    )
-                                    .changed()
-                                {
-                                    out.prefs_changed = true;
-                                    out.relink = true;
-                                }
-                                ui.label(
-                                    RichText::new(
-                                        "On: any lost droppable frame steps the ladder down (early, \
-                                         cautious). Off: only base-layer loss does, so the bitrate \
-                                         climbs higher. Restarts the link.",
-                                    )
-                                    .small()
-                                    .color(Color32::GRAY),
-                                );
-                                if !i.channels.is_empty() {
-                                    ui.separator();
-                                    if let Some(set) =
-                                        channels_button(ui, i.prefs, i.channels, touch)
-                                    {
-                                        p.chan_menu = true;
-                                        out.cmd = Some(Cmd::ChannelScan(set));
-                                    }
-                                }
-                                ui.separator();
-                                if let Some(c) = rows_ui(ui, &LINK, i.table, i.edits, touch) {
-                                    out.cmd = Some(c);
-                                }
-                            }
-                            Tab::Osd => out.prefs_changed = osd_ui(ui, i.prefs),
-                            Tab::Drone => {
-                                if let Some(c) =
-                                    crate::cal::ui(ui, i.cal, i.table, &mut p.cal_confirm, touch)
-                                {
-                                    out.cmd = Some(c);
-                                }
-                                ui.separator();
-                                if let Some(t) = i.table {
-                                    ui.horizontal(|ui| {
-                                        let alive = match t.alive {
-                                            Some(true) => "heartbeat ok",
-                                            Some(false) => "no heartbeat",
-                                            None => "waiting for heartbeat",
-                                        };
-                                        ui.label(format!("list {}, {alive}", t.list));
-                                        if ui
-                                            .add_enabled(t.linked, egui::Button::new("refresh"))
-                                            .clicked()
-                                        {
-                                            out.cmd = Some(Cmd::Refresh);
-                                        }
-                                    });
-                                    if t.mismatch {
-                                        ui.label(
-                                            RichText::new("table mismatch: drone build differs")
-                                                .color(BAD),
-                                        );
-                                    }
-                                }
-                                if let Some(c) = rows_ui(ui, &[], i.table, i.edits, touch) {
-                                    out.cmd = Some(c);
-                                }
-                            }
-                            Tab::Logs => {
-                                ui.label(&i.log_info);
-                                ui.label(
-                                    RichText::new(format!("Palianytsia {}", pal_build::ID))
-                                        .small()
-                                        .color(Color32::GRAY),
-                                );
-                            }
-                        }
+                        out = body(ui, p, i);
                     });
+                    out.close = close;
                 });
         });
+    if out.close {
+        p.open = false;
+    }
+    out
+}
+
+/// The chosen tab's rows, into the caller's `ui` (its scroll area).
+pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
+    let mut out = PanelOut::default();
+    let look = p.look;
+    let h = look.row_h;
+    match p.tab {
+        Tab::Video => out.cmd = rows_ui(ui, &VIDEO, i.table, i.edits, look),
+        Tab::Record => {
+            ui.label("On the drone (microSD):");
+            out.cmd = rows_ui(ui, &RECORD, i.table, i.edits, look);
+            ui.separator();
+            ui.label(RichText::new("Ground DVR: not implemented yet").color(Color32::GRAY));
+        }
+        Tab::Link if p.chan_menu && !i.channels.is_empty() => {
+            let m = channel_menu(ui, i.prefs, i.channels, i.scan, look);
+            p.chan_menu = !m.back;
+            if let Some(c) = m.choose {
+                out.prefs_changed = true;
+                out.cmd = Some(Cmd::Channels(c));
+            } else if let Some(set) = m.rescan {
+                out.cmd = Some(Cmd::ChannelScan(set));
+            }
+        }
+        Tab::Link => {
+            ui.label(RichText::new(&i.link_info).monospace());
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Video width");
+                for bw in [20u8, 40] {
+                    let on = i.prefs.link_bw == bw;
+                    let b = btn(format!("{bw} MHz"), h).selected(on);
+                    if ui.add(b).clicked() && !on {
+                        i.prefs.link_bw = bw;
+                        out.prefs_changed = true;
+                        out.relink = true;
+                    }
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "20 MHz reaches farther at the robust rungs (4-6 dB at \
+                                         MCS0); 40 MHz carries more per rung. Switching restarts \
+                                         the link for a few seconds; the drone needs no change.",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+            ui.separator();
+            if ui
+                .checkbox(&mut i.prefs.s3_demote, "Step down on enhance-layer loss")
+                .changed()
+            {
+                out.prefs_changed = true;
+                out.relink = true;
+            }
+            ui.label(
+                RichText::new(
+                    "On: any lost droppable frame steps the ladder down (early, \
+                                         cautious). Off: only base-layer loss does, so the bitrate \
+                                         climbs higher. Restarts the link.",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+            if !i.channels.is_empty() {
+                ui.separator();
+                if let Some(set) = channels_button(ui, i.prefs, i.channels, h) {
+                    p.chan_menu = true;
+                    out.cmd = Some(Cmd::ChannelScan(set));
+                }
+            }
+            ui.separator();
+            if let Some(c) = rows_ui(ui, &LINK, i.table, i.edits, look) {
+                out.cmd = Some(c);
+            }
+        }
+        Tab::Osd => out.prefs_changed = osd_ui(ui, i.prefs),
+        Tab::Drone => {
+            if let Some(c) = crate::cal::ui(ui, i.cal, i.table, &mut p.cal_confirm, h) {
+                out.cmd = Some(c);
+            }
+            ui.separator();
+            if let Some(t) = i.table {
+                ui.horizontal(|ui| {
+                    let alive = match t.alive {
+                        Some(true) => "heartbeat ok",
+                        Some(false) => "no heartbeat",
+                        None => "waiting for heartbeat",
+                    };
+                    ui.label(format!("list {}, {alive}", t.list));
+                    if ui
+                        .add_enabled(t.linked, egui::Button::new("refresh"))
+                        .clicked()
+                    {
+                        out.cmd = Some(Cmd::Refresh);
+                    }
+                });
+                if t.mismatch {
+                    ui.label(RichText::new("table mismatch: drone build differs").color(BAD));
+                }
+            }
+            if let Some(c) = rows_ui(ui, &[], i.table, i.edits, look) {
+                out.cmd = Some(c);
+            }
+        }
+        Tab::Logs => {
+            ui.label(&i.log_info);
+            ui.label(
+                RichText::new(format!("Palianytsia {}", pal_build::ID))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        }
+    }
     out
 }
 
@@ -617,7 +677,7 @@ fn osd_ui(ui: &mut Ui, p: &mut HudPrefs) -> bool {
 /// The Link tab's "Channels" button with the current choice on it.
 /// Clicked: the channels to scan as the menu opens (the ones the width
 /// offers).
-fn channels_button(ui: &mut Ui, prefs: &HudPrefs, set: &[u8], touch: bool) -> Option<Vec<u8>> {
+fn channels_button(ui: &mut Ui, prefs: &HudPrefs, set: &[u8], h: f32) -> Option<Vec<u8>> {
     use crate::channels::{chosen, offered};
     let offer = offered(set, prefs.link_bw);
     let cur = chosen(&prefs.link_channels, &offer);
@@ -629,7 +689,6 @@ fn channels_button(ui: &mut Ui, prefs: &HudPrefs, set: &[u8], touch: bool) -> Op
         let l: Vec<String> = cur.iter().map(u8::to_string).collect();
         format!("{}, auto", l.join(" "))
     };
-    let h = if touch { 40.0 } else { 0.0 };
     let b = btn(format!("Channels: {what}  >"), h);
     ui.add(b).clicked().then_some(offer)
 }
@@ -662,13 +721,13 @@ fn channel_menu(
     prefs: &mut HudPrefs,
     set: &[u8],
     scan: Option<&crate::channels::ScanView>,
-    touch: bool,
+    look: Look,
 ) -> MenuOut {
     use crate::channels::{chosen, offered, toggle};
     let mut out = MenuOut::default();
     let offer = offered(set, prefs.link_bw);
     let cur = chosen(&prefs.link_channels, &offer);
-    let h = if touch { 40.0 } else { 0.0 };
+    let h = look.row_h;
     let mut next = None;
     ui.horizontal(|ui| {
         if ui.add(btn("<  Link", h)).clicked() {
@@ -693,7 +752,7 @@ fn channel_menu(
     ui.label(RichText::new(status).small().color(Color32::GRAY));
     egui::Grid::new("pal-chan-menu")
         .num_columns(3)
-        .spacing(egui::vec2(10.0, if touch { 6.0 } else { 2.0 }))
+        .spacing(egui::vec2(10.0, look.grid_gap))
         .show(ui, |ui| {
             for &ch in &offer {
                 let b = egui::Button::new(format!("{ch:>3}"))
