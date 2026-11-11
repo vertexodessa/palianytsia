@@ -80,6 +80,9 @@ pub struct Look {
     pub spacing: Option<Spacing>,
     /// Row gap of the channel grid.
     pub grid_gap: f32,
+    /// A drone row's name in a column this wide with its control beside
+    /// it (a wide surface); None: the control under the name.
+    pub label_w: Option<f32>,
 }
 
 impl Look {
@@ -90,6 +93,7 @@ impl Look {
         steppers: false,
         spacing: None,
         grid_gap: 2.0,
+        label_w: None,
     };
     /// Finger-sized targets: ~44 pt rows (Android's 48 dp guideline, minus
     /// the row spacing).
@@ -104,6 +108,24 @@ impl Look {
             icon: 26.0,
         }),
         grid_gap: 6.0,
+        label_w: None,
+    };
+
+    /// A headset's menu surface ([`surface`], [`SURFACE_POINTS`]) read at
+    /// about a metre and aimed at with a hand-held ray: egui's 14 pt body
+    /// text becomes 25 pt and its 10 pt small text 18 pt.
+    pub const HEADSET: Look = Look {
+        row_h: 56.0,
+        text: 1.8,
+        steppers: true,
+        spacing: Some(Spacing {
+            interact: egui::vec2(56.0, 56.0),
+            button_padding: egui::vec2(18.0, 12.0),
+            item: egui::vec2(12.0, 10.0),
+            icon: 34.0,
+        }),
+        grid_gap: 8.0,
+        label_w: Some(330.0),
     };
 
     /// Onto `ui` and everything drawn in it after this.
@@ -403,26 +425,43 @@ fn settable(r: &Row, t: &Table) -> bool {
     t.linked && t.pending.is_none() && r.value.is_some() && r.apply != "read-only"
 }
 
-fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, look: Look) -> Option<Cmd> {
-    let mut cmd = None;
-    let can = settable(r, t);
+/// A row's name, and under it the drone's key and what a set costs.
+fn row_label(ui: &mut Ui, r: &Row) {
     let help = format!("{} ({}, applies by {})\n{}", r.id, r.ty, r.apply, r.help);
     let key = format!("{}.{}", r.section, r.key);
     match plain_name(&r.id) {
         Some(name) => {
             ui.label(RichText::new(name).strong()).on_hover_text(&help);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(key).small().color(Color32::GRAY));
-                if restarts_video(r) {
-                    ui.label(RichText::new("restarts the video").small().color(WARN));
-                }
+            ui.scope(|ui| {
+                // The key line is text, not a control: it does not need a
+                // control's height (a row is as tall as `interact_size`).
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(key).small().color(Color32::GRAY));
+                    if restarts_video(r) {
+                        ui.label(RichText::new("restarts the video").small().color(WARN));
+                    }
+                });
             });
         }
         None => {
             ui.label(RichText::new(key).strong()).on_hover_text(&help);
         }
     }
-    ui.horizontal(|ui| {
+}
+
+/// A row's live value and the control that changes it.
+fn row_control(
+    ui: &mut Ui,
+    i: usize,
+    r: &Row,
+    t: &Table,
+    e: &mut Edits,
+    look: Look,
+) -> Option<Cmd> {
+    let mut cmd = None;
+    let can = settable(r, t);
+    {
         let v = r.value.clone().unwrap_or_else(|| "-".into());
         match r.ty.as_str() {
             "bool" => {
@@ -479,7 +518,34 @@ fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, look: Look) 
                 }
             }
         }
-    });
+    }
+    cmd
+}
+
+fn row_ui(ui: &mut Ui, i: usize, r: &Row, t: &Table, e: &mut Edits, look: Look) -> Option<Cmd> {
+    let cmd = match look.label_w {
+        // Name on the left, control on the right: one row high. A text
+        // value (a camera mode, a size) is too long to sit beside its name.
+        Some(w) if r.ty != "str" => {
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(w, 0.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.set_width(w);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        row_label(ui, r);
+                    },
+                );
+                row_control(ui, i, r, t, e, look)
+            })
+            .inner
+        }
+        _ => {
+            row_label(ui, r);
+            ui.horizontal(|ui| row_control(ui, i, r, t, e, look)).inner
+        }
+    };
     // Below the controls, not beside them: a refusal reason is a sentence
     // and a horizontal row clipped it to "does not fit sens".
     if !r.state.is_empty() && r.state != "idle" {
@@ -642,6 +708,48 @@ pub fn docked(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
     out
 }
 
+/// The size, in egui points, of a surface [`surface`] is laid out for.
+pub const SURFACE_POINTS: [f32; 2] = [800.0, 600.0];
+/// Width of its tab rail.
+const RAIL_W: f32 = 190.0;
+
+/// The container for a surface of its own (the headset's menu quad): it
+/// fills the whole context, opaque, the tabs in a rail on the left and the
+/// scrolling body on the right. Drawn whether or not `p.open`: the front
+/// end owns the surface and decides when it shows.
+pub fn surface(ctx: &egui::Context, p: &mut Panel, i: PanelIn) -> PanelOut {
+    let mut out = PanelOut::default();
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::NONE
+                .fill(Color32::from_rgb(16, 18, 22))
+                .inner_margin(14.0),
+        )
+        .show(ctx, |ui| {
+            p.look.apply(ui);
+            ui.horizontal_top(|ui| {
+                let rail = egui::vec2(RAIL_W, ui.available_height());
+                let close = ui
+                    .allocate_ui_with_layout(
+                        rail,
+                        egui::Layout::top_down_justified(egui::Align::LEFT),
+                        |ui| tabs(ui, p),
+                    )
+                    .inner;
+                ui.separator();
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink(false)
+                        .show(ui, |ui| {
+                            out = body(ui, p, i);
+                        });
+                });
+                out.close = close;
+            });
+        });
+    out
+}
+
 /// The chosen tab's rows, into the caller's `ui` (its scroll area).
 pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
     let mut out = PanelOut::default();
@@ -779,7 +887,7 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             ui.label(RichText::new(&i.log_info).small().color(Color32::GRAY));
             ui.separator();
             if let Some(t) = i.table {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let alive = match t.alive {
                         Some(true) => "heartbeat ok",
                         Some(false) => "no heartbeat",

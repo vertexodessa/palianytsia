@@ -14,7 +14,12 @@
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
 //!           [--hwdec auto|vdpau|vaapi|cuda|sw]  decoder (default auto: first hwaccel
 //!                                   that opens, else software)
-//!           [--params]              open the drone settings window (P toggles; GS only)
+//!           [--params]              open the settings on System with the drone's whole
+//!                                   parameter table unfolded (P toggles; GS only)
+//!           [--panel TAB]           open the settings on a tab: flight, picture, link,
+//!                                   recording, screen, system
+//!           [--headset-menu]        show only the Quest's menu surface (800 x 600 points,
+//!                                   its look): a layout check without a headset
 //!           [--rf-sim SPEC]         live: bench RF loss simulator (`runtime::rf_sim`),
 //!                                   e.g. atten=40-70/60,fade=8/300,up=2
 //!   keys: S link statistics over the video, M monitor plots, P drone settings
@@ -85,6 +90,8 @@ struct Opts {
     params: bool,
     /// Open the settings window on this tab at start (headless checks).
     panel: Option<pal_osd::panel::Tab>,
+    /// Show only the headset's menu surface, at its size and look.
+    headset_menu: bool,
     /// Per-second latency breakdown on stderr (RX queue, capture->AU,
     /// decode, display).
     lat: bool,
@@ -151,6 +158,7 @@ fn parse() -> Opts {
             "--hwdec" => o.hwdec = val(),
             "--rf-sim" => runtime::rf_sim::install_spec(&val()).unwrap_or_else(|e| die(&e)),
             "--params" => o.params = true,
+            "--headset-menu" => o.headset_menu = true,
             "--panel" => {
                 let name = val();
                 o.panel = Some(
@@ -469,6 +477,8 @@ struct App {
     show_monitor: bool,
     snapshot: Option<(PathBuf, f64)>,
     snapshot_sent: bool,
+    /// `--headset-menu`: draw only the headset's menu surface.
+    headset_menu: bool,
 }
 
 fn write_ppm(path: &PathBuf, img: &egui::ColorImage) -> std::io::Result<()> {
@@ -534,15 +544,18 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.console.panel.open = false;
         }
-        pal_osd::panel::gear(ctx, &mut self.console.panel);
+        if !self.headset_menu {
+            pal_osd::panel::gear(ctx, &mut self.console.panel);
+        }
         let key = self
             .console
             .hist
             .last()
             .map_or("?".into(), |s| s.key_fp.clone());
+        let link_info = format!("{}, key {key}", self.shared.radio_label(self.radio.1));
         let mut out = self.console.show_panel(
             ctx,
-            format!("{}, key {key}", self.shared.radio_label(self.radio.1)),
+            link_info.clone(),
             self.log_info.clone(),
             // The desktop picks its channel on the command line (--ch).
             &[],
@@ -576,6 +589,9 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
+                if self.headset_menu {
+                    return;
+                }
                 let area = ui.max_rect();
                 let yuv_size = self.yuv.as_ref().and_then(|y| {
                     let g = y.lock().unwrap_or_else(|p| p.into_inner());
@@ -628,7 +644,14 @@ impl eframe::App for App {
         if chips_moved {
             self.console.save_prefs();
         }
-        if self.console.prefs.stats {
+        if self.headset_menu {
+            // The headset's menu surface alone, as the Quest draws it on
+            // its own quad: a layout check without a headset.
+            let mut out = self
+                .console
+                .show_surface(ctx, link_info, self.log_info.clone(), &[]);
+            self.console.settle(&mut out, Some(&self.cmd_tx));
+        } else if self.console.prefs.stats {
             egui::Area::new(egui::Id::new("telem"))
                 .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -120.0))
                 .show(ctx, |ui| {
@@ -729,7 +752,11 @@ fn main() {
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 760.0])
+            .with_inner_size(if o.headset_menu {
+                pal_osd::panel::SURFACE_POINTS
+            } else {
+                [1280.0, 760.0]
+            })
             .with_title("Palianytsia"),
         ..Default::default()
     };
@@ -803,17 +830,25 @@ fn main() {
                 console: pal_osd::console::Console::new(
                     prefs_path.clone(),
                     pal_osd::panel::Panel {
-                        open: o.params || o.panel.is_some(),
+                        // The headset's surface is drawn whether or not
+                        // the docked panel is open; keep that one shut.
+                        open: !o.headset_menu && (o.params || o.panel.is_some()),
                         tab: o.panel.unwrap_or(if o.params {
                             pal_osd::panel::Tab::System
                         } else {
                             Default::default()
                         }),
                         table_open: o.params,
-                        look: pal_osd::panel::Look::DESKTOP,
+                        look: if o.headset_menu {
+                            pal_osd::panel::Look::HEADSET
+                        } else {
+                            pal_osd::panel::Look::DESKTOP
+                        },
+                        xr: o.headset_menu,
                         ..Default::default()
                     },
                 ),
+                headset_menu: o.headset_menu,
                 radio: (o.ch, o.width),
                 log_info: log_info.clone(),
                 tex: None,

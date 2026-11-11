@@ -220,9 +220,20 @@ impl Console {
         crate::panel::docked(ctx, panel, i)
     }
 
-    /// The panel and what it reads this frame, for a front end that draws
-    /// [`crate::panel::tabs`] and [`crate::panel::body`] in a container of
-    /// its own (the Quest's menu surface).
+    /// The settings on a surface of their own ([`crate::panel::surface`]):
+    /// the headset's menu quad.
+    pub fn show_surface(
+        &mut self,
+        ctx: &egui::Context,
+        link_info: String,
+        log_info: String,
+        channels: &[u8],
+    ) -> PanelOut {
+        let (panel, i) = self.panel_parts(link_info, log_info, channels);
+        crate::panel::surface(ctx, panel, i)
+    }
+
+    /// The panel and what it reads this frame, for a container.
     pub fn panel_parts<'a>(
         &'a mut self,
         link_info: String,
