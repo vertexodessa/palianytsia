@@ -121,8 +121,8 @@ impl S1LossWindow {
     }
 }
 
-/// Post-FEC {arrived, expected} of one layer (`ladder_residual.cpp`): the
-/// decoder's own abandonment, plus symbols a NACK retransmit filled.
+/// Post-FEC {arrived, expected} of one layer for the stats (`residual_counts` in
+/// `ladder_residual.cpp`): the decoder's own abandonment, plus symbols a NACK retransmit filled.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ResidualCounts {
     pub arrived: u64,
@@ -137,6 +137,21 @@ pub fn residual_counts(dec: &UepDecoder, sid: usize, cur: bool) -> ResidualCount
         s.syms_abandoned
     } + s.syms_retx;
     let exp = s.syms_delivered + s.syms_recovered + ab;
+    ResidualCounts {
+        arrived: exp - ab,
+        expected: exp,
+    }
+}
+
+/// The ladder's instant-demote input (`ladder_residual_counts` in `ladder_residual.cpp`): base
+/// layer, current rung, the decoder's abandonment alone. A symbol a NACK retransmit filled counts
+/// as arrived: the drone's resends race the frame's own FEC repairs, and the ones that land first
+/// fill symbols the repairs would have solved anyway, so booking them as loss cost a rung on a
+/// link that abandons nothing with the NACK off.
+pub fn ladder_residual_counts(dec: &UepDecoder) -> ResidualCounts {
+    let s = dec.stats(0).dec;
+    let ab = s.syms_abandoned - s.syms_abandoned_stale;
+    let exp = s.syms_delivered + s.syms_recovered + s.syms_retx + ab;
     ResidualCounts {
         arrived: exp - ab,
         expected: exp,
@@ -487,14 +502,15 @@ impl LinkHealthAssembler {
             now,
         );
         let pre_all = self.pre_loss_all.sample(now);
-        let s1_rc = residual_counts(dec, 0, true);
+        let s1_rc = ladder_residual_counts(dec);
         self.s1_resid_cur.add(s1_rc.expected, s1_rc.arrived, now);
         let s1_rcur = self.s1_resid_cur.sample(now);
         let s3 = s2;
         self.s3_loss.add(s3.arr_expected, s3.arr_arrived, now);
         let s3_sample = self.s3_loss.sample(now);
-        let s3_ab_cur = s3.dec.syms_abandoned - s3.dec.syms_abandoned_stale + s3.dec.syms_retx;
-        let s3_exp_cur = s3.dec.syms_delivered + s3.dec.syms_recovered + s3_ab_cur;
+        let s3_ab_cur = s3.dec.syms_abandoned - s3.dec.syms_abandoned_stale;
+        let s3_exp_cur =
+            s3.dec.syms_delivered + s3.dec.syms_recovered + s3.dec.syms_retx + s3_ab_cur;
         self.s3_loss_cur.add(
             s3.arr_expected - s3.arr_expected_stale,
             s3.arr_arrived - s3.arr_arrived_stale,

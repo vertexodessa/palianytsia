@@ -7,7 +7,8 @@
 #     loss (same seed, same surviving bodies), and so must the final stats
 #     line (webgs::stats_json key for key, nlohmann's number spelling) and,
 #     in GS, the parameter table (webgs::params_json);
-#  4. the F18 set path: the same --param-set script into both cores.
+#  4. the same on a copy with base bodies re-marked as NACK retransmits;
+#  5. the F18 set path: the same --param-set script into both cores.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cargo build -q --release --manifest-path "$ROOT/Cargo.toml" -p pal
@@ -59,6 +60,20 @@ while IFS='|' read -r _ file _ mode _ _ expect _; do
       && [[ $(grep '^stats ' <<<"$ref_out") == "$(grep '^stats ' <<<"$out")" ]]; then
       echo "ok   ref==rust gs --idr drop=$d $file ($(grep -o '"idr_req":[0-9]*' <<<"$out"))"
     else echo "FAIL ref!=rust gs --idr drop=$d $file"; fail=1; fi
+  done
+  # NACK retransmits: every 50th base body re-marked as one (tools/retxmark.py), so the cores
+  # are compared on the retransmit accounting and on what the ladder makes of a filled symbol;
+  # the retransmits a capture holds by itself change no rung in replay.
+  marked=$(python3 "$ROOT/tools/retxmark.py" "$cap" "$TMP/retx.bin" 50)
+  for d in 0 10; do
+    ref_out=$("$PAL" replay "$TMP/retx.bin" -c "$CFG" --mode gs --drop-pct $d --seed 7 \
+      --aus "$TMP/r.aus" --sends "$TMP/r.sends")
+    out=$("$PAL" replay "$TMP/retx.bin" -c "$CFG" --mode gs --core rust --drop-pct $d --seed 7 \
+      --aus "$TMP/u.aus" --sends "$TMP/u.sends")
+    if cmp -s "$TMP/r.aus" "$TMP/u.aus" && cmp -s "$TMP/r.sends" "$TMP/u.sends" \
+      && [[ $(grep '^stats ' <<<"$ref_out") == "$(grep '^stats ' <<<"$out")" ]]; then
+      echo "ok   ref==rust gs retx drop=$d $file (marked=$marked $(grep -o '"nack_saved":[0-9]*' <<<"$out"))"
+    else echo "FAIL ref!=rust gs retx drop=$d $file"; fail=1; fi
   done
   # F18: a set, a refused set while it is pending, a bad value, a refresh-
   # free late set; sends, refusals and the final table must agree.

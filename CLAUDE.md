@@ -27,7 +27,7 @@ status: `docs/spec.md`; read its "Status (2026-11-07)" section first; the dated 
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 tools/m0-parity.sh     # pal-ref == mabur's webgs replay on maburd dry-run files
-tools/m1-replay.sh     # ref == rust: AUs, sent RC bytes, final stats line, --idr path
+tools/m1-replay.sh     # ref == rust: AUs, sent RC bytes, final stats line, --idr path, a copy with bodies re-marked as NACK retransmits
 tools/doc-check.sh     # docs vs tree: .gitmodules branches, MABUR_RELEASE, RC_VERSION, release tag, paths
 python3 tools/tests/drone_install_test.py   # drone-install.py against fake drones: exit code, mabur.toml, changed paths, backup
 tools/android-build.sh clippy -p decode -p pal-android -p pal-quest -p pal-phone -- -D warnings
@@ -109,6 +109,7 @@ pairing key.
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
+- `tools/retxmark.py in.bin out.bin [every]`: a capture copy with base bodies re-marked as NACK retransmits (the m1 retx case; a capture's own retransmits change no rung in replay).
 - Capture analysis (`tools/palcap.py` reads `palcap 1` + SBI/FEC envelopes): `tools/losstrace.py bodies.bin [--json f]`
   union loss from the drone's 802.11 sequence numbers (runs, loss by MCS / RSSI, window-budget check; FCS-failed
   records are mostly foreign frames, see its docstring), `tools/truncwhy.py <session> <losstrace json>` the air before
