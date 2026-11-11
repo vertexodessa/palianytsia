@@ -109,8 +109,10 @@ stale_ms     = 2000        # no arm-state report for this long = assume armed, f
 
 [ampdu]
 # Frame aggregation: packs several frames into one transmission at the
-# faster link rates, raising throughput.
-max_num    = 6             # frames per aggregate (0 = off)
+# faster link rates. Off: an aggregate lost on the air takes three or more
+# video bodies at once, and at the bundle's rates single frames carry the
+# same video. The other keys apply only when max_num is above 0.
+max_num    = 0             # frames per aggregate (0 = off)
 max_time   = 32            # how long the radio waits to fill an aggregate (32 = about 0.8 ms; 1..8 turns it off)
 min_mcs_20 = 4             # aggregate only from this MCS up at 20 MHz
 min_mcs_40 = 2             # ...and at 40 MHz
