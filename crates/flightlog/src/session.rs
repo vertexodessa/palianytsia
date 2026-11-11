@@ -618,6 +618,8 @@ pub struct Summary {
     /// fec.log's episodes per layer; None for a session written before it.
     pub fec: Option<[FecTotals; 2]>,
     pub keyframes: crate::keyframes::Keyframes,
+    /// Capture-to-complete delay of the base stream.
+    pub latency: crate::latency::Latency,
     /// The Android decode loop's per-second `decoder` records.
     pub decoder: crate::decoder::DecoderTotals,
 }
@@ -716,9 +718,12 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             continue;
         }
         let f: Vec<u64> = l.split(' ').filter_map(|x| x.parse().ok()).collect();
-        let [t, sid, bytes, flags, complete, salvaged, _pts] = f[..] else {
+        let [t, sid, bytes, flags, complete, salvaged, pts] = f[..] else {
             continue;
         };
+        if sid == 0 && complete != 0 {
+            s.latency.au(t, pts);
+        }
         t_min = t_min.min(t);
         t_max = t_max.max(t);
         s.aus += 1;
@@ -742,6 +747,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
                 t_min = t_min.min(t);
                 t_max = t_max.max(t);
                 s.keyframes.stats(t, &v);
+                s.latency.stats(t, &v);
                 if let Some(us) = v.get("log_max_us").and_then(Value::as_u64) {
                     if s.log_max_us.is_none_or(|(m, _)| us > m) {
                         s.log_max_us = Some((us, t));
@@ -804,6 +810,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
     s.events = counts;
     s.fec = read_fec(&dir.join(FEC_FILE))?;
     s.keyframes.finish();
+    s.latency.finish();
     s.decoder.finish();
     if t_max >= t_min && t_min != u64::MAX {
         s.span_s = (t_max - t_min) as f64 / 1e6;

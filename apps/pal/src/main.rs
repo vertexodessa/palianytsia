@@ -744,6 +744,7 @@ fn log_summary(o: Opts) {
     if let Some(fec) = &s.fec {
         print_fec(fec);
     }
+    print_latency(&s.latency);
     print_keyframes(&s.keyframes, s.span_s);
     let d = &s.decoder;
     if d.seconds > 0 {
@@ -800,6 +801,37 @@ fn same_value(text: &str, bundle: &toml::Value) -> bool {
 
 /// The drone's parameters in the session's last snapshot; those that
 /// differ from the bundle are listed with the bundle's value.
+/// Capture-to-complete delay of the base stream: the session's spread, then
+/// one line per rung.
+fn print_latency(l: &flightlog::latency::Latency) {
+    use flightlog::latency::spread;
+    if l.all_us.is_empty() {
+        return;
+    }
+    let ms = |v: &[u64]| {
+        let [p50, p90, p95, p99, max] = spread(v).map(|us| us as f64 / 1e3);
+        format!("p50 {p50:.1} ms, p90 {p90:.1}, p95 {p95:.1}, p99 {p99:.1}, max {max:.1}")
+    };
+    let basis = if l.absolute {
+        "capture to complete base AU".to_string()
+    } else {
+        "base AU delay over the fastest one (no drone clock in this session)".to_string()
+    };
+    let left_out = if l.unmeasured > 0 {
+        format!(", {} before the drone clock was known", l.unmeasured)
+    } else {
+        String::new()
+    };
+    println!(
+        "  latency, {basis}: {} ({} AUs{left_out})",
+        ms(&l.all_us),
+        l.all_us.len()
+    );
+    for (rung, v) in &l.by_rung {
+        println!("  latency on rung {rung}: {} ({} AUs)", ms(v), v.len());
+    }
+}
+
 /// Keyframe traffic: requests per minute by reason, heal times, the worst
 /// 10 s and IRAP sizes per rung (what a keyframe budget is sized from).
 fn print_keyframes(k: &flightlog::keyframes::Keyframes, span_s: f64) {

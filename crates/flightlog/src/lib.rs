@@ -3,5 +3,6 @@
 pub mod capture;
 pub mod decoder;
 pub mod keyframes;
+pub mod latency;
 pub mod retain;
 pub mod session;
