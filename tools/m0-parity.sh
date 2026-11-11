@@ -50,11 +50,15 @@ run_case() {  # name, then the shared replay flags
 # match pal-ref's byte for byte; webgs replay has no sends dump.
 sends_case() {  # name, then the shared replay flags
   local name=$1; shift
-  "$PAL" "$TMP/frames.bin" "$TMP/r.aus" -c "$TMP/gs.toml" "$@" --sends "$TMP/r.sends" 2>/dev/null
-  "$PAL" "$TMP/frames.bin" "$TMP/u.aus" -c "$TMP/gs.toml" "$@" --core rust --sends "$TMP/u.sends" 2>/dev/null
-  if cmp -s "$TMP/r.sends" "$TMP/u.sends" && cmp -s "$TMP/r.aus" "$TMP/u.aus"; then
-    echo "ok   $name: $(stat -c %s "$TMP/r.sends") send bytes"
-  else echo "FAIL $name: ref and rust sends or AUs differ"; fail=1; fi
+  "$PAL" "$TMP/frames.bin" "$TMP/r.aus" -c "$TMP/gs.toml" "$@" --sends "$TMP/r.sends" 2>"$TMP/r.err"
+  "$PAL" "$TMP/frames.bin" "$TMP/u.aus" -c "$TMP/gs.toml" "$@" --core rust --sends "$TMP/u.sends" 2>"$TMP/u.err"
+  # The summary line carries the counters and the core's final stats line.
+  if ! cmp -s "$TMP/r.sends" "$TMP/u.sends" || ! cmp -s "$TMP/r.aus" "$TMP/u.aus"; then
+    echo "FAIL $name: ref and rust sends or AUs differ"; fail=1
+  elif [ "$(grep '^pal-ref replay:' "$TMP/r.err")" != "$(grep '^pal-ref replay:' "$TMP/u.err")" ] \
+    || ! grep -q '^pal-ref replay:' "$TMP/r.err"; then
+    echo "FAIL $name: ref and rust final stats lines differ"; fail=1
+  else echo "ok   $name: $(stat -c %s "$TMP/r.sends") send bytes"; fi
 }
 
 for spec in "0 1" "5 7" "15 3"; do
