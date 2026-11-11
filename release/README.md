@@ -1,11 +1,11 @@
-# Palianytsia v0.11
+# Palianytsia v0.12
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.11.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.11.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.12.0.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.12.0.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,22 +14,30 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
 
-## What changed since v0.10
+## What changed since v0.11
 
-Update both ends. The radio protocol is unchanged, so video and control work with a v0.10 peer, but the drone parameter table gained a row: with mixed versions the settings menu reports a table mismatch.
+Update both ends to get the drone-side changes. The radio protocol and the drone parameter table are unchanged, so a v0.12 ground station works with a v0.11 drone and the other way round.
 
-- **The frame rate no longer halves after a long overload.** The drone's model of the air counted packets its full queue had already thrown away, so after a long overload it stayed hours ahead of the real air and dropped every enhance frame: half the frame rate at any bitrate until maburd restarted. The model is now bounded by what the queue can hold.
-- **A rung change no longer knocks the link down by itself.** On SigmaStar every bitrate change makes the encoder emit a keyframe, and the loss that keyframe caused demoted the link again. Loss-driven demotes now wait 1.2 s after a rung change.
-- **A channel move off a healthy link keeps its rung** instead of dropping to rung 0.
-- **Softer keyframe retries.** The GS waits for a requested keyframe's air time at the current rate, up to 1 s, before asking again.
-- **Keyframe size in the menu.** `VENC_MIN_IQP` on the video tab sets the keyframe quality floor, live and saved on the drone. Higher means smaller keyframes and a coarser picture just after one.
-- **Quest window mode.** The video can hang in the room over passthrough.
+- **The link stays on its top rung.** A piece of a frame that arrived as a requested re-send was counted as loss, and the link stepped down for it although nothing was lost. It no longer is.
+- **Smaller keyframes by default.** `VENC_MIN_IQP` ships at 42 instead of 34.
+- **No frame aggregation on the drone by default.** One lost aggregate used to take three or more video packets at once. The air-capacity tables in the drone config are re-measured for single frames.
+- **40 MHz video no longer stalls on RTL8822E boards that need a receiver gain floor.** `maburd` now sets one (`radio.wide_tx_igi_floor` in `mabur.toml`, default 53). 40 MHz is still experimental, see the known limits.
+- **Quest settings menu.** The menu is a panel of its own that opens in front of you and stays put in the room. Its tabs follow the task: Flight, Picture, Link, Recording, Screen, System. The right stick scrolls it.
+- **The picture recovers from a decoder failure** on the phone and the Quest: a dead decoder is rebuilt and one keyframe is requested. A frozen picture is marked on the screen.
+- **The ground station finds a drone on any 5 GHz channel**, not only on the channels of its set.
+- **A crafted video stream can no longer end the ground station**, and three faults in the frame reassembly are fixed.
+- **RTL8812AU ground cards at 40 MHz on channels 153 and 161** transmit on their channel again.
+- **Flight log.** `pal log` prints latency percentiles (capture on the drone to a complete frame on the ground) for the session and per rung, keyframe traffic, the decoder's loss episodes and the drone's parameters. A crash leaves `panic.txt`. `pal --version` and each session name the build.
 
-On one bench at 2944x1656, 60 fps, 150 s per setting, `VENC_MIN_IQP` 34 against 42: median keyframe 239 KB against 78 KB, 99th percentile latency 168 ms against 47 ms, longest 384 ms against 112 ms, incomplete frames 6 against 0. One run per setting, picture quality not scored. The shipped default stays 34.
+An updated drone keeps its `mabur.toml`, so it keeps its old values. To get the new defaults on such a drone, set `[venc] min_iqp = 42`, `[ampdu] max_num = 0` and the two `[air_clock] efficiency_` lines from the shipped `mabur.toml`. `radio.wide_tx_igi_floor` needs no edit: a config without it gets the default.
 
-v0.10 notes: per-frame FEC repair window, the GS waits for the rest of a big frame.
+On one bench (RTL8822E drone, 2944x1656 at 60 fps, 20 MHz, runs of 1 to 3 minutes per setting):
+- Rung changes: 250 to 500 per hour before, about 230 after, with the top rung held 91 % of the time.
+- Keyframe on the top rung: 214 kB median (230 ms of air) at `VENC_MIN_IQP` 34, 40 kB (43 ms) at 42.
+- Latency, capture to complete frame: median 27 ms, 90 % under 31 ms, 99 % under 57 ms.
+- Aggregation off costs air capacity at the fast rates: 11 % at MCS 4, 16 % at MCS 5. The shipped ladder tops out at MCS 4.
 
-v0.9 notes: frame-tail FEC rule from upstream PR #119, `fec.repairs_with_frame` removed, channel hops read channel airtime, `drone/install.py` replaces `install.sh`.
+v0.11 notes: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu.
 
 ## Ground station
 
@@ -38,7 +46,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.11.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.12.0.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -120,12 +128,14 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 
 maburd refuses config keys it does not know, so `install.py` fits the config to the maburd it installs: it removes `fec.repairs_with_frame` when that maburd does not have the key (the original stays in the backup). A v0.8.x maburd takes that key as optional; a v0.7.1 or older one and v0.9 refuse a config that has it (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
 
-## Known limits in v0.11
+## Known limits in v0.12
 
 - Pairing uses the default link key on both ends.
+- The changes of v0.12 have been run on one bench and not flown. The phone app was built but not run for this release; the Quest app and the desktop were.
+- 40 MHz video is experimental. The gain floor default clears every board measured so far, but its cost for the control link at long range is not measured; a board's own lowest working value is lower (36 on the bench board), and nothing measures it for you yet. Calibrate with the ground station set to 40 MHz, or the 40 MHz power table stays the reference board's. Keep `encoder.bitrate_max_kbps` at what your drone can send: above that, frames arrive late and are cut.
+- The link does not notice frames that arrive late, only frames that are lost. A bitrate cap set too high for the drone shows as cut frames on the top rung.
 - The new FEC placement costs drone CPU: the hot thread goes from about 12 % to 19 % of a core at 120 fps and 13 Mbps.
-- At high resolution the link rarely stays on its top rung: on one bench at 2944x1656, 60 fps, 10 of 14 promotes to MCS 4 fell back within 3 s with SNR near 37 dB, and each rung change costs a keyframe. Keyframes also cost up to 300 ms of latency at the default `VENC_MIN_IQP`.
-- The changes of v0.11 have been run on one bench and not flown.
+- The changes of v0.11 have not been flown either.
 - The per-frame FEC window of v0.10 has not been flown: host simulation and one bench run only. The worst inline repair batch at high rates is not measured.
 - At 30-60 fps under steady random loss, a model of the link loses slightly more whole frames with repairs held to the frame end than without (0.6 % against 0.2 % of frames at 4 % loss, before NACK). On the air the difference was within noise.
 - While disarmed, the drone runs low power: 30 fps at 1 Mbps. Full rate starts on arming.
@@ -139,7 +149,7 @@ maburd refuses config keys it does not know, so `install.py` fits the config to 
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.11` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.10` plus the rung change hold, the air clock bound and `VENC_MIN_IQP` from `palianytsia/base-v2`.
+- mabur: fork branch `release/v0.12` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.11` plus the receiver gain floor key, the new drone defaults and the ground-station fixes from `palianytsia/base-v2`.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
