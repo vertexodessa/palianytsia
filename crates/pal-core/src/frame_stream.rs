@@ -296,7 +296,13 @@ impl FrameStream {
 
     fn unwrap_id(&mut self, id: u16, flags: u8) -> (u64, bool) {
         let discont = flags & FLAG_DISCONT != 0;
-        if !self.have_id_base || (discont && !self.in_discont_run) {
+        let d = id.wrapping_sub(self.last_id64 as u16) as i16;
+        // Ids that step back past zero (the first base is 0x10000, so 0x10000
+        // net backwards; only forged or corrupt headers do that) re-base like a
+        // producer restart instead of wrapping the id, the gap count and the
+        // emit cursor around 2^64.
+        let below_zero = d < 0 && u64::from(d.unsigned_abs()) > self.last_id64;
+        if !self.have_id_base || (discont && !self.in_discont_run) || below_zero {
             // Re-base far above anything emitted; only the first flagged frame
             // of a discont run re-bases, the rest delta-track.
             self.have_id_base = true;
@@ -310,7 +316,6 @@ impl FrameStream {
             return (self.last_id64, true);
         }
         self.in_discont_run = discont;
-        let d = id.wrapping_sub(self.last_id64 as u16) as i16;
         self.last_id64 = (self.last_id64 as i64 + i64::from(d)) as u64;
         (self.last_id64, false)
     }
@@ -325,7 +330,11 @@ impl FrameStream {
                     .retain(|_, s| !(s.have_hdr && s.id64 < ne && !s.began));
                 self.st.dropped += (before - self.slots.len()) as u64;
             }
-            // Head of line: the known-header slot with the lowest id64.
+            // Head of line: the known-header slot with the lowest id64. Of two
+            // slots with one id (a repeated frame id on another fseq or layer:
+            // forged, or a corrupt header the block CRC let through) the one
+            // already begun stays the head, so a second frame never begins
+            // inside an open one; the other is late once the head finishes.
             let mut head: Option<(u32, u64)> = None;
             let mut max_known = 0u64;
             for (k, s) in &self.slots {
@@ -333,7 +342,7 @@ impl FrameStream {
                     continue;
                 }
                 max_known = max_known.max(s.id64);
-                if head.is_none_or(|(_, id)| s.id64 < id) {
+                if head.is_none_or(|(_, id)| s.id64 < id || (s.id64 == id && s.began)) {
                     head = Some((*k, s.id64));
                 }
             }

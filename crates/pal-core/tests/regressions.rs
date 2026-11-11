@@ -73,13 +73,11 @@ fn frame(fseq: u16, count: u16, frame_id: u16) -> Vec<u8> {
 }
 
 /// Frame ids 0, 32768, 0, 65535: each step a delta of -32768 or -1, so the
-/// unwrapped id walks from 0x10000 to below zero and lands on u64::MAX; the
-/// emit cursor then overflows. A release build wraps instead: the dropped
-/// counter jumps by about 2^64 and the cursor wraps to 0, and the stream
-/// goes on with no gap. Any transmitter that can put four FEC-valid frames
+/// unwrapped id would walk from 0x10000 below zero; it re-bases like a
+/// producer restart instead of wrapping the emit cursor and the dropped
+/// counter around 2^64. Any transmitter that can put four FEC-valid frames
 /// on the air reaches it; no key is involved.
 #[test]
-#[ignore = "open: a frame id walk below zero overflows the emit cursor (same in mabur)"]
 fn frame_id_walk_below_zero() {
     let mut fs = FrameStream::new(FrameStreamCfg::default());
     let mut out = Out::default();
@@ -95,14 +93,12 @@ fn frame_id_walk_below_zero() {
     assert!(fs.stats().dropped < 8, "{:?}", fs.stats());
 }
 
-/// Two slots whose headers name one frame id: the second begins while the
-/// first is open, so the core's AU sink drops the open AU's bytes and the
-/// first slot's later data and end land on an empty AU. No panic; mabur's
-/// FrameStream has the same shape. Reached only by FEC-valid symbols that
+/// Two slots whose headers name one frame id: the second must not begin
+/// while the first is open (the core's AU sink would drop the open AU's
+/// bytes and land the first slot's end on an empty AU). Reached only by FEC-valid symbols that
 /// repeat a frame id on another fseq or layer (forged, or a corrupt header
 /// the per-block CRC let through).
 #[test]
-#[ignore = "open: slots with one frame id nest begin and end (same in mabur)"]
 fn two_slots_one_frame_id_nest() {
     let mut fs = FrameStream::new(FrameStreamCfg::default());
     let mut out = Out::default();

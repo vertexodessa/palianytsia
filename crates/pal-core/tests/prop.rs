@@ -967,11 +967,15 @@ proptest! {
         }
     }
 
-    /// Anything at all, two slots claiming one frame id included: no panic.
+    /// Anything at all, two slots claiming one frame id included: no panic,
+    /// and begin, data and end still alternate.
     #[test]
     fn frame_stream_any_fragments(ops in proptest::collection::vec(fs_op(), 1..300), seed_au: usize) {
         let f = fixture();
-        run_frame_stream(ops, &f.aus[seed_au % f.aus.len()].0, false)?;
+        let out = run_frame_stream(ops, &f.aus[seed_au % f.aus.len()].0, false)?;
+        if let Some(e) = out.err {
+            return Err(TestCaseError::fail(e));
+        }
     }
 }
 
