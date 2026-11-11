@@ -209,7 +209,6 @@ const BAD: Color32 = Color32::from_rgb(240, 80, 70);
 
 /// Drone rows per tab, by F18 id: the main part, then what folds under
 /// "Advanced". The whole table is under System.
-const FLIGHT: [&str; 1] = ["REC_ENABLE"];
 const PICTURE: [&str; 4] = ["VENC_MODE", "ENC_BITRATE_MAX", "VENC_MIRROR", "VENC_FLIP"];
 const PICTURE_ADV: [&str; 3] = ["ENC_AIRTIME", "VENC_SLICES", "VENC_MIN_IQP"];
 const LINK: [&str; 2] = ["RADIO_PWR_MODE", "RADIO_WALL_MARGN"];
@@ -228,7 +227,11 @@ fn plain_name(id: &str) -> Option<&'static str> {
         "VENC_MIN_IQP" => "Keyframe quality floor",
         "VENC_MIRROR" => "Mirror left-right",
         "VENC_FLIP" => "Flip upside down",
-        "REC_ENABLE" => "Record on the drone",
+        // Not "record now": the row switches the recorder on the drone on
+        // or off as a whole. A recording is started by the GS's record
+        // wish in the RCF (mabur docs/vtx-recorder.md), which this GS does
+        // not send yet.
+        "REC_ENABLE" => "Onboard recorder available",
         "REC_SIZE" => "Recording size",
         "REC_FPS" => "Recording frame rate",
         "REC_BITRATE" => "Recording bitrate, kbps",
@@ -782,9 +785,6 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             }
             ui.label(RichText::new(&i.link_info).monospace());
             ui.separator();
-            table_status(ui, i.table, i.edits);
-            cmd = rows_ui(ui, &FLIGHT, i.table, i.edits, look);
-            ui.separator();
             let before = i.prefs.clone();
             if p.xr {
                 view_ui(ui, i.prefs);
@@ -1192,8 +1192,7 @@ mod tests {
             Tab::System => 3,    // version, table state, the folded table
             Tab::Picture | Tab::Screen => 0,
         };
-        let drone: [(Tab, &[&str]); 5] = [
-            (Tab::Flight, &FLIGHT),
+        let drone: [(Tab, &[&str]); 4] = [
             (Tab::Picture, &PICTURE),
             (Tab::Link, &LINK),
             (Tab::Recording, &RECORDING),
@@ -1203,8 +1202,7 @@ mod tests {
             assert!(ids.len() + ground(tab) <= 8, "{tab:?}");
         }
         let all = [
-            &FLIGHT[..],
-            &PICTURE,
+            &PICTURE[..],
             &PICTURE_ADV,
             &LINK,
             &LINK_ADV,
