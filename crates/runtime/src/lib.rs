@@ -15,6 +15,7 @@ use pal_wire::dot11;
 pub mod cam_fps;
 pub mod dev_card;
 pub mod panic_hook;
+pub mod rf_sim;
 pub mod stats_line;
 
 pub use panic_hook::install_panic_hook;
@@ -212,6 +213,9 @@ impl CoreIo for Sink {
         }
     }
     fn send(&mut self, rc_body: &[u8]) {
+        if rf_sim::active().is_some_and(|s| !s.tx_passes()) {
+            return;
+        }
         if let Some(c) = &self.card {
             c.send_control(rc_body);
         }
@@ -532,6 +536,9 @@ impl CoreLoop {
         if self.sink.log.is_some() && now >= self.last_log_us + 1_000_000 {
             self.last_log_us = now;
             self.log_stats(now, &line, &off);
+            if let Some(s) = rf_sim::active() {
+                self.sink.shared.event("rf_sim", s.snapshot());
+            }
         }
         self.sink.pts_off_us = stats.as_ref().and_then(stats_line::pts_off_us);
         // The ladder and calibration views go to the UI only: the
@@ -553,6 +560,7 @@ impl CoreLoop {
                     ("chscan", scan),
                     ("log_err", log_err),
                     ("card_off_us", off),
+                    ("rf_sim", rf_sim::active().map(|s| s.snapshot())),
                 ],
                 cal,
             ),
@@ -1042,6 +1050,24 @@ impl CardSet {
                 let r = route.read().unwrap_or_else(|p| p.into_inner());
                 let Some(r) = r.as_ref() else { return };
                 let v = dot11::parse(f.frame, f.crc_err, f.data_rate);
+                // Bench RF simulator: before the stamp, so the channel
+                // core's tap and the core both see the simulated air.
+                let mut buf = Vec::new();
+                let g;
+                let (f, v) = match rf_sim::active() {
+                    Some(sim) => {
+                        let body = match &v {
+                            dot11::Verdict::Body(p) => Some((p.body_off, p.mcs)),
+                            _ => None,
+                        };
+                        let Some(x) = sim.rx(f, body, &mut buf) else {
+                            return;
+                        };
+                        g = x;
+                        (&g, dot11::parse(g.frame, g.crc_err, g.data_rate))
+                    }
+                    None => (f, v),
+                };
                 let Some((ch, now)) = (r.stamp)(card_id, f, &v) else {
                     return;
                 };

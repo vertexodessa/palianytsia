@@ -6,6 +6,7 @@
 //!   pal live   -c gs.toml --ch 144 --width 40 [--mode gs|spotter] [--secs 30]
 //!              [--card N] [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
 //!              [--log-dir DIR [--capture-mb N]] [--core ref|rust] [--param-set T_S,ROW,TEXT ...]
+//!              [--rf-sim SPEC]   bench RF loss simulator (`runtime::rf_sim`), e.g. atten=50,fade=8/300
 //!   pal replay <bodies.bin>...|<fl-NNNN_...> -c gs.toml [--mode gs|spotter] [--dump out.h265]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
@@ -91,6 +92,7 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--log-dir" => o.log_dir = Some(val().into()),
             "--decode" => o.decode = true,
             "--hwdec" => o.hwdec = val(),
+            "--rf-sim" => runtime::rf_sim::install_spec(&val()).unwrap_or_else(|e| die(&e)),
             "--param-set" => {
                 let v = val();
                 let mut it = v.splitn(3, ',');
@@ -299,6 +301,9 @@ impl CoreIo for Sink {
         if let Some(w) = self.sends_file.as_mut() {
             w.write_all(&(rc_body.len() as u32).to_le_bytes()).unwrap();
             w.write_all(rc_body).unwrap();
+        }
+        if runtime::rf_sim::active().is_some_and(|s| !s.tx_passes()) {
+            return;
         }
         if let Some(c) = &self.card {
             if !c.send_control(rc_body) {

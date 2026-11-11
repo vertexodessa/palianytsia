@@ -354,6 +354,11 @@ impl LinkCard for DevCard {
         self.foreign.load(Ordering::Relaxed)
     }
     fn send_control(&self, body: &[u8]) -> bool {
+        // Lost on the simulated uplink: sent as far as the core knows.
+        if crate::rf_sim::active().is_some_and(|s| !s.tx_passes()) {
+            self.tx_frames.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let ok = self.with_ctl(|c| c.send_control(body)).unwrap_or(false);
         if ok { &self.tx_frames } else { &self.tx_fail }.fetch_add(1, Ordering::Relaxed);
         ok

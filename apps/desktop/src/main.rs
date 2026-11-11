@@ -15,6 +15,8 @@
 //!           [--hwdec auto|vdpau|vaapi|cuda|sw]  decoder (default auto: first hwaccel
 //!                                   that opens, else software)
 //!           [--params]              open the drone settings window (P toggles; GS only)
+//!           [--rf-sim SPEC]         live: bench RF loss simulator (`runtime::rf_sim`),
+//!                                   e.g. atten=40-70/60,fade=8/300,up=2
 //!   keys: S link statistics over the video, M monitor plots, P drone settings
 //!         (the flight HUD: battery, timer, alt/speed/home, centre dot, is always on)
 //!           [--cpu-rgba]            RGBA via swscale instead of the YUV shader
@@ -145,6 +147,7 @@ fn parse() -> Opts {
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
             "--hwdec" => o.hwdec = val(),
+            "--rf-sim" => runtime::rf_sim::install_spec(&val()).unwrap_or_else(|e| die(&e)),
             "--params" => o.params = true,
             "--lat" => o.lat = true,
             "--cpu-rgba" => o.cpu_rgba = true,

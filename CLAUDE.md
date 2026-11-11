@@ -59,7 +59,12 @@ pairing key.
   is a drone restart. Ihor allowed drone actions; device commands still carry a
   `# predict:` claim.
 - No loss injector in original mabur; `radio.wall_margin_db` caps at 6 dB, so a
-  real 20 % loss capture needs physical attenuation.
+  real 20 % loss capture needs physical attenuation. Without an attenuator the GS side
+  simulates one: `--rf-sim SPEC` (`pal live`, `pal-desktop`) or property `debug.pal.rf_sim`
+  (APKs, read at link start), spec keys in `crates/runtime/src/rf_sim.rs` (attenuation
+  with MCS-dependent loss, fades, flat loss, FCS-bad deliveries, uplink loss); a flight log
+  taken under it carries `rf_sim` events. The bench reads about -28 dBm, so `atten=45`
+  leaves MCS 0 at 40 MHz ~16 dB of margin and `atten=60` about 1 dB.
 
 ## Helpers
 - `configs/bench-ch40.toml`: `gs.toml` pinned to ch 40 for the bench quad.

@@ -243,6 +243,7 @@ impl Ctl<'_> {
 }
 
 /// One received frame, borrowed for the duration of the callback.
+#[derive(Clone, Copy)]
 pub struct RxFrame<'a> {
     /// dot11 frame as the chip delivered it, FCS included.
     pub frame: &'a [u8],

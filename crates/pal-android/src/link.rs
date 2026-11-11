@@ -146,6 +146,13 @@ impl Link {
         let (set_res_tx, set_res_rx) = mpsc::sync_channel(8);
         let (mav_tx, mav_rx) = mpsc::sync_channel(256);
         let shared = Arc::new(Shared::default());
+        // Bench RF loss simulator (`runtime::rf_sim`): property
+        // `debug.pal.rf_sim`, e.g. `atten=50,fade=8/300`, read at each link
+        // start; empty or unset = off. A bad spec is logged and ignored.
+        let sim = decode::mediacodec::prop(c"debug.pal.rf_sim").unwrap_or_default();
+        if let Err(e) = runtime::rf_sim::install_spec(&sim) {
+            log::warn!("{e}");
+        }
         if let Some(r) = cfg.link.ladder_cfg.ladder.last() {
             shared.video_bw.store(r.bw as u8, Ordering::Relaxed);
         }

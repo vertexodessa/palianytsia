@@ -84,7 +84,7 @@ extern "C" {
 }
 
 /// A system property's value, if set.
-fn prop(name: &std::ffi::CStr) -> Option<String> {
+pub fn prop(name: &std::ffi::CStr) -> Option<String> {
     let mut v = [0 as std::ffi::c_char; 92];
     // SAFETY: a NUL-terminated name and a PROP_VALUE_MAX buffer.
     let n = unsafe { __system_property_get(name.as_ptr(), v.as_mut_ptr()) };
