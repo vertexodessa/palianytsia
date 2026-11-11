@@ -49,6 +49,9 @@ struct Counters {
     aus_complete: u64,
     aus_truncated: u64,
     aus_truncated_base: u64,
+    /// Complete sid-0 AUs with a fragment a NACK retransmit delivered
+    /// (`AuLat::retx_fill`): an upper bound on the frames the NACK saved.
+    aus_nack_saved: u64,
     aus_salvaged: u64,
     resets: u64,
     cal_frames: u64,
@@ -107,6 +110,9 @@ impl FrameOut for AuOut<'_> {
         }
         if complete {
             self.c.aus_complete += 1;
+            if self.cur.sid == 0 && lat.retx_fill {
+                self.c.aus_nack_saved += 1;
+            }
         } else {
             self.c.aus_truncated += 1;
             if self.cur.sid == 0 {
@@ -1254,6 +1260,7 @@ impl GsCore for RustCore {
         j.set("aus", self.c.aus_complete);
         j.set("trunc", self.c.aus_truncated);
         j.set("trunc_base", self.c.aus_truncated_base);
+        j.set("nack_saved", self.c.aus_nack_saved);
         j.set("salvaged", self.c.aus_salvaged);
         j.set("sends", g.map_or(0, |g| g.sends));
         j.set("rcf_sent", g.map_or(0, |g| g.rcf_sent));

@@ -45,6 +45,7 @@ struct Out {
     nested: u32,
     ends: u32,
     begins_off_sid0: u32,
+    complete_with_retx_fill: u32,
 }
 
 impl FrameOut for Out {
@@ -54,7 +55,8 @@ impl FrameOut for Out {
         self.open = true;
     }
     fn data(&mut self, _: &[u8]) {}
-    fn end(&mut self, _: bool, _: &AuLat) {
+    fn end(&mut self, complete: bool, lat: &AuLat) {
+        self.complete_with_retx_fill += u32::from(complete && lat.retx_fill);
         self.open = false;
         self.ends += 1;
     }
@@ -157,4 +159,36 @@ fn outage_jump_waits_for_a_second_frame_or_the_gap_timeout() {
     assert_eq!(fs.stats().clean, 12);
     fs.poll(851, &mut out);
     assert_eq!(fs.stats().clean, 13);
+}
+
+/// Fragment `idx` (> 0) of `<fseq, count>`: four AU bytes, no header.
+fn tail_frag(fseq: u16, idx: u16, count: u16) -> Vec<u8> {
+    let mut p = vec![0u8; 6];
+    p[..2].copy_from_slice(&fseq.to_le_bytes());
+    p[2..4].copy_from_slice(&idx.to_le_bytes());
+    p[4..6].copy_from_slice(&count.to_le_bytes());
+    p.extend_from_slice(&[1, 2, 3, 4]);
+    p
+}
+
+/// `retx_fill` (the `nack_saved` count): set when a retransmit brings a
+/// fragment the AU did not have, not when it repeats one it had.
+#[test]
+fn retx_fill_marks_only_a_new_fragment() {
+    let mut fs = FrameStream::new(FrameStreamCfg::default());
+    let mut out = Out::default();
+    let direct = FragArrival::default();
+    let retx = FragArrival {
+        retx: true,
+        ..FragArrival::default()
+    };
+    fs.push_fragment(0, &frame(1, 2, 0), 10, &direct, &mut out);
+    fs.push_fragment(0, &tail_frag(1, 1, 2), 11, &retx, &mut out);
+    assert_eq!(out.ends, 1);
+    assert_eq!(out.complete_with_retx_fill, 1);
+    fs.push_fragment(0, &tail_frag(2, 1, 2), 20, &direct, &mut out);
+    fs.push_fragment(0, &tail_frag(2, 1, 2), 21, &retx, &mut out);
+    fs.push_fragment(0, &frame(2, 2, 1), 22, &direct, &mut out);
+    assert_eq!(out.ends, 2);
+    assert_eq!(out.complete_with_retx_fill, 1);
 }

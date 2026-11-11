@@ -703,6 +703,18 @@ fn log_summary(o: Opts) {
         s.truncated_base,
         s.salvaged
     );
+    if let Some(st) = &s.last_stats {
+        let u = |v: Option<&serde_json::Value>| v.and_then(serde_json::Value::as_u64);
+        if let Some(n) = st.get("nack").filter(|n| n.is_object()) {
+            println!(
+                "  nack: fill {}, waste {}, late {}; complete base AUs with a retransmitted fragment {} (upper bound on saved)",
+                u(n.get("fill")).unwrap_or(0),
+                u(n.get("waste")).unwrap_or(0),
+                u(n.get("late")).unwrap_or(0),
+                u(st.get("nack_saved")).map_or("?".into(), |v| v.to_string())
+            );
+        }
+    }
     for (t, to) in &s.session_edges {
         println!("  session -> {to} at {:.3} s", *t as f64 / 1e6);
     }

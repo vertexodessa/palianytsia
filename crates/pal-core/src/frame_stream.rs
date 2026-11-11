@@ -31,6 +31,11 @@ pub struct AuLat {
     pub enc_us: u16,
     pub drone_air_ms: u16,
     pub hdr_retx: bool,
+    /// Some fragment of this AU was new when it arrived out of a NACK
+    /// retransmit body (directly, or recovered by FEC on that body's
+    /// symbol): a complete base AU with it is one the NACK may have saved.
+    /// An upper bound: later repairs could have recovered the same symbols.
+    pub retx_fill: bool,
     pub skipped_before: u32,
     pub vcl_nal: u8,
     pub slice: SliceSalvage,
@@ -246,6 +251,9 @@ impl FrameStream {
             s.first_ms = now_ms;
             s.last_progress_ms = now_ms;
             s.count = count;
+        }
+        if arr.retx && !s.chunks.contains_key(&idx) {
+            s.lat.retx_fill = true;
         }
         s.chunks.insert(idx, pkt[FRAG_HDR_LEN..].to_vec());
         if let Some(seq) = arr.sw_seq {
