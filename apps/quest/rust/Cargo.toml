@@ -25,3 +25,8 @@ log = "0.4"
 egui = { workspace = true }
 egui_glow = "0.31"
 glow = "0.16"
+
+# Host tests read the menu surface's size and look from pal-osd to check the
+# angles the quad shows them at.
+[dev-dependencies]
+pal-osd = { workspace = true, features = ["ui"] }

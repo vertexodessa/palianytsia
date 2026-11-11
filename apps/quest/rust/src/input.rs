@@ -159,7 +159,6 @@ impl Input {
     }
 
     /// A short tick in the right hand: a press landed on a control.
-    #[allow(dead_code)] // called from the menu commit on
     pub fn pulse(&self, session: &xr::Session<xr::OpenGlEs>) {
         let v = xr::HapticVibration::new()
             .amplitude(0.3)

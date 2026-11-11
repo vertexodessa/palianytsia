@@ -17,7 +17,7 @@ status: `docs/spec.md`; read its "Status (2026-11-07)" section first; the dated 
 | `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |
 | `apps/phone` | phone app (M3): `rust/` = `pal-phone` cdylib (JNI start/stats/lastError/stop over `runtime`, MediaCodec into the Surface), `android/` = Java shell (USB permission, SurfaceView, text OSD). `tools/phone-apk.sh [cfg]` builds the APK |
 | `crates/pal-android` | Android link shared by phone and Quest: `Link::start(fd, window, config)` runs core + MediaCodec threads and the flight log, `Ports` for the UI, bounded `stop()` |
-| `apps/quest` | Quest 3 app (M3): `rust/` = `pal-quest` NativeActivity (OpenXR: video via surface swapchain quad, egui OSD quad, controller ray + panel, USB supervisor with 3 s retry; up to 2 cards: card 0 = link/TX, all receive, the channel core scouts on the other; a card added or detached restarts the link), `android/` = manifest only. `tools/quest-apk.sh [cfg]` builds the APK (OpenXR loader pulled from Maven Central) |
+| `apps/quest` | Quest 3 app (M3): `rust/` = `pal-quest` NativeActivity (OpenXR: video via surface swapchain quad, egui OSD quad, the settings menu on a quad of its own fixed in the room while open, controller ray + cursor quads, USB supervisor with 3 s retry; up to 2 cards: card 0 = link/TX, all receive, the channel core scouts on the other; a card added or detached restarts the link), `android/` = manifest only. `tools/quest-apk.sh [cfg]` builds the APK (OpenXR loader pulled from Maven Central) |
 | `apps/desktop` | `pal-desktop` (eframe): `--live` or `--replay`, `--snapshot out.ppm --secs N` for headless checks |
 | `third_party/libusb` | upstream libusb v1.0.27, Android only (`tools/android-libusb.sh`; `tools/android-build.sh build -p <crate>` cross-builds for aarch64) |
 | `third_party/{mabur,devourer}` | pinned submodules of the vertexodessa forks (mabur: branch `palianytsia/base-v2` = upstream master plus our commits (rebased 2026-11-08 onto master + upstream PR #119, the frame-tail FEC rule; the earlier lines are kept as branches `palianytsia/base-v2-pre-2026-11-08` and `palianytsia/base-v2-pre-2026-11-07`, and tags `palianytsia/v0.8`, `palianytsia/v0.8.1`), `palianytsia/base` is the pre-2026-11-03 line; devourer: `palianytsia/base`); change them only as a fork commit on that branch (Ihor allowed it when Palianytsia needs it), pushed, then bump the pointer here |
@@ -115,6 +115,9 @@ pairing key.
   each truncated AU, `tools/idrwhy.py <session>` keyframes against air time and drone queue, `tools/sessions.py <root>`
   one TSV row per session. Test: `crates/flightlog/tests/losstrace.rs`.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.
+  `--panel <tab>` opens the settings on a tab (flight, picture, link, recording, screen, system);
+  `--headset-menu` shows only the Quest's menu surface at its 800 x 600 points and look, so a menu
+  change is checked on the host before it goes into the headset.
 
 ## Finding code
 `zg query "<what it does>"` works here (index in `.zvec-grep/`, 87 files, submodules not indexed: use rg in `third_party/mabur`). Re-run `zg index` after large edits.

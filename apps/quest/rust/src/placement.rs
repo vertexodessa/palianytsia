@@ -239,11 +239,6 @@ pub const MENU_WIDTH_M: f32 = 0.89;
 pub const MENU_ASPECT: f32 = 0.75;
 pub const MENU_DIST_M: f32 = 1.1;
 pub const MENU_PITCH_DEG: f32 = 20.0;
-/// The menu surface in egui points, the factor on egui's text sizes (body
-/// 14 pt, small 10 pt) and the least height of a row's control.
-pub const MENU_POINTS: [f32; 2] = [800.0, 600.0];
-pub const MENU_TEXT_SCALE: f32 = 1.8;
-pub const MENU_ROW_PT: f32 = 56.0;
 
 /// Where the menu hangs, decided once when it opens. With a head pose:
 /// fixed in the room (LOCAL), in the direction the head faces, turned to
@@ -433,6 +428,7 @@ impl Grab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pal_osd::panel::SURFACE_POINTS as MENU_POINTS;
 
     fn near(a: V3, b: V3) -> bool {
         distance(a, b) < 1e-4
@@ -646,13 +642,16 @@ mod tests {
 
     #[test]
     fn menu_text_and_targets_are_big_enough() {
+        // pal-osd owns the surface's size in points and its look; this
+        // crate owns the quad. Together they give the angles a pilot sees.
+        let look = pal_osd::panel::Look::HEADSET;
         // One point at the centre of the surface, in degrees.
         let pt = deg((MENU_WIDTH_M / MENU_POINTS[0] / MENU_DIST_M).atan());
         // egui's body and small text sizes.
-        let (body, small) = (14.0 * MENU_TEXT_SCALE, 10.0 * MENU_TEXT_SCALE);
+        let (body, small) = (14.0 * look.text, 10.0 * look.text);
         assert!(body * pt >= 1.3, "body {}", body * pt);
         assert!(small * pt >= 1.0, "small {}", small * pt);
-        assert!(MENU_ROW_PT * pt >= 3.0, "row {}", MENU_ROW_PT * pt);
+        assert!(look.row_h * pt >= 3.0, "row {}", look.row_h * pt);
         assert!((MENU_POINTS[1] / MENU_POINTS[0] - MENU_ASPECT).abs() < 1e-6);
     }
 

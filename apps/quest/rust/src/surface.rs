@@ -30,8 +30,7 @@ pub struct Surface {
 
 /// What a draw tells the caller.
 pub struct Drawn {
-    /// egui is using the pointer: it is over a widget or dragging one.
-    #[allow(dead_code)] // read from the menu commit on
+    /// A widget is being pressed or dragged.
     pub used_pointer: bool,
 }
 
@@ -98,7 +97,8 @@ impl Surface {
         };
         self.ctx.set_pixels_per_point(self.ppp);
         let out = self.ctx.run(input, run);
-        let used_pointer = self.ctx.is_using_pointer() || self.ctx.wants_pointer_input();
+        // Not `wants_pointer_input`: that is true anywhere over a panel.
+        let used_pointer = self.ctx.is_using_pointer();
         let prims = self.ctx.tessellate(out.shapes, out.pixels_per_point);
         let idx = self.sc.acquire_image().map_err(|e| e.to_string())?;
         self.sc

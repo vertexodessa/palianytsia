@@ -1,11 +1,15 @@
 //! The OpenXR side, grown from the quest-xr-probe spike (docs/spec.md has
 //! its results), whose findings it keeps: the ndk_context Activity swap,
-//! the zero fields of the surface swapchain, the vertical flip. Two quad
-//! layers: the video, decoded by MediaCodec straight into an
+//! the zero fields of the surface swapchain, the vertical flip. Quad
+//! layers only: the video, decoded by MediaCodec straight into an
 //! XR_KHR_android_surface_swapchain, and the OSD above it. In goggle mode
 //! they sit in VIEW space, head-locked like real FPV goggles; in window
-//! mode they hang in LOCAL space over passthrough. The frame loop never
-//! waits for video.
+//! mode they hang in LOCAL space over passthrough. While the settings menu
+//! is open it is a third quad, placed in front of the head when it opens
+//! and fixed in the room (LOCAL) in both modes, with the pointer's ray and
+//! cursor as two more. Each frame the loop reads the controller, decides
+//! what the ray points at and who gets the sticks, and builds the list of
+//! quads once. The frame loop never waits for video.
 use std::ffi::CString;
 use std::io::Read;
 use std::ptr;
@@ -20,7 +24,7 @@ use openxr::sys;
 
 use crate::background::Background;
 use crate::input::{locate, Input};
-use crate::osd::{Osd, UiIn};
+use crate::osd::{Osd, Surf, UiIn};
 use crate::placement::{
     self, Grab, Placement, Pose, Ray, SpaceKind, Sticks, Target, MAX_DIST_M, MIN_DIST_M,
 };
@@ -30,10 +34,13 @@ use pal_osd::prefs::QuestView;
 /// Video swapchain size: the decoder scales into it.
 const VW: u32 = 1920;
 const VH: u32 = 1080;
-/// While the menu is open in window mode, the video part of the OSD quad
-/// is at least this wide per metre of distance (50 degrees across): the
-/// panel is drawn at a fixed share of the quad, unreadable on a small window.
-const MENU_MIN_WIDTH_PER_M: f32 = 0.93;
+/// The pointer's ray is this wide and, when it points at nothing, this
+/// long; the cursor is a disc this wide on the surface it points at.
+const RAY_WIDTH_M: f32 = 0.003;
+const RAY_FREE_M: f32 = 2.0;
+const CURSOR_M: f32 = 0.012;
+/// Full stick deflection scrolls the menu this many points a second.
+const SCROLL_PT_S: f32 = 900.0;
 
 #[derive(Clone, Copy)]
 struct Extent {
@@ -142,12 +149,6 @@ fn video_placement(
     }
 }
 
-/// The surfaces the ray can point at.
-#[derive(Clone, Copy, PartialEq)]
-enum Surf {
-    Osd,
-}
-
 /// One quad layer of a frame, as data: where, in which space, which
 /// swapchain. The frame loop builds the list once, after input and
 /// steering; `Submit` only turns it into the runtime's structs.
@@ -163,14 +164,9 @@ struct QuadSpec {
     video: bool,
 }
 
-/// The OSD quad, centred on the video.
-fn osd_placement(video: &Placement, view: QuestView, menu: bool, scr: &Screen) -> Placement {
-    let min = if view == QuestView::Window && menu {
-        MENU_MIN_WIDTH_PER_M * scr.window.dist_m / video.width_m
-    } else {
-        1.0
-    };
-    video.scaled(crate::osd::SPAN * min.max(1.0))
+/// The OSD quad: centred on the video, SPAN times its size, always.
+fn osd_placement(video: &Placement) -> Placement {
+    video.scaled(crate::osd::SPAN)
 }
 
 struct Egl {
@@ -702,6 +698,11 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let mut view = QuestView::Goggle;
     let mut background: Option<Background> = None;
     let mut win = WindowCtl::default();
+    // The settings menu's quad: Some while it is open. It is placed once,
+    // when it opens (`placement::menu_at`), and again only when the runtime
+    // recentres LOCAL under it.
+    let mut menu: Option<(SpaceKind, Placement)> = None;
+    let mut recentred = false;
     let mut t_frame = Instant::now();
     let mut video: Option<sys::Swapchain> = None;
     let mut osd: Option<Osd> = None;
@@ -747,6 +748,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                     xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => quit = true,
                     _ => {}
                 }
+            } else if let xr::Event::ReferenceSpaceChangePending(_) = e {
+                recentred = true;
             }
         }
         if !running {
@@ -804,26 +807,44 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             );
         }
         let t = fs.predicted_display_time;
-        let head = (view == QuestView::Window)
-            .then(|| locate(&space, &local, t))
-            .flatten();
+        // The head in the room: the window and the menu are placed by it,
+        // and the pointer's ray turns to it.
+        let head = locate(&space, &local, t);
         if view == QuestView::Window {
             win.place(head, &scr);
         }
-        let menu = osd.as_ref().is_some_and(Osd::panel_open);
-        let (v_space, video_at) = video_placement(view, win.window, &scr);
         // Input at the predicted display time, so the ray matches the
         // frame it is drawn into.
         let frame = input
             .as_ref()
             .map_or_else(Default::default, |i| i.poll(&session, &space, &local, t));
+        if frame.menu {
+            menu = match menu {
+                Some(_) => None,
+                None => Some(placement::menu_at(head, scr.extent(view).dist_m)),
+            };
+            log::info!("menu {}", if menu.is_some() { "open" } else { "closed" });
+        } else if recentred && menu.is_some() {
+            menu = Some(placement::menu_at(head, scr.extent(view).dist_m));
+        }
+        recentred = false;
+        let (v_space, video_at) = video_placement(view, win.window, &scr);
         // What the ray points at, front to back.
-        let targets = [Target {
+        let mut targets = Vec::with_capacity(2);
+        if let Some((space, at)) = menu {
+            targets.push(Target {
+                id: Surf::Menu,
+                space,
+                at,
+                size: pal_osd::panel::SURFACE_POINTS,
+            });
+        }
+        targets.push(Target {
             id: Surf::Osd,
             space: v_space,
-            at: osd_placement(&video_at, view, menu, &scr),
+            at: osd_placement(&video_at),
             size: crate::osd::points().into(),
-        }];
+        });
         let hit = placement::route(&frame.aim, &targets);
         let dt = t_frame.elapsed().as_secs_f32().min(0.1);
         t_frame = Instant::now();
@@ -836,27 +857,39 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             (aimed, win.carried())
         });
         win.grip_was = frame.grip;
-        let (size, dist) = match placement::sticks(false, window, frame.right_y, frame.left_y) {
-            Sticks::Screen { size, dist } => (size, dist),
-            Sticks::Scroll(_) | Sticks::Idle => (0.0, 0.0),
-        };
+        let mut scroll = 0.0;
+        let (size, dist) =
+            match placement::sticks(menu.is_some(), window, frame.right_y, frame.left_y) {
+                Sticks::Screen { size, dist } => (size, dist),
+                Sticks::Scroll(y) => {
+                    scroll = y * SCROLL_PT_S * dt;
+                    (0.0, 0.0)
+                }
+                Sticks::Idle => (0.0, 0.0),
+            };
         let before = scr.extent(view).dist_m;
         scr.steer(view, size, dist, dt);
         if view == QuestView::Window {
             win.follow(before, &scr);
         }
         if let Some(o) = osd.as_mut() {
-            o.tick(
+            let out = o.tick(
                 &hub,
                 UiIn {
-                    menu: frame.menu,
+                    menu_open: menu.is_some(),
                     stats: frame.stats,
                     click: frame.click,
-                    on_osd: hit
-                        .filter(|h| h.id == Surf::Osd)
-                        .map(|h| egui::pos2(h.pos[0], h.pos[1])),
+                    on: hit.map(|h| (h.id, egui::pos2(h.pos[0], h.pos[1]))),
+                    scroll,
                 },
             );
+            if out.close {
+                menu = None;
+                log::info!("menu closed");
+            }
+            if let (true, Some(i)) = (out.pulse, input.as_ref()) {
+                i.pulse(&session);
+            }
         }
         // SAFETY: as above.
         unsafe {
@@ -864,7 +897,15 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         }
         // The frame's quads, back to front, after its grab and sticks.
         let (v_space, video_at) = video_placement(view, win.window, &scr);
-        let mut quads = Vec::with_capacity(2);
+        let mut quads = Vec::with_capacity(5);
+        let egui_quad = |s: &crate::surface::Surface, space, at| QuadSpec {
+            space,
+            at,
+            sc: s.sc.as_raw(),
+            w: s.w,
+            h: s.h,
+            video: false,
+        };
         if let Some(sc) = video {
             quads.push(QuadSpec {
                 space: v_space,
@@ -875,15 +916,28 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 video: true,
             });
         }
-        if let Some(o) = osd.as_ref().filter(|o| o.hud.ready) {
-            quads.push(QuadSpec {
-                space: v_space,
-                at: osd_placement(&video_at, view, o.panel_open(), &scr),
-                sc: o.hud.sc.as_raw(),
-                w: o.hud.w,
-                h: o.hud.h,
-                video: false,
-            });
+        if let Some(o) = osd.as_ref() {
+            if o.hud.ready {
+                quads.push(egui_quad(&o.hud, v_space, osd_placement(&video_at)));
+            }
+            if let Some((m_space, m_at)) = menu {
+                if o.menu.ready {
+                    quads.push(egui_quad(&o.menu, m_space, m_at));
+                }
+                // The pointer, from this frame's aim: its quads move at
+                // display rate whatever the menu's own redraw rate.
+                if let (Some(ray), Some(h)) = (frame.aim.local, head) {
+                    let reach = hit.map_or(RAY_FREE_M, |x| x.reach);
+                    if let Some(at) = placement::ray_quad(&ray, reach, h.pos, RAY_WIDTH_M) {
+                        quads.push(egui_quad(&o.ray, SpaceKind::Local, at));
+                    }
+                }
+                let on = hit.and_then(|x| Some((x, targets.iter().find(|t| t.id == x.id)?)));
+                if let Some((x, tg)) = on {
+                    let at = placement::cursor_quad(&tg.at, x.point, CURSOR_M);
+                    quads.push(egui_quad(&o.cursor, tg.space, at));
+                }
+            }
         }
         Submit {
             fp,
