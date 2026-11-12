@@ -90,8 +90,13 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   no wait in 179 windows of 5 s, frame stage at most 33.7 ms in a window, no truncated base picture,
   capture to complete picture p50 24.9, p95 31.4, p99 40.4 ms, 132 of about 53 800 capture slots
   missing, 10 860 repairs skipped in 15 of the windows (the seconds after a rung change, when the
-  stream peaks at 20 to 22 Mbit/s) against 278 076 the worker built. Not measured: what the skipped
-  repairs cost under loss (the bench lost 0.01 to 0.04 %). The build before the change, the same 15
+  stream peaks at 20 to 22 Mbit/s) against 278 076 the worker built. What the skipped repairs cost under
+  loss, resolved 2026-11-12 (Quest 3 as the ground station, 40 MHz, 40 s arms at 20000, before
+  against after): under 200 foreign frames a second on the channel, 8 and 5 truncated base pictures
+  and 10 and 7 keyframe requests before against 0 and 0 and 2 and 2 after (4065 and 5128 repairs
+  skipped); under 8 % simulated loss per card, 6 truncated base pictures and p95 141 ms before
+  against 0 and 48 ms after (2483 skipped). No cost seen; loss at range through an attenuator is
+  not measured. The build before the change, the same 15
   minutes right after, did not fall into the cycle: 26 waits in 10 windows, the longest 105 ms, the
   frame stage up to 120 ms, capture to complete picture p50 24.0, p95 30.9, p99 40.7 ms and at most
   168 ms (84 ms after the change), 21 slots missing. So at 18000 the change removes the waits and the
