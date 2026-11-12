@@ -55,7 +55,7 @@ size       = "1920x1080"
 fps        = 90            # 1..120 binned: up to 90 the full-view 1920x1080 mode, 91-100 1728x972, 101-120 1728x816. 1..100 non-binned: up to 60 2944x1656, 61-100 2272x1278;
                            # size must keep that mode's aspect ratio and fit inside it (docs/camera-modes.md)
 binning    = true          # true: full view, 2x2 binned. false: 1:1 pixels, a zoomed non-binned window, 1..100 fps only (docs/camera-modes.md)
-gop_s      = 0             # seconds between refresh starts; 0 = none: the GS asks for an IDR when its picture is damaged
+gop_s      = 0.0           # seconds between refresh starts; 0 = none: the GS asks for an IDR when its picture is damaged
 qp_delta   = 4             # quality offset between keyframes and P-frames
 max_ipprop = 2             # keyframe may be at most this many times a P-frame's size
 min_iqp    = 42            # keyframe quality floor: higher = smaller keyframes. 34 gives keyframes of 200 kB and more at the faster link rates (a quarter of a second of air); 46 makes them smaller than an ordinary frame

@@ -86,8 +86,19 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   of the capture slots missing before against 2 slots of about 3400 after, capture to complete
   picture p95 161 and 159 ms against 32.8 and 32.5, 64 and 44 keyframe requests against 1 and 1. A
   worker that cannot keep up skips repairs instead (`backlog_drops`: 3300 to 5200 per 5 s at 20000,
-  next to none at the 18000 the quad's config has). Not measured: what the skipped repairs cost
-  under loss (the bench lost 0.01 to 0.04 %), and a run longer than a minute at 18000.
+  in episodes at the 18000 the quad's config has). One run of 15 minutes at 18000 after the change:
+  no wait in 179 windows of 5 s, frame stage at most 33.7 ms in a window, no truncated base picture,
+  capture to complete picture p50 24.9, p95 31.4, p99 40.4 ms, 132 of about 53 800 capture slots
+  missing, 10 860 repairs skipped in 15 of the windows (the seconds after a rung change, when the
+  stream peaks at 20 to 22 Mbit/s) against 278 076 the worker built. Not measured: what the skipped
+  repairs cost under loss (the bench lost 0.01 to 0.04 %). The build before the change, the same 15
+  minutes right after, did not fall into the cycle: 26 waits in 10 windows, the longest 105 ms, the
+  frame stage up to 120 ms, capture to complete picture p50 24.0, p95 30.9, p99 40.7 ms and at most
+  168 ms (84 ms after the change), 21 slots missing. So at 18000 the change removes the waits and the
+  two 100 ms spikes; the percentiles of one run each do not differ. Not explained: 123 of the 132
+  slots missing after the change fell into two stretches of 2 s, each within 10 s of a rung change,
+  in which the drone sent about 60 % of its usual packets with no wait and the frame stage at 14 to
+  16 ms; the run before the change had no such stretch.
 - mabur pin, 2026-11-12 (pal-d3by): the periodic refresh is two drone parameters, rows 17 `VENC_GOP_S`
   and 18 `VENC_IREFRESH` (`venc.gop_s`, `venc.intra_refresh_frames`; the table has 19 rows, so GS and
   drone update together: a mixed pair shows a table mismatch and the new rows without a value). The
@@ -98,7 +109,7 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   top sixth, and with the refresh off nothing heals until a keyframe). Each set restarts the video
   (625 to 708 ms). Checked: both rows set and read back over the link, `pal-desktop --panel picture
   --params` snapshots against that build. Not yet seen: the switch in the headset.
-- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.12.1, signed APKs; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
+- M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.13, signed APKs; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):
   one Perfetto trace with kernel USB/IRQ events (xhci/usb tracepoints, usbfs reap, kprobes) and

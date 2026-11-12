@@ -1,11 +1,11 @@
-# Palianytsia v0.12.1
+# Palianytsia v0.13
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.12.1.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.12.1.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.13.0.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.13.0.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,35 +14,22 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
 
-## What changed in v0.12.1
+## What changed since v0.12
+Update both ends together. The drone parameter table has two new rows, so a v0.13 ground station with an older drone (or the other way round) shows "table mismatch" and the new settings without a value. The video itself still flies between v0.12 and v0.13.
 
-- **An update from an old drone config no longer leaves maburd stopped.** `install.py` keeps the drone's own `mabur.toml` on an update. A config from before per-width TX power walls still has `radio.rate_walls_rel`, a key maburd no longer knows, so v0.12's maburd refused it and did not start. `install.py` now renames it to `radio.rate_walls_rel_20` (with no `_40` table, 40 MHz uses the same walls, as before), or drops it when a `_20` table is already there. The original stays in the backup. A drone stuck after a v0.12 install is repaired by running the v0.12.1 `install.py` again.
+- **The picture no longer stalls when the stream runs near the drone's limit.** Above about 18 Mbit/s the drone's video thread waited for the thread that builds the repair packets, up to 167 ms at a time, and stayed in that state: frames were skipped at the camera, the ones that followed were large and arrived late. It now waits only when it must, and that did not happen in any run. When the drone's CPU cannot build every repair packet it sends fewer of them instead of holding frames back.
+- **Periodic refresh is a setting.** Picture, Advanced: "Periodic refresh every, s" and "Refresh picture instead of a keyframe". Off by default (the ground station asks for a keyframe when its picture is damaged). With the second one on, the drone sends one all-intra picture per period instead of a keyframe. Each change restarts the video for about 0.7 s.
+- **Calibration covers both widths.** One start calibrates TX power and capacity at 20 MHz, then measures the board's own 40 MHz receive-gain floor and writes it (never under the default 53), then calibrates 40 MHz. If the 40 MHz part fails, what 20 MHz applied stays. The floor measurement needs a quiet channel; on a busy one the drone says so and nothing is written.
+- **Flight log.** `pal log` says how many frames its latency percentiles leave out (truncated, never emitted). Channel-search events carry the time they happened.
 
-maburd, the drone config and the apps are the same as in v0.12 (the APKs only carry the new version number).
+On one bench (RTL8822E drone, 2944x1656 at 60 fps, 40 MHz):
+- Bitrate ceiling raised to 20000 kbps, 60 s runs alternating, two each: before, 30 % and 27 % of the camera's frames were missing, 95 % of the frames were complete within 161 and 159 ms, and the ground station asked for a keyframe 64 and 44 times; after, 2 frames of about 3400 were missing, 95 % within 33 ms, 1 request.
+- At the shipped ceiling of 18000 kbps, one run of 15 minutes each: before, 26 waits, the longest 105 ms, and a worst frame of 168 ms; after, no wait and a worst frame of 84 ms. The typical frame is the same (median 24 and 25 ms, 95 % within 31 ms), and neither run fell into the stalled state. After the change 0.2 % of the camera's frames were missing, most of them in two stretches of 2 s that are not explained yet (before: 0.04 %).
+- Refresh every second, 30 pictures removed from a recording: with a keyframe or with the refresh picture the image is whole again at the next refresh; with the refresh off it stays damaged until a keyframe is asked for.
 
-## What changed since v0.11
-Update both ends to get the drone-side changes. The radio protocol and the drone parameter table are unchanged, so a v0.12 ground station works with a v0.11 drone and the other way round.
+Not measured: what the missing repair packets cost on a lossy link (the bench loses 0.01 to 0.04 % of the packets). Calibration against a v0.13 drone always runs the 40 MHz steps too; those have host tests only.
 
-- **The link stays on its top rung.** A piece of a frame that arrived as a requested re-send was counted as loss, and the link stepped down for it although nothing was lost. It no longer is.
-- **Smaller keyframes by default.** `VENC_MIN_IQP` ships at 42 instead of 34.
-- **No frame aggregation on the drone by default.** One lost aggregate used to take three or more video packets at once. The air-capacity tables in the drone config are re-measured for single frames.
-- **40 MHz video no longer stalls on RTL8822E boards that need a receiver gain floor.** `maburd` now sets one (`radio.wide_tx_igi_floor` in `mabur.toml`, default 53). 40 MHz is still experimental, see the known limits.
-- **Quest settings menu.** The menu is a panel of its own that opens in front of you and stays put in the room. Its tabs follow the task: Flight, Picture, Link, Recording, Screen, System. The right stick scrolls it.
-- **The picture recovers from a decoder failure** on the phone and the Quest: a dead decoder is rebuilt and one keyframe is requested. A frozen picture is marked on the screen.
-- **The ground station finds a drone on any 5 GHz channel**, not only on the channels of its set.
-- **Faults a damaged or crafted video stream could trigger are fixed.** A forged picture size or slice layout could end the ground station, a forged or repeated frame number could freeze the picture, and a corrupted packet could put its data into the wrong stream.
-- **RTL8812AU ground cards at 40 MHz on channels 153 and 161** transmit on their channel again.
-- **Flight log.** `pal log` prints latency percentiles (capture on the drone to a complete frame on the ground) for the session and per rung, keyframe traffic, the decoder's loss episodes and the drone's parameters. A crash leaves `panic.txt`. `pal --version` and each session name the build.
-
-An updated drone keeps its `mabur.toml`, so it keeps its old values. To get the new defaults on such a drone, set `[venc] min_iqp = 42`, `[ampdu] max_num = 0` and the two `[air_clock] efficiency_` lines from the shipped `mabur.toml`. `radio.wide_tx_igi_floor` needs no edit: a config without it gets the default.
-
-On one bench (RTL8822E drone, 2944x1656 at 60 fps, 20 MHz, runs of 1 to 3 minutes per setting):
-- Rung changes per hour: 254 and 507 in two runs of 150 s before, 234 in one run of 100 s after, with the top rung held 91 % of that run. With the re-sends switched off the same link changed rung 101 and 152 times per hour.
-- Keyframe on the top rung: 214 kB median (230 ms of air) at `VENC_MIN_IQP` 34, 40 kB (43 ms) at 42.
-- Latency, capture to complete frame: median 27 ms, 90 % under 31 ms, 99 % under 57 ms.
-- Aggregation off costs air capacity at the fast rates: 11 % at MCS 4, 16 % at MCS 5. The shipped ladder tops out at MCS 4.
-
-v0.11 notes: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu.
+v0.12 notes: the link stays on its top rung (NACK residual rule), `VENC_MIN_IQP` 42, A-MPDU off by default, the 40 MHz receive-gain floor, the Quest menu panel.
 
 ## Ground station
 
@@ -51,7 +38,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.12.1.apk    # or the phone APK
+   adb install palianytsia-quest-0.13.0.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -133,11 +120,13 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 
 maburd refuses config keys it does not know, so `install.py` fits the config to the maburd it installs: it removes `fec.repairs_with_frame` when that maburd does not have the key (the original stays in the backup). A v0.8.x maburd takes that key as optional; a v0.7.1 or older one and v0.9 refuse a config that has it (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
 
-## Known limits in v0.12
+## Known limits in v0.13
 
 - Pairing uses the default link key on both ends.
-- The changes of v0.12 have been run on one bench and not flown. The phone app was built but not run for this release; the Quest app and the desktop were.
-- 40 MHz video is experimental. The gain floor default clears every board measured so far, but its cost for the control link at long range is not measured; a board's own lowest working value is lower (36 on the bench board), and nothing measures it for you yet. Calibrate with the ground station set to 40 MHz, or the 40 MHz power table stays the reference board's. Keep `encoder.bitrate_max_kbps` at what your drone can send: above that, frames arrive late and are cut.
+- The changes of v0.13 have been run on one bench and not flown, with the desktop app as the ground station. The Quest and phone apps were built but not run for this release, so the two new settings have not been used in the headset.
+- Calibration: against a v0.13 drone the Calibrate button always runs all five steps (power and capacity at 20 MHz, the receive-gain floor, power and capacity at 40 MHz); there is no way to run the 20 MHz part alone. The floor measurement has been run on one board. The 40 MHz power and capacity steps have host tests only and have not been run in the field.
+- Periodic refresh: with the shipped frame layering only "off" (a keyframe) and "on" (one refresh picture) restore the whole image. A longer refresh stripe (`venc.intra_refresh_frames` above 1 in `mabur.toml`) restores the top of the picture only.
+- 40 MHz video is experimental. The gain floor default clears every board measured so far, but its cost for the control link at long range is not measured; a board's own lowest working value is lower (36 on the bench board), and calibration now measures it on a quiet channel. Without a calibration the 40 MHz power table stays the reference board's. Keep `encoder.bitrate_max_kbps` at what your drone can send: above that, frames arrive late and are cut.
 - The link does not notice frames that arrive late, only frames that are lost. A bitrate cap set too high for the drone shows as cut frames on the top rung.
 - The new FEC placement costs drone CPU: the hot thread goes from about 12 % to 19 % of a core at 120 fps and 13 Mbps.
 - The changes of v0.11 have not been flown either.

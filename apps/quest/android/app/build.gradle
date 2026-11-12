@@ -11,7 +11,7 @@ android {
         // on API 32 (the quest-xr-probe spike, docs/spec.md).
         minSdk 32
         targetSdk 32
-        versionCode 16
+        versionCode 17
         // The one product version, also in the native library's flight logs.
         versionName rootProject.file("../../../release/VERSION").text.trim()
         ndk { abiFilters "arm64-v8a" }
