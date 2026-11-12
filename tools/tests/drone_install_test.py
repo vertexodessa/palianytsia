@@ -98,6 +98,7 @@ BIN_OLD = b"\x7fELF old build repairs_with_frame x" + b"a" * 5000  # v0.8: knows
 BIN_V07 = b"\x7fELF v07 build" + b"b" * 5000  # neither the key nor the frame-tail log
 BIN_NEW = b"\x7fELF new build frame_end_us/rep=%llu" + b"c" * 6000  # v0.9+: the key is gone
 BIN_NEW2 = b"\x7fELF new2 frame_end_us/rep=%llu" + b"d" * 6000
+BIN_WALLS = b"\x7fELF v0.12 frame_end_us/rep=%llu rate_walls_rel_20" + b"f" * 6000  # per-width walls only
 KO = b"\x7fELF six-mode imx415 module"
 
 CFG_KEY = (
@@ -113,6 +114,11 @@ CFG_64 = "[fec]\nwindow = 64\n"
 # with CRLF endings after a commented section header still is.
 CFG_KEY_ODD = "[msp]\nrepairs_with_frame = true\n[fec] # tuned\r\n  repairs_with_frame=true\r\nwindow = 64\r\n"
 CFG_KEY_ODD_STRIPPED = "[msp]\nrepairs_with_frame = true\n[fec] # tuned\r\nwindow = 64\r\n"
+# The one-table walls key of old configs; the same name in another section is not it.
+CFG_WALLS = "[radio]\n  rate_walls_rel = [63, 63, 63, 42, 20, 1, -2, -4]  # cal\n[msp]\nrate_walls_rel = 1\n[fec]\nwindow = 64\n"
+CFG_WALLS_SPLIT = "[radio]\n  rate_walls_rel_20 = [63, 63, 63, 42, 20, 1, -2, -4]  # cal\n[msp]\nrate_walls_rel = 1\n[fec]\nwindow = 64\n"
+CFG_WALLS_BOTH = "[radio]\nrate_walls_rel = [1, 2, 3, 4, 5, 6, 7, 8]\nrate_walls_rel_20 = [63, 63, 63, 63, 45, 23, 22, 21]\n[fec]\nwindow = 64\n"
+CFG_WALLS_BOTH_FIXED = "[radio]\nrate_walls_rel_20 = [63, 63, 63, 63, 45, 23, 22, 21]\n[fec]\nwindow = 64\n"
 
 LS = b"#!/bin/sh\ncase $SENSOR in\n\timx335)\n\t\tinsmod x\n\t\t;;\nesac\n"
 LS_PATCHED = (
@@ -126,7 +132,7 @@ LS_PATCHED = (
 INIT = b"#!/bin/sh\necho init $1\n"
 
 NAMED = {
-    "BIN_OLD": BIN_OLD, "BIN_V07": BIN_V07, "BIN_NEW": BIN_NEW, "BIN_NEW2": BIN_NEW2,
+    "BIN_OLD": BIN_OLD, "BIN_V07": BIN_V07, "BIN_NEW": BIN_NEW, "BIN_NEW2": BIN_NEW2, "BIN_WALLS": BIN_WALLS,
     "BIN_OLD+e": BIN_OLD + b"e", "KO": KO, "LS": LS, "INIT": INIT,
 }
 BY_SHA = {hashlib.sha256(v).hexdigest(): k for k, v in NAMED.items()}
@@ -232,6 +238,18 @@ SCENARIOS = [
     S("removed_key_stripped_only_in_fec_section", drone=dict(cfg=CFG_KEY_ODD),
       rc=0, toml=CFG_KEY_ODD_STRIPPED, changes={"etc/mabur.toml": CFG_KEY_ODD_STRIPPED, "usr/bin/maburd": "BIN_NEW"},
       backup={**BACKUP_OLD, "mabur.toml": CFG_KEY_ODD}),
+    S("old_walls_key_renamed_to_20_table", drone=dict(cfg=CFG_WALLS), pkg=dict(bin_=BIN_WALLS),
+      rc=0, toml=CFG_WALLS_SPLIT, changes={"etc/mabur.toml": CFG_WALLS_SPLIT, "usr/bin/maburd": "BIN_WALLS"},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_WALLS},
+      says=["mabur.toml: radio.rate_walls_rel renamed to rate_walls_rel_20"]),
+    S("old_walls_key_dropped_when_20_table_set", drone=dict(cfg=CFG_WALLS_BOTH), pkg=dict(bin_=BIN_WALLS),
+      rc=0, toml=CFG_WALLS_BOTH_FIXED, changes={"etc/mabur.toml": CFG_WALLS_BOTH_FIXED, "usr/bin/maburd": "BIN_WALLS"},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_WALLS_BOTH},
+      says=["mabur.toml: removed radio.rate_walls_rel, rate_walls_rel_20 is already set"]),
+    S("same_binary_repairs_config_with_old_walls_key", drone=dict(bin_=BIN_WALLS, cfg=CFG_WALLS),
+      pkg=dict(bin_=BIN_WALLS, cfg=None),
+      rc=0, toml=CFG_WALLS_SPLIT, changes={"etc/mabur.toml": CFG_WALLS_SPLIT},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_WALLS, "maburd": "BIN_WALLS"}),
     S("same_binary_and_clean_config_changes_nothing", drone=dict(bin_=BIN_NEW, cfg=CFG_64),
       rc=0, toml=CFG_64, changes={}, backup=None, says=["== already installed, nothing to do"]),
     S("same_binary_repairs_config_with_refused_key", drone=dict(bin_=BIN_NEW),

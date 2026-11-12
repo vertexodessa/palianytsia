@@ -290,7 +290,7 @@ def confirm(args, question):
         raise SystemExit(1)
 
 
-def migrate_config(text, strip_key, raise_window):
+def migrate_config(text, strip_key, raise_window, split_walls=False):
     """Fits a mabur.toml to the maburd about to run; returns (text, changes).
 
     A maburd that does not know fec.repairs_with_frame refuses to start on a
@@ -298,13 +298,26 @@ def migrate_config(text, strip_key, raise_window):
     rule, on a config with no such key, had its window raised to 64 by that
     build at boot; the new maburd no longer does, so the one-time raise is
     made here. A window set by hand on a current build is left alone.
+
+    radio.rate_walls_rel (one wall table for both widths) became
+    rate_walls_rel_20/_40 and the old key is refused. It is renamed to _20:
+    a config without _40 runs 40 MHz on the 20 table, as the old key did.
+    When _20 is already there, the old line is only dropped.
     """
     out, changes = [], []
-    in_fec = False
+    in_fec = in_radio = False
+    has_w20 = re.search(rb"(?m)^[ \t]*rate_walls_rel_20[ \t]*=", text) is not None
     for line in text.splitlines(keepends=True):
         bare = line.rstrip(b"\r\n")
         if re.match(rb"[ \t]*\[", bare):
             in_fec = re.fullmatch(rb"[ \t]*\[fec\][ \t]*(#.*)?", bare) is not None
+            in_radio = re.fullmatch(rb"[ \t]*\[radio\][ \t]*(#.*)?", bare) is not None
+        if in_radio and split_walls and re.match(rb"[ \t]*rate_walls_rel[ \t]*=", bare):
+            if has_w20:
+                changes.append("removed radio.rate_walls_rel, rate_walls_rel_20 is already set")
+                continue
+            changes.append("radio.rate_walls_rel renamed to rate_walls_rel_20 (40 MHz uses it too)")
+            line = line.replace(b"rate_walls_rel", b"rate_walls_rel_20", 1)
         if in_fec and strip_key and re.match(rb"[ \t]*repairs_with_frame[ \t]*=", bare):
             changes.append("removed fec.repairs_with_frame, this maburd does not have it")
             continue
@@ -379,7 +392,9 @@ def prepare_config(drone, cfg, old_cfg, binary_data, old_bin, info, workdir):
         and (info["old_tail"] or "0") == "0"
         and re.search(rb"(?m)^[ \t]*repairs_with_frame[ \t]*=", text) is None
     )
-    migrated, changes = migrate_config(text, REMOVED_KEY not in binary_data, raise_window)
+    migrated, changes = migrate_config(
+        text, REMOVED_KEY not in binary_data, raise_window, b"rate_walls_rel_20" in binary_data
+    )
     for change in changes:
         warn(f"   mabur.toml: {change}")
     if migrated == text:
