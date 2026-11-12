@@ -67,6 +67,8 @@ pub enum Cmd {
     Refresh,
     /// TX-power calibration with the default sweeps (pal_core::cal).
     CalStart,
+    /// A run over these sweeps only (the bench: `pal-desktop --cal-start`).
+    CalSweeps(Vec<pal_wire::cal::SweepSpec>),
     CalAbort,
     /// The channels the link may sit on, applied on the live link
     /// (`GsCore::set_channels`).

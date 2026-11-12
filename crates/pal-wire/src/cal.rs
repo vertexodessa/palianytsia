@@ -126,6 +126,22 @@ pub struct SweepSpec {
     pub bw: u8,
 }
 
+impl SweepSpec {
+    /// The operator's token for a sweep (maburgs `CalControl::parse_token`):
+    /// power20, power40, cap20, cap40, floor (the 40 MHz floor sweep).
+    pub fn parse_token(tok: &str) -> Option<SweepSpec> {
+        let (kind, bw) = match tok {
+            "power20" => (Kind::Power, 20),
+            "power40" => (Kind::Power, 40),
+            "cap20" => (Kind::Capacity, 20),
+            "cap40" => (Kind::Capacity, 40),
+            "floor" => (Kind::Floor, 40),
+            _ => return None,
+        };
+        Some(SweepSpec { kind, bw })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SweepCmd {
     pub nonce: u32,

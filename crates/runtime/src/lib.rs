@@ -306,13 +306,15 @@ impl CoreLoop {
         self.cal.last_state.clear();
     }
 
-    fn cal_cmd(&mut self, start: bool) {
-        let r = if start {
-            self.core.cal_start(&[])
+    /// `start`: the sweeps of the run (empty = the default plan); None = abort.
+    fn cal_cmd(&mut self, start: Option<&[pal_wire::cal::SweepSpec]>) {
+        let r = if let Some(sweeps) = start {
+            self.core.cal_start(sweeps)
         } else {
             self.core.cal_abort();
             Ok(())
         };
+        let start = start.is_some();
         eprintln!(
             "pal: calibration {}: {r:?}",
             if start { "start" } else { "abort" }
@@ -450,8 +452,9 @@ impl CoreLoop {
                 let _ = self.ports.set_res_tx.try_send((row, r));
             }
             pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
-            pal_osd::params::Cmd::CalStart => self.cal_cmd(true),
-            pal_osd::params::Cmd::CalAbort => self.cal_cmd(false),
+            pal_osd::params::Cmd::CalStart => self.cal_cmd(Some(&[])),
+            pal_osd::params::Cmd::CalSweeps(s) => self.cal_cmd(Some(&s)),
+            pal_osd::params::Cmd::CalAbort => self.cal_cmd(None),
             pal_osd::params::Cmd::ChannelScan(chs) => {
                 let r = self.core.chan_scan(&chs);
                 eprintln!("pal: channel scan {chs:?}: {r:?}");

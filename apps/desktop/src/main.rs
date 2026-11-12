@@ -22,6 +22,10 @@
 //!                                   its look): a layout check without a headset
 //!           [--rf-sim SPEC]         live: bench RF loss simulator (`runtime::rf_sim`),
 //!                                   e.g. atten=40-70/60,fade=8/300,up=2
+//!           [--cal-start T_S[,SWEEP...]]  start a calibration run T_S seconds after start,
+//!                                   as the panel's button does; with sweeps (power20,
+//!                                   power40, cap20, cap40, floor) only those: the bench
+//!                                   pair is too close for the default run's power20
 //!   keys: S link statistics over the video, M monitor plots, P drone settings
 //!         (the flight HUD: battery, timer, alt/speed/home, centre dot, is always on)
 //!           [--cpu-rgba]            RGBA via swscale instead of the YUV shader
@@ -80,6 +84,8 @@ struct Opts {
     log_dir: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     secs: f64,
+    /// `--cal-start`: seconds after start, and the sweeps (empty = default).
+    cal_start: Option<(f64, Vec<pal_wire::cal::SweepSpec>)>,
     mav_udp: Option<String>,
     /// Live: IDR requests on (`--no-idr` off). Replay: off (`--idr` on),
     /// as `pal replay`, so one capture gives the same stats in both apps.
@@ -157,6 +163,17 @@ fn parse() -> Opts {
             "--no-idr" => o.idr = Some(false),
             "--hwdec" => o.hwdec = val(),
             "--rf-sim" => runtime::rf_sim::install_spec(&val()).unwrap_or_else(|e| die(&e)),
+            "--cal-start" => {
+                let v = val();
+                let mut it = v.split(',');
+                let t = it.next().and_then(|t| t.parse::<f64>().ok());
+                let sweeps: Option<Vec<_>> =
+                    it.map(pal_wire::cal::SweepSpec::parse_token).collect();
+                match (t, sweeps) {
+                    (Some(t), Some(s)) if t >= 0.0 => o.cal_start = Some((t, s)),
+                    _ => die("--cal-start T_S[,power20|power40|cap20|cap40|floor ...]"),
+                }
+            }
             "--params" => o.params = true,
             "--headset-menu" => o.headset_menu = true,
             "--panel" => {
@@ -694,6 +711,17 @@ fn main() {
     let (stats_tx, stats_rx) = mpsc::sync_channel::<String>(64);
     let (params_tx, params_rx) = mpsc::sync_channel::<String>(4);
     let (cmd_tx, cmd_rx) = mpsc::channel::<pal_osd::params::Cmd>();
+    if let Some((t, sweeps)) = o.cal_start.clone() {
+        let tx = cmd_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs_f64(t));
+            let _ = tx.send(if sweeps.is_empty() {
+                pal_osd::params::Cmd::CalStart
+            } else {
+                pal_osd::params::Cmd::CalSweeps(sweeps)
+            });
+        });
+    }
     let (set_res_tx, set_res_rx) = mpsc::sync_channel(8);
     let (mav_tx, mav_rx) = mpsc::sync_channel::<Vec<u8>>(256);
     let udp = o.mav_udp.as_ref().map(|a| {
