@@ -62,8 +62,10 @@ pub const TABLE: &[Row] = &[
     Row { id: "RADIO_PWR_MODE", section: "radio", key: "power_mode", ty: PType::Str, apply: Apply::Reprogram, help: "TX power table: offset flies the calibrated walls, none the chip's own; none undoes a calibration" },
     Row { id: "VENC_MODES", section: "venc", key: "driver_modes", ty: PType::Str, apply: Apply::ReadOnly, help: "The camera driver's modes as VENC_MODE values at each mode's full size and top rate, comma-separated; empty until the camera starts" },
     Row { id: "VENC_MIN_IQP", section: "venc", key: "min_iqp", ty: PType::Int32, apply: Apply::Reprogram, help: "Keyframe quality floor, 0 to 51 (0 = the firmware's own); higher makes keyframes smaller and the moment after each one coarser" },
+    Row { id: "VENC_GOP_S", section: "venc", key: "gop_s", ty: PType::Real32, apply: Apply::Rebuild, help: "Seconds between refresh starts, 0 or 0.5 to 10; 0 = none, the picture heals only when the ground station asks for a keyframe" },
+    Row { id: "VENC_IREFRESH", section: "venc", key: "intra_refresh_frames", ty: PType::Int32, apply: Apply::Rebuild, help: "Frames the intra stripe of a refresh start is spread over, 0 to 255; 0 = a keyframe at each refresh start, 1 = one all-intra picture there; with temporal layering (venc.ref_base above 0) a longer stripe refreshes the top of the picture only; does nothing while VENC_GOP_S is 0" },
 ];
-pub const COUNT: usize = 17;
+pub const COUNT: usize = 19;
 const _: () = assert!(TABLE.len() == COUNT);
 const MAX_ID_LEN: usize = 16;
 const VENC_MODE_ROW: usize = 2;

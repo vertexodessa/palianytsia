@@ -162,7 +162,8 @@ pub struct Panel {
     pub chan_menu: bool,
     /// The front end is a headset: the view and video filter rows apply.
     pub xr: bool,
-    /// System shows the whole parameter table unfolded (desktop `--params`).
+    /// The folds start open: the whole parameter table on System and each
+    /// tab's Advanced rows (desktop `--params`).
     pub table_open: bool,
     /// A set held back because the drone is armed and the row restarts the
     /// video: row index and value, waiting for Apply or Cancel.
@@ -210,7 +211,13 @@ const BAD: Color32 = Color32::from_rgb(240, 80, 70);
 /// Drone rows per tab, by F18 id: the main part, then what folds under
 /// "Advanced". The whole table is under System.
 const PICTURE: [&str; 4] = ["VENC_MODE", "ENC_BITRATE_MAX", "VENC_MIRROR", "VENC_FLIP"];
-const PICTURE_ADV: [&str; 3] = ["ENC_AIRTIME", "VENC_SLICES", "VENC_MIN_IQP"];
+const PICTURE_ADV: [&str; 5] = [
+    "ENC_AIRTIME",
+    "VENC_SLICES",
+    "VENC_MIN_IQP",
+    "VENC_GOP_S",
+    "VENC_IREFRESH",
+];
 const LINK: [&str; 2] = ["RADIO_PWR_MODE", "RADIO_WALL_MARGN"];
 const LINK_ADV: [&str; 1] = ["RADIO_LDPC"];
 const RECORDING: [&str; 4] = ["REC_ENABLE", "REC_SIZE", "REC_FPS", "REC_BITRATE"];
@@ -225,6 +232,8 @@ fn plain_name(id: &str) -> Option<&'static str> {
         "ENC_AIRTIME" => "Share of the air the video may use",
         "VENC_SLICES" => "Slices per frame",
         "VENC_MIN_IQP" => "Keyframe quality floor",
+        "VENC_GOP_S" => "Periodic refresh every, s (0 = off)",
+        "VENC_IREFRESH" => "Refresh picture instead of a keyframe",
         "VENC_MIRROR" => "Mirror left-right",
         "VENC_FLIP" => "Flip upside down",
         // Not "record now": the row switches the recorder on the drone on
@@ -276,7 +285,9 @@ fn step(id: &str) -> f64 {
     match id {
         "ENC_BITRATE_MAX" | "REC_BITRATE" => 1000.0,
         "ENC_AIRTIME" => 0.05,
-        "RADIO_WALL_MARGN" => 0.5,
+        // 0.5 is also the shortest period the drone takes, so one step up
+        // from 0 (off) lands on a value it accepts.
+        "RADIO_WALL_MARGN" | "VENC_GOP_S" => 0.5,
         "VENC_MIN_IQP" => 2.0,
         _ => 1.0,
     }
@@ -453,6 +464,16 @@ fn row_label(ui: &mut Ui, r: &Row) {
     }
 }
 
+/// A row drawn as a switch: a bool, and on a surface without a keyboard the
+/// refresh stripe while it holds 0 or 1, the two values that heal the whole
+/// picture (a keyframe, or one all-intra picture). With the drone's temporal
+/// layering a stripe spread over 2 frames refreshes the top half only and
+/// over 6 the top sixth, so a longer stripe is not offered; a drone that
+/// holds one shows it as a number.
+fn switch(r: &Row, v: &str, look: Look) -> bool {
+    r.ty == "bool" || (look.steppers && r.id == "VENC_IREFRESH" && matches!(v, "0" | "1"))
+}
+
 /// A row's live value and the control that changes it.
 fn row_control(
     ui: &mut Ui,
@@ -467,7 +488,7 @@ fn row_control(
     {
         let v = r.value.clone().unwrap_or_else(|| "-".into());
         match r.ty.as_str() {
-            "bool" => {
+            _ if switch(r, &v, look) => {
                 let mut on = v == "1";
                 if ui
                     .add_enabled(can, egui::Checkbox::new(&mut on, ""))
@@ -622,9 +643,15 @@ fn rows_ui(ui: &mut Ui, ids: &[&str], t: Option<&Table>, e: &mut Edits, look: Lo
 }
 
 /// `ids` folded under an "Advanced" header, closed until asked for.
-fn advanced(ui: &mut Ui, salt: &str, add: impl FnOnce(&mut Ui) -> Option<Cmd>) -> Option<Cmd> {
+fn advanced(
+    ui: &mut Ui,
+    salt: &str,
+    open: bool,
+    add: impl FnOnce(&mut Ui) -> Option<Cmd>,
+) -> Option<Cmd> {
     egui::CollapsingHeader::new("Advanced")
         .id_salt(salt)
+        .default_open(open)
         .show(ui, add)
         .body_returned
         .flatten()
@@ -796,7 +823,9 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             table_status(ui, i.table, i.edits);
             cmd = rows_ui(ui, &PICTURE, i.table, i.edits, look);
             let (t, e) = (i.table, &mut *i.edits);
-            if let Some(c) = advanced(ui, "picture", |ui| rows_ui(ui, &PICTURE_ADV, t, e, look)) {
+            if let Some(c) = advanced(ui, "picture", p.table_open, |ui| {
+                rows_ui(ui, &PICTURE_ADV, t, e, look)
+            }) {
                 cmd = Some(c);
             }
         }
@@ -850,7 +879,7 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             }
             let (t, e, prefs) = (i.table, &mut *i.edits, &mut *i.prefs);
             let mut relink = false;
-            let adv = advanced(ui, "link", |ui| {
+            let adv = advanced(ui, "link", p.table_open, |ui| {
                 let c = rows_ui(ui, &LINK_ADV, t, e, look);
                 relink = ui
                     .checkbox(&mut prefs.s3_demote, "Step down on enhance-layer loss")
@@ -1212,6 +1241,28 @@ mod tests {
         for id in all.into_iter().flatten() {
             assert!(plain_name(id).is_some(), "{id} has no plain name");
         }
+    }
+
+    #[test]
+    fn the_refresh_stripe_is_a_switch_only_at_the_values_that_heal() {
+        let row = |id: &str, ty: &str| Row {
+            id: id.into(),
+            ty: ty.into(),
+            ..Default::default()
+        };
+        let stripe = row("VENC_IREFRESH", "int");
+        let (touch, keys) = (Look::HEADSET, Look::DESKTOP);
+        assert!(touch.steppers && !keys.steppers);
+        assert!(switch(&stripe, "0", touch));
+        assert!(switch(&stripe, "1", touch));
+        // A longer stripe set from elsewhere stays a number the pilot can
+        // step back down; with a keyboard the row is a text field.
+        assert!(!switch(&stripe, "2", touch));
+        assert!(!switch(&stripe, "-", touch));
+        assert!(!switch(&stripe, "1", keys));
+        // Another int at 0 or 1 is not a switch; a bool always is.
+        assert!(!switch(&row("VENC_MIN_IQP", "int"), "1", touch));
+        assert!(switch(&row("REC_ENABLE", "bool"), "0", keys));
     }
 
     #[test]

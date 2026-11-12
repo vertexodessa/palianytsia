@@ -118,7 +118,8 @@ pairing key.
   each truncated AU, `tools/idrwhy.py <session>` keyframes against air time and drone queue, `tools/sessions.py <root>`
   one TSV row per session. Test: `crates/flightlog/tests/losstrace.rs`.
 - `pal-desktop ... --snapshot out.ppm --secs N`: headless UI check; `pal log DIR`: flight-log summary.
-  `--panel <tab>` opens the settings on a tab (flight, picture, link, recording, screen, system);
+  `--panel <tab>` opens the settings on a tab (flight, picture, link, recording, screen, system),
+  with `--params` also that tab's Advanced rows;
   `--headset-menu` shows only the Quest's menu surface at its 800 x 600 points and look, so a menu
   change is checked on the host before it goes into the headset.
 

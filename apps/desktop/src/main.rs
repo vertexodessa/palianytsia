@@ -15,7 +15,8 @@
 //!           [--hwdec auto|vdpau|vaapi|cuda|sw]  decoder (default auto: first hwaccel
 //!                                   that opens, else software)
 //!           [--params]              open the settings on System with the drone's whole
-//!                                   parameter table unfolded (P toggles; GS only)
+//!                                   parameter table unfolded (P toggles; GS only); with
+//!                                   --panel TAB, that tab with its Advanced rows unfolded
 //!           [--panel TAB]           open the settings on a tab: flight, picture, link,
 //!                                   recording, screen, system
 //!           [--headset-menu]        show only the Quest's menu surface (800 x 600 points,

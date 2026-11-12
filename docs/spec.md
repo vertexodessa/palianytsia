@@ -76,6 +76,28 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   20 MHz channel alone (with a tenth of the air taken there the edge `0x24` read 86 to 89 % and the
   walk would read high with no note); a sweep under real undelivered traffic has host tests only (one
   injector card, and the sweep needs it as the GS). A neighbour at -60 to -80 dBm is not measured.
+- mabur pin, 2026-11-12 (pal-1oao): the drone's FEC encoder no longer stalls the frame stage on its
+  repair worker. Its ring-row backstop joined the worker (the whole backlog, 100 to 167 ms) once 510
+  symbols had been sealed since the queue was last empty, and a full backlog takes the worker longer
+  than a 20 Mbit/s layer needs to seal 512 symbols, so above about 18 Mbit/s a stream fell into a
+  cycle of waits, capture overruns and large pictures. The backstop now checks the row the oldest
+  queued repair reads, waits only until that row is free, and the ring has 4096 slack rows (about
+  1.4 MB a layer). Bench quad, ceiling 20000 kbps, 60 s arms alternating, two each: 30.2 and 27.0 %
+  of the capture slots missing before against 2 slots of about 3400 after, capture to complete
+  picture p95 161 and 159 ms against 32.8 and 32.5, 64 and 44 keyframe requests against 1 and 1. A
+  worker that cannot keep up skips repairs instead (`backlog_drops`: 3300 to 5200 per 5 s at 20000,
+  next to none at the 18000 the quad's config has). Not measured: what the skipped repairs cost
+  under loss (the bench lost 0.01 to 0.04 %), and a run longer than a minute at 18000.
+- mabur pin, 2026-11-12 (pal-d3by): the periodic refresh is two drone parameters, rows 17 `VENC_GOP_S`
+  and 18 `VENC_IREFRESH` (`venc.gop_s`, `venc.intra_refresh_frames`; the table has 19 rows, so GS and
+  drone update together: a mixed pair shows a table mismatch and the new rows without a value). The
+  panel has them under Picture, Advanced; on a surface without a keyboard the second is a switch
+  between a keyframe (0) and one all-intra picture (1), the two values that heal the whole picture
+  on the bench quad (2944x1656 at 60, refresh every 1 s, 30 pictures removed from the dump: 1 is
+  bit-exact again from the first refresh at about twice a P frame, 2 heals the top half only, 6 the
+  top sixth, and with the refresh off nothing heals until a keyframe). Each set restarts the video
+  (625 to 708 ms). Checked: both rows set and read back over the link, `pal-desktop --panel picture
+  --params` snapshots against that build. Not yet seen: the switch in the headset.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.12.1, signed APKs; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):
