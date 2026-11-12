@@ -217,7 +217,7 @@ mod tests {
     fn a_floor_sweep_lasts_its_longest_walk() {
         assert_eq!(
             sweep_duration_ms(&pal_wire::cal::make_floor_sweep(1, 2)),
-            70_500
+            72_500
         );
     }
 

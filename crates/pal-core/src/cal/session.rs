@@ -173,6 +173,10 @@ pub struct FloorResult {
     /// The lowest candidate passed: the unit never stalled in the range
     /// tried, so its edge is "none found at or above" it.
     pub below_range: bool,
+    /// The drone's verdict (`FloorReport::noisy`), other traffic: the
+    /// walk has no answer, nothing is written and the floor in the
+    /// drone's file stays in force.
+    pub noisy: bool,
     /// The value sent to the drone; 0 = none.
     pub written: u8,
     /// The drone adopted `written`.
@@ -1045,6 +1049,10 @@ impl CalSession {
             self.phase_start_ms = now_ms;
             self.sent_once = false;
             self.state = State::Apply;
+        } else if self.cmd.kind == Kind::Floor && self.floor.noisy {
+            // Nothing stalled and the floor in the drone's file is still in
+            // force: the 40 MHz sweeps after it measure the link as it flies.
+            self.next_sweep(now_ms);
         } else if self.cmd.kind == Kind::Floor {
             // Without a floor that holds, the 40 MHz sweeps after it would
             // measure a transmitter that stalls: the 40 MHz part stops here.
@@ -1217,6 +1225,14 @@ impl CalSession {
         self.floor.rep = unpack_floor_done(&done);
         if self.floor.rep.ref_fps == 0 {
             self.floor.note = "the reference point sent nothing".into();
+        } else if self.floor.rep.noisy {
+            self.floor.noisy = true;
+            // The report's byte saturates at 0xFF.
+            let heard = match self.floor.rep.heard_fps {
+                0xFF => "255 or more".to_string(),
+                n => n.to_string(),
+            };
+            self.floor.note = format!("the channel is not quiet: the drone heard {heard} frames/s");
         } else if self.floor.rep.floor == 0 {
             self.floor.note = "no floor passed".into();
         } else {

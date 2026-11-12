@@ -46,7 +46,36 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   unit's wide-TX receive-gain edge and writes `radio.wide_tx_igi_floor = max(edge + 4, 0x35)`, never
   under the default the tenth entry ships (devourer `SetWideTxIgiFloor` applies it live). A failure in
   the 40 MHz part keeps what 20 MHz applied: the run ends done with 40 MHz uncalibrated and the reason
-  (cal.log `N` row, `callog 6`; the panel). Ported to the Rust core; not run on hardware.
+  (cal.log `N` row, `callog 6`; the panel). Ported to the Rust core. The floor sweep's reference point
+  and its watchdog's target sit at `0x50`, not at the top of the IGI field: at `0x7c` and above
+  devourer's energy-detect threshold left its byte and stopped a saturated 40 MHz transmitter for
+  good (devourer now bounds it), which is what killed the drone's video in the first bench run. The
+  reference is the worst second of a 4 s dwell, as a candidate's verdict is (a blast's first second
+  runs about 7 % above the rest while the send queue fills). Run on the bench quad on a quiet channel, 2026-11-12: `0x20` held and
+  was freed, edge `0x24`, `0x35` written, video back on 20 MHz. No hardware run yet: the 40 MHz power
+  and capacity sweeps (the bench pair is too close for a power sweep). The walk has an answer only
+  in silence: other traffic takes rate from healthy floors through carrier sense, so the edge reads
+  too high or none passes, and frames the drone hears free a held transmitter part of the time
+  (bench, 2026-11-12, floor `0x20`: 0 frames/s in silence, 29 % of the full rate with 5 frames/s heard,
+  54 % with 20, 84 % with 80, never the pass bar with frames the receiver delivers; the edge `0x24`:
+  99 % with 40 frames/s, 95 % with 160).
+  The drone judges the channel and says so in its report (`noisy`, cal.log `L` row, sixth field); the
+  GS writes nothing, says `the channel is not quiet`, and goes on with the 40 MHz sweeps. One bound,
+  5 a second, two counts: frames its receiver delivers, as a mean over the candidate points flown
+  (ends the walk at once), and receiver events over the stretch that decides the report, the dwell
+  and confirmation of the value about to be reported or of the last candidate when none passed. An
+  event is a delivered frame or a carrier-sense event of the driver's counter (devourer
+  `RxActivity`), which has the frames the receiver starts on and does not deliver; those free the
+  hold most (40 such frames/s, 1 frame/s delivered: `0x20` at 96 % of the full rate, past the bar in
+  6 of 8 dwells) and would make the walk read the edge too low. Bench, 2026-11-12: the counter reads
+  the injected rate exactly, delivered or not, and 0 at `0x22` and above in silence; channel 40 (78
+  to 686 frames/s heard) ends after the first candidate, channel 144 measures the edge (`0x24` twice,
+  the marginal `0x22` once, `0x35` written each time). Under the edge the counter is no measure of
+  the channel and ends nothing: `0x20` in silence reads 0 or a steady 19 events a second, sending 26
+  to 60 % of the full rate (7 of 10 runs of 20 s). Not covered (pal-ueu): traffic on the secondary
+  20 MHz channel alone (with a tenth of the air taken there the edge `0x24` read 86 to 89 % and the
+  walk would read high with no note); a sweep under real undelivered traffic has host tests only (one
+  injector card, and the sweep needs it as the GS). A neighbour at -60 to -80 dBm is not measured.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.12.1, signed APKs; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):

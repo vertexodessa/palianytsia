@@ -559,7 +559,7 @@ pub const FLOOR_MAX_CANDIDATES: usize = 12;
 pub const FLOOR_MAX: u8 = 0x7f;
 pub const FLOOR_SETTLE_MS: u16 = 300;
 pub const FLOOR_DWELL_MS: u16 = 4000;
-pub const FLOOR_REF_DWELL_MS: u32 = 2000;
+pub const FLOOR_REF_DWELL_MS: u32 = 4000;
 pub const FLOOR_CONFIRM_MS: u32 = 8000;
 pub const FLOOR_MAX_CONFIRMS: u32 = 2;
 /// The unit's edge plus this many IGI steps (about 1 dB each of the
@@ -567,7 +567,6 @@ pub const FLOOR_MAX_CONFIRMS: u32 = 2;
 pub const FLOOR_MARGIN_STEPS: u8 = 4;
 /// devourer's default floor, what the bundle's drone config ships.
 pub const FLOOR_DEFAULT: u8 = 0x35;
-
 /// lo, lo + FLOOR_STEP, ... up to hi, at most FLOOR_MAX_CANDIDATES; empty
 /// for a range outside [1, FLOOR_MAX] or upside down.
 pub fn floor_candidates(lo: i32, hi: i32) -> Vec<u8> {
@@ -637,6 +636,21 @@ pub struct FloorReport {
     pub tried: u8,
     /// The last confirmation's worst second, % of the reference.
     pub confirm_pct: u8,
+    /// Frames/s the drone's receiver delivered over the candidate points
+    /// flown, saturating at 0xFF. With `noisy`, the rate that ended the
+    /// walk: those frames, or the receiver's events over the stretch that
+    /// decided the report (the larger of the frames and the driver's
+    /// carrier-sense count, which also has frames started on and dropped).
+    pub heard_fps: u8,
+    /// The drone's verdict: the channel was not quiet, the walk has no
+    /// answer and `floor` is 0. The walk has an answer on a quiet channel
+    /// only: other traffic takes rate from a healthy floor through carrier
+    /// sense, so the walk reads the edge too high or finds none, and frame
+    /// starts free a held transmitter, so it reads the edge too low. The
+    /// drone holds the bound (mabur `kFloorQuietMaxHeardPerS`); the GS does
+    /// not repeat it. Traffic on the secondary 20 MHz channel alone is in
+    /// neither count.
+    pub noisy: bool,
     /// Per candidate tried, its worst second in frames/s.
     pub min_fps: [u16; FLOOR_MAX_CANDIDATES],
 }
@@ -644,7 +658,9 @@ pub struct FloorReport {
 /// SweepDone for Kind::Floor: offered[0] the reference rate, offered[1]
 /// the confirmed floor, offered[2..7] the candidates' worst seconds two
 /// per word (the even candidate in the low half), blocked_pct[0] the
-/// candidates tried, blocked_pct[1] the confirmation's percent.
+/// candidates tried, blocked_pct[1] the confirmation's percent,
+/// blocked_pct[2] the frames/s heard, blocked_pct[3] 1 when the channel
+/// was not quiet.
 pub fn pack_floor_done(nonce: u32, seq: u8, r: &FloorReport) -> SweepDone {
     let mut d = SweepDone {
         nonce,
@@ -658,6 +674,8 @@ pub fn pack_floor_done(nonce: u32, seq: u8, r: &FloorReport) -> SweepDone {
     }
     d.blocked_pct[0] = r.tried;
     d.blocked_pct[1] = r.confirm_pct;
+    d.blocked_pct[2] = r.heard_fps;
+    d.blocked_pct[3] = u8::from(r.noisy);
     d
 }
 
@@ -667,6 +685,8 @@ pub fn unpack_floor_done(d: &SweepDone) -> FloorReport {
         floor: d.offered[1].min(u32::from(FLOOR_MAX)) as u8,
         tried: (d.blocked_pct[0] as usize).min(FLOOR_MAX_CANDIDATES) as u8,
         confirm_pct: d.blocked_pct[1],
+        heard_fps: d.blocked_pct[2],
+        noisy: d.blocked_pct[3] != 0,
         ..FloorReport::default()
     };
     for i in 0..FLOOR_MAX_CANDIDATES / 2 {
@@ -678,6 +698,18 @@ pub fn unpack_floor_done(d: &SweepDone) -> FloorReport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sweep_tokens_parse_as_maburcal_names_them() {
+        let p = |t| SweepSpec::parse_token(t).map(|s| (s.kind, s.bw));
+        assert_eq!(p("power20"), Some((Kind::Power, 20)));
+        assert_eq!(p("power40"), Some((Kind::Power, 40)));
+        assert_eq!(p("cap20"), Some((Kind::Capacity, 20)));
+        assert_eq!(p("cap40"), Some((Kind::Capacity, 40)));
+        assert_eq!(p("floor"), Some((Kind::Floor, 40)));
+        assert_eq!(p("verify20"), None);
+        assert_eq!(p(""), None);
+    }
+
     use super::*;
     use alloc::vec;
 
@@ -899,7 +931,7 @@ mod tests {
         assert!(floor_candidates(0, 10).is_empty());
         assert!(floor_candidates(0x30, 0x20).is_empty());
         // 15 settles + 2 + 12 x 4 + 2 x 8 s.
-        assert_eq!(floor_sweep_max_ms(&make_floor_sweep(1, 0)), 70_500);
+        assert_eq!(floor_sweep_max_ms(&make_floor_sweep(1, 0)), 72_500);
         let s = make_floor_sweep(7, 3);
         assert_eq!(
             (s.kind, s.bw, s.mcs_mask),
@@ -925,15 +957,27 @@ mod tests {
             floor: 0x24,
             tried: 3,
             confirm_pct: 100,
+            heard_fps: 3,
             ..FloorReport::default()
         };
         r.min_fps[..3].copy_from_slice(&[0, 2130, 2484]);
         let d = pack_floor_done(9, 4, &r);
         assert_eq!(
-            (d.nonce, d.seq, d.offered[1], d.offered[2]),
-            (9, 4, 0x24, 2130 << 16)
+            (d.nonce, d.seq, d.offered[1], d.offered[2], d.blocked_pct[2]),
+            (9, 4, 0x24, 2130 << 16, 3)
         );
+        assert_eq!(d.blocked_pct[3], 0);
         assert_eq!(unpack_floor_done(&d), r);
+        let busy = FloorReport {
+            ref_fps: 2484,
+            tried: 1,
+            heard_fps: 40,
+            noisy: true,
+            ..FloorReport::default()
+        };
+        let d = pack_floor_done(9, 4, &busy);
+        assert_eq!((d.blocked_pct[2], d.blocked_pct[3]), (40, 1));
+        assert_eq!(unpack_floor_done(&d), busy);
     }
 
     #[test]

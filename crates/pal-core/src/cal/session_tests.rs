@@ -1761,7 +1761,7 @@ fn floor_rows_land_in_the_cal_log() {
     assert_eq!(ls[2], "S 0 floor 40 4000");
     assert_eq!(ls[3], "F 32 0");
     assert_eq!(ls[4], "F 34 2484");
-    assert_eq!(ls[5], "L 2484 34 100 53"); // edge 0x22, the default written
+    assert_eq!(ls[5], "L 2484 34 100 53 0 0"); // edge 0x22, the default written
 }
 
 // ---- both widths in one run ----
@@ -1818,6 +1818,64 @@ fn no_pair_skips_the_40_mhz_part_and_keeps_the_20_mhz_one() {
     assert_eq!(s.cal_width(), 0);
     // The drone's run is closed at once, as at any other Done.
     assert_eq!(abort_nonce(&s.due_mav(100020)), Some(41));
+}
+
+/// mabur tests/test_cal_session.cpp: a busy channel shows no edge; nothing
+/// is written and the 40 MHz sweeps run at the floor the file holds.
+#[test]
+fn a_floor_sweep_on_a_busy_channel_writes_nothing_and_40_mhz_goes_on() {
+    let mut s = wide_session();
+    start(
+        &mut s,
+        47,
+        &[
+            sp(Kind::Power, 20),
+            sp(Kind::Floor, 40),
+            sp(Kind::Power, 40),
+        ],
+        0,
+    );
+    assert!(pass_power20(&mut s, 47, 100000).is_some());
+    ack(&mut s, 47, 1, 100010);
+    let r = FloorReport {
+        ref_fps: 2484,
+        heard_fps: 190,
+        noisy: true,
+        ..FloorReport::default()
+    };
+    s.on_mav(&CalMsg::Done(pack_floor_done(47, 1, &r)), 105000);
+    let snap = s.snapshot();
+    assert!(snap.floor.have && snap.floor.noisy);
+    assert_eq!(snap.floor.written, 0);
+    assert_eq!(
+        snap.floor.note,
+        "the channel is not quiet: the drone heard 190 frames/s"
+    );
+    assert!(snap.width[1].skipped.is_empty());
+    assert_ne!(snap.state, State::Done);
+    let next = sweep(s.due_mav(105010)).unwrap();
+    assert_eq!((next.kind, next.bw), (Kind::Power, 40));
+}
+
+#[test]
+fn a_saturated_heard_count_reads_as_a_lower_bound() {
+    let mut s = wide_session();
+    start(&mut s, 48, &[sp(Kind::Floor, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack(&mut s, 48, 0, 10);
+    let mut r = FloorReport {
+        ref_fps: 2682,
+        tried: 1,
+        heard_fps: 0xFF,
+        noisy: true,
+        ..FloorReport::default()
+    };
+    r.min_fps[0] = 1635;
+    s.on_mav(&CalMsg::Done(pack_floor_done(48, 0, &r)), 9000);
+    assert_eq!(
+        s.snapshot().floor.note,
+        "the channel is not quiet: the drone heard 255 or more frames/s"
+    );
 }
 
 #[test]

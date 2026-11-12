@@ -11,7 +11,8 @@
 //! P <rate> <offered> <recv_best> <air_bits_best> <eff_x1000> <blocked_pct> <flags> <span_ms>
 //! V <rate> <idx> <pct>
 //! F <floor> <min_fps>                            per floor candidate tried
-//! L <ref_fps> <found> <confirm_pct> <written>    per floor sweep; 0 = none
+//! L <ref_fps> <found> <confirm_pct> <written> <heard_fps> <noisy>
+//!                                                per floor sweep; 0 = none
 //! A <bw> <0|1> <reason to end of line>
 //! N <bw> <why to end of line>                    the width's rest skipped
 //! ```
@@ -105,8 +106,10 @@ pub fn skipped_line(bw: u8, why: &str) -> String {
 }
 
 /// One floor sweep: `F <floor> <min_fps>` per candidate tried, then
-/// `L <ref_fps> <found> <confirm_pct> <write>` (found 0 = none passed,
-/// write 0 = nothing written).
+/// `L <ref_fps> <found> <confirm_pct> <write> <heard_fps> <noisy>` (found
+/// 0 = none passed, write 0 = nothing written, heard = frames/s the
+/// drone's receiver took during the sweep, noisy 1 = the drone found the
+/// channel not quiet).
 pub fn floor_lines(r: &FloorReport, cands: &[u8], write: u8) -> Vec<String> {
     let mut out: Vec<String> = cands
         .iter()
@@ -115,8 +118,12 @@ pub fn floor_lines(r: &FloorReport, cands: &[u8], write: u8) -> Vec<String> {
         .map(|(c, m)| format!("F {c} {m}"))
         .collect();
     out.push(format!(
-        "L {} {} {} {write}",
-        r.ref_fps, r.floor, r.confirm_pct
+        "L {} {} {} {write} {} {}",
+        r.ref_fps,
+        r.floor,
+        r.confirm_pct,
+        r.heard_fps,
+        u8::from(r.noisy)
     ));
     out
 }
@@ -323,11 +330,22 @@ mod tests {
         let cands = pal_wire::cal::floor_candidates(0x20, 0x36);
         assert_eq!(
             floor_lines(&r, &cands, 0x35),
-            ["F 32 0", "F 34 2130", "F 36 2484", "L 2484 36 100 53"]
+            ["F 32 0", "F 34 2130", "F 36 2484", "L 2484 36 100 53 0 0"]
         );
         assert_eq!(
             floor_lines(&FloorReport::default(), &cands, 0),
-            ["L 0 0 0 0"]
+            ["L 0 0 0 0 0 0"]
+        );
+        let busy = FloorReport {
+            ref_fps: 2682,
+            tried: 1,
+            heard_fps: 40,
+            noisy: true,
+            ..FloorReport::default()
+        };
+        assert_eq!(
+            floor_lines(&busy, &cands, 0),
+            ["F 32 0", "L 2682 0 0 0 40 1"]
         );
     }
 
