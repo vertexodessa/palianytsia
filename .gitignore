@@ -8,3 +8,4 @@
 /captures/
 /drone-backup-*/
 __pycache__/
+/graphify-out/
