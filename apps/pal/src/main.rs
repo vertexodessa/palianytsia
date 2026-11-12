@@ -801,11 +801,12 @@ fn same_value(text: &str, bundle: &toml::Value) -> bool {
 
 /// The drone's parameters in the session's last snapshot; those that
 /// differ from the bundle are listed with the bundle's value.
-/// Capture-to-complete delay of the base stream: the session's spread, then
-/// one line per rung.
+/// Capture-to-complete delay of the base stream: the session's spread with
+/// the frames it leaves out, the share complete within 30, 50 and 100 ms of
+/// all the drone captured, then one line per rung.
 fn print_latency(l: &flightlog::latency::Latency) {
     use flightlog::latency::spread;
-    if l.all_us.is_empty() {
+    if l.all_us.is_empty() && l.truncated == 0 {
         return;
     }
     let ms = |v: &[u64]| {
@@ -823,10 +824,28 @@ fn print_latency(l: &flightlog::latency::Latency) {
         String::new()
     };
     println!(
-        "  latency, {basis}: {} ({} AUs{left_out})",
+        "  latency, {basis}: {} ({} complete AUs; not in these numbers: {} truncated, {} never emitted{left_out})",
         ms(&l.all_us),
-        l.all_us.len()
+        l.all_us.len(),
+        l.truncated,
+        l.missing
     );
+    if let (Some(a), Some(b), Some(c)) = (l.within(30), l.within(50), l.within(100)) {
+        println!(
+            "  base frames complete within 30 ms {:.1} %, 50 ms {:.1} %, 100 ms {:.1} % of the {} captured (truncated and never emitted count as late)",
+            a * 100.0,
+            b * 100.0,
+            c * 100.0,
+            l.captured()
+        );
+    }
+    if l.truncated > 0 && !l.emitted_us.is_empty() {
+        println!(
+            "  latency of every emitted base AU, a truncated one at its emit time: {} ({} AUs)",
+            ms(&l.emitted_us),
+            l.emitted_us.len()
+        );
+    }
     for (rung, v) in &l.by_rung {
         println!("  latency on rung {rung}: {} ({} AUs)", ms(v), v.len());
     }

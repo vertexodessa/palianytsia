@@ -721,8 +721,8 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
         let [t, sid, bytes, flags, complete, salvaged, pts] = f[..] else {
             continue;
         };
-        if sid == 0 && complete != 0 {
-            s.latency.au(t, pts);
+        if sid == 0 {
+            s.latency.au(t, pts, complete != 0);
         }
         t_min = t_min.min(t);
         t_max = t_max.max(t);
