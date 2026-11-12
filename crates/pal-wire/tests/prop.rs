@@ -647,23 +647,28 @@ fn cal_msg() -> impl Strategy<Value = cal::CalMsg> {
         (
             any::<u32>(),
             any::<[u8; 2]>(),
-            any::<[bool; 2]>(),
+            any::<[bool; 3]>(),
             any::<[i8; 8]>(),
             any::<i8>(),
-            any::<[u16; 8]>()
+            any::<[u16; 8]>(),
+            any::<u8>()
         )
-            .prop_map(
-                |(nonce, sb, h, walls, legacy, eff_x1000)| cal::CalMsg::Apply(cal::ApplyCmd {
+            .prop_map(|(nonce, sb, h, walls, legacy, eff_x1000, floor)| {
+                // A floor apply carries the floor in the legacy byte, so its
+                // legacy reads back as the default and a plain one's floor as 0.
+                cal::CalMsg::Apply(cal::ApplyCmd {
                     nonce,
                     seq: sb[0],
                     bw: sb[1],
                     has_walls: h[0],
                     has_eff: h[1],
                     walls,
-                    legacy,
+                    legacy: if h[2] { cal::WALL_LEAVE } else { legacy },
                     eff_x1000,
+                    has_floor: h[2],
+                    floor: if h[2] { floor } else { 0 },
                 })
-            ),
+            }),
         (any::<u32>(), any::<[u8; 2]>(), any::<bool>(), reason).prop_map(
             |(nonce, sb, ok, reason)| cal::CalMsg::Applied(cal::Applied {
                 nonce,

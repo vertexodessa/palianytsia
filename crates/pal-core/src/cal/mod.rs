@@ -40,7 +40,7 @@ pub fn status_json(s: &CalSnapshot, sweeps: &[pal_wire::cal::SweepSpec], capable
     j.set("sweeps", tokens);
     let mut widths = J::arr();
     for (wi, w) in s.width.iter().enumerate() {
-        if !w.have_walls && !w.have_eff && !w.eff_unknown {
+        if !w.have_walls && !w.have_eff && !w.eff_unknown && w.skipped.is_empty() {
             continue;
         }
         let mut o = J::obj();
@@ -48,6 +48,8 @@ pub fn status_json(s: &CalSnapshot, sweeps: &[pal_wire::cal::SweepSpec], capable
         o.set("applied", w.applied);
         o.set("apply_reason", w.apply_reason.as_str());
         o.set("eff_unknown", w.eff_unknown);
+        // Why the rest of this width was not measured; "" = it was.
+        o.set("skipped", w.skipped.as_str());
         let mut rates = J::arr();
         for r in 0..8 {
             let mut x = J::obj();
@@ -78,7 +80,31 @@ pub fn status_json(s: &CalSnapshot, sweeps: &[pal_wire::cal::SweepSpec], capable
         widths.push(o);
     }
     j.set("widths", widths);
+    j.set("floor", floor_json(&s.floor));
     j.dump()
+}
+
+/// The run's floor sweep, null when the run had none and nothing to say
+/// about it. `edge` is the unit's lowest confirmed floor, null when none
+/// passed or when the lowest candidate (`lowest`) already did
+/// (`below_range`: no edge in the range tried); `written` what was sent.
+fn floor_json(f: &session::FloorResult) -> J {
+    if !f.ran && f.note.is_empty() {
+        return J::Null;
+    }
+    let mut o = J::obj();
+    o.set("ran", f.ran);
+    o.set(
+        "edge",
+        (f.have && f.rep.floor != 0 && !f.below_range).then_some(f.rep.floor),
+    );
+    o.set("below_range", f.below_range);
+    o.set("lowest", f.cands.first().copied());
+    o.set("ref_fps", f.have.then_some(f.rep.ref_fps));
+    o.set("written", (f.written != 0).then_some(f.written));
+    o.set("applied", f.applied);
+    o.set("note", f.note.as_str());
+    o
 }
 #[cfg(test)]
 mod session_tests;

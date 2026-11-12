@@ -1,16 +1,19 @@
 //! `cal.log`, the raw per-cell record of a calibration run (mabur
-//! `cal_log`). The format is mabur's `callog 5`, byte for byte, so mabur's
+//! `cal_log`). The format is mabur's `callog 6`, byte for byte, so mabur's
 //! `maburcal report` reads a file the Rust GS wrote:
 //!
 //! ```text
-//! callog 5                                       once per file
+//! callog 6                                       once per file
 //! R <nonce> <margin_db> <ch> <pick> <ldpc>        once per run
-//! S <seq> <power|capacity> <bw> <frames|dwell_ms> scopes the rows below
+//! S <seq> <power|capacity|floor> <bw> <frames|dwell_ms> scopes the rows below
 //! C <rate> <idx> <expected> <recv0> <recv1> <corrupt> <rssi0> <rssi1>
 //! W <rate> <wall> <floor> <best_card> <flags>
 //! P <rate> <offered> <recv_best> <air_bits_best> <eff_x1000> <blocked_pct> <flags> <span_ms>
 //! V <rate> <idx> <pct>
+//! F <floor> <min_fps>                            per floor candidate tried
+//! L <ref_fps> <found> <confirm_pct> <written>    per floor sweep; 0 = none
 //! A <bw> <0|1> <reason to end of line>
+//! N <bw> <why to end of line>                    the width's rest skipped
 //! ```
 //!
 //! The line builders are pure; `CalLog` only appends them. Every I/O
@@ -21,22 +24,23 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use pal_wire::cal::Kind;
+use pal_wire::cal::{FloorReport, Kind};
 
 use super::analysis::{CalCell, CapCell, CapResult, RateWall, RSSI_NONE};
 
-pub const MARKER: &str = "callog 5";
+pub const MARKER: &str = "callog 6";
 
 pub fn run_line(nonce: u32, margin_db: f64, ch: u8, pick: &str, ldpc: bool) -> String {
     format!("R {nonce} {margin_db:.2} {ch} {pick} {}", u8::from(ldpc))
 }
 
-/// A verify pass shares the `power` word: both are frame counts.
+/// A verify pass shares the `power` word: both are frame counts. A floor
+/// sweep's param is its per-candidate dwell_ms.
 pub fn sweep_line(seq: u8, kind: Kind, bw: u8, param: u32) -> String {
-    let k = if kind == Kind::Capacity {
-        "capacity"
-    } else {
-        "power"
+    let k = match kind {
+        Kind::Capacity => "capacity",
+        Kind::Floor => "floor",
+        _ => "power",
     };
     format!("S {seq} {k} {bw} {param}")
 }
@@ -83,14 +87,38 @@ pub fn verify_line(rate: u8, idx: i32, pct: i32) -> String {
     format!("V {rate} {idx} {pct}")
 }
 
-/// The reason comes from the drone: a control byte in it would split the
-/// record, so each becomes a space.
-pub fn applied_line(bw: u8, ok: bool, reason: &str) -> String {
-    let clean: String = reason
-        .chars()
+/// A control byte would split the record: each becomes a space.
+fn flatten(s: &str) -> String {
+    s.chars()
         .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect()
+}
+
+/// The reason comes from the drone, so it is flattened.
+pub fn applied_line(bw: u8, ok: bool, reason: &str) -> String {
+    format!("A {bw} {} {}", u8::from(ok), flatten(reason))
+}
+
+/// A width's remaining sweeps skipped; `why` may carry the drone's words.
+pub fn skipped_line(bw: u8, why: &str) -> String {
+    format!("N {bw} {}", flatten(why))
+}
+
+/// One floor sweep: `F <floor> <min_fps>` per candidate tried, then
+/// `L <ref_fps> <found> <confirm_pct> <write>` (found 0 = none passed,
+/// write 0 = nothing written).
+pub fn floor_lines(r: &FloorReport, cands: &[u8], write: u8) -> Vec<String> {
+    let mut out: Vec<String> = cands
+        .iter()
+        .zip(r.min_fps.iter())
+        .take(usize::from(r.tried))
+        .map(|(c, m)| format!("F {c} {m}"))
         .collect();
-    format!("A {bw} {} {clean}", u8::from(ok))
+    out.push(format!(
+        "L {} {} {} {write}",
+        r.ref_fps, r.floor, r.confirm_pct
+    ));
+    out
 }
 
 /// Whether the marker is due in `dir`, retiring a `cal.log` of another
@@ -191,6 +219,14 @@ impl CalLog {
     pub fn applied(&mut self, bw: u8, ok: bool, reason: &str) {
         self.line(&applied_line(bw, ok, reason));
     }
+    pub fn skipped(&mut self, bw: u8, why: &str) {
+        self.line(&skipped_line(bw, why));
+    }
+    pub fn floor(&mut self, r: &FloorReport, cands: &[u8], write: u8) {
+        for l in floor_lines(r, cands, write) {
+            self.line(&l);
+        }
+    }
 }
 
 impl Drop for CalLog {
@@ -266,6 +302,33 @@ mod tests {
             applied_line(20, false, "line one\nline two\ttab"),
             "A 20 0 line one line two tab"
         );
+        assert_eq!(sweep_line(2, Kind::Floor, 40, 4000), "S 2 floor 40 4000");
+        assert_eq!(
+            skipped_line(40, "floor: ch 165 has no\n40 MHz pair"),
+            "N 40 floor: ch 165 has no 40 MHz pair"
+        );
+    }
+
+    /// mabur tests/test_cal_log.cpp: the edge 0x24 behind a marginal 0x22.
+    #[test]
+    fn floor_rows_one_per_candidate_tried_then_the_result() {
+        let mut r = FloorReport {
+            ref_fps: 2484,
+            floor: 0x24,
+            tried: 3,
+            confirm_pct: 100,
+            ..FloorReport::default()
+        };
+        r.min_fps[..3].copy_from_slice(&[0, 2130, 2484]);
+        let cands = pal_wire::cal::floor_candidates(0x20, 0x36);
+        assert_eq!(
+            floor_lines(&r, &cands, 0x35),
+            ["F 32 0", "F 34 2130", "F 36 2484", "L 2484 36 100 53"]
+        );
+        assert_eq!(
+            floor_lines(&FloorReport::default(), &cands, 0),
+            ["L 0 0 0 0"]
+        );
     }
 
     #[test]
@@ -316,7 +379,7 @@ mod tests {
         assert_eq!(
             lines(&d),
             [
-                "callog 5",
+                "callog 6",
                 "R 42 1.00 149 auto 1",
                 "V 0 10 90",
                 "R 43 1.50 149 stayed 1",
@@ -333,7 +396,7 @@ mod tests {
             let mut l = CalLog::open(&d);
             l.verify(1, 2, 3);
         }
-        assert_eq!(lines(&d), ["callog 5", "V 1 2 3"]);
+        assert_eq!(lines(&d), ["callog 6", "V 1 2 3"]);
         let old = std::fs::read_to_string(d.join("cal.log.callog3")).unwrap();
         assert!(old.starts_with("callog 3\n"));
     }

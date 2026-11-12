@@ -1,7 +1,7 @@
 //! The GS's sweep commands and how long the drone airs each (mabur
 //! `cal_plan.h`). Pure.
 
-use pal_wire::cal::{Kind, SweepCmd, SweepSpec, WALL_LEAVE};
+use pal_wire::cal::{floor_sweep_max_ms, Kind, SweepCmd, SweepSpec, WALL_LEAVE};
 
 use crate::config::Rung;
 
@@ -57,10 +57,15 @@ pub fn verify_cells(park_rel: &[i32; 8]) -> Vec<(u8, i32)> {
         .collect()
 }
 
-/// How long the drone airs a SweepCmd, counted as its engine walks it.
+/// How long the drone airs a SweepCmd, counted as its engine walks it. A
+/// floor sweep: the longest walk the rules allow; the drone's SweepDone
+/// normally ends the window well before it.
 pub fn sweep_duration_ms(c: &SweepCmd) -> u32 {
     if c.kind == Kind::Capacity {
         return c.mcs_mask.count_ones() * (u32::from(c.settle_ms) + u32::from(c.dwell_ms));
+    }
+    if c.kind == Kind::Floor {
+        return floor_sweep_max_ms(c);
     }
     let cells = 8 * (i32::from(c.idx_hi) - i32::from(c.idx_lo) + 1).max(0) as u32;
     let per_cell =
@@ -73,10 +78,12 @@ pub fn verify_duration_ms(cells: usize) -> u32 {
     cells as u32 * per_cell
 }
 
-/// What a bare start runs: power then capacity at 20 MHz, and at 40 when
-/// the GS flies 40 and the ladder has a 40 MHz rung (maburgs
-/// `default_sweeps`).
-pub fn default_sweeps(radio_width: u8, ladder: &[Rung]) -> Vec<SweepSpec> {
+/// What a bare start runs (maburgs `default_sweeps`). A peer that tunes
+/// itself to 40 for a 40 MHz sweep (`peer_wide`, CAP_CAL_WIDE, with GS
+/// cards that follow) gets both widths whatever the link flies: power20,
+/// cap20, the floor, power40, cap40. Otherwise power then capacity at 20
+/// MHz, and at 40 when the GS flies 40 and the ladder has a 40 MHz rung.
+pub fn default_sweeps(radio_width: u8, ladder: &[Rung], peer_wide: bool) -> Vec<SweepSpec> {
     let mut out = vec![
         SweepSpec {
             kind: Kind::Power,
@@ -87,6 +94,12 @@ pub fn default_sweeps(radio_width: u8, ladder: &[Rung]) -> Vec<SweepSpec> {
             bw: 20,
         },
     ];
+    if peer_wide {
+        out.extend(
+            [Kind::Floor, Kind::Power, Kind::Capacity].map(|kind| SweepSpec { kind, bw: 40 }),
+        );
+        return out;
+    }
     if radio_width == 40 && ladder.iter().any(|r| r.bw == 40) {
         out.push(SweepSpec {
             kind: Kind::Power,
@@ -159,9 +172,9 @@ mod tests {
             bw,
         };
         let (r20, r40) = (rung(20), rung(40));
-        assert_eq!(default_sweeps(20, &[r20, r40]).len(), 2);
-        assert_eq!(default_sweeps(40, &[r20]).len(), 2);
-        let s = default_sweeps(40, &[r20, r40]);
+        assert_eq!(default_sweeps(20, &[r20, r40], false).len(), 2);
+        assert_eq!(default_sweeps(40, &[r20], false).len(), 2);
+        let s = default_sweeps(40, &[r20, r40], false);
         assert_eq!(s.len(), 4);
         assert_eq!(
             s[2],
@@ -173,6 +186,39 @@ mod tests {
         assert_eq!(effective_width(40, true, 20), 20);
         assert_eq!(effective_width(40, true, 0), 40);
         assert_eq!(effective_width(40, false, 20), 40);
+    }
+
+    /// mabur test_cal_control: a wide peer gets both widths and the floor
+    /// whatever the GS's own width and ladder.
+    #[test]
+    fn a_wide_peer_gets_both_widths_and_the_floor() {
+        let r20 = Rung {
+            mcs: 0,
+            overhead_base: 0.0,
+            overhead_enh: 0.0,
+            bw: 20,
+        };
+        let s = default_sweeps(20, &[r20], true);
+        let toks: Vec<(Kind, u8)> = s.iter().map(|s| (s.kind, s.bw)).collect();
+        assert_eq!(
+            toks,
+            [
+                (Kind::Power, 20),
+                (Kind::Capacity, 20),
+                (Kind::Floor, 40),
+                (Kind::Power, 40),
+                (Kind::Capacity, 40)
+            ]
+        );
+        assert_eq!(default_sweeps(40, &[r20], true), s);
+    }
+
+    #[test]
+    fn a_floor_sweep_lasts_its_longest_walk() {
+        assert_eq!(
+            sweep_duration_ms(&pal_wire::cal::make_floor_sweep(1, 2)),
+            70_500
+        );
     }
 
     #[test]

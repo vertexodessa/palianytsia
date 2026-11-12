@@ -513,6 +513,8 @@ pub struct ChannelCore {
     cur_ch: Vec<u8>,
     /// The receiver width (cfg.width_mhz).
     width_mhz: u8,
+    /// set_cal_width; 0 = none.
+    cal_width: u8,
     width_tried: Vec<bool>,
     /// When a failed resync may run again; 0 = not due.
     width_retry_ms: Vec<f64>,
@@ -770,6 +772,7 @@ impl ChannelCore {
             saved_op: cfg.start_ch,
             gs_start_ms,
             cur_ch: vec![cfg.start_ch; n],
+            cal_width: 0,
             width_tried: vec![false; n],
             width_retry_ms: vec![0.0; n],
             energy_last: vec![None; n],
@@ -902,6 +905,43 @@ impl ChannelCore {
     }
     pub fn dwell_busy(&self) -> bool {
         self.live.gates.dwell_busy.load(Relaxed)
+    }
+
+    /// Calibration's hold on the cards' width: 40 while a 40 MHz sweep runs
+    /// (`CalSession::cal_width`), 0 to give them back to the link's width.
+    /// Only the per-card resync target moves (the ranker, the scout and the
+    /// ladder keep the link's width), and a change re-arms every card's
+    /// resync.
+    pub fn set_cal_width(&mut self, w: u8) {
+        if w == self.cal_width {
+            return;
+        }
+        let was = self.resync_width();
+        self.cal_width = w;
+        if self.resync_width() == was {
+            return;
+        }
+        self.log(format!(
+            "maburgs link: cards {was} -> {} MHz (calibration)",
+            self.resync_width()
+        ));
+        self.width_tried.iter_mut().for_each(|t| *t = false);
+        self.step_width_resync();
+    }
+    pub fn cal_width(&self) -> u8 {
+        self.cal_width
+    }
+    /// The link's receiver width; calibration's hold never moves it.
+    pub fn width_mhz(&self) -> u8 {
+        self.width_mhz
+    }
+    /// What the per-card width resync holds the cards at.
+    fn resync_width(&self) -> u8 {
+        if self.cal_width != 0 {
+            self.cal_width
+        } else {
+            self.width_mhz
+        }
     }
     pub fn scout_gated_sends(&self) -> u64 {
         self.scout_gated_sends.load(Relaxed)
@@ -2245,7 +2285,7 @@ impl ChannelCore {
         // The scout thread drives only its own card, so while it searches
         // every other card is fixed here and the scout card is left to it.
         let scout_busy = self.scout_owns();
-        let w = self.width_mhz;
+        let w = self.resync_width();
         let live = self.live.clone();
         for (i, fe) in live.cards.iter().enumerate() {
             let scouting = scout_busy && self.is_scout_card(i);

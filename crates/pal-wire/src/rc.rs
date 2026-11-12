@@ -29,6 +29,12 @@ pub const CAP_FRAME_WIRE: u16 = 0x0001;
 pub const CAP_TELEMETRY: u16 = 0x0002;
 pub const CAP_CALIBRATE: u16 = 0x0004;
 pub const CAP_MAVLINK: u16 = 0x0008;
+/// The drone's calibration runs the floor sweep (cal kind 4) and tunes
+/// itself to 40 MHz for a run's 40 MHz sweeps, back at the run's end
+/// (mabur rc_proto.h). A bit, not an RC_VERSION bump: an older drone still
+/// calibrates, it is just never sent kind 4 (its decoder would take it for
+/// a power sweep) and calibrates 40 MHz only while both ends fly it.
+pub const CAP_CAL_WIDE: u16 = 0x0010;
 /// Disc.cap_bits (GS -> drone): op_width is a proposal the drone retunes to.
 pub const DISC_CAP_WIDTH: u16 = 0x0001;
 

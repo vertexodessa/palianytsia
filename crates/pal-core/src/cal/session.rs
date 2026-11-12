@@ -14,10 +14,18 @@
 //! (`Picking`, through a `CalPicker`): one measure round, one relocate if
 //! op is not the best member. The owner drives it with `step_pick` every
 //! tick; nothing reaches the drone until the pick ends.
+//!
+//! A run that measures 20 MHz too never fails over its 40 MHz part: a
+//! refusal, a timeout or a floor that does not hold skips the rest of 40
+//! MHz (`skip_wide`), what 20 MHz applied stays, and the run ends Done with
+//! the reason in `WidthResult::skipped`. `cal_width` tells the owner to
+//! hold the GS's cards at 40 while a 40 MHz sweep runs; the drone tunes
+//! itself on the SweepCmd and back when the run closes.
 
 use pal_wire::cal::{
-    park_rel_for, Abort, AckResult, Applied, ApplyCmd, CalMsg, FrameInfo, Kind, SweepCmd,
-    SweepDone, SweepSpec, FLAG_LDPC, WALL_LEAVE,
+    floor_candidates, floor_to_write, make_floor_sweep, park_rel_for, unpack_floor_done, Abort,
+    AckResult, Applied, ApplyCmd, CalMsg, FloorReport, FrameInfo, Kind, SweepCmd, SweepDone,
+    SweepSpec, FLAG_LDPC, WALL_LEAVE,
 };
 use pal_wire::rc::TagCtx;
 
@@ -146,6 +154,31 @@ pub struct WidthResult {
     pub park: [i32; 8],
     /// Best-card verify delivery per rate; -1 = not verified.
     pub verify_pct: [i32; 8],
+    /// Why this width's remaining sweeps were skipped ("" = none were): the
+    /// width is uncalibrated past what was applied before it. Only the 40
+    /// MHz part of a run is skipped, never failed (`skip_wide`).
+    pub skipped: String,
+}
+
+/// What the run's floor sweep produced (pal_wire::cal floor rules).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FloorResult {
+    /// The run held a floor sweep the drone accepted.
+    pub ran: bool,
+    /// Its SweepDone arrived: `rep` is the drone's report.
+    pub have: bool,
+    pub rep: FloorReport,
+    /// The candidates the sweep commanded.
+    pub cands: Vec<u8>,
+    /// The lowest candidate passed: the unit never stalled in the range
+    /// tried, so its edge is "none found at or above" it.
+    pub below_range: bool,
+    /// The value sent to the drone; 0 = none.
+    pub written: u8,
+    /// The drone adopted `written`.
+    pub applied: bool,
+    /// Why nothing was written, or the drone's note on the apply.
+    pub note: String,
 }
 
 impl Default for WidthResult {
@@ -161,6 +194,7 @@ impl Default for WidthResult {
             eff_x1000: [0; 8],
             park: [i32::from(WALL_LEAVE); 8],
             verify_pct: [-1; 8],
+            skipped: String::new(),
         }
     }
 }
@@ -180,6 +214,7 @@ pub struct CalSnapshot {
     pub stamp_mismatch: u32,
     /// [0] = 20 MHz, [1] = 40 MHz.
     pub width: [WidthResult; 2],
+    pub floor: FloorResult,
     pub fail_reason: String,
 }
 
@@ -187,23 +222,23 @@ impl CalSnapshot {
     /// "verify" during the verify pass, else the sweep's own kind.
     pub fn kind_name(&self) -> &'static str {
         if self.state == State::Verify {
-            "verify"
-        } else if self.cur.kind == Kind::Capacity {
-            "capacity"
-        } else {
-            "power"
+            return "verify";
+        }
+        match self.cur.kind {
+            Kind::Capacity => "capacity",
+            Kind::Floor => "floor",
+            _ => "power",
         }
     }
 }
 
-/// The operator's token for one sweep: power20, cap40, ...
+/// The operator's token for one sweep: power20, cap40, floor (always 40).
 pub fn sweep_token(s: &SweepSpec) -> String {
-    let k = if s.kind == Kind::Capacity {
-        "cap"
-    } else {
-        "power"
-    };
-    format!("{k}{}", s.bw)
+    match s.kind {
+        Kind::Floor => "floor".into(),
+        Kind::Capacity => format!("cap{}", s.bw),
+        _ => format!("power{}", s.bw),
+    }
 }
 
 fn median(mut v: Vec<i32>) -> i32 {
@@ -217,13 +252,23 @@ fn ack_word(r: AckResult) -> &'static str {
         AckResult::AnchorUnreadable => "anchor_unreadable",
         AckResult::Busy => "busy",
         AckResult::Unsupported => "unsupported",
+        AckResult::NoPair => "no_pair",
     }
 }
 
-/// Power before capacity within a width: a capacity sweep flies at the
-/// power its own width's walls were just parked at.
+/// Within a width: the floor first, so every 40 MHz sweep after it flies
+/// at the floor it found; power before capacity, so a capacity sweep flies
+/// at the power its own width's walls were just parked at.
+fn kind_order(k: Kind) -> u8 {
+    match k {
+        Kind::Floor => 0,
+        Kind::Power => 1,
+        _ => 2,
+    }
+}
+
 fn sweep_key(s: &SweepSpec) -> (u8, u8) {
-    (s.bw, u8::from(s.kind != Kind::Power))
+    (s.bw, kind_order(s.kind))
 }
 
 pub struct CalSession {
@@ -234,6 +279,7 @@ pub struct CalSession {
     nonce: u32,
     linked: bool,
     cal_capable: bool,
+    peer_wide: bool,
     peer_ctx: TagCtx,
     tag_ctx: TagCtx,
     fail_reason: String,
@@ -288,6 +334,7 @@ pub struct CalSession {
     /// Re-applies of this power sweep's walls after a failed verify.
     verify_retries: u8,
     width: [WidthResult; 2],
+    floor: FloorResult,
 }
 
 impl CalSession {
@@ -299,6 +346,7 @@ impl CalSession {
             nonce: 0,
             linked: false,
             cal_capable: false,
+            peer_wide: false,
             peer_ctx: TagCtx::default(),
             tag_ctx: TagCtx::default(),
             fail_reason: String::new(),
@@ -340,6 +388,7 @@ impl CalSession {
             apply_wrote_walls: false,
             verify_retries: 0,
             width: Default::default(),
+            floor: FloorResult::default(),
         }
     }
 
@@ -351,11 +400,14 @@ impl CalSession {
         self.now
     }
 
-    /// Starts a run over `sweeps` (sorted per width ascending, power before
-    /// capacity, deduplicated). Refuses an empty list, a Verify or
-    /// non-20/40 entry, a run (or pick) already going, a down link or a
-    /// peer without CAP_CALIBRATE. An Auto `picker` starts the channel
-    /// pick; any other (or none) sweeps on its op at once.
+    /// Starts a run over `sweeps` (sorted per width ascending, floor before
+    /// power before capacity, deduplicated). Refuses an empty list, a
+    /// Verify or non-20/40 entry, a Floor entry at 20 MHz, a run (or pick)
+    /// already going, a down link or a peer without CAP_CALIBRATE. A Floor
+    /// entry against a peer without CAP_CAL_WIDE is dropped, not refused:
+    /// the run goes on with the rest and the floor result says why. An
+    /// Auto `picker` starts the channel pick; any other (or none) sweeps on
+    /// its op at once.
     pub fn start(
         &mut self,
         nonce: u32,
@@ -380,10 +432,27 @@ impl CalSession {
         }
         for s in &sweeps {
             if s.kind == Kind::Verify {
-                return Err("refused: a sweep is power or capacity".into());
+                return Err("refused: a sweep is power, capacity or floor".into());
             }
             if s.bw != 20 && s.bw != 40 {
                 return Err("refused: a sweep's width is 20 or 40".into());
+            }
+            if s.kind == Kind::Floor && s.bw != 40 {
+                return Err("refused: the floor sweep is 40 MHz".into());
+            }
+        }
+        let mut floor = FloorResult::default();
+        // A drone without CAP_CAL_WIDE would read kind 4 as a power sweep
+        // (its decoder does not check the kind): never sent, and the rest
+        // of the run goes on without it.
+        if !self.peer_wide {
+            let n0 = sweeps.len();
+            sweeps.retain(|s| s.kind != Kind::Floor);
+            if sweeps.len() != n0 {
+                floor.note = "peer does not support the floor sweep".into();
+            }
+            if sweeps.is_empty() {
+                return Err("refused: peer does not support the floor sweep".into());
             }
         }
         sweeps.sort_by_key(sweep_key);
@@ -400,6 +469,7 @@ impl CalSession {
         self.ack_flags = 0;
         self.done = None;
         self.width = Default::default();
+        self.floor = floor;
         // pending_abort is kept: the previous run's Abort copies still owed
         // must still go out.
         self.reloc_ordered = false;
@@ -499,11 +569,28 @@ impl CalSession {
                 if self.state != State::AwaitAck || a.nonce != self.nonce || a.seq != self.cmd.seq {
                     return;
                 }
+                if a.result == AckResult::Unsupported && self.cmd.kind == Kind::Floor {
+                    // A drone with no runtime floor (not a Jaguar3 radio):
+                    // the run goes on without the floor, at the one the
+                    // drone's config already has.
+                    self.floor.note = "peer does not support the floor sweep".into();
+                    self.next_sweep(now_ms);
+                    return;
+                }
+                if a.result == AckResult::NoPair {
+                    // The channel has no 40 MHz pair (165): nothing at 40
+                    // can run on it.
+                    if self.cmd.kind == Kind::Floor {
+                        self.floor.note = "no 40 MHz pair".into();
+                    }
+                    self.skip_wide(format!("ch {} has no 40 MHz pair", self.channel), now_ms);
+                    return;
+                }
                 if a.result != AckResult::Accepted {
-                    self.fail(format!(
-                        "sweep refused by the drone: {}",
-                        ack_word(a.result)
-                    ));
+                    self.fail_or_skip(
+                        format!("sweep refused by the drone: {}", ack_word(a.result)),
+                        now_ms,
+                    );
                     return;
                 }
                 self.on_accepted(a.flags, a.start_in_ms, now_ms);
@@ -613,10 +700,19 @@ impl CalSession {
                     self.stamp_mismatch += 1;
                     return;
                 }
-                if self.cmd.kind == Kind::Power {
-                    self.tally_power(card, f, rssi_dbm, crc_ok);
-                } else {
-                    self.tally_capacity(card, f, rssi_dbm, crc_ok, air_bytes, rx_ms);
+                match self.cmd.kind {
+                    Kind::Power => self.tally_power(card, f, rssi_dbm, crc_ok),
+                    Kind::Capacity => {
+                        self.tally_capacity(card, f, rssi_dbm, crc_ok, air_bytes, rx_ms)
+                    }
+                    // The floor is judged by the drone's own send rate, not
+                    // by what the GS hears; a frame only shows which
+                    // candidate is on the air.
+                    _ => {
+                        if f.idx >= 0 {
+                            self.cell_i = f.idx as u32 + 1;
+                        }
+                    }
                 }
             }
             State::Verify => {
@@ -640,6 +736,17 @@ impl CalSession {
 
     pub fn running(&self) -> bool {
         self.state.running()
+    }
+
+    /// The width the GS's cards must be held at for the sweep in hand: 40
+    /// while a running run's current sweep is 40 MHz (its SweepCmd, the
+    /// sweep, its apply and verify), 0 otherwise (the link's own width).
+    pub fn cal_width(&self) -> u8 {
+        if self.running() && self.cmd.bw == 40 {
+            40
+        } else {
+            0
+        }
     }
 
     /// Abandons the run: Aborts go out through due_mav if the run reached
@@ -673,6 +780,15 @@ impl CalSession {
         self.cal_capable = cal_capable;
         self.peer_ctx = ctx;
     }
+    /// Whether the peer advertised CAP_CAL_WIDE (it runs the floor sweep
+    /// and tunes itself for 40 MHz sweeps). Told every tick with set_peer;
+    /// false until told.
+    pub fn set_peer_wide(&mut self, wide: bool) {
+        self.peer_wide = wide;
+    }
+    pub fn peer_wide(&self) -> bool {
+        self.peer_wide
+    }
 
     /// The context every cal message of this run is packed under, frozen
     /// when the run first commands the drone: the drone latches the pair
@@ -703,6 +819,7 @@ impl CalSession {
             flags: self.ack_flags,
             stamp_mismatch: self.stamp_mismatch,
             width: self.width.clone(),
+            floor: self.floor.clone(),
             fail_reason: self.fail_reason.clone(),
         };
         if let Some(cur) = self.sweeps.get(self.sweep_i) {
@@ -712,6 +829,8 @@ impl CalSession {
                 self.verify_cells.len() as u32
             } else if self.cmd.kind == Kind::Capacity {
                 rates
+            } else if self.cmd.kind == Kind::Floor {
+                self.floor.cands.len() as u32
             } else {
                 rates * self.cells_per_row() as u32
             };
@@ -736,7 +855,7 @@ impl CalSession {
     fn step(&mut self, now_ms: u64) {
         match self.state {
             State::AwaitAck if now_ms - self.phase_start_ms >= self.cfg.ack_timeout_ms => {
-                self.fail("calibration ack timeout".into());
+                self.fail_or_skip("calibration ack timeout".into(), now_ms);
             }
             State::Sweep | State::AwaitDone => {
                 // SweepDone normally ends this early; its loss costs at
@@ -756,7 +875,7 @@ impl CalSession {
                 }
             }
             State::Apply if now_ms - self.phase_start_ms >= self.cfg.apply_timeout_ms => {
-                self.fail("calibration apply timeout".into());
+                self.fail_or_skip("calibration apply timeout".into(), now_ms);
             }
             State::Verify if now_ms >= self.window_end_ms => self.finish_verify(now_ms),
             _ => {}
@@ -767,11 +886,15 @@ impl CalSession {
         self.sweep_i = i;
         let sp = self.sweeps[i];
         let seq = i as u8;
-        self.cmd = if sp.kind == Kind::Power {
-            make_power_sweep(self.nonce, seq, sp.bw)
-        } else {
-            make_capacity_sweep(self.nonce, seq, sp.bw)
+        self.cmd = match sp.kind {
+            Kind::Power => make_power_sweep(self.nonce, seq, sp.bw),
+            Kind::Floor => make_floor_sweep(self.nonce, seq),
+            _ => make_capacity_sweep(self.nonce, seq, sp.bw),
         };
+        if sp.kind == Kind::Floor {
+            self.floor.cands =
+                floor_candidates(i32::from(self.cmd.idx_lo), i32::from(self.cmd.idx_hi));
+        }
         // Frozen at the first command: the GS keeps beaconing between
         // sweeps and may adopt a fresh pair meanwhile.
         if i == 0 {
@@ -817,13 +940,16 @@ impl CalSession {
             );
             self.run_logged = true;
         }
-        let param = if self.cmd.kind == Kind::Capacity {
-            self.cmd.dwell_ms
-        } else {
+        let param = if self.cmd.kind == Kind::Power {
             self.cmd.frames_per_cell
+        } else {
+            self.cmd.dwell_ms
         };
         self.log
             .sweep(self.cmd.seq, self.cmd.kind, self.cmd.bw, u32::from(param));
+        if self.cmd.kind == Kind::Floor {
+            self.floor.ran = true;
+        }
         self.sweep_end_ms =
             now_ms + u64::from(start_in_ms) + u64::from(sweep_duration_ms(&self.cmd));
         self.window_end_ms = self.sweep_end_ms + self.cfg.phase_slack_ms;
@@ -906,18 +1032,24 @@ impl CalSession {
 
     fn finish_sweep(&mut self, now_ms: u64) {
         self.state = State::Analyze;
-        let apply = if self.cmd.kind == Kind::Power {
-            self.analyze_power()
-        } else {
-            self.analyze_capacity_sweep()
+        let apply = match self.cmd.kind {
+            Kind::Power => self.analyze_power(now_ms),
+            Kind::Floor => self.analyze_floor(),
+            _ => self.analyze_capacity_sweep(),
         };
-        if self.state == State::Failed {
+        // The MCS0 rule in analyze_power already ended the sweep.
+        if self.state != State::Analyze {
             return;
         }
         if apply {
             self.phase_start_ms = now_ms;
             self.sent_once = false;
             self.state = State::Apply;
+        } else if self.cmd.kind == Kind::Floor {
+            // Without a floor that holds, the 40 MHz sweeps after it would
+            // measure a transmitter that stalls: the 40 MHz part stops here.
+            let note = self.floor.note.clone();
+            self.skip_wide(note, now_ms);
         } else {
             self.next_sweep(now_ms);
         }
@@ -932,7 +1064,7 @@ impl CalSession {
         }
     }
 
-    fn analyze_power(&mut self) -> bool {
+    fn analyze_power(&mut self, now_ms: u64) -> bool {
         let n = self.cells_per_row();
         let mut apply = self.fresh_apply();
         let mut rows: [Vec<CalCell>; 8] = Default::default();
@@ -986,11 +1118,14 @@ impl CalSession {
         // run applies nothing, its capacity sweep included.
         if walls[0].wall != NO_WALL && walls[0].flags & FLAG_NO_DIP == 0 {
             self.apply_wrote_walls = false;
-            self.fail(format!(
-                "MCS0 lost frames at power {} (floor {}): the channel was busy or the \
-                 pair too close; nothing applied, the drone keeps its walls",
-                walls[0].wall, walls[0].floor_idx
-            ));
+            self.fail_or_skip(
+                format!(
+                    "MCS0 lost frames at power {} (floor {}): the channel was busy or the \
+                     pair too close; nothing applied, the drone keeps its walls",
+                    walls[0].wall, walls[0].floor_idx
+                ),
+                now_ms,
+            );
             return false;
         }
         apply.has_walls = any;
@@ -1068,13 +1203,56 @@ impl CalSession {
         any
     }
 
+    fn analyze_floor(&mut self) -> bool {
+        self.apply = self.fresh_apply();
+        self.apply_wrote_walls = false;
+        let Some(done) = self.done else {
+            // Which value passed is only in the drone's report.
+            self.floor.note = "the floor sweep's result was lost".into();
+            self.log
+                .floor(&FloorReport::default(), &self.floor.cands, 0);
+            return false;
+        };
+        self.floor.have = true;
+        self.floor.rep = unpack_floor_done(&done);
+        if self.floor.rep.ref_fps == 0 {
+            self.floor.note = "the reference point sent nothing".into();
+        } else if self.floor.rep.floor == 0 {
+            self.floor.note = "no floor passed".into();
+        } else {
+            self.floor.below_range = self.floor.cands.first() == Some(&self.floor.rep.floor);
+            self.floor.written = floor_to_write(self.floor.rep.floor);
+        }
+        self.log
+            .floor(&self.floor.rep, &self.floor.cands, self.floor.written);
+        if self.floor.written == 0 {
+            return false;
+        }
+        self.apply.has_floor = true;
+        self.apply.floor = self.floor.written;
+        true
+    }
+
     fn on_applied(&mut self, a: &Applied, now_ms: u64) {
         self.log.applied(a.bw, a.ok, &a.reason);
+        if self.cmd.kind == Kind::Floor {
+            self.floor.applied = a.ok;
+            self.floor.note = a.reason.clone();
+            if !a.ok {
+                self.skip_wide(
+                    format!("floor apply refused by the drone: {}", a.reason),
+                    now_ms,
+                );
+                return;
+            }
+            self.next_sweep(now_ms);
+            return;
+        }
         let w = self.width_result();
         w.applied = a.ok;
         w.apply_reason = a.reason.clone();
         if !a.ok {
-            self.fail(format!("apply refused by the drone: {}", a.reason));
+            self.fail_or_skip(format!("apply refused by the drone: {}", a.reason), now_ms);
             return;
         }
         if self.cmd.kind == Kind::Power && self.apply_wrote_walls {
@@ -1174,6 +1352,45 @@ impl CalSession {
             self.begin_sweep(self.sweep_i + 1, now_ms);
             return;
         }
+        self.finish_run();
+    }
+
+    /// The 40 MHz part of a run that measured 20 MHz too: what 20 MHz
+    /// applied stays, and the run ends Done with 40 MHz uncalibrated.
+    /// Anything else fails the run.
+    fn fail_or_skip(&mut self, why: String, now_ms: u64) {
+        if self.cmd.bw == 40 && self.has_width(20) {
+            self.skip_wide(why, now_ms);
+            return;
+        }
+        self.fail(why);
+    }
+
+    /// Records why on width[1].skipped (and cal.log) and goes on past the
+    /// run's remaining 40 MHz sweeps: Done with what was applied so far.
+    fn skip_wide(&mut self, why: String, now_ms: u64) {
+        let part = match self.cmd.kind {
+            Kind::Floor => "floor",
+            Kind::Capacity => "cap40",
+            _ => "power40",
+        };
+        let skipped = format!("{part}: {why}");
+        self.log.skipped(40, &skipped);
+        self.width[1].skipped = skipped;
+        // The sweeps are sorted by width, so whatever follows a 40 MHz
+        // sweep is 40 MHz too.
+        let mut j = self.sweep_i + 1;
+        while j < self.sweeps.len() && self.sweeps[j].bw == 40 {
+            j += 1;
+        }
+        if j < self.sweeps.len() {
+            self.begin_sweep(j, now_ms);
+            return;
+        }
+        self.finish_run();
+    }
+
+    fn finish_run(&mut self) {
         self.state = State::Done;
         // Closes the drone's run now, restoring its power and video; the
         // close keeps what the applies wrote.
@@ -1202,6 +1419,10 @@ impl CalSession {
 
     fn width_result(&mut self) -> &mut WidthResult {
         &mut self.width[usize::from(self.cmd.bw == 40)]
+    }
+
+    fn has_width(&self, bw: u8) -> bool {
+        self.sweeps.iter().any(|s| s.bw == bw)
     }
 
     fn has_power20(&self) -> bool {

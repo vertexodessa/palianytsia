@@ -1,5 +1,5 @@
-//! mabur `tests/test_channel_core.cpp`, minus the calibration and relay
-//! cases (neither is ported).
+//! mabur `tests/test_channel_core.cpp`, minus the relay cases (not
+//! ported).
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -98,6 +98,10 @@ impl Rig {
         Self::with_use(n, pinned, start, &[])
     }
     fn with_use(n: usize, pinned: bool, start: u8, use_: &[u8]) -> Self {
+        Self::build(n, pinned, start, use_, 40)
+    }
+    /// `width` = the link's receiver width (cfg.width_mhz).
+    fn build(n: usize, pinned: bool, start: u8, use_: &[u8], width: u8) -> Self {
         let mut cfg = bundle();
         cfg.radio.channels = vec![40, 64, 112, 144];
         cfg.radio.use_ = use_.to_vec();
@@ -110,14 +114,14 @@ impl Rig {
             .map(|i| {
                 let c = FakeCard::new(clk.clone(), start_ch);
                 // The boot scout card opens at 20, every other at the link width.
-                c.s().width_mhz = if i == n - 1 { 20 } else { 40 };
+                c.s().width_mhz = if i == n - 1 { 20 } else { width };
                 c
             })
             .collect();
         let vrx = VrxController::new(VrxCfg::from_config(&cfg, start_ch, 0));
         let cc = ChannelCoreCfg {
             radio: cfg.radio.clone(),
-            width_mhz: 40,
+            width_mhz: width,
             hop: cfg.hop.clone(),
             key: cfg.link.key,
             start_ch,
@@ -1709,4 +1713,57 @@ fn a_calibration_run_picks_its_channel_through_the_core() {
         (snap.channel, snap.pick_note.as_str()),
         (112, "auto: moved to 112")
     );
+}
+
+// ---- calibration's width hold ----
+
+fn called_set_width(c: &FakeCard) -> bool {
+    c.calls().iter().any(|l| l.starts_with("set_width"))
+}
+
+/// A 20 MHz link calibrating 40: the cards go to 40 for the sweep and come
+/// back to the link's width after, and the link's own width never moves.
+#[test]
+fn set_cal_width_holds_the_cards_at_40_and_gives_them_back() {
+    let mut g = Rig::build(2, true, 40, &[], 20);
+    for _ in 0..10 {
+        g.tick(true);
+    }
+    assert_eq!(g.core.width_mhz(), 20);
+    for c in &g.cards {
+        c.s().calls.clear();
+    }
+    g.core.set_cal_width(40);
+    assert_eq!(g.core.width_mhz(), 20);
+    assert!(g.cards.iter().all(|c| c.s().width_mhz == 40));
+    assert!(g.has_line("maburgs link: cards 20 -> 40 MHz (calibration)"));
+    // Held through the ticks: the per-tick resync aims at the hold.
+    for _ in 0..10 {
+        g.tick(true);
+    }
+    assert!(g.cards.iter().all(|c| c.s().width_mhz == 40));
+    g.core.set_cal_width(0);
+    assert!(g.cards.iter().all(|c| c.s().width_mhz == 20));
+    assert!(g.has_line("maburgs link: cards 40 -> 20 MHz (calibration)"));
+    for c in &g.cards {
+        c.s().calls.clear();
+    }
+    g.core.set_cal_width(0); // no change: nothing touched
+    assert!(!g.cards.iter().any(|c| called_set_width(c)));
+}
+
+/// A link already at 40: the hold changes nothing on the cards.
+#[test]
+fn set_cal_width_on_a_40_mhz_link_touches_no_card() {
+    let mut g = Rig::new(2, true, 40);
+    for _ in 0..10 {
+        g.tick(true);
+    }
+    for c in &g.cards {
+        c.s().calls.clear();
+    }
+    g.core.set_cal_width(40);
+    assert!(!g.cards.iter().any(|c| called_set_width(c)));
+    g.core.set_cal_width(0);
+    assert!(!g.cards.iter().any(|c| called_set_width(c)));
 }

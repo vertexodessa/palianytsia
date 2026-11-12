@@ -161,6 +161,9 @@ impl Gs {
         self.cal
             .session
             .set_peer(linked, capable, self.vrx.session_ctx());
+        self.cal
+            .session
+            .set_peer_wide(self.peer_can(rc::CAP_CAL_WIDE));
     }
 
     /// WebGs::send_: false = the scout gate dropped it (counted by the core),
@@ -1683,6 +1686,80 @@ mod tests {
         assert!(card.s().sent[n2..]
             .iter()
             .any(|f| matches!(rc::frame_type(f), Some(rc::T_RCF | rc::T_DISC))));
+    }
+
+    /// A CAP_CAL_WIDE drone on a 20 MHz link: the bare start plans both
+    /// widths and the floor, and the card is held at 40 for a 40 MHz sweep
+    /// and given back when the run ends.
+    #[test]
+    fn a_wide_drone_gets_both_widths_and_the_card_follows_the_sweep() {
+        let mut cfg = bundle();
+        cfg.radio.pin = Some(64);
+        let clk = FakeClock::default();
+        clk.set(1000);
+        let card = FakeCard::new(clk.clone(), 64);
+        let mut core = RustCore::with_cards(&cfg, opts(64), env(&card, &clk)).unwrap();
+        let mut io = Io::default();
+        let us = |c: &FakeClock| c.ms() * 1000;
+        core.tick(us(&clk), &mut io);
+        let ack = {
+            let g = core.gs.as_ref().unwrap();
+            rc::DiscAck {
+                vrx_nonce: g.vrx.rz_nonce(),
+                vtx_nonce: 9,
+                chip_caps: rc::CAP_FRAME_WIRE | rc::CAP_CALIBRATE | rc::CAP_CAL_WIDE,
+                agreed_channel: g.vrx.proposal(),
+                agreed_width: 20,
+                seq: 1,
+                ..rc::DiscAck::default()
+            }
+        };
+        core.on_rx(
+            &RxBody {
+                mono_us: us(&clk),
+                crc_ok: true,
+                rx_channel: 64,
+                body: rc::pack_disc_ack(&ack),
+                ..RxBody::default()
+            },
+            &mut io,
+        );
+        for _ in 0..50 {
+            clk.advance(2);
+            core.tick(us(&clk), &mut io);
+        }
+        assert_eq!(card.s().width_mhz, 20);
+        core.cal_start(&[]).unwrap();
+        let j = core.cal_json().unwrap();
+        assert!(
+            j.contains(r#""sweeps":["power20","cap20","floor","power40","cap40"]"#),
+            "{j}"
+        );
+        clk.advance(2);
+        core.tick(us(&clk), &mut io);
+        assert_eq!(card.s().width_mhz, 20, "power20 flies the link's width");
+        core.cal_abort();
+        for _ in 0..20 {
+            clk.advance(5);
+            core.tick(us(&clk), &mut io);
+        }
+
+        core.cal_start(&[SweepSpec {
+            kind: cal::Kind::Floor,
+            bw: 40,
+        }])
+        .unwrap();
+        clk.advance(2);
+        core.tick(us(&clk), &mut io);
+        assert_eq!(card.s().width_mhz, 40, "held at 40 for the floor sweep");
+        assert_eq!(
+            core.gs.as_ref().unwrap().chan.as_ref().unwrap().width_mhz(),
+            20
+        );
+        core.cal_abort();
+        clk.advance(2);
+        core.tick(us(&clk), &mut io);
+        assert_eq!(card.s().width_mhz, 20, "given back when the run ends");
     }
 
     #[test]

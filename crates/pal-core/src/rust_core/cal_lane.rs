@@ -45,10 +45,14 @@ impl CalLane {
         }
     }
 
-    /// A run: `sweeps` empty = the default plan for the width the link
-    /// flies. The channel core picks the channel first when it can measure
-    /// (auto, a spare card); without one the run sweeps on `channel`. The
-    /// caller has set the session's peer.
+    /// A run: `sweeps` empty = the default plan. The channel core picks the
+    /// channel first when it can measure (auto, a spare card); without one
+    /// the run sweeps on `channel`. The caller has set the session's peer.
+    ///
+    /// A CAP_CAL_WIDE drone tunes itself to 40 for a 40 MHz sweep; the GS's
+    /// cards follow through the channel core (`tick`), so with one both
+    /// widths are open whatever the link flies. Without a channel core
+    /// nothing moves the cards: the link's width bounds the run as before.
     pub fn start(
         &mut self,
         sweeps: &[SweepSpec],
@@ -58,9 +62,11 @@ impl CalLane {
         channel: u8,
         now_ms: u64,
     ) -> Result<(), String> {
-        let width = effective_width(self.radio_width, linked, self.peer_width);
+        let link_width = effective_width(self.radio_width, linked, self.peer_width);
+        let wide = self.session.peer_wide() && (chan.is_some() || link_width == 40);
+        let width = if wide { 40 } else { link_width };
         let sweeps = if sweeps.is_empty() {
-            default_sweeps(width, &self.ladder)
+            default_sweeps(link_width, &self.ladder, wide)
         } else {
             if sweeps.iter().any(|s| s.bw > width) {
                 return Err(format!("refused: the link flies {width} MHz at most"));
@@ -104,7 +110,13 @@ impl CalLane {
         if let Some(c) = chan.as_deref_mut() {
             self.session.step_pick(now_ms, c);
         }
-        if let Some(m) = self.session.due_mav(now_ms) {
+        let due = self.session.due_mav(now_ms);
+        // After due_mav, which moves the run on: the cards are at 40 before
+        // a 40 MHz SweepCmd goes out and back once the run ends.
+        if let Some(c) = chan.as_deref_mut() {
+            c.set_cal_width(self.session.cal_width());
+        }
+        if let Some(m) = due {
             let dwell_busy = chan.is_some_and(|c| c.dwell_busy());
             let held = matches!(m, cal::CalMsg::Sweep(_))
                 && !cal_cmd_clear(self.session.radio_silent(now_ms), dwell_busy);

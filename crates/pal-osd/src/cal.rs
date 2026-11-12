@@ -36,7 +36,42 @@ pub struct CalWidth {
     pub applied: bool,
     pub apply_reason: String,
     pub eff_unknown: bool,
+    /// Why the rest of this width was not measured ("" = it was): the
+    /// width stays uncalibrated past what was written before it.
+    pub skipped: String,
     pub rates: Vec<CalRate>,
+}
+
+/// The run's floor sweep (the 40 MHz receive-gain floor).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CalFloor {
+    /// The unit's lowest confirmed floor; None when none passed or when
+    /// the lowest candidate already did (`below_range`).
+    pub edge: Option<u64>,
+    pub below_range: bool,
+    /// The lowest candidate tried.
+    pub lowest: Option<u64>,
+    /// The value sent to the drone.
+    pub written: Option<u64>,
+    pub applied: bool,
+    pub note: String,
+}
+
+impl CalFloor {
+    /// maburcal's `floor40:` line: the edge measured, then what was
+    /// written (never under the default, so often not the edge).
+    pub fn line(&self) -> String {
+        let edge = match (self.edge, self.below_range, self.lowest) {
+            (Some(e), _, _) => format!("floor edge 0x{e:02x}"),
+            (None, true, Some(lo)) => format!("floor edge none found at or above 0x{lo:02x}"),
+            _ => "floor".to_string(),
+        };
+        match self.written {
+            Some(w) if self.applied => format!("{edge}, 0x{w:02x} written"),
+            Some(w) => format!("{edge}, 0x{w:02x} not written: {}", self.note),
+            None => format!("{edge} not written: {}", self.note),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -55,6 +90,7 @@ pub struct CalView {
     pub pick: String,
     pub fail_reason: String,
     pub widths: Vec<CalWidth>,
+    pub floor: Option<CalFloor>,
     /// The last start's refusal ("refused: link is down", ...).
     pub refusal: Option<String>,
     /// The linked drone advertises CAP_CALIBRATE.
@@ -68,6 +104,7 @@ impl CalView {
             applied: bool_or(w, "applied", false),
             apply_reason: str_or(w, "apply_reason", ""),
             eff_unknown: bool_or(w, "eff_unknown", false),
+            skipped: str_or(w, "skipped", ""),
             rates: list(w, "rates", |r| CalRate {
                 mcs: u64_or(r, "mcs", 0) as u8,
                 wall: opt_i64(r, "wall"),
@@ -91,6 +128,14 @@ impl CalView {
             pick: str_or(v, "pick", ""),
             fail_reason: str_or(v, "fail_reason", ""),
             widths,
+            floor: v.get("floor").filter(|f| f.is_object()).map(|f| CalFloor {
+                edge: f.get("edge").and_then(Value::as_u64),
+                below_range: bool_or(f, "below_range", false),
+                lowest: f.get("lowest").and_then(Value::as_u64),
+                written: f.get("written").and_then(Value::as_u64),
+                applied: bool_or(f, "applied", false),
+                note: str_or(f, "note", ""),
+            }),
             refusal: v.get("refusal").and_then(Value::as_str).map(str::to_string),
             capable: bool_or(v, "capable", false),
         })
@@ -218,7 +263,7 @@ pub fn ui(
             .color(WARN),
         );
         ui.label(
-            RichText::new("Video is paused until the run ends (about 40-80 s).")
+            RichText::new("Video is paused until the run ends (about 40 s to 2 min).")
                 .small()
                 .color(Color32::GRAY),
         );
@@ -229,9 +274,10 @@ pub fn ui(
         let answer = confirm_row(
             ui,
             "The drone sweeps its TX power on every MCS and writes its own walls \
-             (power_mode = offset). Video stops for about 40-80 s. Put the drone \
-             a few metres away or more first: close up the receiver saturates \
-             and the walls come out wrong.",
+             (power_mode = offset); a drone that supports it does both 20 and 40 MHz \
+             and its 40 MHz receive-gain floor. Video stops for about 40 s to 2 min. \
+             Put the drone a few metres away or more first: close up the receiver \
+             saturates and the walls come out wrong.",
             "Start calibration",
             h,
         );
@@ -310,25 +356,49 @@ pub fn ui(
         }
         _ => {}
     }
+    if let Some(f) = &v.floor {
+        ui.separator();
+        let c = if f.applied { OK } else { WARN };
+        ui.label(RichText::new(f.line()).color(c));
+    }
     for w in &v.widths {
         results(ui, w);
     }
     cmd
 }
 
+/// A width's outcome in a few words, with its colour.
+fn width_outcome(w: &CalWidth) -> (String, Color32) {
+    if !w.skipped.is_empty() {
+        let head = if w.applied {
+            "partly written, rest uncalibrated"
+        } else {
+            "uncalibrated"
+        };
+        (format!("{head}: {}", w.skipped), WARN)
+    } else if w.applied {
+        ("written to the drone".into(), OK)
+    } else if w.apply_reason.is_empty() {
+        ("not written".into(), Color32::GRAY)
+    } else {
+        (format!("not written: {}", w.apply_reason), BAD)
+    }
+}
+
 fn results(ui: &mut Ui, w: &CalWidth) {
     ui.separator();
-    let applied = if w.applied {
-        RichText::new("written to the drone").color(OK)
-    } else if w.apply_reason.is_empty() {
-        RichText::new("not written").color(Color32::GRAY)
-    } else {
-        RichText::new(format!("not written: {}", w.apply_reason)).color(BAD)
-    };
+    let (text, colour) = width_outcome(w);
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{} MHz", w.bw)).strong());
-        ui.label(applied);
+        ui.label(RichText::new(text).color(colour));
     });
+    let measured = w
+        .rates
+        .iter()
+        .any(|r| r.wall.is_some() || r.park.is_some() || r.eff.is_some());
+    if !measured {
+        return;
+    }
     if w.eff_unknown {
         ui.label(
             RichText::new("capacity: the drone's summary was lost, efficiency not written")
@@ -464,9 +534,62 @@ mod tests {
                 applied: bw == 20,
                 apply_reason: "ok".into(),
                 eff_unknown: bw == 40,
+                skipped: if bw == 40 {
+                    "cap40: busy".into()
+                } else {
+                    String::new()
+                },
                 rates: (0..8).map(rate).collect(),
             });
         }
+        v.floor = Some(CalFloor {
+            note: "no floor passed".into(),
+            ..CalFloor::default()
+        });
+        draw(Some(&v), &mut confirm);
+    }
+
+    /// What `pal_core::cal::status_json` writes for a run whose floor held
+    /// and whose 40 MHz power apply was refused.
+    #[test]
+    fn the_floor_and_a_skipped_width_reach_the_panel() {
+        let j = r#"{"state":"done","running":false,"sweep_k":4,"sweep_n":5,"kind":"power",
+            "bw":40,"cell_i":0,"cell_n":0,"channel":64,"pick":"pinned","stamp_mismatch":0,
+            "fail_reason":"","sweeps":["power20","cap20","floor","power40","cap40"],
+            "capable":true,"floor":{"applied":true,"below_range":false,"edge":36,
+            "lowest":32,"note":"ok","ran":true,"ref_fps":2484,"written":53},
+            "widths":[{"bw":40,"applied":false,"apply_reason":"config line not found",
+            "eff_unknown":false,"skipped":"power40: apply refused by the drone: config line not found",
+            "rates":[]}]}"#;
+        let v = CalView::parse(&serde_json::from_str(j).unwrap()).unwrap();
+        let f = v.floor.clone().unwrap();
+        assert_eq!(f.line(), "floor edge 0x24, 0x35 written");
+        let (text, colour) = width_outcome(&v.widths[0]);
+        assert_eq!(
+            text,
+            "uncalibrated: power40: apply refused by the drone: config line not found"
+        );
+        assert_eq!(colour, WARN);
+        let below = CalFloor {
+            below_range: true,
+            lowest: Some(0x20),
+            written: Some(0x35),
+            applied: true,
+            ..CalFloor::default()
+        };
+        assert_eq!(
+            below.line(),
+            "floor edge none found at or above 0x20, 0x35 written"
+        );
+        let none = CalFloor {
+            note: "no floor passed".into(),
+            ..CalFloor::default()
+        };
+        assert_eq!(none.line(), "floor not written: no floor passed");
+        // A core without the floor: null, no line.
+        let v = CalView::parse(&serde_json::json!({"state": "idle", "floor": null})).unwrap();
+        assert!(v.floor.is_none());
+        let mut confirm = Confirm::None;
         draw(Some(&v), &mut confirm);
     }
 

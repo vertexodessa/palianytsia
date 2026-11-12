@@ -5,9 +5,10 @@
 use std::path::{Path, PathBuf};
 
 use pal_wire::cal::{
-    build_payload, park_rel_for, parse_payload, AckResult, Applied, ApplyCmd, CalMsg, FrameInfo,
-    Kind, SweepAck, SweepCmd, SweepDone, SweepSpec, FLAG_LDPC, FLAG_STBC, PAYLOAD_LEN, REL_MIN,
-    WALL_LEAVE,
+    build_payload, floor_sweep_max_ms, floor_to_write, make_floor_sweep, pack_floor_done,
+    park_rel_for, parse_payload, AckResult, Applied, ApplyCmd, CalMsg, FloorReport, FrameInfo,
+    Kind, SweepAck, SweepCmd, SweepDone, SweepSpec, FLAG_LDPC, FLAG_STBC, FLOOR_DEFAULT, FLOOR_LO,
+    FLOOR_MCS, PAYLOAD_LEN, REL_MIN, WALL_LEAVE,
 };
 use pal_wire::rc::TagCtx;
 
@@ -1553,4 +1554,443 @@ fn the_step_down_stops_after_four_db() {
     }
     assert_eq!(s.state(), State::Done);
     assert_eq!(walls[3], a.walls[3] - 4 * VERIFY_RETRY_MAX as i8);
+}
+
+// ---- floor sweep ----
+
+fn floor_done(nonce: u32, seq: u8, found: u8, tried: u8) -> CalMsg {
+    let mut r = FloorReport {
+        ref_fps: 2484,
+        floor: found,
+        tried,
+        confirm_pct: if found != 0 { 100 } else { 0 },
+        ..FloorReport::default()
+    };
+    for i in 0..tried {
+        r.min_fps[usize::from(i)] = if found != 0 && i + 1 == tried {
+            2484
+        } else {
+            0
+        };
+    }
+    CalMsg::Done(pack_floor_done(nonce, seq, &r))
+}
+
+fn wide_session() -> CalSession {
+    let mut s = session();
+    s.set_peer_wide(true);
+    s
+}
+
+#[test]
+fn floor_sorts_first_within_40_and_is_commanded_as_built() {
+    let mut s = wide_session();
+    start(
+        &mut s,
+        1,
+        &[
+            sp(Kind::Capacity, 40),
+            sp(Kind::Power, 40),
+            sp(Kind::Floor, 40),
+            sp(Kind::Power, 20),
+            sp(Kind::Floor, 40),
+        ],
+        0,
+    );
+    assert_eq!(
+        s.sweeps(),
+        [
+            sp(Kind::Power, 20),
+            sp(Kind::Floor, 40),
+            sp(Kind::Power, 40),
+            sp(Kind::Capacity, 40)
+        ]
+    );
+
+    let mut t = wide_session();
+    start(&mut t, 2, &[sp(Kind::Floor, 40)], 0);
+    assert_eq!(sweep(t.due_mav(0)).unwrap(), make_floor_sweep(2, 0));
+    assert_eq!(t.snapshot().cell_n, 12);
+    assert_eq!(t.snapshot().kind_name(), "floor");
+    assert_eq!(sweep_token(&sp(Kind::Floor, 40)), "floor");
+
+    let mut u = wide_session();
+    assert!(u
+        .start(3, vec![sp(Kind::Floor, 20)], 0, None)
+        .unwrap_err()
+        .contains("40 MHz"));
+}
+
+#[test]
+fn a_found_floor_is_written_with_its_margin_and_the_run_goes_on() {
+    let mut s = wide_session();
+    start(&mut s, 5, &[sp(Kind::Floor, 40), sp(Kind::Power, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack(&mut s, 5, 0, 10);
+    assert!(s.radio_silent(20));
+    // Frames show which candidate is on the air; nothing is tallied.
+    frame(
+        &mut s,
+        0,
+        stamp(Kind::Floor, FLOOR_MCS, 2, 40, FLAGS, 0),
+        true,
+        1400,
+        20,
+    );
+    assert_eq!(s.snapshot().cell_i, 3);
+    s.on_mav(&floor_done(5, 0, 0x24, 3), 30000);
+    let a = apply(s.due_mav(30010)).unwrap();
+    assert!(a.has_floor);
+    assert_eq!(a.floor, 0x35); // 0x24 + 4 steps is under the default
+    assert!(!a.has_walls && !a.has_eff);
+    assert_eq!(a.bw, 40);
+    applied(&mut s, 5, 0, 40, true, "", 30020);
+    let snap = s.snapshot();
+    assert!(snap.floor.ran && snap.floor.have && snap.floor.applied);
+    assert_eq!((snap.floor.rep.floor, snap.floor.written), (0x24, 0x35));
+    assert!(!snap.floor.below_range);
+    assert_eq!((snap.state, snap.sweep_i), (State::AwaitAck, 1));
+}
+
+#[test]
+fn the_written_floor_is_the_edge_plus_margin_never_under_the_default() {
+    assert_eq!(FLOOR_DEFAULT, 0x35);
+    assert_eq!(floor_to_write(0x24), 0x35); // needs 0x28: the default stays
+    assert_eq!(floor_to_write(0x34), 0x38); // needs more: raised
+    assert_eq!(floor_to_write(0x7e), 0x7f); // clamped to the IGI field
+}
+
+#[test]
+fn a_floor_that_passes_at_the_lowest_candidate_reports_no_edge() {
+    let mut s = wide_session();
+    start(&mut s, 8, &[sp(Kind::Floor, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack(&mut s, 8, 0, 10);
+    s.on_mav(&floor_done(8, 0, FLOOR_LO, 1), 20000);
+    assert_eq!(apply(s.due_mav(20010)).unwrap().floor, FLOOR_DEFAULT);
+    let snap = s.snapshot();
+    assert!(snap.floor.below_range);
+    assert_eq!(snap.floor.written, 0x35);
+}
+
+#[test]
+fn a_unit_that_needs_more_than_the_default_gets_it_raised() {
+    let mut s = wide_session();
+    start(&mut s, 9, &[sp(Kind::Floor, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack(&mut s, 9, 0, 10);
+    s.on_mav(&floor_done(9, 0, 0x34, 11), 60000);
+    assert_eq!(apply(s.due_mav(60010)).unwrap().floor, 0x38);
+    assert!(!s.snapshot().floor.below_range);
+}
+
+#[test]
+fn no_passing_floor_writes_nothing_and_says_so() {
+    let mut s = wide_session();
+    start(&mut s, 6, &[sp(Kind::Floor, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack(&mut s, 6, 0, 10);
+    s.on_mav(&floor_done(6, 0, 0, 12), 60000);
+    let snap = s.snapshot();
+    assert_eq!(snap.state, State::Done);
+    assert!(snap.floor.have);
+    assert_eq!(snap.floor.written, 0);
+    assert_eq!(snap.floor.note, "no floor passed");
+}
+
+#[test]
+fn a_lost_floor_report_writes_nothing() {
+    let mut s = wide_session();
+    start(&mut s, 7, &[sp(Kind::Floor, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack(&mut s, 7, 0, 10);
+    let window = u64::from(floor_sweep_max_ms(&make_floor_sweep(7, 0)))
+        + CalSessionCfg::default().phase_slack_ms;
+    assert!(s.radio_silent(10 + window - 1));
+    s.due_mav(10 + window + 1);
+    let snap = s.snapshot();
+    assert_eq!(snap.state, State::Done);
+    assert!(!snap.floor.have);
+    assert_eq!(snap.floor.written, 0);
+    assert_eq!(snap.floor.note, "the floor sweep's result was lost");
+}
+
+#[test]
+fn a_peer_without_the_floor_sweep_runs_the_rest() {
+    let mut s = session(); // no CAP_CAL_WIDE
+    start(&mut s, 8, &[sp(Kind::Power, 20), sp(Kind::Floor, 40)], 0);
+    assert_eq!(s.sweeps(), [sp(Kind::Power, 20)]);
+    assert_eq!(
+        s.snapshot().floor.note,
+        "peer does not support the floor sweep"
+    );
+    let mut t = session();
+    assert_eq!(
+        t.start(9, vec![sp(Kind::Floor, 40)], 0, None).unwrap_err(),
+        "refused: peer does not support the floor sweep"
+    );
+}
+
+#[test]
+fn an_unsupported_floor_ack_moves_on_to_the_next_sweep() {
+    let mut s = wide_session();
+    start(&mut s, 10, &[sp(Kind::Floor, 40), sp(Kind::Power, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack_r(&mut s, 10, 0, 10, FLAGS, AckResult::Unsupported);
+    let snap = s.snapshot();
+    assert_eq!((snap.state, snap.sweep_i), (State::AwaitAck, 1));
+    assert_eq!(snap.floor.note, "peer does not support the floor sweep");
+    let cmd = sweep(s.due_mav(20)).unwrap();
+    assert!(cmd.kind == Kind::Power && cmd.bw == 40);
+}
+
+#[test]
+fn floor_rows_land_in_the_cal_log() {
+    let d = fresh("floor_log");
+    let mut s = CalSession::new(CalSessionCfg::default(), CalLog::open(&d));
+    s.set_peer(true, true, TagCtx::default());
+    s.set_peer_wide(true);
+    start(&mut s, 11, &[sp(Kind::Floor, 40)], 0);
+    assert!(sweep(s.due_mav(0)).is_some());
+    ack(&mut s, 11, 0, 10);
+    s.on_mav(&floor_done(11, 0, 0x22, 2), 30000);
+    assert!(apply(s.due_mav(30010)).is_some());
+    applied(&mut s, 11, 0, 40, true, "", 30020);
+    let ls = log_lines(&d);
+    assert_eq!(ls[0], "callog 6");
+    assert_eq!(ls[2], "S 0 floor 40 4000");
+    assert_eq!(ls[3], "F 32 0");
+    assert_eq!(ls[4], "F 34 2484");
+    assert_eq!(ls[5], "L 2484 34 100 53"); // edge 0x22, the default written
+}
+
+// ---- both widths in one run ----
+
+/// Runs power20 of a run started at 0 through its apply and verify;
+/// returns the next sweep's SweepCmd, offered at `t`.
+fn pass_power20(s: &mut CalSession, nonce: u32, t: u64) -> Option<SweepCmd> {
+    run_power(s, nonce, 0, 20, &WALLS, 0);
+    applied(s, nonce, 0, 20, true, "", 100);
+    sweep(s.due_mav(t))
+}
+
+#[test]
+fn cal_width_holds_the_cards_at_40_only_for_a_40_mhz_sweep() {
+    let mut s = wide_session();
+    assert_eq!(s.cal_width(), 0);
+    start(&mut s, 40, &[sp(Kind::Power, 20), sp(Kind::Floor, 40)], 0);
+    assert_eq!(s.cal_width(), 0);
+    let cmd = pass_power20(&mut s, 40, 100000).unwrap();
+    assert_eq!(cmd.kind, Kind::Floor);
+    assert_eq!(s.cal_width(), 40);
+    ack(&mut s, 40, 1, 100010);
+    assert_eq!(s.cal_width(), 40);
+    s.on_mav(&floor_done(40, 1, 0x24, 3), 130000);
+    assert!(apply(s.due_mav(130010)).is_some());
+    assert_eq!(s.cal_width(), 40);
+    applied(&mut s, 40, 1, 40, true, "", 130020);
+    assert_eq!(s.state(), State::Done);
+    assert_eq!(s.cal_width(), 0);
+}
+
+#[test]
+fn no_pair_skips_the_40_mhz_part_and_keeps_the_20_mhz_one() {
+    let mut s = wide_session();
+    start(
+        &mut s,
+        41,
+        &[
+            sp(Kind::Power, 20),
+            sp(Kind::Floor, 40),
+            sp(Kind::Power, 40),
+            sp(Kind::Capacity, 40),
+        ],
+        0,
+    );
+    assert!(pass_power20(&mut s, 41, 100000).is_some());
+    ack_r(&mut s, 41, 1, 100010, FLAGS, AckResult::NoPair);
+    let snap = s.snapshot();
+    assert_eq!(snap.state, State::Done);
+    assert!(snap.width[0].applied);
+    assert!(snap.width[1].skipped.contains("no 40 MHz pair"));
+    assert!(snap.width[1].skipped.starts_with("floor: "));
+    assert_eq!(snap.floor.note, "no 40 MHz pair");
+    assert_eq!(s.cal_width(), 0);
+    // The drone's run is closed at once, as at any other Done.
+    assert_eq!(abort_nonce(&s.due_mav(100020)), Some(41));
+}
+
+#[test]
+fn no_floor_passing_skips_the_40_mhz_sweeps_after_it() {
+    let mut s = wide_session();
+    start(
+        &mut s,
+        42,
+        &[
+            sp(Kind::Power, 20),
+            sp(Kind::Floor, 40),
+            sp(Kind::Power, 40),
+        ],
+        0,
+    );
+    assert!(pass_power20(&mut s, 42, 100000).is_some());
+    ack(&mut s, 42, 1, 100010);
+    s.on_mav(&floor_done(42, 1, 0, 12), 170000);
+    let snap = s.snapshot();
+    assert_eq!(snap.state, State::Done);
+    assert!(snap.width[0].applied);
+    assert_eq!(snap.width[1].skipped, "floor: no floor passed");
+    assert!(!snap.width[1].have_walls);
+}
+
+#[test]
+fn a_refused_40_mhz_apply_leaves_the_run_done_with_40_uncalibrated() {
+    let mut s = wide_session();
+    start(
+        &mut s,
+        43,
+        &[
+            sp(Kind::Power, 20),
+            sp(Kind::Power, 40),
+            sp(Kind::Capacity, 40),
+        ],
+        0,
+    );
+    assert!(pass_power20(&mut s, 43, 100000).is_some());
+    run_power(&mut s, 43, 1, 40, &WALLS, 100300);
+    applied(&mut s, 43, 1, 40, false, "config line not found", 100400);
+    let snap = s.snapshot();
+    assert_eq!(snap.state, State::Done);
+    assert!(snap.fail_reason.is_empty());
+    assert!(snap.width[0].applied);
+    assert!(!snap.width[1].applied);
+    assert_eq!(
+        snap.width[1].skipped,
+        "power40: apply refused by the drone: config line not found"
+    );
+}
+
+#[test]
+fn a_40_mhz_ack_timeout_after_20_is_skipped_but_alone_still_fails() {
+    let cfg = CalSessionCfg::default();
+    let mut s = wide_session();
+    start(&mut s, 44, &[sp(Kind::Power, 20), sp(Kind::Power, 40)], 0);
+    assert!(pass_power20(&mut s, 44, 100000).is_some());
+    s.due_mav(100000 + cfg.ack_timeout_ms);
+    assert_eq!(s.state(), State::Done);
+    assert_eq!(
+        s.snapshot().width[1].skipped,
+        "power40: calibration ack timeout"
+    );
+
+    let mut t = wide_session();
+    start(&mut t, 45, &[sp(Kind::Power, 40)], 0);
+    assert!(t.due_mav(0).is_some());
+    t.due_mav(cfg.ack_timeout_ms);
+    assert_eq!(t.state(), State::Failed);
+    assert!(t.snapshot().width[1].skipped.is_empty());
+}
+
+#[test]
+fn a_refused_40_mhz_ack_after_20_is_skipped() {
+    let mut s = wide_session();
+    start(&mut s, 46, &[sp(Kind::Power, 20), sp(Kind::Power, 40)], 0);
+    assert!(pass_power20(&mut s, 46, 100000).is_some());
+    ack_r(&mut s, 46, 1, 100010, FLAGS, AckResult::Busy);
+    assert_eq!(s.state(), State::Done);
+    assert_eq!(
+        s.snapshot().width[1].skipped,
+        "power40: sweep refused by the drone: busy"
+    );
+}
+
+#[test]
+fn a_refused_floor_apply_skips_the_40_mhz_part() {
+    let mut s = wide_session();
+    start(
+        &mut s,
+        47,
+        &[
+            sp(Kind::Power, 20),
+            sp(Kind::Floor, 40),
+            sp(Kind::Power, 40),
+        ],
+        0,
+    );
+    assert!(pass_power20(&mut s, 47, 100000).is_some());
+    ack(&mut s, 47, 1, 100010);
+    s.on_mav(&floor_done(47, 1, 0x24, 3), 130000);
+    assert!(apply(s.due_mav(130010)).is_some());
+    applied(&mut s, 47, 1, 40, false, "no wide_tx_igi_floor key", 130020);
+    let snap = s.snapshot();
+    assert_eq!(snap.state, State::Done);
+    assert!(!snap.floor.applied);
+    assert_eq!(
+        snap.width[1].skipped,
+        "floor: floor apply refused by the drone: no wide_tx_igi_floor key"
+    );
+}
+
+/// Rust only (mabur has no MCS0 rule): a power40 whose MCS0 row dips
+/// after power20 applied skips 40 MHz instead of failing the run.
+#[test]
+fn an_mcs0_dip_at_40_after_20_skips_the_40_mhz_part() {
+    let mut s = wide_session();
+    start(&mut s, 49, &[sp(Kind::Power, 20), sp(Kind::Power, 40)], 0);
+    assert!(pass_power20(&mut s, 49, 100000).is_some());
+    let cmd = sweep(s.due_mav(100300)).unwrap();
+    assert_eq!((cmd.kind, cmd.bw), (Kind::Power, 40));
+    ack(&mut s, 49, 1, 100310);
+    let mut dip = WALLS;
+    dip[0] = 20;
+    feed_power(&mut s, 40, &dip, 100320, FLAGS, u32::from(POWER_FRAMES));
+    s.on_mav(&power_done(49, 1, u32::from(POWER_FRAMES)), 100330);
+    let snap = s.snapshot();
+    assert_eq!(snap.state, State::Done);
+    assert!(snap.width[0].applied);
+    assert!(snap.width[1]
+        .skipped
+        .starts_with("power40: MCS0 lost frames"));
+}
+
+#[test]
+fn skipped_rows_land_in_the_cal_log() {
+    let d = fresh("skip_log");
+    let mut s = CalSession::new(CalSessionCfg::default(), CalLog::open(&d));
+    s.set_peer(true, true, TagCtx::default());
+    s.set_peer_wide(true);
+    start(&mut s, 48, &[sp(Kind::Power, 20), sp(Kind::Floor, 40)], 0);
+    assert!(pass_power20(&mut s, 48, 100000).is_some());
+    ack_r(&mut s, 48, 1, 100010, FLAGS, AckResult::NoPair);
+    let ls = log_lines(&d);
+    assert_eq!(ls.last().unwrap(), "N 40 floor: ch 0 has no 40 MHz pair");
+}
+
+#[test]
+fn the_status_json_carries_the_floor_and_a_skipped_width() {
+    let mut s = wide_session();
+    start(
+        &mut s,
+        50,
+        &[
+            sp(Kind::Power, 20),
+            sp(Kind::Floor, 40),
+            sp(Kind::Power, 40),
+        ],
+        0,
+    );
+    assert!(pass_power20(&mut s, 50, 100000).is_some());
+    ack(&mut s, 50, 1, 100010);
+    s.on_mav(&floor_done(50, 1, 0, 12), 170000);
+    let j = super::status_json(&s.snapshot(), s.sweeps(), true);
+    assert!(j.contains(r#""skipped":"floor: no floor passed""#), "{j}");
+    assert!(
+        j.contains(r#""floor":{"applied":false,"below_range":false,"edge":null"#),
+        "{j}"
+    );
+    assert!(j.contains(r#""note":"no floor passed""#), "{j}");
+    assert!(
+        j.contains(r#""sweeps":["power20","floor","power40"]"#),
+        "{j}"
+    );
 }

@@ -1,7 +1,8 @@
 //! TX-power calibration wire formats (mabur `cal_wire.h`, `cal_proto.h`,
-//! `cal_park.h`, `cal_mav.cpp`): the stamp every sweep frame carries, the
-//! six calibration messages of the mabur MAVLink dialect (60000-60005) and
-//! the verify-pass park rule both ends share.
+//! `cal_park.h`, `cal_floor.h`, `cal_mav.cpp`): the stamp every sweep frame
+//! carries, the six calibration messages of the mabur MAVLink dialect
+//! (60000-60005), the verify-pass park rule and the floor sweep's rules
+//! both ends share.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,6 +15,8 @@ pub enum Kind {
     Power = 1,
     Verify = 2,
     Capacity = 3,
+    /// The wide-TX receive-gain floor (40 MHz only; `floor` rules below).
+    Floor = 4,
 }
 
 impl Kind {
@@ -22,6 +25,7 @@ impl Kind {
             1 => Some(Kind::Power),
             2 => Some(Kind::Verify),
             3 => Some(Kind::Capacity),
+            4 => Some(Kind::Floor),
             _ => None,
         }
     }
@@ -161,7 +165,11 @@ pub enum AckResult {
     Accepted = 0,
     AnchorUnreadable = 1,
     Busy = 2,
+    /// A kind this drone does not run (a floor sweep on a radio without a
+    /// runtime receive-gain floor, or a kind newer than its build).
     Unsupported = 3,
+    /// A 40 MHz sweep on a channel with no HT40 pair.
+    NoPair = 4,
 }
 
 impl AckResult {
@@ -171,6 +179,7 @@ impl AckResult {
             0 => AckResult::Accepted,
             1 => AckResult::AnchorUnreadable,
             2 => AckResult::Busy,
+            4 => AckResult::NoPair,
             _ => AckResult::Unsupported,
         }
     }
@@ -218,6 +227,10 @@ pub struct ApplyCmd {
     pub walls: [i8; 8],
     pub legacy: i8,
     pub eff_x1000: [u16; 8],
+    /// radio.wide_tx_igi_floor from a floor sweep (bw 40). Never in the
+    /// same apply as walls, so on the wire it rides `legacy` (has bit 2).
+    pub has_floor: bool,
+    pub floor: u8,
 }
 
 impl Default for ApplyCmd {
@@ -231,6 +244,8 @@ impl Default for ApplyCmd {
             walls: [WALL_LEAVE; 8],
             legacy: WALL_LEAVE,
             eff_x1000: [0; 8],
+            has_floor: false,
+            floor: 0,
         }
     }
 }
@@ -340,10 +355,11 @@ pub fn payload(m: &CalMsg) -> (u32, Vec<u8>) {
             for x in a.eff_x1000 {
                 put16(&mut v, x);
             }
-            let has = u8::from(a.has_walls) | (u8::from(a.has_eff) << 1);
+            let has =
+                u8::from(a.has_walls) | (u8::from(a.has_eff) << 1) | (u8::from(a.has_floor) << 2);
             v.extend_from_slice(&[a.seq, a.bw, has]);
             v.extend(a.walls.iter().map(|&w| w as u8));
-            v.push(a.legacy as u8);
+            v.push(if a.has_floor { a.floor } else { a.legacy as u8 });
             MSG_APPLY
         }
         CalMsg::Applied(a) => {
@@ -411,15 +427,22 @@ pub fn decode(msgid: u32, p: &[u8]) -> Option<CalMsg> {
             CalMsg::Done(d)
         }
         MSG_APPLY => {
+            let has_floor = p[22] & 4 != 0;
             let mut a = ApplyCmd {
                 nonce: rd32(p, 0),
                 seq: p[20],
                 bw: p[21],
                 has_walls: p[22] & 1 != 0,
                 has_eff: p[22] & 2 != 0,
-                legacy: p[31] as i8,
+                has_floor,
                 ..ApplyCmd::default()
             };
+            // 0..0x7f: the floor fits the int8 legacy field.
+            if has_floor {
+                a.floor = p[31];
+            } else {
+                a.legacy = p[31] as i8;
+            }
             for i in 0..8 {
                 a.eff_x1000[i] = rd16(p, 4 + 2 * i);
                 a.walls[i] = p[23 + i] as i8;
@@ -504,6 +527,139 @@ pub fn park_rel_for(walls: &[i8; 8], margin_db: f64) -> [i32; 8] {
     park
 }
 
+// ---- the floor sweep (cal_floor.h) ----
+
+/// HT MCS 2 at 40 MHz, production-sized frames: the rate the stall was
+/// measured at.
+pub const FLOOR_MCS: u8 = 2;
+/// Candidates, ascending, two IGI steps apart: 0x20 is the bottom of the
+/// receiver's normal DIG window on a DFS channel, 0x36 the first even step
+/// past devourer's default 0x35.
+pub const FLOOR_LO: u8 = 0x20;
+pub const FLOOR_HI: u8 = 0x36;
+pub const FLOOR_STEP: u8 = 2;
+pub const FLOOR_MAX_CANDIDATES: usize = 12;
+/// The top of the 7-bit IGI field.
+pub const FLOOR_MAX: u8 = 0x7f;
+pub const FLOOR_SETTLE_MS: u16 = 300;
+pub const FLOOR_DWELL_MS: u16 = 4000;
+pub const FLOOR_REF_DWELL_MS: u32 = 2000;
+pub const FLOOR_CONFIRM_MS: u32 = 8000;
+pub const FLOOR_MAX_CONFIRMS: u32 = 2;
+/// The unit's edge plus this many IGI steps (about 1 dB each of the
+/// drone's uplink sensitivity while 40 MHz flies) is what the unit needs.
+pub const FLOOR_MARGIN_STEPS: u8 = 4;
+/// devourer's default floor, what the bundle's drone config ships.
+pub const FLOOR_DEFAULT: u8 = 0x35;
+
+/// lo, lo + FLOOR_STEP, ... up to hi, at most FLOOR_MAX_CANDIDATES; empty
+/// for a range outside [1, FLOOR_MAX] or upside down.
+pub fn floor_candidates(lo: i32, hi: i32) -> Vec<u8> {
+    if lo < 1 || hi > i32::from(FLOOR_MAX) || lo > hi {
+        return Vec::new();
+    }
+    (lo..=hi)
+        .step_by(usize::from(FLOOR_STEP))
+        .take(FLOOR_MAX_CANDIDATES)
+        .map(|v| v as u8)
+        .collect()
+}
+
+/// The value written for a unit whose lowest confirmed floor is `edge`:
+/// edge + FLOOR_MARGIN_STEPS, never under FLOOR_DEFAULT, at most FLOOR_MAX.
+/// Calibration raises the floor for a unit that needs more than the
+/// default and otherwise leaves the default; it never lowers it. On one
+/// RTL8822E at 40 MHz (edge 0x24) floors 0x28 and 0x35 gave the same
+/// video (capture to complete AU p50 24 ms, p90 27-28 ms) but the drone
+/// took 62 % and 73 % of the GS's RCFs at 0x28 against 93 % and 98 % at
+/// 0x35: the lower floor hears the close-range uplink worse. What a lower
+/// floor buys at long range is unmeasured, so the policy stays here, in one
+/// place (mabur `floor_to_write`).
+pub fn floor_to_write(edge: u8) -> u8 {
+    let need = (u32::from(edge) + u32::from(FLOOR_MARGIN_STEPS)).min(u32::from(FLOOR_MAX));
+    need.max(u32::from(FLOOR_DEFAULT)) as u8
+}
+
+/// The floor sweep as the GS commands it: the candidates in idx_lo/idx_hi,
+/// the per-candidate dwell in dwell_ms, the settle in settle_ms, the one
+/// MCS in mcs_mask. Always 40 MHz.
+pub fn make_floor_sweep(nonce: u32, seq: u8) -> SweepCmd {
+    SweepCmd {
+        nonce,
+        seq,
+        kind: Kind::Floor,
+        bw: 40,
+        frames_per_cell: 0,
+        gap_us: 0,
+        settle_ms: FLOOR_SETTLE_MS,
+        dwell_ms: FLOOR_DWELL_MS,
+        idx_lo: FLOOR_LO as i8,
+        idx_hi: FLOOR_HI as i8,
+        mcs_mask: 1 << FLOOR_MCS,
+    }
+}
+
+/// The longest the drone can take for `c`: the reference point, every
+/// candidate and FLOOR_MAX_CONFIRMS confirmations, each with its settle.
+pub fn floor_sweep_max_ms(c: &SweepCmd) -> u32 {
+    let n = floor_candidates(i32::from(c.idx_lo), i32::from(c.idx_hi)).len() as u32;
+    let points = 1 + n + FLOOR_MAX_CONFIRMS;
+    points * u32::from(c.settle_ms)
+        + FLOOR_REF_DWELL_MS
+        + n * u32::from(c.dwell_ms)
+        + FLOOR_MAX_CONFIRMS * FLOOR_CONFIRM_MS
+}
+
+/// What a floor sweep found, as the drone's SweepDone carries it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FloorReport {
+    /// Reference rate, frames/s.
+    pub ref_fps: u32,
+    /// Lowest confirmed value; 0 = none passed.
+    pub floor: u8,
+    /// Candidates dwelt on, from the first.
+    pub tried: u8,
+    /// The last confirmation's worst second, % of the reference.
+    pub confirm_pct: u8,
+    /// Per candidate tried, its worst second in frames/s.
+    pub min_fps: [u16; FLOOR_MAX_CANDIDATES],
+}
+
+/// SweepDone for Kind::Floor: offered[0] the reference rate, offered[1]
+/// the confirmed floor, offered[2..7] the candidates' worst seconds two
+/// per word (the even candidate in the low half), blocked_pct[0] the
+/// candidates tried, blocked_pct[1] the confirmation's percent.
+pub fn pack_floor_done(nonce: u32, seq: u8, r: &FloorReport) -> SweepDone {
+    let mut d = SweepDone {
+        nonce,
+        seq,
+        ..SweepDone::default()
+    };
+    d.offered[0] = r.ref_fps;
+    d.offered[1] = u32::from(r.floor);
+    for i in 0..FLOOR_MAX_CANDIDATES / 2 {
+        d.offered[2 + i] = u32::from(r.min_fps[2 * i]) | (u32::from(r.min_fps[2 * i + 1]) << 16);
+    }
+    d.blocked_pct[0] = r.tried;
+    d.blocked_pct[1] = r.confirm_pct;
+    d
+}
+
+pub fn unpack_floor_done(d: &SweepDone) -> FloorReport {
+    let mut r = FloorReport {
+        ref_fps: d.offered[0],
+        floor: d.offered[1].min(u32::from(FLOOR_MAX)) as u8,
+        tried: (d.blocked_pct[0] as usize).min(FLOOR_MAX_CANDIDATES) as u8,
+        confirm_pct: d.blocked_pct[1],
+        ..FloorReport::default()
+    };
+    for i in 0..FLOOR_MAX_CANDIDATES / 2 {
+        r.min_fps[2 * i] = (d.offered[2 + i] & 0xFFFF) as u16;
+        r.min_fps[2 * i + 1] = (d.offered[2 + i] >> 16) as u16;
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,7 +700,7 @@ mod tests {
     #[test]
     fn rejects_bad_kind_bw_flags() {
         let base = build_payload(Kind::Power, 0, 5, 20, 0, 1, PAYLOAD_LEN);
-        for (i, b) in [(4, 4u8), (7, 30), (8, 4)] {
+        for (i, b) in [(4, 5u8), (7, 30), (8, 4)] {
             let mut p = base.clone();
             p[i] = b;
             assert!(parse_payload(&p).is_none(), "byte {i} = {b}");
@@ -598,6 +754,7 @@ mod tests {
                 walls: [63, 63, 60, 50, 45, 23, WALL_LEAVE, -64],
                 legacy: 63,
                 eff_x1000: [930, 880, 840, 800, 760, 0, 780, 1000],
+                ..ApplyCmd::default()
             }),
             CalMsg::Applied(Applied {
                 nonce: 12,
@@ -672,6 +829,95 @@ mod tests {
         partial.extend_from_slice(&cal[..5]);
         assert!(!all_packets_are_cal(&partial));
         assert!(!all_packets_are_cal(&[]));
+    }
+
+    #[test]
+    fn floor_frame_parses_with_the_reference_index() {
+        let p = build_payload(Kind::Floor, FLOOR_MCS, -1, 40, 3, 9, 1405);
+        let f = parse_payload(&p).unwrap();
+        assert_eq!(
+            (f.kind, f.rate, f.idx, f.bw),
+            (Kind::Floor, FLOOR_MCS, -1, 40)
+        );
+    }
+
+    /// mabur cal_mav.cpp: has bit 2, the floor in the legacy byte.
+    #[test]
+    fn a_floor_apply_rides_the_legacy_byte() {
+        let a = ApplyCmd {
+            nonce: 5,
+            seq: 2,
+            bw: 40,
+            has_floor: true,
+            floor: 0x7f,
+            ..ApplyCmd::default()
+        };
+        let (_, p) = payload(&CalMsg::Apply(a));
+        assert_eq!((p[22], p[31]), (4, 0x7f));
+        assert_eq!(
+            decode_all(&encode(&CalMsg::Apply(a), 1, 1, 0)),
+            vec![CalMsg::Apply(a)]
+        );
+        // Without the bit the byte is legacy again.
+        let w = ApplyCmd {
+            legacy: -5,
+            ..ApplyCmd::default()
+        };
+        assert_eq!(
+            decode_all(&encode(&CalMsg::Apply(w), 1, 1, 0)),
+            vec![CalMsg::Apply(w)]
+        );
+    }
+
+    #[test]
+    fn no_pair_decodes_and_an_unknown_result_is_unsupported() {
+        assert_eq!(AckResult::from_u8(4), AckResult::NoPair);
+        assert_eq!(AckResult::from_u8(9), AckResult::Unsupported);
+    }
+
+    #[test]
+    fn floor_candidates_and_the_longest_walk() {
+        let c = floor_candidates(i32::from(FLOOR_LO), i32::from(FLOOR_HI));
+        assert_eq!(c.len(), 12);
+        assert_eq!((c[0], c[11]), (0x20, 0x36));
+        assert!(floor_candidates(0, 10).is_empty());
+        assert!(floor_candidates(0x30, 0x20).is_empty());
+        // 15 settles + 2 + 12 x 4 + 2 x 8 s.
+        assert_eq!(floor_sweep_max_ms(&make_floor_sweep(1, 0)), 70_500);
+        let s = make_floor_sweep(7, 3);
+        assert_eq!(
+            (s.kind, s.bw, s.mcs_mask),
+            (Kind::Floor, 40, 1 << FLOOR_MCS)
+        );
+    }
+
+    #[test]
+    fn the_written_floor_is_the_edge_plus_margin_never_under_the_default() {
+        assert_eq!(FLOOR_DEFAULT, 0x35);
+        assert_eq!(floor_to_write(0x24), 0x35); // needs 0x28: the default stays
+        assert_eq!(floor_to_write(0x31), 0x35);
+        assert_eq!(floor_to_write(0x32), 0x36);
+        assert_eq!(floor_to_write(0x34), 0x38); // needs more: raised
+        assert_eq!(floor_to_write(0x7c), 0x7f);
+        assert_eq!(floor_to_write(0x7e), 0x7f); // clamped to the IGI field
+    }
+
+    #[test]
+    fn a_floor_report_round_trips_through_sweep_done() {
+        let mut r = FloorReport {
+            ref_fps: 2484,
+            floor: 0x24,
+            tried: 3,
+            confirm_pct: 100,
+            ..FloorReport::default()
+        };
+        r.min_fps[..3].copy_from_slice(&[0, 2130, 2484]);
+        let d = pack_floor_done(9, 4, &r);
+        assert_eq!(
+            (d.nonce, d.seq, d.offered[1], d.offered[2]),
+            (9, 4, 0x24, 2130 << 16)
+        );
+        assert_eq!(unpack_floor_done(&d), r);
     }
 
     #[test]
