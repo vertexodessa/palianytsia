@@ -44,8 +44,10 @@ pub struct Shared {
     pub core_done: AtomicBool,
     pub lat: Lat,
     /// Events from other threads (decoder stalls) for the flight log; the
-    /// core loop drains them on its tick.
-    pub events: Mutex<Vec<(&'static str, serde_json::Value)>>,
+    /// core loop drains them on its tick and stamps them with it. The third
+    /// field is the raiser's own time (`event_at`), for events raised while
+    /// the loop itself is held and cannot tick.
+    pub events: Mutex<Vec<(&'static str, serde_json::Value, Option<u64>)>>,
     /// The channel the card listens on; 0 before the card is up.
     pub channel: AtomicU8,
     /// The card is sweeping the channel set for the drone.
@@ -101,10 +103,22 @@ impl Shared {
     }
 
     pub fn event(&self, ev: &'static str, detail: serde_json::Value) {
+        self.queue(ev, detail, None);
+    }
+
+    /// An event that happened at `t_us` on the core loop's clock. A drone
+    /// search runs inside one tick for as long as it takes (24 s on the
+    /// bench with the drone's service down for 14 s), and the tick that
+    /// drains its events comes after it.
+    pub fn event_at(&self, t_us: u64, ev: &'static str, detail: serde_json::Value) {
+        self.queue(ev, detail, Some(t_us));
+    }
+
+    fn queue(&self, ev: &'static str, detail: serde_json::Value, at: Option<u64>) {
         let mut q = self.events.lock().unwrap_or_else(|p| p.into_inner());
         // A wedged core loop must not grow this without bound.
         if q.len() < 256 {
-            q.push((ev, detail));
+            q.push((ev, detail, at));
         }
     }
 }
@@ -420,8 +434,8 @@ impl CoreLoop {
         );
         if let Some(l) = self.sink.log.as_mut() {
             let _ = l.tick(now);
-            for (ev, d) in evs {
-                let _ = l.event(now, ev, d);
+            for (ev, d, at) in evs {
+                let _ = l.event(at.unwrap_or(now), ev, d);
             }
         }
     }
@@ -924,22 +938,29 @@ fn search(
         }
         rounds += 1;
         if rounds == 1 {
-            shared.event("search", serde_json::json!({"set": set, "first": first}));
+            // Raised once a whole pass found nothing; the search began at `t`.
+            shared.event_at(t, "search", serde_json::json!({"set": set, "first": first}));
         }
         if rounds == GRID_AFTER_ROUNDS {
             let grid: Vec<u8> = pal_wire::ht40::grid_5g(width)
                 .into_iter()
                 .filter(|c| !order.contains(c))
                 .collect();
-            shared.event("search_grid", serde_json::json!({"channels": grid.len()}));
+            shared.event_at(
+                io.now_us(),
+                "search_grid",
+                serde_json::json!({"channels": grid.len()}),
+            );
             order.extend(grid);
         }
     };
     shared.searching.store(false, Ordering::Relaxed);
     if let Some(ch) = found {
-        shared.event(
+        let now = io.now_us();
+        shared.event_at(
+            now,
             "drone_found",
-            serde_json::json!({"ch": ch, "ms": (io.now_us() - t) / 1000, "rounds": rounds}),
+            serde_json::json!({"ch": ch, "ms": (now - t) / 1000, "rounds": rounds}),
         );
     }
     Ok(found)
@@ -1261,7 +1282,7 @@ fn run_runtime_owned(
             if seen.lost(hits.load(Ordering::Relaxed), now) && searching {
                 cl.sink
                     .shared
-                    .event("drone_lost", serde_json::json!({"ch": core_ch}));
+                    .event_at(now, "drone_lost", serde_json::json!({"ch": core_ch}));
                 if !find(cl, &mut core_ch)? {
                     return Ok(false);
                 }
@@ -1535,8 +1556,8 @@ mod tests {
         }
         let ages: Vec<_> = told
             .iter()
-            .filter(|(ev, _)| *ev == "rung_reason")
-            .map(|(_, v)| v["age_ms"].as_i64().unwrap())
+            .filter(|(ev, _, _)| *ev == "rung_reason")
+            .map(|(_, v, _)| v["age_ms"].as_i64().unwrap())
             .collect();
         // Seen with the first 10 Hz stats line after each move, at 1.6 s
         // and 3.3 s; the odd tenth carries the wobble's 1 ms. Every later
@@ -1548,6 +1569,43 @@ mod tests {
     fn free_space_reads_the_volume_or_nothing() {
         assert!(free_bytes(&std::env::temp_dir()).is_some_and(|b| b > 0));
         assert_eq!(free_bytes(std::path::Path::new("/no/such/dir")), None);
+    }
+
+    #[test]
+    fn an_event_raised_with_its_own_time_is_logged_at_that_time() {
+        let root = std::env::temp_dir().join(format!("pal-rt-evtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let run = flightlog::session::Run {
+            app: "test",
+            core: "rust",
+            mode: "gs",
+            config: None,
+        };
+        let log = Session::create(&root, std::time::SystemTime::now(), 0, &run).unwrap();
+        let dir = log.dir().to_path_buf();
+        let Rig { mut cl, shared, .. } = rig(Box::new(AuCore), Some(log));
+        cl.tick(1_000_000);
+        // A drone search holds the loop: lost at 1.2 s, found at 3.9 s, and
+        // the next tick only at 4 s.
+        shared.event_at(1_200_000, "drone_lost", serde_json::json!({"ch": 40}));
+        shared.event_at(3_900_000, "drone_found", serde_json::json!({"ch": 40}));
+        shared.event("cards", serde_json::json!({"chips": "x"}));
+        cl.tick(4_000_000);
+        drop(cl);
+        let text = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let at = |name: &str| {
+            text.lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|v| v["ev"] == name)
+                .unwrap_or_else(|| panic!("{name} in {text}"))["t_us"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(at("drone_lost"), 1_200_000);
+        assert_eq!(at("drone_found"), 3_900_000);
+        // No time of its own: the draining tick's.
+        assert_eq!(at("cards"), 4_000_000);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1583,7 +1641,10 @@ mod tests {
             t += TICK_US;
         }
         drop(cl);
-        let logged: Vec<_> = told.iter().filter(|(ev, _)| *ev == "log_error").collect();
+        let logged: Vec<_> = told
+            .iter()
+            .filter(|(ev, _, _)| *ev == "log_error")
+            .collect();
         assert_eq!(logged.len(), 1, "{told:?}");
         assert!(
             logged[0].1["error"]

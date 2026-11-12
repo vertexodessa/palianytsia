@@ -186,7 +186,14 @@ mod tests {
         }
 
         fn events(&self) -> Vec<(&'static str, serde_json::Value)> {
-            self.shared.events.lock().unwrap().clone()
+            let q = self.shared.events.lock().unwrap();
+            q.iter().map(|(n, v, _)| (*n, v.clone())).collect()
+        }
+
+        /// The time each event carries for the flight log.
+        fn times(&self) -> Vec<Option<u64>> {
+            let q = self.shared.events.lock().unwrap();
+            q.iter().map(|(_, _, at)| *at).collect()
         }
 
         fn names(&self) -> Vec<&'static str> {
@@ -374,6 +381,15 @@ mod tests {
         assert_eq!(f.events()[1].1, serde_json::json!({"channels": grid.len()}));
         assert_eq!(found(&f)["rounds"], GRID_AFTER_ROUNDS);
         assert_eq!(found(&f)["ch"], 100);
+        // The core loop does not tick while the sweep runs, so each event
+        // carries its own time: the search from its start, the grid when the
+        // second pass ended, the find when it happened.
+        let ms = found(&f)["ms"].as_u64().unwrap();
+        assert_eq!(
+            f.times(),
+            [Some(T0), Some(T0 + 4 * VISIT), Some(T0 + ms * 1000)]
+        );
+        assert!(ms * 1000 > 6 * VISIT, "{ms}");
     }
 
     #[test]
