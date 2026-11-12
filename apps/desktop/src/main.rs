@@ -9,6 +9,9 @@
 //!     --bw: video link width (every ladder rung); default the saved pref (Link tab)
 //!     live is the default; config from -c, $PAL_CONFIG, or configs/gs-auto.toml (finds the drone);
 //!     channel from its radio section, mode gs
+//!     no --ch on an auto config (Rust core, GS): the channel core runs as in the apps and the
+//!     Link tab has their channel menu (scan, tick the channels the link may use; saved);
+//!     --ch N holds that one channel: no search, no menu
 //!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
@@ -67,6 +70,11 @@ struct Opts {
     width: u8,
     /// Video link width (every ladder rung's bw); 0 = the saved pref.
     link_bw: u8,
+    /// The channels the Link tab's menu offers: the config's set once the
+    /// saved choices are applied to it (`resolve_config`). Empty = no menu:
+    /// a --ch or a pinned config holds one channel, and pal-ref's channel
+    /// core takes no choice.
+    menu_channels: Vec<u8>,
     /// What this run reads, resolved once in `parse`. On a live run it has
     /// the video width applied.
     cfg: pal_core::config::Config,
@@ -211,8 +219,8 @@ fn parse() -> Opts {
         eprintln!("pal-desktop: config {}", p.display());
         p
     });
-    resolve_config(&mut o);
     o.mode = mode.unwrap_or(if o.live() { Mode::Gs } else { Mode::Spotter });
+    resolve_config(&mut o);
     if o.live() {
         // Channel from the config unless given: radio.channel's pin, else
         // the first of radio.channels.
@@ -247,35 +255,68 @@ fn prefs_path() -> PathBuf {
         .join("palianytsia/hud.json")
 }
 
-/// Reads the config once. A live run applies the video width when it
-/// starts: every ladder rung at --bw, else the saved pref.
+/// Reads the config once. A live run applies the saved link choices when it
+/// starts: every ladder rung at --bw, else the saved width; and where the
+/// Rust channel core will run (a GS, no --ch, no pin in the config) the rest
+/// of what the apps apply (`with_link_pick`): the 5 GHz grid as the set to
+/// search and choose from, the saved channels, the enhance-loss switch.
 fn resolve_config(o: &mut Opts) {
     let path = o.config.clone();
     let mut text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+    let mut menu = false;
     if o.live() {
+        let prefs = pal_osd::prefs::HudPrefs::load(&prefs_path());
         let bw = match o.link_bw {
-            0 => pal_osd::prefs::HudPrefs::load(&prefs_path()).link_bw,
+            0 => prefs.link_bw,
             b => b,
         };
-        match pal_core::config::with_link_bw(&text, bw) {
-            Ok(t) => {
-                eprintln!("pal-desktop: video width {bw} MHz");
-                text = t;
-                if !o.rust {
-                    let p = std::env::temp_dir()
-                        .join(format!("pal-desktop-{}-bw{bw}.toml", std::process::id()));
-                    std::fs::write(&p, &text)
-                        .unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
-                    o.config = p.clone();
-                    o.ref_toml = Some(p);
-                }
+        menu = o.rust
+            && o.mode == Mode::Gs
+            && o.ch == 0
+            && pal_core::config::parse_config_str(&text).is_ok_and(|c| c.radio.pin.is_none());
+        if menu {
+            let pick = pal_core::config::LinkPick {
+                bw,
+                channels: prefs.link_channels,
+                s3_demote: Some(prefs.s3_demote),
+            };
+            let (t, skipped) = pal_core::config::with_link_pick(&text, pick);
+            for s in skipped {
+                eprintln!("pal-desktop: {s}");
             }
-            Err(e) => eprintln!("pal-desktop: video width {bw} MHz not applied: {e}"),
+            text = t;
+        } else {
+            match pal_core::config::with_link_bw(&text, bw) {
+                Ok(t) => {
+                    eprintln!("pal-desktop: video width {bw} MHz");
+                    text = t;
+                    if !o.rust {
+                        let p = std::env::temp_dir()
+                            .join(format!("pal-desktop-{}-bw{bw}.toml", std::process::id()));
+                        std::fs::write(&p, &text)
+                            .unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
+                        o.config = p.clone();
+                        o.ref_toml = Some(p);
+                    }
+                }
+                Err(e) => eprintln!("pal-desktop: video width {bw} MHz not applied: {e}"),
+            }
         }
     }
     o.cfg = pal_core::config::parse_config_str(&text)
         .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+    if menu {
+        o.menu_channels = o.cfg.radio.channels.clone();
+        eprintln!(
+            "pal-desktop: video width {} MHz, channels {}",
+            o.cfg.rx_width(),
+            match &o.cfg.radio.use_ {
+                u if u.is_empty() => "any (auto)".to_string(),
+                u => format!("{u:?}"),
+            }
+        );
+    }
     o.config_text = text;
 }
 
@@ -487,6 +528,8 @@ struct App {
     console: pal_osd::console::Console,
     /// Channel and width the card runs on, for the Link tab.
     radio: (u8, u8),
+    /// The Link tab's channel menu offers these (`Opts::menu_channels`).
+    channels: Vec<u8>,
     log_info: String,
     tex: Option<egui::TextureHandle>,
     shown_seq: u64,
@@ -575,8 +618,7 @@ impl eframe::App for App {
             ctx,
             link_info.clone(),
             self.log_info.clone(),
-            // The desktop picks its channel on the command line (--ch).
-            &[],
+            &self.channels,
         );
         self.console.settle(&mut out, Some(&self.cmd_tx));
         if out.relink {
@@ -665,9 +707,9 @@ impl eframe::App for App {
         if self.headset_menu {
             // The headset's menu surface alone, as the Quest draws it on
             // its own quad: a layout check without a headset.
-            let mut out = self
-                .console
-                .show_surface(ctx, link_info, self.log_info.clone(), &[]);
+            let mut out =
+                self.console
+                    .show_surface(ctx, link_info, self.log_info.clone(), &self.channels);
             self.console.settle(&mut out, Some(&self.cmd_tx));
         } else if self.console.prefs.stats {
             egui::Area::new(egui::Id::new("telem"))
@@ -879,6 +921,7 @@ fn main() {
                 ),
                 headset_menu: o.headset_menu,
                 radio: (o.ch, o.width),
+                channels: o.menu_channels.clone(),
                 log_info: log_info.clone(),
                 tex: None,
                 shown_seq: 0,
