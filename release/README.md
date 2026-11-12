@@ -1,11 +1,11 @@
-# Palianytsia v0.12
+# Palianytsia v0.12.1
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.12.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.12.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.12.1.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.12.1.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,8 +14,13 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
 
-## What changed since v0.11
+## What changed in v0.12.1
 
+- **An update from an old drone config no longer leaves maburd stopped.** `install.py` keeps the drone's own `mabur.toml` on an update. A config from before per-width TX power walls still has `radio.rate_walls_rel`, a key maburd no longer knows, so v0.12's maburd refused it and did not start. `install.py` now renames it to `radio.rate_walls_rel_20` (with no `_40` table, 40 MHz uses the same walls, as before), or drops it when a `_20` table is already there. The original stays in the backup. A drone stuck after a v0.12 install is repaired by running the v0.12.1 `install.py` again.
+
+maburd, the drone config and the apps are the same as in v0.12 (the APKs only carry the new version number).
+
+## What changed since v0.11
 Update both ends to get the drone-side changes. The radio protocol and the drone parameter table are unchanged, so a v0.12 ground station works with a v0.11 drone and the other way round.
 
 - **The link stays on its top rung.** A piece of a frame that arrived as a requested re-send was counted as loss, and the link stepped down for it although nothing was lost. It no longer is.
@@ -46,7 +51,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.12.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.12.1.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
