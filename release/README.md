@@ -27,7 +27,7 @@ On one bench (RTL8822E drone, 2944x1656 at 60 fps, 40 MHz):
 - At the shipped ceiling of 18000 kbps, one run of 15 minutes each: before, 26 waits, the longest 105 ms, and a worst frame of 168 ms; after, no wait and a worst frame of 84 ms. The typical frame is the same (median 24 and 25 ms, 95 % within 31 ms), and neither run fell into the stalled state. After the change 0.2 % of the camera's frames were missing, most of them in two stretches of 2 s that are not explained yet (before: 0.04 %).
 - Refresh every second, 30 pictures removed from a recording: with a keyframe or with the refresh picture the image is whole again at the next refresh; with the refresh off it stays damaged until a keyframe is asked for.
 
-Not measured: what the missing repair packets cost on a lossy link (the bench loses 0.01 to 0.04 % of the packets). Calibration against a v0.13 drone always runs the 40 MHz steps too; those have host tests only.
+Not measured: what the missing repair packets cost on a lossy link (the bench loses 0.01 to 0.04 % of the packets). From the Quest and phone apps, a calibration against a v0.13 drone runs the 40 MHz steps too; those have host tests only.
 
 v0.12 notes: the link stays on its top rung (NACK residual rule), `VENC_MIN_IQP` 42, A-MPDU off by default, the 40 MHz receive-gain floor, the Quest menu panel.
 
@@ -124,7 +124,7 @@ maburd refuses config keys it does not know, so `install.py` fits the config to 
 
 - Pairing uses the default link key on both ends.
 - The changes of v0.13 have been run on one bench and not flown, with the desktop app as the ground station. The Quest and phone apps were built but not run for this release, so the two new settings have not been used in the headset.
-- Calibration: against a v0.13 drone the Calibrate button always runs all five steps (power and capacity at 20 MHz, the receive-gain floor, power and capacity at 40 MHz); there is no way to run the 20 MHz part alone. The floor measurement has been run on one board. The 40 MHz power and capacity steps have host tests only and have not been run in the field.
+- Calibration: against a v0.13 drone the Calibrate button of the Quest and phone apps, and of a desktop started with the shipped `gs.toml` and no `--ch`, runs five steps: power and capacity at 20 MHz, the receive-gain floor, power and capacity at 40 MHz. The apps have no button for the 20 MHz part alone. A desktop pinned to a channel with `--ch` on a 20 MHz link runs the 20 MHz part only (run once on the bench against this maburd). The floor measurement has been run on one board. The 40 MHz power and capacity steps have host tests only.
 - Periodic refresh: with the shipped frame layering only "off" (a keyframe) and "on" (one refresh picture) restore the whole image. A longer refresh stripe (`venc.intra_refresh_frames` above 1 in `mabur.toml`) restores the top of the picture only.
 - 40 MHz video is experimental. The gain floor default clears every board measured so far, but its cost for the control link at long range is not measured; a board's own lowest working value is lower (36 on the bench board), and calibration now measures it on a quiet channel. Without a calibration the 40 MHz power table stays the reference board's. Keep `encoder.bitrate_max_kbps` at what your drone can send: above that, frames arrive late and are cut.
 - The link does not notice frames that arrive late, only frames that are lost. A bitrate cap set too high for the drone shows as cut frames on the top rung.
