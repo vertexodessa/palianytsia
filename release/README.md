@@ -1,11 +1,11 @@
-# Palianytsia v0.13
+# Palianytsia v0.13.1
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.13.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.13.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.13.1.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.13.1.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -13,6 +13,13 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/S96mabur` | The init script that runs maburd; `install.py` puts it in place. |
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
+
+## What changed in v0.13.1
+- **The desktop app has the channel menu.** Gear, Link, Channels, as in the Quest and phone apps: it scans the 5 GHz channels, shows foreign frames per second and a DFS mark for each, and the ticked ones are where the link may sit. One ticked channel holds the link there; a change moves a live link by a hop. The choice is saved and applied at the next start. Before, the desktop had no way to choose a channel but `--ch`, although this README said it had the menu. `--ch N` still holds one channel with no search and no menu.
+- **The desktop applies "Step down on enhance-layer loss".** The switch was shown and saved but only the apps used it.
+- **README:** the desktop writes a flight log only when started with `--log-dir DIR`.
+
+maburd, the drone config and the Quest and phone apps are the same as in v0.13 (the APKs only carry the new version number). A v0.13 ground station and drone work with v0.13.1.
 
 ## What changed since v0.12
 Update both ends together. The drone parameter table has two new rows, so a v0.13 ground station with an older drone (or the other way round) shows "table mismatch" and the new settings without a value. The video itself still flies between v0.12 and v0.13.
@@ -39,7 +46,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.13.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.13.1.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -64,10 +71,10 @@ The decoder is picked at start and named on the console. `decode: hwaccel vdpau`
 Run it as:
 
 ```
-./pal-desktop-linux-x86_64 -c gs.toml
+./pal-desktop-linux-x86_64 -c gs.toml --log-dir ~/pal-logs
 ```
 
-It runs the same core and channel logic as the APKs, including the channel menu (`--core ref` runs mabur's C++ core instead, without the channel menu). The card needs USB access, either through a udev rule or by running as root.
+It runs the same core and channel logic as the APKs, including the channel menu: gear, Link, Channels (`--core ref` runs mabur's C++ core instead, without the channel menu). `--ch N` holds one channel instead: no search and no menu, so the drone must already be on it. With `--log-dir` each run leaves a flight log folder `fl-...` there (without it, none); for a report send its `cal.log`, `events.jsonl` and `stats.jsonl` (the `bodies*.bin` files are the recorded air and are large). The card needs USB access, either through a udev rule or by running as root.
 
 ## Drone
 
