@@ -1752,6 +1752,25 @@ fn set_cal_width_holds_the_cards_at_40_and_gives_them_back() {
     assert!(!g.cards.iter().any(|c| called_set_width(c)));
 }
 
+/// A hold the cards refused leaves a retry time behind; giving the cards back
+/// drops it (mabur's `set_cal_width` clears `width_retry_ms_`), so no try
+/// from the old hold fires under the next one.
+#[test]
+fn set_cal_width_drops_the_retry_of_a_refused_hold() {
+    let mut g = Rig::build(2, true, 40, &[], 20);
+    for _ in 0..10 {
+        g.tick(true);
+    }
+    for c in &g.cards {
+        c.s().fail_set_width = true;
+    }
+    g.core.set_cal_width(40);
+    assert!(g.cards.iter().all(|c| c.s().width_mhz == 20));
+    assert!(g.core.width_retry_ms.iter().all(|&t| t != 0.0));
+    g.core.set_cal_width(0);
+    assert!(g.core.width_retry_ms.iter().all(|&t| t == 0.0));
+}
+
 /// A link already at 40: the hold changes nothing on the cards.
 #[test]
 fn set_cal_width_on_a_40_mhz_link_touches_no_card() {

@@ -926,6 +926,7 @@ impl ChannelCore {
             self.resync_width()
         ));
         self.width_tried.iter_mut().for_each(|t| *t = false);
+        self.width_retry_ms.iter_mut().for_each(|t| *t = 0.0);
         self.step_width_resync();
     }
     pub fn cal_width(&self) -> u8 {
