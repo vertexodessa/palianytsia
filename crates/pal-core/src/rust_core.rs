@@ -379,6 +379,12 @@ impl ChannelSink for LogSink {
         );
         j.set("frames", d.frames);
         j.set("in_session", d.in_session);
+        // Where a dwell's time away from the link channel goes: the retune
+        // out, the register reads after the observe window, the retune back.
+        j.set("to_us", d.to_us);
+        j.set("read_us", d.read_us);
+        j.set("back_us", d.back_us);
+        j.set("flags", d.flags);
         self.push("scout_dwell", j);
     }
     fn pick(&mut self, t_ms: f64, picked: Option<u8>, rounds: u64, _: &[RankEntry], _: i32) {
