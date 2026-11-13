@@ -47,6 +47,10 @@ pub struct NackStats {
     pub dropped_deadline: u64,
     pub suppressed: u64,
     pub lead_skipped: u64,
+    /// Of `filled`, the fills seen only after the seq's deadline (`gap_timeout_ms` after t0): too
+    /// late for the frame. Not in the stats line; `link.nack_residual = "timely"` books them as
+    /// lost.
+    pub filled_late: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -153,6 +157,13 @@ impl NackTracker {
                 SourceState::Retx => {
                     if e.tries > 0 {
                         self.stats.filled += 1;
+                        // Past the deadline: a poll already booked it dropped, or the fill
+                        // landed between the deadline and this poll.
+                        if e.deadline_counted
+                            || now.wrapping_sub(e.first_missing_ms) > inp.gap_timeout_ms
+                        {
+                            self.stats.filled_late += 1;
+                        }
                         self.win.filled += 1;
                         if self.win.fill_ms.len() < MAX_FILL_SAMPLES {
                             self.win
@@ -339,6 +350,58 @@ mod tests {
         assert!(t.poll(130, &inp2).is_none());
         assert_eq!(t.stats().filled, 3);
         assert_eq!(t.take_window().fill_ms, vec![18, 18, 18]);
+    }
+
+    #[test]
+    fn fill_past_the_deadline_books_filled_late() {
+        // gap_timeout 50 from t0 = 1000. 100 fills in time; 101 is seen dropped at 1060 and
+        // fills at 1070; 102 fills between the deadline and the next poll, so no poll ever saw
+        // it unknown past the deadline.
+        let mut t = NackTracker::new(NackCfg {
+            enable: true,
+            ..NackCfg::default()
+        });
+        let st = RefCell::new(BTreeMap::from([
+            (100u32, SourceState::Unknown),
+            (101, SourceState::Unknown),
+            (102, SourceState::Unknown),
+        ]));
+        let missing = || {
+            st.borrow()
+                .iter()
+                .filter(|(_, v)| **v == SourceState::Unknown)
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        let state = |s: u32| st.borrow().get(&s).copied().unwrap_or(SourceState::Direct);
+        let tail = || None;
+        let util = || 0.0;
+        let inp = NackInputs {
+            missing: &missing,
+            state: &state,
+            tail: &tail,
+            util: &util,
+            down_util: 0.35,
+            gap_timeout_ms: 50,
+        };
+        assert!(t.poll(1000, &inp).is_none());
+        assert!(t.poll(1012, &inp).is_some());
+        st.borrow_mut().insert(100, SourceState::Retx);
+        t.poll(1040, &inp);
+        assert_eq!((t.stats().filled, t.stats().filled_late), (1, 0));
+        t.poll(1049, &inp);
+        st.borrow_mut().insert(102, SourceState::Retx);
+        t.poll(1060, &inp);
+        assert_eq!((t.stats().filled, t.stats().filled_late), (2, 1));
+        assert_eq!(t.stats().dropped_deadline, 1);
+        st.borrow_mut().insert(101, SourceState::Retx);
+        t.poll(1070, &inp);
+        assert_eq!((t.stats().filled, t.stats().filled_late), (3, 2));
+        assert_eq!(
+            t.stats().dropped_deadline,
+            1,
+            "booked once, not again on the fill"
+        );
     }
 
     #[test]

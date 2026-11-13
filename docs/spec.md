@@ -141,6 +141,24 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   and no live `set_pin`. `chan_trace` checks the video gate, four lease scripts and the members row
   against the C++ core; nothing in the apps calls `observe` yet. The rebase also merged our grid
   search with #122's search observe in `channel_scout`.
+- mabur pin, 2026-11-13 (pal-rbrw): `link.nack_residual` picks what a symbol a NACK retransmit
+  filled counts as in the residual the ladder demotes on: `"filled"` (default, the rule of the
+  eighth 2026-11-11 pin), `"all"` (the rule before it: lost, as if no retransmit came) or `"timely"`
+  (arrived when the NACK tracker saw the fill by its seq's deadline, the gap timeout after the seq
+  went missing, lost when later; the tracker counts those as `filled_late`, not in the stats line).
+  Both cores (`ladder_residual.cpp`, `link_health.rs`); the bundle and `configs/*.toml` ship
+  `"filled"`, any other value fails boot (`config_diff` probes each). It is for a bench A/B under
+  sustained loss, after a tester reported the ladder holding a failing rung while the retransmits
+  could not keep up. `tools/m1-replay.sh` runs the retransmit copy and one whose retransmits land
+  80 ms late (`retxmark.py` DELAY_MS, past the 50 ms deadline) under each rule, ref==rust, and fails
+  if two rules send the same RC bytes on every capture. On the ladder capture without drops: the
+  retransmit copy gives 6 rung changes ending on rung 2 under `filled` and `timely` (37 of its 128
+  fills are late, none moves a rung), 2 ending on rung 0 under `all`; the late copy 6 ending on 2,
+  4 ending on 0 and 7 ending on 1 (41 of 83 fills late). Found on the way: the stats' NACK `late`
+  (`late_fill`) is not a late retransmit but a requested seq whose own copy came after the request;
+  replaying that capture as recorded, 3878 of 4599 requested symbols (3909 asked by the tail
+  trigger) against 79 filled, while the drone's telemetry counts 3965 re-sent. Not run: the bench
+  A/B, any device.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.13.1, signed APKs; v0.13.1, 2026-11-13: the channel menu in the desktop app (the apps' link pick at start, `Cmd::Channels` on the live link), maburd and apps as v0.13, bench only; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):

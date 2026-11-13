@@ -3,9 +3,11 @@
 //! `transition_edge.h`, `probe_track.cpp`, `ladder_residual.cpp`,
 //! `rf_labels.h`).
 use crate::aggregator::Aggregator;
+use crate::config::NackResidual;
 use crate::ladder::LinkHealth;
 use crate::uep::UepDecoder;
 use crate::RxBody;
+use pal_fec::decoder::DecoderStats;
 use pal_wire::probe::{self, ProbeRx};
 use pal_wire::profile::{self, PhyMode, Profile};
 use pal_wire::rc::NO_PROBE_PROFILE;
@@ -144,16 +146,39 @@ pub fn residual_counts(dec: &UepDecoder, sid: usize, cur: bool) -> ResidualCount
 }
 
 /// The ladder's instant-demote input (`ladder_residual_counts` in `ladder_residual.cpp`): base
-/// layer, current rung, the decoder's abandonment alone. A symbol a NACK retransmit filled counts
-/// as arrived: the drone's resends race the frame's own FEC repairs, and the ones that land first
-/// fill symbols the repairs would have solved anyway, so booking them as loss cost a rung on a
-/// link that abandons nothing with the NACK off.
-pub fn ladder_residual_counts(dec: &UepDecoder) -> ResidualCounts {
-    let s = dec.stats(0).dec;
+/// layer, current rung, the decoder's abandonment plus the retx-filled symbols `mode` books as
+/// lost. `late_fills` is the NACK tracker's cumulative `NackStats::filled_late`, read only under
+/// `Timely`.
+pub fn ladder_residual_counts(
+    dec: &UepDecoder,
+    mode: NackResidual,
+    late_fills: u64,
+) -> ResidualCounts {
+    ladder_residual_of(&dec.stats(0).dec, mode, late_fills)
+}
+
+/// `ladder_residual_counts` over the base layer's decoder counters.
+/// - `Filled`: no retx-filled symbol is lost. The drone's resends race the frame's own FEC
+///   repairs, and the ones that land first fill symbols the repairs would have solved anyway, so
+///   booking them as loss cost a rung on a link that abandons nothing with the NACK off.
+/// - `All`: every one is, as in `residual_counts`. On a link with sustained loss `Filled` holds a
+///   rung whose holes only the retransmits fill, and they spend air on that same rung.
+/// - `Timely`: the ones the tracker saw fill after the seq's deadline (gap timeout after it was
+///   first seen missing): too late to save the frame. `late_fills <= syms_retx` by construction;
+///   the `min` only keeps a counter mismatch from wrapping.
+///
+/// `expected` is the same in every mode: a mode moves symbols between arrived and lost.
+pub fn ladder_residual_of(s: &DecoderStats, mode: NackResidual, late_fills: u64) -> ResidualCounts {
     let ab = s.syms_abandoned - s.syms_abandoned_stale;
     let exp = s.syms_delivered + s.syms_recovered + s.syms_retx + ab;
+    let lost = ab
+        + match mode {
+            NackResidual::Filled => 0,
+            NackResidual::All => s.syms_retx,
+            NackResidual::Timely => late_fills.min(s.syms_retx),
+        };
     ResidualCounts {
-        arrived: exp - ab,
+        arrived: exp - lost,
         expected: exp,
     }
 }
@@ -342,6 +367,10 @@ pub struct LinkHealthInputs {
     pub op: OpPoint,
     pub probe_profile: u8,
     pub probe_rung: i32,
+    /// `NackStats::filled_late`, cumulative; 0 without a NACK tracker. The tracker must have
+    /// polled after this tick's drain: a late fill un-books an arrival the decoder booked, and a
+    /// window that saw the arrival first would read the drop as a counter reset.
+    pub nack_late_fills: u64,
 }
 
 pub struct LhTick {
@@ -354,6 +383,7 @@ const PROBE_SWITCH_BLANK_MS: f64 = 150.0;
 
 pub struct LinkHealthAssembler {
     n_cards: usize,
+    nack_residual: NackResidual,
     probe_bpb: usize,
     probe_block_payload: usize,
     probe_track: ProbeTrack,
@@ -382,9 +412,15 @@ pub struct LinkHealthAssembler {
 }
 
 impl LinkHealthAssembler {
-    pub fn new(n_cards: usize, probe_bpb: usize, probe_block_payload: usize) -> Self {
+    pub fn new(
+        n_cards: usize,
+        probe_bpb: usize,
+        probe_block_payload: usize,
+        nack_residual: NackResidual,
+    ) -> Self {
         Self {
             n_cards,
+            nack_residual,
             probe_bpb,
             probe_block_payload,
             probe_track: ProbeTrack::new(probe_bpb, 100.0, n_cards),
@@ -502,7 +538,7 @@ impl LinkHealthAssembler {
             now,
         );
         let pre_all = self.pre_loss_all.sample(now);
-        let s1_rc = ladder_residual_counts(dec);
+        let s1_rc = ladder_residual_counts(dec, self.nack_residual, inp.nack_late_fills);
         self.s1_resid_cur.add(s1_rc.expected, s1_rc.arrived, now);
         let s1_rcur = self.s1_resid_cur.sample(now);
         let s3 = s2;
@@ -612,5 +648,73 @@ impl LinkHealthAssembler {
         for (i, c) in agg.cards().iter().enumerate().take(self.n_cards) {
             self.prev_pool_frames[i] = c.rf_pool.frames;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1000 symbols: 900 direct, 60 repaired, 30 retx-filled (8 of them late), 10 abandoned of
+    /// which 4 are pre-transition debris.
+    fn stats() -> DecoderStats {
+        DecoderStats {
+            syms_delivered: 900,
+            syms_recovered: 60,
+            syms_retx: 30,
+            syms_abandoned: 10,
+            syms_abandoned_stale: 4,
+            ..DecoderStats::default()
+        }
+    }
+
+    #[test]
+    fn nack_residual_modes_move_retx_fills_between_arrived_and_lost() {
+        let s = stats();
+        let expected = 900 + 60 + 30 + 6;
+        let filled = ladder_residual_of(&s, NackResidual::Filled, 8);
+        assert_eq!((filled.arrived, filled.expected), (expected - 6, expected));
+        let all = ladder_residual_of(&s, NackResidual::All, 8);
+        assert_eq!((all.arrived, all.expected), (expected - 6 - 30, expected));
+        let timely = ladder_residual_of(&s, NackResidual::Timely, 8);
+        assert_eq!(
+            (timely.arrived, timely.expected),
+            (expected - 6 - 8, expected)
+        );
+        // No late fills: timely reads as filled; a count past syms_retx reads as all.
+        let on_time = ladder_residual_of(&s, NackResidual::Timely, 0);
+        assert_eq!(on_time.arrived, filled.arrived);
+        let over = ladder_residual_of(&s, NackResidual::Timely, 99);
+        assert_eq!(over.arrived, all.arrived);
+    }
+
+    #[test]
+    fn all_is_the_stats_residual_on_the_current_rung() {
+        // "all" is the rule before retx fills counted as arrived: residual_counts(.., cur).
+        let s = stats();
+        let all = ladder_residual_of(&s, NackResidual::All, 0);
+        let ab = s.syms_abandoned - s.syms_abandoned_stale + s.syms_retx;
+        let exp = s.syms_delivered + s.syms_recovered + ab;
+        assert_eq!((all.arrived, all.expected), (exp - ab, exp));
+    }
+
+    #[test]
+    fn timely_window_stays_monotonic_when_fill_and_late_count_land_together() {
+        // A late fill un-books an arrival; booked in the same tick as its syms_retx, the
+        // window sees the symbol lost and never a counter going backwards.
+        let mut w = S1LossWindow::default();
+        let mut s = stats();
+        let r0 = ladder_residual_of(&s, NackResidual::Timely, 8);
+        w.add(r0.expected, r0.arrived, 0.0);
+        s.syms_delivered += 100;
+        s.syms_retx += 1;
+        let r1 = ladder_residual_of(&s, NackResidual::Timely, 9);
+        assert!(r1.arrived >= r0.arrived && r1.expected >= r0.expected);
+        w.add(r1.expected, r1.arrived, 10.0);
+        // The first add books the totals as they stand (14 lost of 996); the tick adds 1 of
+        // 101, and no reset dropped the first entry.
+        let l = w.sample(10.0);
+        assert!(l.valid);
+        assert!((l.loss - 15.0 / 1097.0).abs() < 1e-12, "{}", l.loss);
     }
 }

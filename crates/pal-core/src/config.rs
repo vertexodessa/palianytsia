@@ -324,6 +324,39 @@ impl Default for LadderCfg {
     }
 }
 
+/// What a base symbol a NACK retransmit filled counts as in the ladder's residual
+/// (`link.nack_residual`, mabur `ladder_residual.h` `NackResidual`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NackResidual {
+    /// Arrived.
+    #[default]
+    Filled,
+    /// Lost, as if no retransmit had come (what the stats' residual books).
+    All,
+    /// Arrived when the fill beat the NACK tracker's deadline for its seq, lost when later
+    /// (`NackStats::filled_late`).
+    Timely,
+}
+
+impl NackResidual {
+    /// The config spelling; None for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "filled" => Some(Self::Filled),
+            "all" => Some(Self::All),
+            "timely" => Some(Self::Timely),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Filled => "filled",
+            Self::All => "all",
+            Self::Timely => "timely",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NackCfg {
     pub enable: bool,
@@ -362,6 +395,7 @@ pub struct LinkCfg {
     pub rcf_slot_hold_ms: i32,
     pub arrival_guard_syms: u32,
     pub nack: NackCfg,
+    pub nack_residual: NackResidual,
     pub static_mcs: i32,
     pub static_overhead_base: f64,
     pub static_overhead_enh: f64,
@@ -381,6 +415,7 @@ impl Default for LinkCfg {
             rcf_slot_hold_ms: 30,
             arrival_guard_syms: 192,
             nack: NackCfg::default(),
+            nack_residual: NackResidual::Filled,
             static_mcs: -1,
             static_overhead_base: 0.5,
             static_overhead_enh: 0.5,
@@ -1098,6 +1133,7 @@ const LINK_KEYS: &[&str] = &[
     "rcf_slot_hold_ms",
     "arrival_guard_syms",
     "nack",
+    "nack_residual",
     "key_file",
     "key",
 ];
@@ -1270,6 +1306,7 @@ pub fn dump(c: &Config) -> String {
         rcf_slot_hold_ms,
         arrival_guard_syms,
         nack,
+        nack_residual,
         static_mcs,
         static_overhead_base,
         static_overhead_enh,
@@ -1309,6 +1346,7 @@ pub fn dump(c: &Config) -> String {
         "link.nack.settle_min_samples",
         settle_min_samples.to_string(),
     );
+    put("link.nack_residual", nack_residual.name().to_string());
     put("link.static_mcs", static_mcs.to_string());
     put("link.static_overhead_base", f(*static_overhead_base));
     put("link.static_overhead_enh", f(*static_overhead_enh));
@@ -1925,6 +1963,16 @@ fn parse_config(j: &Table) -> R<Config> {
                 &format!("must be < fec.seq_horizon ({})", c.fec.seq_horizon),
             );
         }
+        let nr = get_str(r, "nack_residual", "filled", "link")?;
+        l.nack_residual = match NackResidual::parse(&nr) {
+            Some(m) => m,
+            None => {
+                return fail(
+                    "link.nack_residual",
+                    "must be \"filled\", \"all\" or \"timely\"",
+                )
+            }
+        };
         if let Some(rs) = section(r, "rung_stats")? {
             check_keys(rs, "link.rung_stats", RUNG_STATS_KEYS)?;
             l.ladder_cfg.rung_stats_half_life_samples =
@@ -2060,6 +2108,32 @@ fn parse_config(j: &Table) -> R<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nack_residual_parses_three_values_and_refuses_others() {
+        let p = |t: &str| parse_config_str(t).map(|c| c.link.nack_residual);
+        assert_eq!(p("").unwrap(), NackResidual::Filled);
+        assert_eq!(p("[link]\n").unwrap(), NackResidual::Filled);
+        for (s, m) in [
+            ("filled", NackResidual::Filled),
+            ("all", NackResidual::All),
+            ("timely", NackResidual::Timely),
+        ] {
+            assert_eq!(p(&format!("[link]\nnack_residual = \"{s}\"\n")).unwrap(), m);
+            assert_eq!(m.name(), s);
+            assert_eq!(NackResidual::parse(s), Some(m));
+        }
+        let e = p("[link]\nnack_residual = \"late\"\n")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "config: link.nack_residual: must be \"filled\", \"all\" or \"timely\""
+        );
+        let e = p("[link]\nnack_residual = 1\n").unwrap_err().to_string();
+        assert_eq!(e, "config: link.nack_residual: not a string");
+        assert!(p("[link.nack]\nresidual = \"all\"\n").is_err());
+    }
 
     fn repo(p: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

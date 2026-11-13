@@ -621,7 +621,12 @@ impl RustCore {
             gs,
             // Probe bodies ride the enh layer's geometry; blocks_per_body
             // is 4 on decode (config.cpp).
-            lha: LinkHealthAssembler::new(n_cards, 4, sw::HEADER_LEN + layers[1].symbol_size),
+            lha: LinkHealthAssembler::new(
+                n_cards,
+                4,
+                sw::HEADER_LEN + layers[1].symbol_size,
+                cfg.link.nack_residual,
+            ),
             last_health: LinkHealth::empty(),
             spotter_op: OpPoint {
                 bw: i32::from(cfg.rx_width()),
@@ -971,11 +976,14 @@ impl GsCore for RustCore {
                 op: *g.vrx.cur_op(),
                 probe_profile: g.vrx.probe_profile(),
                 probe_rung: g.vrx.ctl().probe_rung(),
+                // poll_nack ran above, after this tick's drain.
+                nack_late_fills: g.nack.as_ref().map_or(0, |n| n.t.stats().filled_late),
             },
             None => LinkHealthInputs {
                 op: self.spotter_op,
                 probe_profile: rc::NO_PROBE_PROFILE,
                 probe_rung: -1,
+                nack_late_fills: 0,
             },
         };
         let lh = self.lha.tick(now_ms as f64, &mut self.agg, &inp);

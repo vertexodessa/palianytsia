@@ -8,7 +8,10 @@
 #     line (webgs::stats_json key for key, nlohmann's number spelling) and,
 #     in GS, the parameter table (webgs::params_json);
 #  4. the same on a copy with base bodies re-marked as NACK retransmits;
-#  5. the F18 set path: the same --param-set script into both cores.
+#  5. that copy and one whose retransmits land 80 ms late, under each
+#     link.nack_residual rule (filled, all, timely); the rules must also
+#     tell apart somewhere in the set, or the cases test nothing;
+#  6. the F18 set path: the same --param-set script into both cores.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cargo build -q --release --manifest-path "$ROOT/Cargo.toml" -p pal
@@ -22,6 +25,7 @@ fi
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 fail=0
 sha() { sha256sum "$1" | cut -d' ' -f1; }
+declare -A mode_sends  # "<file> <copy> <drop> <rule>" -> sha of the RC bytes sent
 while IFS='|' read -r _ file _ mode _ _ expect _; do
   file=$(echo "$file" | xargs); mode=$(echo "$mode" | xargs); expect=$(echo "$expect" | xargs)
   [[ $file == *.bin ]] || continue
@@ -75,6 +79,30 @@ while IFS='|' read -r _ file _ mode _ _ expect _; do
       echo "ok   ref==rust gs retx drop=$d $file (marked=$marked $(grep -o '"nack_saved":[0-9]*' <<<"$out"))"
     else echo "FAIL ref!=rust gs retx drop=$d $file"; fail=1; fi
   done
+  # The ladder's rule for a NACK-filled symbol (link.nack_residual) on the retx copy and on one
+  # whose marked bodies land 80 ms later: past the 50 ms gap deadline, where "timely" books a fill
+  # as lost and "filled" as arrived. Without retransmits the three rules read the same.
+  python3 "$ROOT/tools/retxmark.py" "$cap" "$TMP/retx-late.bin" 50 80 >/dev/null
+  for rule in filled all timely; do
+    sed "s/^nack_residual *=.*/nack_residual = \"$rule\"/" "$CFG" > "$TMP/rule.toml"
+    if ! grep -q "^nack_residual = \"$rule\"$" "$TMP/rule.toml"; then
+      echo "FAIL $CFG has no nack_residual line to set"; fail=1; break
+    fi
+    for copy in retx retx-late; do
+      for d in 0 10; do
+        ref_out=$("$PAL" replay "$TMP/$copy.bin" -c "$TMP/rule.toml" --mode gs --drop-pct $d --seed 7 \
+          --aus "$TMP/r.aus" --sends "$TMP/r.sends")
+        out=$("$PAL" replay "$TMP/$copy.bin" -c "$TMP/rule.toml" --mode gs --core rust --drop-pct $d \
+          --seed 7 --aus "$TMP/u.aus" --sends "$TMP/u.sends")
+        s=$(sha "$TMP/u.sends")
+        mode_sends["$file $copy $d $rule"]=$s
+        if cmp -s "$TMP/r.aus" "$TMP/u.aus" && cmp -s "$TMP/r.sends" "$TMP/u.sends" \
+          && [[ $(grep '^stats ' <<<"$ref_out") == "$(grep '^stats ' <<<"$out")" ]]; then
+          echo "ok   ref==rust gs $copy nack_residual=$rule drop=$d $file (sends ${s:0:12} $(grep -o '"rung":[0-9]*' <<<"$out"))"
+        else echo "FAIL ref!=rust gs $copy nack_residual=$rule drop=$d $file"; fail=1; fi
+      done
+    done
+  done
   # F18: a set, a refused set while it is pending, a bad value, a refresh-
   # free late set; sends, refusals and the final table must agree.
   PS=(--param-set 5,4,9000 --param-set 6,99,1 --param-set 20,1,maybe --param-set 32,0,2.5)
@@ -87,4 +115,18 @@ while IFS='|' read -r _ file _ mode _ _ expect _; do
     echo "ok   ref==rust gs --param-set $file ($(grep -o '"list":"[a-z]*"' <<<"$out"))"
   else echo "FAIL ref!=rust gs --param-set $file"; fail=1; fi
 done < "$CAPS/README.md"
+# The rule cases prove something only where the rules send different RC bytes: "all" against
+# "filled" (any retx fill), "timely" against both (a fill past the deadline, the late copy).
+differs() {
+  local k
+  for k in "${!mode_sends[@]}"; do
+    [[ $k == *" $1" ]] || continue
+    [[ ${mode_sends[$k]} != "${mode_sends[${k% *} $2]}" ]] && return 0
+  done
+  return 1
+}
+for pair in "all filled" "timely filled" "timely all"; do
+  if differs $pair; then echo "ok   nack_residual $pair: different sends on some capture"
+  else echo "FAIL nack_residual $pair: the same sends on every capture"; fail=1; fi
+done
 exit $fail

@@ -259,6 +259,8 @@ enum Kind {
     Num(f64, f64),
     Bool,
     Str,
+    /// A string with a fixed set of values; anything else is refused.
+    Choice(&'static [&'static str]),
     /// Probed by hand-written cases (special_cases).
     Special,
 }
@@ -335,6 +337,7 @@ fn kind(path: &str) -> Option<Kind> {
         "link.s3_min_syms" => Int(1, 100000),
         "link.s3_settle_ms" => Int(0, 5000),
         "link.key_file" => Str,
+        "link.nack_residual" => Choice(&["filled", "all", "timely"]),
         "link.ladder[].mcs" => Int(0, 7),
         "link.ladder[].bw" => Int(20, 40),
         "link.ladder[].overhead_base" | "link.ladder[].overhead_enh" => Num(0.1, 2.0),
@@ -888,6 +891,25 @@ fn keyed_cases() -> Vec<Case> {
                     "\"pal-test\"",
                     Value::String("pal-test".into()),
                 ));
+                v.push(set_case(sec, key, "1", Value::Integer(1)));
+                v.push(set_case(sec, key, "true", Value::Boolean(true)));
+            }
+            Kind::Choice(vals) => {
+                for x in vals {
+                    v.push(set_case(
+                        sec,
+                        key,
+                        &format!("{x:?}"),
+                        Value::String((*x).into()),
+                    ));
+                }
+                v.push(set_case(
+                    sec,
+                    key,
+                    "\"pal-test\"",
+                    Value::String("pal-test".into()),
+                ));
+                v.push(set_case(sec, key, "\"\"", Value::String(String::new())));
                 v.push(set_case(sec, key, "1", Value::Integer(1)));
                 v.push(set_case(sec, key, "true", Value::Boolean(true)));
             }

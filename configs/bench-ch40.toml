@@ -95,6 +95,12 @@ s3_down_util           = 0.15   # enhance-layer loss level that triggers a step 
 s3_min_syms            = 50     # below this much traffic, a window tells us nothing
 s3_settle_ms           = 300    # ignore this check just after a rung change
 
+# What a piece the software NACK (see [link.nack]) got re-sent counts as
+# when the link decides whether to step down: "filled" = arrived, "all" =
+# lost (as if no re-send came), "timely" = arrived only if it came before
+# the frame gave up on it (frame_gap_timeout_ms).
+nack_residual          = "filled"
+
 static_overhead_base   = 0.5    # FEC overhead with static_mcs only
 static_overhead_enh    = 0.5    # ...and on the enhance layer
 
