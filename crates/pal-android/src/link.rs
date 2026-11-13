@@ -273,6 +273,8 @@ impl Link {
             set_res_tx,
         };
         let mk_cl = move |core: Box<dyn pal_core::GsCore>| CoreLoop::new(core, sink, ports, false);
+        // Keeps the drone on the maburd this APK carries.
+        runtime::drone_update::spawn_auto(shared.clone());
         let sh = shared.clone();
         let dec_t = std::thread::Builder::new()
             .name("pal-decode".into())

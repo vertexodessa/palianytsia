@@ -475,16 +475,7 @@ fn update_drone(
             1
         }
         Ok(pl) => {
-            let last = std::cell::Cell::new((0u64, Instant::now()));
-            let link_ok = || {
-                let n = shared.frames.load(Ordering::Relaxed);
-                let (seen, at) = last.get();
-                if n != seen {
-                    last.set((n, Instant::now()));
-                    return true;
-                }
-                at.elapsed() < Duration::from_millis(500)
-            };
+            let link_ok = du::video_flows(&shared);
             match du::run(&shared.maint, &pl, &link_ok, &mut Steps(Instant::now(), 0)) {
                 Ok(r) => {
                     eprintln!(

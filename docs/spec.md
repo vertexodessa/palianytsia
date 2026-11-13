@@ -200,8 +200,22 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   in 0.4 s; 1.46 MB uploaded in 12.2 s (video on) and 13.7 s (video off, 0 AU/s), sha256 equal;
   update A -> B in 50.9 s (upload 12.5 s, new maburd answering from RAM at 27.8 s, back on flash at
   50.9 s, state `committed`); a "maburd" that exits 1 is restored by the trial and the quad stays on
-  B. Open: a drone without the lane needs one last PC install; the app UI (pal-mg3d.4), power-cut
-  and link-loss cases (pal-mg3d.5); the stream's go-back-N resends 10 % of the upload.
+  B. Open: a drone without the lane needs one last PC install; power-cut and link-loss cases
+  (pal-mg3d.5); the stream's go-back-N resends 10 % of the upload.
+- 2026-11-13 (pal-mg3d.4): the apps keep the drone on their own maburd. A build with `PAL_MABURD`
+  carries that file (`crates/runtime/build.rs`, `drone_update::embedded`; the release builds the
+  APKs and the desktop after maburd and passes it, `tools/{phone,quest}-apk.sh` refuse a release
+  build without it). `drone_update::spawn_auto` (pal-desktop live in gs mode, both APKs) probes the
+  drone whenever one is heard (a session, or Telems in another RC version) and installs its maburd
+  when the drone's differs, older or newer; never while the drone is armed, once per drone maburd
+  per app run. The UI stats line carries `update`; the banner shows `UPDATING DRONE` with the step
+  and a percentage, then `DRONE UPDATED` or `DRONE UPDATE FAILED`, and System says what the drone
+  runs. The maintenance frames go out through the core's TX card (`GsCore::send_raw`): with the
+  channel core owning the cards, `CoreIo::send` reaches none. The swap script waits 2 s before it
+  stops the old maburd, so the answer to the command that started it leaves first. Bench quad,
+  pal-desktop carrying build B against a drone on A: update started 7.0 s after the app, done in
+  49.2 s (`committed`, config unchanged); the same app again: no update, System "the drone runs
+  this app's maburd". Not run yet: the APKs against the drone.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.13.1, signed APKs; v0.13.1, 2026-11-13: the channel menu in the desktop app (the apps' link pick at start, `Cmd::Channels` on the live link), maburd and apps as v0.13, bench only; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):

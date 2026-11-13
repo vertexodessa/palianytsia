@@ -178,6 +178,25 @@ impl Gs {
         self.send_now(f, now_us, io)
     }
 
+    /// A frame of another lane (`GsCore::send_raw`), held back like the
+    /// core's own while a calibration sweep owns the air or the scout has
+    /// the TX card off the link; no RC counter moves.
+    fn send_raw(&mut self, body: &[u8], now_us: u64, io: &mut dyn CoreIo) {
+        if self.cal.session.radio_silent(now_us / 1000) {
+            return;
+        }
+        let card = self.sel.selected();
+        if self.chan.as_ref().is_some_and(|c| !c.may_send(card)) {
+            return;
+        }
+        match self.cards.get(card) {
+            Some(c) => {
+                c.send_control(body);
+            }
+            None => io.send(body),
+        }
+    }
+
     /// The card this RCF step transmits on (maburgs main.cpp at vrx.step).
     /// A card the scout owns is off searching or measuring and never a
     /// candidate; while a dwell or a hop is in flight the last pick holds
@@ -847,6 +866,13 @@ impl RustCore {
 }
 
 impl GsCore for RustCore {
+    /// A spotter sends nothing.
+    fn send_raw(&mut self, body: &[u8], now_us: u64, io: &mut dyn CoreIo) {
+        if let Some(g) = self.gs.as_mut() {
+            g.send_raw(body, now_us, io);
+        }
+    }
+
     fn on_rx(&mut self, m: &RxBody, io: &mut dyn CoreIo) {
         self.now_us = self.now_us.max(m.mono_us);
         self.c.bodies += 1;
@@ -1528,6 +1554,16 @@ mod tests {
         let j = core.stats_json();
         assert!(j.contains("\"hop\":{"), "{j}");
         assert!(j.contains("\"channel\":64"), "{j}");
+        // Another lane's frame (the maintenance lane) leaves on the same
+        // card, not through CoreIo, and moves no RC counter.
+        let sends = core.gs.as_ref().unwrap().sends;
+        core.send_raw(b"MT\x01raw", clk.ms() * 1000, &mut io);
+        assert_eq!(io.sent, 0);
+        assert_eq!(
+            card.s().sent.last().map(Vec::as_slice),
+            Some(&b"MT\x01raw"[..])
+        );
+        assert_eq!(core.gs.as_ref().unwrap().sends, sends);
     }
 
     /// A second card's bodies reach the aggregator (maburgs sizes it by the

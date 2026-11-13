@@ -18,6 +18,8 @@ pub mod prefs;
 pub mod stall;
 #[cfg(feature = "ui")]
 pub mod telem;
+#[cfg(feature = "ui")]
+pub mod update;
 
 use std::collections::VecDeque;
 

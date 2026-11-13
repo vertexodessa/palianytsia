@@ -56,6 +56,9 @@ pub struct Snapshot {
     pub chscan: Option<channels::ScanView>,
     /// The write error that stopped the flight log (UI stats line only).
     pub log_err: Option<String>,
+    /// The automatic drone update; None in a build that carries no maburd
+    /// (UI stats line only).
+    pub update: Option<crate::update::UpdateView>,
 }
 
 /// What the next rung promote waits on (`GsCore::ladder_json`).
@@ -218,6 +221,7 @@ impl Snapshot {
             cal: v.get("cal").and_then(cal::CalView::parse),
             chscan: v.get("chscan").and_then(channels::ScanView::parse),
             log_err: v.get("log_err").and_then(Value::as_str).map(str::to_string),
+            update: v.get("update").and_then(crate::update::UpdateView::parse),
         })
     }
 }
@@ -447,8 +451,14 @@ fn place_chips(
 /// command the drone), shown when nothing else is. The version comes first:
 /// the key cannot even be checked across versions.
 pub fn key_warning(s: &Snapshot) -> Option<(String, bool)> {
+    if let Some(b) = s.update.as_ref().and_then(|u| u.banner()) {
+        return Some(b);
+    }
     if let Some((drone, app)) = s.peer_rc {
-        let fix = if drone > app {
+        let no_lane = s.update.as_ref().is_some_and(|u| u.state == "no_lane");
+        let fix = if no_lane {
+            "UPDATE THE DRONE FROM A PC"
+        } else if drone > app {
             "UPDATE THE APP"
         } else {
             "UPDATE THE DRONE"

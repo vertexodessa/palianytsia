@@ -64,6 +64,7 @@ jobs:
           path: dist/maburd-${{ env.TAG }}-ssc338q-8822e
 
   apks:
+    needs: maburd
     runs-on: ubuntu-24.04
     env:
       # The NDK the local release builds use (the newest in ~/Android/Sdk).
@@ -99,6 +100,12 @@ jobs:
           printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=palianytsia\nkeyPassword=%s\n' \
             "$RUNNER_TEMP/release.jks" "$STORE_PASSWORD" "$KEY_PASSWORD" > "$RUNNER_TEMP/signing.properties"
           echo "PAL_SIGNING=$RUNNER_TEMP/signing.properties" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: maburd
+          path: parts/maburd
+      - name: The drone maburd the apps carry
+        run: echo "PAL_MABURD=$PWD/parts/maburd/maburd-$TAG-ssc338q-8822e" >> "$GITHUB_ENV"
       - name: Quest APK
         run: PAL_RELEASE=1 tools/quest-apk.sh
       - name: Phone APK
@@ -119,6 +126,7 @@ jobs:
   desktop:
     # glibc 2.39: the binary starts on Ubuntu 24.04 / Debian 13 / Fedora 40
     # and newer (README).
+    needs: maburd
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -130,6 +138,12 @@ jobs:
         run: rustup toolchain install --no-self-update && rustc --version
       - name: Static FFmpeg
         run: tools/ffmpeg-static.sh > ffmpeg.log 2>&1 || { tail -40 ffmpeg.log; exit 1; }
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: maburd
+          path: parts/maburd
+      - name: The drone maburd the apps carry
+        run: echo "PAL_MABURD=$PWD/parts/maburd/maburd-$TAG-ssc338q-8822e" >> "$GITHUB_ENV"
       - name: pal-desktop
         run: PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release --locked -p pal-desktop
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

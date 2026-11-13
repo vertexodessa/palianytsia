@@ -14,12 +14,20 @@
 //!
 //! Anything wrong before step 4's commit leaves flash as it was: the swap
 //! script starts the old maburd again by itself.
+//!
+//! An app built with `PAL_MABURD` carries its release's maburd (`embedded`)
+//! and keeps the drone on it (`spawn_auto`): whenever a drone is heard, it
+//! reads the drone's maburd and installs its own when they differ, older or
+//! newer.
 
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 use crate::maint::{Hub, State};
+use crate::Shared;
 
 pub const UP: &str = "/tmp/mabur-up";
 const SWAP_SH: &[u8] = include_bytes!("../../../release/drone/mabur-swap.sh");
@@ -58,6 +66,18 @@ impl Payload {
             s96: rd("S96mabur")?,
         })
     }
+}
+
+/// The drone files this build carries, or None for a build without
+/// `PAL_MABURD` (a developer's build: it updates no drone). The config and
+/// init script are the release's own (`release/drone`).
+pub fn embedded() -> Option<Payload> {
+    const MABURD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/maburd"));
+    (!MABURD.is_empty()).then(|| Payload {
+        maburd: MABURD.to_vec(),
+        toml: include_bytes!("../../../release/drone/mabur.toml").to_vec(),
+        s96: include_bytes!("../../../release/drone/S96mabur").to_vec(),
+    })
 }
 
 pub fn sha256_hex(b: &[u8]) -> String {
@@ -178,6 +198,36 @@ pub struct Report {
     pub secs: f64,
 }
 
+/// Why a command on the drone gave no result.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExecError {
+    /// No answer to the OPEN: no drone in reach, or a maburd without the
+    /// maintenance lane.
+    NoAnswer,
+    /// The drone refused or ended the session (`maint::STATUS_*`).
+    Closed(i16),
+    Other(String),
+}
+
+impl std::fmt::Display for ExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::NoAnswer => write!(f, "the drone does not answer"),
+            Self::Closed(st) if *st == pal_wire::maint::STATUS_ARMED => {
+                write!(f, "the drone is armed")
+            }
+            Self::Closed(st) => write!(f, "the drone refused or ended the session (status {st})"),
+            Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<ExecError> for String {
+    fn from(e: ExecError) -> String {
+        e.to_string()
+    }
+}
+
 /// One command on the drone: (exit status, output). `input` goes to its
 /// stdin. Err when the drone does not answer within `answer` or the command
 /// does not end within `limit`, or the session is refused.
@@ -188,7 +238,7 @@ pub fn exec(
     answer: Duration,
     limit: Duration,
     mut on_bytes: impl FnMut(u64),
-) -> Result<(i16, Vec<u8>), String> {
+) -> Result<(i16, Vec<u8>), ExecError> {
     let id = hub.open(cmd);
     let t0 = Instant::now();
     let (mut off, mut out) = (0usize, Vec::new());
@@ -201,7 +251,7 @@ pub fn exec(
         }
         hub.read(id, &mut out);
         let Some(i) = hub.info(id) else {
-            break Err("session lost".to_string());
+            break Err(ExecError::Other("session lost".to_string()));
         };
         on_bytes((off - hub.unacked(id)) as u64);
         match i.state {
@@ -209,16 +259,13 @@ pub fn exec(
                 hub.read(id, &mut out);
                 break Ok((st, out));
             }
-            State::Closed(st) => {
-                break Err(format!(
-                    "the drone refused or ended the session (status {st})"
-                ))
-            }
-            State::Opening if t0.elapsed() > answer => {
-                break Err("the drone does not answer".to_string())
-            }
+            State::Closed(st) => break Err(ExecError::Closed(st)),
+            State::Opening if t0.elapsed() > answer => break Err(ExecError::NoAnswer),
             _ if t0.elapsed() > limit => {
-                break Err(format!("`{cmd}` did not end in {} s", limit.as_secs()))
+                break Err(ExecError::Other(format!(
+                    "`{cmd}` did not end in {} s",
+                    limit.as_secs()
+                )))
             }
             _ => {}
         }
@@ -242,10 +289,10 @@ const PROBE: &str = "echo \"exe=$(readlink /proc/$PPID/exe)\"; \
     echo \"sha=$(sha256sum /usr/bin/maburd 2>/dev/null | cut -d' ' -f1)\"; \
     echo \"state=$(cat /tmp/mabur-up/state 2>/dev/null)\"; echo ---; cat /etc/mabur.toml";
 
-fn probe(hub: &Hub, answer: Duration) -> Result<Probe, String> {
+fn probe(hub: &Hub, answer: Duration) -> Result<Probe, ExecError> {
     let (st, out) = exec(hub, PROBE, &[], answer, Duration::from_secs(10), |_| {})?;
     if st != 0 {
-        return Err(format!("probe exited {st}"));
+        return Err(ExecError::Other(format!("probe exited {st}")));
     }
     let text = String::from_utf8_lossy(&out);
     let (head, config) = text.split_once("---\n").unwrap_or((&text, ""));
@@ -394,14 +441,19 @@ fn upload_and_swap(
         }
     }
     prog.step("starting the new maburd (trial, flash untouched)");
-    exec(
+    // The old maburd carries this shell and stops seconds after the script
+    // starts, so the answer can be lost on the way; the probes below find
+    // out whether the trial runs. A refusal means it never started.
+    if let Err(e @ ExecError::Closed(_)) = exec(
         hub,
         &format!("chmod 755 {UP}/maburd {UP}/swap.sh && setsid {UP}/swap.sh trial </dev/null >/dev/null 2>&1 & echo started"),
         &[],
         Duration::from_secs(5),
         Duration::from_secs(10),
         |_| {},
-    )?;
+    ) {
+        return Err(e.into());
+    }
     // The new maburd starts with video on; the lease would turn it off again.
     hub.set_video_off(false);
     let trial_exe = format!("{UP}/maburd");
@@ -443,6 +495,193 @@ fn upload_and_swap(
     Ok(())
 }
 
+/// A `link_ok` for `run`: decoded frames rose within the last 500 ms.
+pub fn video_flows(sh: &Shared) -> impl Fn() -> bool + '_ {
+    let last = std::cell::Cell::new((sh.frames.load(Ordering::Relaxed), Instant::now()));
+    move || {
+        let n = sh.frames.load(Ordering::Relaxed);
+        let (seen, at) = last.get();
+        if n != seen {
+            last.set((n, Instant::now()));
+            return true;
+        }
+        at.elapsed() < Duration::from_millis(500)
+    }
+}
+
+/// What the automatic update does after a probe.
+#[derive(Debug, PartialEq)]
+enum Next {
+    /// Probe again after this long; the state names why.
+    Wait(Duration, &'static str),
+    /// Nothing to do until the drone is heard anew.
+    Settled(&'static str),
+    /// The drone's maburd differs and this app already tried once: the
+    /// failure stays on screen; trying again on every contact would cut the
+    /// video for a minute each time.
+    Keep,
+    Update,
+}
+
+fn decide(p: &Result<Probe, ExecError>, want: &str, tried: bool) -> Next {
+    match p {
+        Err(ExecError::NoAnswer) => Next::Wait(Duration::from_secs(20), "no_lane"),
+        Err(ExecError::Closed(st)) if *st == pal_wire::maint::STATUS_ARMED => {
+            Next::Wait(Duration::from_secs(3), "armed")
+        }
+        Err(_) => Next::Wait(Duration::from_secs(10), "error"),
+        // A swap in progress (another GS, or one this app lost): the drone
+        // ends it by itself within the swap script's commit wait.
+        Ok(p) if p.exe != "/usr/bin/maburd" => Next::Wait(Duration::from_secs(10), "busy"),
+        Ok(p) if p.sha == want => Next::Settled("current"),
+        Ok(_) if tried => Next::Keep,
+        Ok(_) => Next::Update,
+    }
+}
+
+/// Drone maburd hashes this process has tried to replace: once each, across
+/// link restarts (a Quest restarts its link when a card comes or goes).
+static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// How long "updated" stays on screen.
+const UPDATED_SHOW: Duration = Duration::from_secs(15);
+
+/// Keeps the drone on this app's maburd while the link runs: a thread that
+/// probes the drone whenever it is heard (a session, or Telems in another
+/// RC version: the lane works across versions) and runs the update when the
+/// drone's maburd differs. Its state goes to `Shared::update`, and from
+/// there to the UI stats line. No-op for a build without a payload.
+pub fn spawn_auto(sh: Arc<Shared>) {
+    let Some(pl) = embedded() else {
+        return;
+    };
+    let r = std::thread::Builder::new()
+        .name("pal-dupdate".into())
+        .spawn(move || auto_loop(&sh, &pl));
+    if let Err(e) = r {
+        log::warn!("drone update thread: {e}");
+    }
+}
+
+struct AutoProgress<'a> {
+    sh: &'a Shared,
+    base: serde_json::Value,
+    step: String,
+}
+
+impl Progress for AutoProgress<'_> {
+    fn step(&mut self, what: &str) {
+        self.step = what.to_string();
+        let mut v = self.base.clone();
+        v["state"] = "updating".into();
+        v["step"] = what.into();
+        self.sh.set_update(v);
+        self.sh
+            .event("drone_update", serde_json::json!({ "step": what }));
+    }
+    fn bytes(&mut self, done: u64, total: u64) {
+        let mut v = self.base.clone();
+        v["state"] = "updating".into();
+        v["step"] = self.step.as_str().into();
+        v["done"] = done.into();
+        v["total"] = total.into();
+        self.sh.set_update(v);
+    }
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(12)]
+}
+
+fn auto_loop(sh: &Shared, pl: &Payload) {
+    let want = sha256_hex(&pl.maburd);
+    let base = |state: &str| serde_json::json!({ "state": state, "app": short(&want) });
+    sh.set_update(base("waiting"));
+    let (mut was_heard, mut settled) = (false, false);
+    let mut next = Instant::now();
+    let mut updated_at: Option<Instant> = None;
+    while !sh.quit.load(Ordering::Relaxed) && !sh.core_done.load(Ordering::Acquire) {
+        if updated_at.is_some_and(|t| t.elapsed() > UPDATED_SHOW) {
+            updated_at = None;
+            let mut v = base("current");
+            v["drone"] = short(&want).into();
+            sh.set_update(v);
+        }
+        let heard = sh.drone_heard.load(Ordering::Relaxed);
+        if heard && !was_heard {
+            settled = false;
+            next = Instant::now();
+        }
+        was_heard = heard;
+        if !heard || settled || Instant::now() < next {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        }
+        let p = probe(&sh.maint, Duration::from_secs(3));
+        let tried = p.as_ref().is_ok_and(|p| {
+            TRIED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&p.sha)
+        });
+        let mut v = base("");
+        if let Ok(p) = &p {
+            v["drone"] = short(&p.sha).into();
+        }
+        match decide(&p, &want, tried) {
+            Next::Wait(d, state) => {
+                v["state"] = state.into();
+                if let Err(e) = &p {
+                    v["error"] = e.to_string().into();
+                }
+                sh.set_update(v);
+                next = Instant::now() + d;
+            }
+            Next::Settled(state) => {
+                v["state"] = state.into();
+                sh.set_update(v);
+                settled = true;
+            }
+            Next::Keep => settled = true,
+            Next::Update => {
+                let from = p.map(|p| p.sha).unwrap_or_default();
+                TRIED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(from.clone());
+                sh.event(
+                    "drone_update",
+                    serde_json::json!({ "from": from, "to": want }),
+                );
+                let mut prog = AutoProgress {
+                    sh,
+                    base: v.clone(),
+                    step: String::new(),
+                };
+                match run(&sh.maint, pl, &video_flows(sh), &mut prog) {
+                    Ok(r) => {
+                        v["state"] = "updated".into();
+                        v["secs"] = r.secs.into();
+                        sh.event(
+                            "drone_update",
+                            serde_json::json!({ "done_s": r.secs, "config": r.config_changes }),
+                        );
+                        updated_at = Some(Instant::now());
+                    }
+                    Err(e) => {
+                        log::warn!("drone update: {e}");
+                        v["state"] = "failed".into();
+                        v["error"] = e.as_str().into();
+                        sh.event("drone_update", serde_json::json!({ "failed": e }));
+                    }
+                }
+                sh.set_update(v);
+                settled = true;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +710,41 @@ mod tests {
                 && u.starts_with("[venc]\nmin_iqp = 42\nfps = 60\n"),
             "{u}"
         );
+    }
+
+    #[test]
+    fn the_automatic_update_installs_any_other_maburd_once_and_never_on_an_armed_drone() {
+        let drone = |exe: &str, sha: &str| {
+            Ok(Probe {
+                exe: exe.into(),
+                sha: sha.into(),
+                ..Probe::default()
+            })
+        };
+        let on_flash = "/usr/bin/maburd";
+        assert_eq!(
+            decide(&drone(on_flash, "aa"), "aa", false),
+            Next::Settled("current")
+        );
+        assert_eq!(
+            decide(&drone(on_flash, "bb"), "aa", false),
+            Next::Update,
+            "older or newer"
+        );
+        assert_eq!(decide(&drone(on_flash, "bb"), "aa", true), Next::Keep);
+        assert!(matches!(
+            decide(&drone("/tmp/mabur-up/maburd", "bb"), "aa", false),
+            Next::Wait(_, "busy")
+        ));
+        let armed = Err(ExecError::Closed(pal_wire::maint::STATUS_ARMED));
+        assert!(matches!(
+            decide(&armed, "aa", false),
+            Next::Wait(_, "armed")
+        ));
+        assert!(matches!(
+            decide(&Err(ExecError::NoAnswer), "aa", false),
+            Next::Wait(_, "no_lane")
+        ));
     }
 
     #[test]
@@ -538,6 +812,7 @@ mod tests {
             .env("INIT", d.join("init"))
             .env("COMMIT_WAIT", wait.to_string())
             .env("STOP_WAIT", "2")
+            .env("START_DELAY", "0")
             .env("NAME", "pal-swap-test-no-such-process")
             .spawn()
             .unwrap()

@@ -922,6 +922,10 @@ fn main() {
                                     drive: drive(&o),
                                 };
                                 let (ch, w) = (o.ch, o.width);
+                                if o.mode == Mode::Gs {
+                                    // Keeps the drone on the maburd this build carries.
+                                    runtime::drone_update::spawn_auto(shared.clone());
+                                }
                                 if let Err(e) = runtime::run_live(cl, cfg, |chip| {
                                     eprintln!("pal-desktop: card {chip} on ch {ch} / {w} MHz")
                                 }) {

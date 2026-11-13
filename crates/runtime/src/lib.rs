@@ -73,6 +73,13 @@ pub struct Shared {
     pub peer_rc: PeerRc,
     /// The maintenance lane: shell sessions on the drone, the video-off wish.
     pub maint: maint::Hub,
+    /// A drone is heard: a session, or its Telems in another RC version.
+    /// The core loop sets it on each stats pass; the automatic drone update
+    /// probes when it rises.
+    pub drone_heard: AtomicBool,
+    /// The automatic drone update's state (`drone_update::spawn_auto`), for
+    /// the UI stats line; None in a build that carries no maburd.
+    pub update: Mutex<Option<serde_json::Value>>,
 }
 
 /// A drone's Telem in another RC version (`rc::foreign_rc_version`), counted on the RX thread.
@@ -171,6 +178,10 @@ impl Shared {
             return k;
         }
         last
+    }
+
+    pub fn set_update(&self, v: serde_json::Value) {
+        *self.update.lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
     }
 
     pub fn event(&self, ev: &'static str, detail: serde_json::Value) {
@@ -496,7 +507,7 @@ impl CoreLoop {
     /// The maintenance lane's frames go out through the core's TX card.
     fn pump_maint(&mut self, now: u64) {
         for f in self.sink.shared.maint.poll(now / 1000) {
-            self.sink.send(&f);
+            self.core.send_raw(&f, now, &mut self.sink);
         }
     }
 
@@ -681,6 +692,17 @@ impl CoreLoop {
         if let Some(e) = ev {
             self.sink.shared.event("peer_rc", e);
         }
+        self.sink
+            .shared
+            .drone_heard
+            .store(session || peer_rc.is_some(), Ordering::Relaxed);
+        let update = self
+            .sink
+            .shared
+            .update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let off = (!off.is_empty()).then(|| off.into());
         let idr_stuck = self
             .sink
@@ -700,6 +722,7 @@ impl CoreLoop {
                     ("rf_sim", rf_sim::active().map(|s| s.snapshot())),
                     ("peer_rc", peer_rc),
                     ("idr_stuck", idr_stuck),
+                    ("update", update),
                 ],
                 cal,
             ),

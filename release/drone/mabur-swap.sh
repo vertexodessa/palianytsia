@@ -22,6 +22,7 @@ INIT=${INIT:-/etc/init.d/S96mabur}
 COMMIT_WAIT=${COMMIT_WAIT:-120}
 STOP_WAIT=${STOP_WAIT:-10}
 NAME=${NAME:-maburd}   # the process name the old daemon runs under
+START_DELAY=${START_DELAY:-2}
 
 state() {
   echo "$1" > "$UP/state"
@@ -42,6 +43,9 @@ start_init() { setsid "$INIT" start </dev/null >/dev/null 2>&1; }
 
 trial() {
   rm -f "$UP/commit"
+  # The shell that started this runs under the old maburd: its answer leaves
+  # before that maburd stops.
+  sleep "$START_DELAY"
   state stopping
   "$INIT" stop >/dev/null 2>&1
   killall "$NAME" 2>/dev/null

@@ -9,6 +9,17 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CFG=${1:-$ROOT/configs/gs-auto.toml}
 NDK=${ANDROID_NDK_HOME:-$(ls -d "${ANDROID_HOME:-$HOME/Android/Sdk}"/ndk/* | sort -V | tail -1)}
 export ANDROID_NDK_HOME=$NDK
+# The drone maburd the app keeps a drone on (runtime::drone_update): a release
+# APK carries its own release's build, from tools/build-maburd.sh.
+if [[ -n ${PAL_MABURD:-} ]]; then
+  PAL_MABURD=$(realpath "$PAL_MABURD"); export PAL_MABURD
+  echo "drone maburd $PAL_MABURD sha256 $(sha256sum < "$PAL_MABURD" | cut -c1-12)"
+elif [[ ${PAL_RELEASE:-0} == 1 ]]; then
+  echo "a release APK needs PAL_MABURD (the release's maburd)" >&2
+  exit 1
+else
+  echo "no PAL_MABURD: this APK updates no drone"
+fi
 "$ROOT/tools/android-build.sh" build --release -p pal-phone
 A=$ROOT/apps/phone/android/app/src/main
 mkdir -p "$A/jniLibs/arm64-v8a" "$A/assets"

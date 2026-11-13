@@ -193,6 +193,8 @@ pub struct PanelIn<'a> {
     pub warning: Option<(String, bool)>,
     /// The flight controller's arm state; None before any telemetry.
     pub armed: Option<bool>,
+    /// The automatic drone update; None in a build that carries no maburd.
+    pub update: Option<&'a crate::update::UpdateView>,
 }
 
 #[derive(Default)]
@@ -919,6 +921,11 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
         Tab::System => {
             ui.label(format!("Palianytsia {}", pal_build::ID));
             ui.label(RichText::new(&i.log_info).small().color(Color32::GRAY));
+            let sw = i.update.map_or_else(
+                || "this build carries no maburd: it updates no drone".to_string(),
+                |u| u.line(),
+            );
+            ui.label(format!("Drone software: {sw}"));
             ui.separator();
             if let Some(t) = i.table {
                 ui.horizontal_wrapped(|ui| {

@@ -124,6 +124,12 @@ pub trait GsCore {
     fn stats_json(&self) -> String;
     /// `(mcs, bw)` of the `stats_json` line; mcs is -1 while none is known.
     fn link_op(&self) -> (i32, i32);
+    /// A frame of a lane the core does not know (the maintenance lane), out
+    /// on the card the core's own RC goes out on. A core that owns its cards
+    /// sends it there itself: `io.send` reaches no card then.
+    fn send_raw(&mut self, body: &[u8], _now_us: u64, io: &mut dyn CoreIo) {
+        io.send(body);
+    }
     /// Bytes from a local MAVLink peer (a GCS), cut at any boundary; tunneled
     /// to the drone under the live session. Gs mode only.
     fn mav_push_outbound(&mut self, _bytes: &[u8]) {}

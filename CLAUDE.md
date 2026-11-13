@@ -119,7 +119,10 @@ pairing key.
 - The drone's shell over the air (maintenance lane, gs mode): `pal live ... --exec CMD` (exits with
   CMD's status), `--shell`, `--input FILE` (CMD's stdin), `--video-off`; `--update-drone DIR`
   installs DIR/{maburd,mabur.toml,S96mabur} with no PC (trial from RAM, commit to flash,
-  `release/drone/mabur-swap.sh`). The drone's maburd must already have the lane.
+  `release/drone/mabur-swap.sh`). The drone's maburd must already have the lane. A build with
+  `PAL_MABURD=<maburd>` carries it, and pal-desktop live (gs mode) and both APKs then install it on
+  any drone whose maburd differs (`runtime::drone_update::spawn_auto`, banner `UPDATING DRONE`);
+  release APKs and the release desktop need `PAL_MABURD`.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `tools/retxmark.py in.bin out.bin [every]`: a capture copy with base bodies re-marked as NACK retransmits (the m1 retx case; a capture's own retransmits change no rung in replay).
 - Capture analysis (`tools/palcap.py` reads `palcap 1` + SBI/FEC envelopes): `tools/losstrace.py bodies.bin [--json f]`
