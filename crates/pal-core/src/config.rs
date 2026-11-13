@@ -269,6 +269,9 @@ pub struct LadderCfg {
     pub probation_ms: i32,
     pub penalty_base_ms: i32,
     pub penalty_max_ms: i32,
+    /// Loss lockout: see `LadderController::strike_rung`. 0 = off.
+    pub lockout_ms: i32,
+    pub lockout_latch: i32,
     pub hold_after_down_ms: i32,
     pub min_between_changes_ms: i32,
     pub feedback_timeout_ms: i32,
@@ -309,6 +312,8 @@ impl Default for LadderCfg {
             probation_ms: 3000,
             penalty_base_ms: 10000,
             penalty_max_ms: 60000,
+            lockout_ms: 0,
+            lockout_latch: 4,
             hold_after_down_ms: 4000,
             min_between_changes_ms: 150,
             feedback_timeout_ms: 1000,
@@ -1125,6 +1130,8 @@ const LINK_KEYS: &[&str] = &[
     "probation_ms",
     "penalty_base_ms",
     "penalty_max_ms",
+    "lockout_ms",
+    "lockout_latch",
     "hold_after_down_ms",
     "min_between_changes_ms",
     "feedback_timeout_ms",
@@ -1366,6 +1373,8 @@ pub fn dump(c: &Config) -> String {
         probation_ms,
         penalty_base_ms,
         penalty_max_ms,
+        lockout_ms,
+        lockout_latch,
         hold_after_down_ms,
         min_between_changes_ms,
         feedback_timeout_ms,
@@ -1399,6 +1408,8 @@ pub fn dump(c: &Config) -> String {
     put(&format!("{p}probation_ms"), probation_ms.to_string());
     put(&format!("{p}penalty_base_ms"), penalty_base_ms.to_string());
     put(&format!("{p}penalty_max_ms"), penalty_max_ms.to_string());
+    put(&format!("{p}lockout_ms"), lockout_ms.to_string());
+    put(&format!("{p}lockout_latch"), lockout_latch.to_string());
     put(
         &format!("{p}hold_after_down_ms"),
         hold_after_down_ms.to_string(),
@@ -1916,6 +1927,8 @@ fn parse_config(j: &Table) -> R<Config> {
         lc.probation_ms = get_i32(r, "probation_ms", 3000, 0, 600000, "link")?;
         lc.penalty_base_ms = get_i32(r, "penalty_base_ms", 10000, 0, 600000, "link")?;
         lc.penalty_max_ms = get_i32(r, "penalty_max_ms", 60000, 0, 600000, "link")?;
+        lc.lockout_ms = get_i32(r, "lockout_ms", 0, 0, 600000, "link")?;
+        lc.lockout_latch = get_i32(r, "lockout_latch", 4, 1, 100, "link")?;
         lc.hold_after_down_ms = get_i32(r, "hold_after_down_ms", 4000, 0, 600000, "link")?;
         lc.min_between_changes_ms = get_i32(r, "min_between_changes_ms", 150, 0, 600000, "link")?;
         lc.feedback_timeout_ms = get_i32(r, "feedback_timeout_ms", 1000, 0, 600000, "link")?;

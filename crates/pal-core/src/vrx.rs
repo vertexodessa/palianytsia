@@ -328,6 +328,8 @@ impl VrxController {
         self.peer_caps = ack.chip_caps;
         self.peer_acked = true;
         if adopted {
+            // A new drone session: the loss that struck the rungs was the old one's.
+            self.ctrl.clear_lockout();
             self.seq32 = 0;
             self.rcfs_since_adopt = 0;
             self.move_armed = true;

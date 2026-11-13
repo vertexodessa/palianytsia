@@ -82,6 +82,9 @@ pub struct LadderUp {
     pub streak: u64,
     pub streak_need: u64,
     pub penalty_ms: i64,
+    /// Loss lockout on the next rung: -1 latched, 0 none.
+    pub lock_ms: i64,
+    pub strikes: i64,
 }
 
 impl Ladder {
@@ -100,6 +103,8 @@ impl Ladder {
             streak: u64_or(v, "streak", 0),
             streak_need: u64_or(v, "streak_need", 0),
             penalty_ms: i("penalty_ms").unwrap_or(0),
+            lock_ms: i("lock_ms").unwrap_or(0),
+            strikes: i("strikes").unwrap_or(0),
         });
         let last = v.get("last_reason").and_then(Value::as_str).map(|r| {
             (
@@ -118,11 +123,28 @@ impl Ladder {
     }
 
     /// The chip text and whether the promote is blocked right now, in the
-    /// order the controller checks: penalty, s1 loss, s1 clean run, probe.
+    /// order the controller checks: lockout, penalty, s1 loss, s1 clean run, probe.
     pub fn summary(&self) -> (String, bool) {
         let Some(u) = &self.up else {
             return ("top rung".into(), false);
         };
+        if u.lock_ms < 0 {
+            return (
+                format!("r{} locked: {} losses", self.rung + 1, u.strikes),
+                true,
+            );
+        }
+        if u.lock_ms > 0 {
+            return (
+                format!(
+                    "r{} locked {:.0} s ({} lost)",
+                    self.rung + 1,
+                    u.lock_ms as f64 / 1000.0,
+                    u.strikes
+                ),
+                true,
+            );
+        }
         if u.penalty_ms > 0 {
             return (
                 format!(
@@ -1024,6 +1046,15 @@ mod tests {
         );
         assert_eq!(l.summary(), ("top rung".into(), false));
         assert_eq!(l.last.as_ref().map(|x| x.2), Some(4));
+        let l = row(&format!(
+            r#"{{{base},"probe":"clean","streak":95,"lock_ms":21400,"strikes":2}}"#
+        ));
+        assert_eq!(l.summary(), ("r1 locked 21 s (2 lost)".into(), true));
+        let l = row(&format!(
+            r#"{{{base},"probe":"clean","streak":95,"lock_ms":-1,"strikes":4}}"#
+        ));
+        assert_eq!(l.summary(), ("r1 locked: 4 losses".into(), true));
+        assert!(l.summary().0.len() <= UP_WIDTH);
     }
 
     fn card(rssi: Option<i64>, frames: u64, crc_fail: u64) -> CardRx {

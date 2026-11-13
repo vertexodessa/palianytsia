@@ -1103,6 +1103,8 @@ impl GsCore for RustCore {
             j.set("streak", u.probe.streak_bodies);
             j.set("streak_need", u.probe_need);
             j.set("penalty_ms", u.next_penalty_ms);
+            j.set("lock_ms", u.next_lock_ms);
+            j.set("strikes", u.next_strikes);
         }
         let e = c.last_event();
         if e.t_ms > 0.0 {

@@ -328,10 +328,12 @@ fn kind(path: &str) -> Option<Kind> {
         | "link.probation_ms"
         | "link.penalty_base_ms"
         | "link.penalty_max_ms"
+        | "link.lockout_ms"
         | "link.hold_after_down_ms"
         | "link.min_between_changes_ms"
         | "link.feedback_timeout_ms"
         | "link.starved_confirm_ms" => Int(MS.0, MS.1),
+        "link.lockout_latch" => Int(1, 100),
         "link.s3_demote" => Bool,
         "link.s3_down_util" => Num(0.01, 2.0),
         "link.s3_min_syms" => Int(1, 100000),

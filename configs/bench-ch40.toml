@@ -83,6 +83,8 @@ clean_ms               = 1500
 probation_ms           = 3000   # after stepping up, a quick fall back counts as a failed promote
 penalty_base_ms        = 5000   # a failed rung is blocked this long, doubling on repeats...
 penalty_max_ms         = 10000  # ...up to this
+lockout_ms             = 0      # a rung left on loss is locked this long (0 = off)...
+lockout_latch          = 4      # ...and the latch-th such loss locks it until a hop or a new session
 hold_after_down_ms     = 0      # wait after stepping down before stepping up again
 min_between_changes_ms = 150    # minimum time between any two rung changes
 feedback_timeout_ms    = 1000   # no link reports this long = fall to the most robust rung

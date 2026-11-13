@@ -115,6 +115,19 @@ pub struct UpStatus {
     pub probe_need: u64,
     /// Remaining block on the next rung after a failed promote.
     pub next_penalty_ms: i32,
+    /// Remaining loss lockout on the next rung; -1 = latched, 0 = none.
+    pub next_lock_ms: i32,
+    /// Loss demotes the next rung has taken since the last clear.
+    pub next_strikes: i32,
+}
+
+/// `LadderController::locked`: one rung the loss lockout holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lockout {
+    pub rung: i32,
+    /// -1 = latched.
+    pub ms_left: i32,
+    pub strikes: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -345,6 +358,8 @@ pub struct LadderController {
     probation_rung: i32,
     fail_count: Vec<i32>,
     penalty_until: Vec<f64>,
+    strikes: Vec<i32>,
+    lock_until: Vec<f64>,
     probe_state: ProbeGateState,
     probe_state_since_ms: f64,
     probe_streak_open: bool,
@@ -365,6 +380,8 @@ pub struct LadderController {
 }
 
 const NEVER: f64 = -1e18;
+/// `lock_until` of a latched rung: later than any clock this process will see.
+const LATCHED: f64 = 1e18;
 /// A rung change retunes the encoder's bitrate, and on Star6E that emits a
 /// keyframe several times a P frame's size, which can take hundreds of ms of air.
 /// The frames queued behind it arrive late and read as residual loss. Demoting on
@@ -399,6 +416,8 @@ impl LadderController {
             probation_rung: -1,
             fail_count: vec![0; n],
             penalty_until: vec![NEVER; n],
+            strikes: vec![0; n],
+            lock_until: vec![NEVER; n],
             probe_state: ProbeGateState::Off,
             probe_state_since_ms: 0.0,
             probe_streak_open: false,
@@ -477,6 +496,10 @@ impl LadderController {
             .into_iter()
             .find(|(r, _)| *r as usize == next)
             .map_or(0, |(_, ms)| ms);
+        let lock = self
+            .locked(now)
+            .into_iter()
+            .find(|l| l.rung as usize == next);
         Some(UpStatus {
             u: self.u,
             up_util: self.cfg.up_util,
@@ -490,6 +513,8 @@ impl LadderController {
             probe_max_util: self.probe_util_threshold(),
             probe_need: self.cfg.probe.clean_bodies as u64,
             next_penalty_ms: pen_ms,
+            next_lock_ms: lock.map_or(0, |l| l.ms_left),
+            next_strikes: self.strikes[next],
         })
     }
     fn probe_util_threshold(&self) -> f64 {
@@ -557,6 +582,54 @@ impl LadderController {
             .filter(|(_, &u)| now < u)
             .map(|(r, &u)| (r as i32, (u - now) as i32))
             .collect()
+    }
+
+    /// Rungs the loss lockout holds now.
+    pub fn locked(&self, now: f64) -> Vec<Lockout> {
+        self.lock_until
+            .iter()
+            .enumerate()
+            .filter(|(_, &u)| now < u)
+            .map(|(r, &u)| Lockout {
+                rung: r as i32,
+                ms_left: if u == LATCHED { -1 } else { (u - now) as i32 },
+                strikes: self.strikes[r],
+            })
+            .collect()
+    }
+
+    pub fn strikes(&self, rung: usize) -> i32 {
+        self.strikes[rung]
+    }
+
+    /// Forget every strike and lock: what they measured belongs to a link
+    /// that is gone (a new drone session; `restore` does the same for a hop).
+    pub fn clear_lockout(&mut self) {
+        self.strikes.fill(0);
+        self.lock_until.fill(NEVER);
+    }
+
+    /// One strike per loss demote, charged to the rung left. Strikes below
+    /// `lockout_latch` lock it for `lockout_ms`, the latch-th until a clear;
+    /// an expired lock keeps its strikes. Rung 0 is never left by a demote,
+    /// so the floor is never locked.
+    fn strike_rung(&mut self, rung: i32, now: f64) {
+        if self.cfg.lockout_ms <= 0 {
+            return;
+        }
+        let r = rung as usize;
+        if self.strikes[r] < self.cfg.lockout_latch {
+            self.strikes[r] += 1;
+        }
+        self.lock_until[r] = if self.strikes[r] >= self.cfg.lockout_latch {
+            LATCHED
+        } else {
+            now + f64::from(self.cfg.lockout_ms)
+        };
+    }
+
+    fn is_locked(&self, rung: usize, now: f64) -> bool {
+        now < self.lock_until[rung]
     }
 
     fn set_probe_state(&mut self, s: ProbeGateState, now: f64) {
@@ -669,6 +742,16 @@ impl LadderController {
     /// One step down with the shared bookkeeping of every demote path.
     fn demote(&mut self, now: f64, reason: CtlReason, u: f64, fade: bool) {
         let from = self.idx;
+        if matches!(
+            reason,
+            CtlReason::Residual
+                | CtlReason::S3Residual
+                | CtlReason::Util
+                | CtlReason::S3Util
+                | CtlReason::Probation
+        ) {
+            self.strike_rung(from, now);
+        }
         self.idx = from - 1;
         self.last_down_ms = now;
         self.last_change_ms = now;
@@ -854,6 +937,7 @@ impl LadderController {
                 && now - self.last_down_ms >= f64::from(self.cfg.hold_after_down_ms)
                 && now - self.last_change_ms >= f64::from(self.cfg.min_between_changes_ms)
                 && !self.is_penalized(next, now)
+                && !self.is_locked(next, now)
             {
                 let g = self.probe_gate();
                 let mut reason = CtlReason::Promote;
@@ -913,6 +997,8 @@ impl LadderController {
     }
 
     pub fn restore(&mut self, rung: i32, now: f64) {
+        // The strikes were measured on the channel the hop left.
+        self.clear_lockout();
         let rung = rung.clamp(0, self.cfg.ladder.len() as i32 - 1);
         let from = self.idx;
         self.idx = rung;
@@ -927,5 +1013,230 @@ impl LadderController {
 
     pub fn blank_store(&mut self, until_ms: f64) {
         self.blank_store_until_ms = self.blank_store_until_ms.max(until_ms);
+    }
+}
+
+#[cfg(test)]
+mod lockout_tests {
+    use super::*;
+
+    /// mabur's test ladder, probe off, no probation penalty, no hold after a
+    /// demote, a 1 s clean run and a 30 s lockout latching at the 4th strike:
+    /// a promote held back below is held by the lockout and nothing else.
+    fn cfg() -> LadderCfg {
+        let mut c = LadderCfg::default();
+        c.probe.enable = false;
+        c.penalty_base_ms = 0;
+        c.penalty_max_ms = 0;
+        c.hold_after_down_ms = 0;
+        c.clean_ms = 1000;
+        c.lockout_ms = 30000;
+        c.lockout_latch = 4;
+        c
+    }
+    fn ok(pre: f64) -> LinkHealth {
+        LinkHealth {
+            sample_valid: true,
+            pre_fec_loss: pre,
+            ..LinkHealth::empty()
+        }
+    }
+    fn resid() -> LinkHealth {
+        LinkHealth {
+            residual_loss: 0.05,
+            ..ok(0.0)
+        }
+    }
+    /// Clean samples every 50 ms until `rung`; returns the promote time.
+    fn climb(c: &mut LadderController, t: &mut f64, rung: i32) -> f64 {
+        while c.rung() < rung {
+            c.update(&ok(0.0), *t);
+            if c.rung() == rung {
+                return *t;
+            }
+            *t += 50.0;
+            assert!(*t < 1e7);
+        }
+        *t
+    }
+    /// Neutral samples (between up_util and down_util) for `ms`.
+    fn hold(c: &mut LadderController, t: &mut f64, ms: f64) {
+        let end = *t + ms;
+        while *t <= end {
+            let b = c.budget_base();
+            c.update(&ok(0.3 * b), *t);
+            *t += 50.0;
+        }
+    }
+    fn lock_ms(c: &LadderController, t: f64, rung: i32) -> i32 {
+        c.locked(t)
+            .iter()
+            .find(|l| l.rung == rung)
+            .map_or(0, |l| l.ms_left)
+    }
+
+    #[test]
+    fn strikes_lock_for_lockout_ms_and_the_fourth_latches() {
+        let cfg = cfg();
+        let mut c = LadderController::new(cfg.clone());
+        let mut t = 0.0;
+        climb(&mut c, &mut t, 2);
+        for strike in 1..=4 {
+            hold(&mut c, &mut t, 4000.0);
+            assert_eq!(c.rung(), 2);
+            let down = t;
+            assert!(c.update(&resid(), t));
+            assert_eq!(c.last_event().reason, CtlReason::Residual);
+            assert_eq!((c.rung(), c.strikes(2), c.strikes(1)), (1, strike, 0));
+            if strike < 4 {
+                assert_eq!(lock_ms(&c, t, 2), cfg.lockout_ms);
+                let up = climb(&mut c, &mut t, 2);
+                assert!(up >= down + f64::from(cfg.lockout_ms));
+                assert!(up <= down + f64::from(cfg.lockout_ms + cfg.clean_ms) + 100.0);
+                assert_eq!(c.strikes(2), strike, "an expired lock keeps its strikes");
+            } else {
+                assert_eq!(lock_ms(&c, t, 2), -1);
+                let end = t + 300_000.0;
+                while t < end {
+                    t += 50.0;
+                    c.update(&ok(0.0), t);
+                }
+                assert_eq!(c.rung(), 1, "latched: five clean minutes do not lift it");
+            }
+        }
+    }
+
+    #[test]
+    fn a_locked_rung_is_a_ceiling_and_the_floor_is_never_locked() {
+        let cfg = cfg();
+        let mut c = LadderController::new(cfg.clone());
+        let mut t = 0.0;
+        climb(&mut c, &mut t, 2);
+        hold(&mut c, &mut t, 4000.0);
+        c.update(&resid(), t);
+        let free = t + f64::from(cfg.lockout_ms);
+        hold(&mut c, &mut t, 1300.0);
+        c.update(&resid(), t);
+        assert_eq!((c.rung(), c.strikes(1), c.strikes(0)), (0, 1, 0));
+        assert_eq!(lock_ms(&c, t, 0), 0);
+        let up1 = climb(&mut c, &mut t, 1);
+        assert!(
+            up1 >= free,
+            "rung 1 was struck later, so it frees after rung 2"
+        );
+        // Rung 2 locked, rung 1 not: the climb off the floor stops at 1.
+        let mut c = LadderController::new(cfg.clone());
+        let mut t = 0.0;
+        climb(&mut c, &mut t, 2);
+        hold(&mut c, &mut t, 4000.0);
+        c.update(&resid(), t);
+        let free = t + f64::from(cfg.lockout_ms);
+        assert!(
+            c.on_tick(t + 2000.0),
+            "timeout to the floor strikes nothing"
+        );
+        t += 2000.0;
+        assert_eq!(c.strikes(1), 0);
+        let up1 = climb(&mut c, &mut t, 1);
+        assert!(up1 < free);
+        let up2 = climb(&mut c, &mut t, 2);
+        assert!(up2 >= free && up2 <= free + f64::from(cfg.clean_ms) + 100.0);
+    }
+
+    #[test]
+    fn util_s3_and_probation_demotes_strike_timeout_and_starved_do_not() {
+        let mut c = LadderController::new(cfg());
+        let mut t = 0.0;
+        climb(&mut c, &mut t, 3);
+        hold(&mut c, &mut t, 4000.0);
+        while c.rung() == 3 {
+            let b = c.budget_base();
+            c.update(&ok(0.9 * b), t);
+            t += 50.0;
+        }
+        assert_eq!((c.last_event().reason, c.strikes(3)), (CtlReason::Util, 1));
+        hold(&mut c, &mut t, 1300.0);
+        let b = c.budget_base();
+        c.update(
+            &LinkHealth {
+                s3_valid: true,
+                s3_expected_syms: 500,
+                s3_residual_loss: 0.05,
+                ..ok(0.3 * b)
+            },
+            t,
+        );
+        assert_eq!(
+            (c.last_event().reason, c.strikes(2)),
+            (CtlReason::S3Residual, 1)
+        );
+
+        let mut p = LadderController::new(LadderCfg {
+            lockout_ms: 1000,
+            ..cfg()
+        });
+        let mut tp = 0.0;
+        climb(&mut p, &mut tp, 1);
+        assert!(p.probation_ms_left(tp) > 0);
+        tp += 50.0;
+        let b = p.budget_base();
+        p.update(&ok(0.9 * b), tp);
+        assert_eq!(
+            (p.last_event().reason, p.strikes(1)),
+            (CtlReason::Probation, 1)
+        );
+        assert_eq!(lock_ms(&p, tp, 1), 1000);
+
+        let mut o = LadderController::new(cfg());
+        let mut to = 0.0;
+        climb(&mut o, &mut to, 2);
+        assert!(o.on_tick(to + 2000.0));
+        assert_eq!(o.last_event().reason, CtlReason::Timeout);
+        let mut s = LadderController::new(cfg());
+        let mut ts = 0.0;
+        climb(&mut s, &mut ts, 2);
+        while s.rung() > 0 {
+            s.update(
+                &LinkHealth {
+                    video_starved: true,
+                    ..ok(0.0)
+                },
+                ts,
+            );
+            ts += 50.0;
+        }
+        assert_eq!(s.last_event().reason, CtlReason::Starved);
+        assert!(o.locked(to).is_empty() && s.locked(ts).is_empty());
+    }
+
+    #[test]
+    fn off_by_default_and_clear_forgets_every_strike() {
+        let mut c = LadderController::new(LadderCfg {
+            lockout_ms: 0,
+            ..cfg()
+        });
+        let mut t = 0.0;
+        climb(&mut c, &mut t, 2);
+        hold(&mut c, &mut t, 4000.0);
+        c.update(&resid(), t);
+        assert_eq!((c.rung(), c.strikes(2)), (1, 0));
+        let down = t;
+        let up = climb(&mut c, &mut t, 2);
+        assert!(
+            up < down + 2000.0,
+            "straight back up, as before the lockout"
+        );
+        assert_eq!(LadderCfg::default().lockout_ms, 0);
+
+        let mut c = LadderController::new(cfg());
+        let mut t = 0.0;
+        climb(&mut c, &mut t, 2);
+        hold(&mut c, &mut t, 4000.0);
+        c.update(&resid(), t);
+        let up = c.up_status(t).unwrap();
+        assert_eq!((up.next_lock_ms, up.next_strikes), (30000, 1));
+        c.clear_lockout();
+        assert!(c.locked(t).is_empty());
+        assert_eq!(c.strikes(2), 0);
     }
 }

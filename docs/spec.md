@@ -169,6 +169,17 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   maburd, 39 of 60 s at full frame rate against 2, 4 shed episodes against 14, drone queue p90 16
   bodies against 73; each step costs one keyframe (Star6E emits one on a rate change). Bench only,
   not flown.
+- mabur pin, 2026-11-13 (pal-pzj.4): a loss lockout per rung in the ladder, both cores,
+  `link.lockout_ms` (0 = off, the shipped value in every GS config) and `link.lockout_latch` (4).
+  Every loss demote (s1/s3 residual, s1/s3 util, probation) strikes the rung it leaves; a strike
+  below the latch locks it against promotes for `lockout_ms`, the latch-th until a channel hop or a
+  new drone session; fade, starved, timeout and re-entry moves strike nothing, the floor is never
+  locked. The ladder chip says `rN locked ...`. Replay of `2026-11-11-bench-gs-ch144w40-ladder.bin`
+  with `lockout_ms = 30000`: 2 rung changes against 7 (1 0 1 2 1 2 1), ref==rust in AUs, sends and
+  stats at 0/10/20/35 % loss; `tools/m1-replay.sh` runs every capture with it on and fails unless
+  it changes the sends somewhere. Open: it stays off until a keyframe-age bound exists (pal-pzj.22:
+  with `venc.gop_s` 0 the rung changes are the periodic keyframe today), and the bench A/B (rung
+  changes per hour, time at the top rung) is not run.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.13.1, signed APKs; v0.13.1, 2026-11-13: the channel menu in the desktop app (the apps' link pick at start, `Cmd::Channels` on the live link), maburd and apps as v0.13, bench only; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):

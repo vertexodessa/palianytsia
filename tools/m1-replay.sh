@@ -11,7 +11,8 @@
 #  5. that copy and one whose retransmits land 80 ms late, under each
 #     link.nack_residual rule (filled, all, timely); the rules must also
 #     tell apart somewhere in the set, or the cases test nothing;
-#  6. the F18 set path: the same --param-set script into both cores.
+#  6. the loss lockout on (link.lockout_ms), which must change the sends somewhere;
+#  7. the F18 set path: the same --param-set script into both cores.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cargo build -q --release --manifest-path "$ROOT/Cargo.toml" -p pal
@@ -26,6 +27,7 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 fail=0
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 declare -A mode_sends  # "<file> <copy> <drop> <rule>" -> sha of the RC bytes sent
+lockout_moved=0        # 1 once the lockout changed the RC bytes sent on some capture
 while IFS='|' read -r _ file _ mode _ _ expect _; do
   file=$(echo "$file" | xargs); mode=$(echo "$mode" | xargs); expect=$(echo "$expect" | xargs)
   [[ $file == *.bin ]] || continue
@@ -103,6 +105,27 @@ while IFS='|' read -r _ file _ mode _ _ expect _; do
       done
     done
   done
+  # The loss lockout (link.lockout_ms, off in gs.toml): both cores under it at 0 and 10 %
+  # loss; the drop-0 sends are kept to show it changed a command somewhere in the set.
+  sed "s/^lockout_ms *=.*/lockout_ms = 30000/" "$CFG" > "$TMP/lock.toml"
+  if ! grep -q "^lockout_ms = 30000$" "$TMP/lock.toml"; then
+    echo "FAIL $CFG has no lockout_ms line to set"; fail=1
+  else
+    for d in 0 10; do
+      ref_out=$("$PAL" replay "$cap" -c "$TMP/lock.toml" --mode gs --drop-pct $d --seed 7 \
+        --aus "$TMP/r.aus" --sends "$TMP/r.sends")
+      out=$("$PAL" replay "$cap" -c "$TMP/lock.toml" --mode gs --core rust --drop-pct $d --seed 7 \
+        --aus "$TMP/u.aus" --sends "$TMP/u.sends")
+      if cmp -s "$TMP/r.aus" "$TMP/u.aus" && cmp -s "$TMP/r.sends" "$TMP/u.sends" \
+        && [[ $(grep '^stats ' <<<"$ref_out") == "$(grep '^stats ' <<<"$out")" ]]; then
+        echo "ok   ref==rust gs lockout drop=$d $file ($(grep -o '"rung":[0-9]*' <<<"$out"))"
+      else echo "FAIL ref!=rust gs lockout drop=$d $file"; fail=1; fi
+      if [[ $d == 0 ]]; then
+        "$PAL" replay "$cap" -c "$CFG" --mode gs --core rust --seed 7 --sends "$TMP/o.sends" >/dev/null
+        cmp -s "$TMP/o.sends" "$TMP/u.sends" || lockout_moved=1
+      fi
+    done
+  fi
   # F18: a set, a refused set while it is pending, a bad value, a refresh-
   # free late set; sends, refusals and the final table must agree.
   PS=(--param-set 5,4,9000 --param-set 6,99,1 --param-set 20,1,maybe --param-set 32,0,2.5)
@@ -129,4 +152,6 @@ for pair in "all filled" "timely filled" "timely all"; do
   if differs $pair; then echo "ok   nack_residual $pair: different sends on some capture"
   else echo "FAIL nack_residual $pair: the same sends on every capture"; fail=1; fi
 done
+if [[ $lockout_moved == 1 ]]; then echo "ok   lockout: different sends on some capture"
+else echo "FAIL lockout: the same sends on every capture"; fail=1; fi
 exit $fail

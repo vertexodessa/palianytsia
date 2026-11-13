@@ -189,7 +189,7 @@ class ConfigDump {
 
   void ladder(const maburgs::LadderCfg& lc) {
     const auto& [rungs, down_util, up_util, confirm_ms, clean_ms, probation_ms, penalty_base_ms,
-                 penalty_max_ms, hold_after_down_ms, min_between_changes_ms, feedback_timeout_ms,
+                 penalty_max_ms, lockout_ms, lockout_latch, hold_after_down_ms, min_between_changes_ms, feedback_timeout_ms,
                  starved_confirm_ms, probe, s3_demote, s3_down_util, s3_min_syms, s3_settle_ms,
                  rung_stats, fade] = lc;
     const std::string p = "link.ladder_cfg.";
@@ -209,6 +209,8 @@ class ConfigDump {
     i(p + "probation_ms", probation_ms);
     i(p + "penalty_base_ms", penalty_base_ms);
     i(p + "penalty_max_ms", penalty_max_ms);
+    i(p + "lockout_ms", lockout_ms);
+    i(p + "lockout_latch", lockout_latch);
     i(p + "hold_after_down_ms", hold_after_down_ms);
     i(p + "min_between_changes_ms", min_between_changes_ms);
     i(p + "feedback_timeout_ms", feedback_timeout_ms);
