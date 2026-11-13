@@ -221,7 +221,11 @@ impl Aggregator {
         } else {
             if let Some(sid) = stream_id {
                 self.sid_clean_us[usize::from(sid)] = m.mono_us + 1;
-                self.any_clean_us = m.mono_us + 1;
+                // Only video ends a fade: MSP flies at the robust control
+                // modulation and stays FCS-good while every video body fails.
+                if sid <= 1 {
+                    self.any_clean_us = m.mono_us + 1;
+                }
             }
             c.agg_pos = if m.phy_valid { 0 } else { c.agg_pos + 1 };
             if c.has_seq {
@@ -274,9 +278,9 @@ impl Aggregator {
         // would move its CRC-good blocks to another stream. Such a body is
         // routed only to a stream some card heard FCS-good within
         // CLEAN_STREAM_US; otherwise it stays a crc_fail and goes nowhere. In
-        // a fade with no FCS-good SBI body at all for that long, salvage is
-        // the only source left, so every FCS-bad body is routed by its
-        // peeked id as before.
+        // a fade with no FCS-good video body for that long, salvage is the
+        // only source left, so every FCS-bad body is routed by its peeked id
+        // as before.
         if !m.crc_ok && heard_within(self.any_clean_us, m.mono_us) {
             let seen = stream_id.map_or(0, |sid| self.sid_clean_us[usize::from(sid)]);
             if !heard_within(seen, m.mono_us) {
@@ -317,6 +321,32 @@ mod tests {
     fn walk(a: &Aggregator) -> (u64, u64, u64) {
         let c = &a.cards()[0];
         (c.self_frames, c.seq_received, c.seq_expected)
+    }
+
+    /// mabur `clean_msp_does_not_end_a_fade`: MSP stays FCS-good through a
+    /// fade that fails every video body; the corrupt video bodies are all
+    /// salvage has left, so a clean MSP body must not shut the gate.
+    #[test]
+    fn clean_msp_does_not_end_a_fade() {
+        let body = |sid: u8| {
+            pal_wire::sbi::Packer::new(16, 1, sid)
+                .add(&[0x5a; 16])
+                .unwrap()
+        };
+        let at = |ms: u64, crc_ok: bool, sid: u8| RxBody {
+            crc_ok,
+            mono_us: ms * 1000,
+            mac_seq: ms as u16,
+            body: body(sid),
+            ..Default::default()
+        };
+        let mut a = agg();
+        a.on_rx_body(&at(10, true, 0)); // video clean once
+        for ms in (100..=600).step_by(50) {
+            assert!(matches!(a.on_rx_body(&at(ms, true, 4)), Route::Msp));
+        }
+        // 591 ms without a clean video body: a fade, route as named.
+        assert!(matches!(a.on_rx_body(&at(601, false, 0)), Route::Video(_)));
     }
 
     #[test]

@@ -614,6 +614,10 @@ pub struct ParamClient {
     set_send_ms: u64,
     set_resends: i32,
     set_in_progress: bool,
+    /// The set changes the row's held value, so a re-read showing `set_value`
+    /// proves the apply. Setting the value already held proves nothing: that
+    /// set ends only on the drone's own ACCEPTED or FAILED (mabur).
+    set_reread_proves: bool,
     set_deadline_ms: u64,
     text_id: u16,
     text_next_seq: u8,
@@ -644,6 +648,7 @@ impl ParamClient {
             set_send_ms: 0,
             set_resends: 0,
             set_in_progress: false,
+            set_reread_proves: false,
             set_deadline_ms: 0,
             text_id: 0,
             text_next_seq: 0,
@@ -782,6 +787,7 @@ impl ParamClient {
                             // while InProgress finds the published value.
                             let done = self.state.pending_row == Some(idx)
                                 && self.set_in_progress
+                                && self.set_reread_proves
                                 && self.set_value.as_ref() == Some(&v);
                             self.state.rows[idx].value = Some(v);
                             self.fresh[idx] = true;
@@ -986,6 +992,7 @@ impl ParamClient {
             match parse_text(ty, text) {
                 None => format!("bad value for {}", type_name(ty)),
                 Some(v) => {
+                    self.set_reread_proves = self.state.rows[row].value.as_ref() != Some(&v);
                     self.send_set_packet(row, &v);
                     let r = &mut self.state.rows[row];
                     r.st = RowState::Sending;
@@ -1107,6 +1114,36 @@ mod tests {
         assert_eq!(pc.state().pending_row, None);
         assert_eq!(pc.state().list, ListState::Pending);
         assert_eq!(pc.stats().timeouts, 0);
+    }
+
+    /// Mirrors the C++ reread_of_an_unchanged_value_waits_for_the_ack.
+    #[test]
+    fn reread_of_an_unchanged_value_waits_for_the_ack() {
+        let row = find(b"VENC_MODE\0\0\0\0\0\0\0").expect("row");
+        let mut pc = ParamClient::default();
+        pc.set_linked(true, 0);
+        pc.on_packet(&value_pkt(row, "90@1920x1080/binned"), 10);
+        for t in [2000, 4000, 6000, 8000] {
+            pc.tick(t);
+        }
+        let t0 = 10_000;
+        pc.set(row, "90@1920x1080/binned", t0).expect("set");
+        pc.on_packet(
+            &ack_pkt(row, "90@1920x1080/binned", PARAM_ACK_IN_PROGRESS),
+            t0 + 100,
+        );
+        pc.take_out();
+        pc.tick(t0 + 2000);
+        assert_eq!(pc.take_out().len(), 1); // the re-read still goes out
+        pc.on_packet(&value_pkt(row, "90@1920x1080/binned"), t0 + 2050);
+        assert_eq!(pc.state().rows[row].st, RowState::InProgress);
+        assert_eq!(pc.state().pending_row, Some(row));
+        pc.on_packet(
+            &ack_pkt(row, "90@1920x1080/binned", PARAM_ACK_FAILED),
+            t0 + 2100,
+        );
+        assert_eq!(pc.state().rows[row].st, RowState::Failed);
+        assert_eq!(pc.state().pending_row, None);
     }
 
     #[test]

@@ -169,6 +169,14 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   maburd, 39 of 60 s at full frame rate against 2, 4 shed episodes against 14, drone queue p90 16
   bodies against 73; each step costs one keyframe (Star6E emits one on a rate change). Bench only,
   not flown.
+- mabur pin, 2026-11-13 (pal-kjx8): the FCS-bad routing rule's "nothing clean for 500 ms" fade
+  exception counts only clean video bodies (stream 0/1). A clean MSP body (robust control rate) kept
+  the gate shut in a fade that failed every video body, so salvage dropped exactly the bodies it
+  lives on. Both cores, test `clean_msp_does_not_end_a_fade` in each.
+- mabur pin, 2026-11-13 (pal-5fwh): the parameter client's InProgress re-read ends a set as
+  Accepted only when the set changes the held value; setting the value already held waits for the
+  drone's own ACCEPTED or FAILED, so an early Accepted no longer hides a later FAILED. Both clients,
+  test `reread_of_an_unchanged_value_waits_for_the_ack` in each.
 - mabur pin, 2026-11-13 (pal-pzj.4): a loss lockout per rung in the ladder, both cores,
   `link.lockout_ms` (0 = off, the shipped value in every GS config) and `link.lockout_latch` (4).
   Every loss demote (s1/s3 residual, s1/s3 util, probation) strikes the rung it leaves; a strike
