@@ -30,6 +30,9 @@
 //!                                   as the panel's button does; with sweeps (power20,
 //!                                   power40, cap20, cap40, floor) only those: the bench
 //!                                   pair is too close for the default run's power20
+//!           [--chan-at T_S:scan[=CH,...]|T_S:CH[,CH...]]  live, repeatable: at T_S seconds
+//!                                   send the Link menu's channel scan (of the drone's set, or
+//!                                   of CH...) or its channel choice, as the menu does
 //!   keys: S link statistics over the video, M monitor plots, P drone settings
 //!         (the flight HUD: battery, timer, alt/speed/home, centre dot, is always on)
 //!           [--cpu-rgba]            RGBA via swscale instead of the YUV shader
@@ -95,6 +98,8 @@ struct Opts {
     secs: f64,
     /// `--cal-start`: seconds after start, and the sweeps (empty = default).
     cal_start: Option<(f64, Vec<pal_wire::cal::SweepSpec>)>,
+    /// `--chan-at`: the channel menu's commands at set times.
+    chan_at: Vec<(f64, pal_osd::params::Cmd)>,
     mav_udp: Option<String>,
     /// Live: IDR requests on (`--no-idr` off). Replay: off (`--idr` on),
     /// as `pal replay`, so one capture gives the same stats in both apps.
@@ -117,6 +122,30 @@ struct Opts {
 fn die(msg: &str) -> ! {
     eprintln!("pal-desktop: {msg}");
     std::process::exit(2)
+}
+
+/// `T_S:scan` = the menu's scan of the drone's whole set; `T_S:CH,...` = the
+/// menu's choice of those channels.
+fn parse_chan_at(v: &str) -> Option<(f64, pal_osd::params::Cmd)> {
+    let (t, what) = v.split_once(':')?;
+    let t = t.parse::<f64>().ok().filter(|t| *t >= 0.0)?;
+    if what == "scan" {
+        return Some((t, pal_osd::params::Cmd::ChannelScan(Vec::new())));
+    }
+    let (scan, list) = match what.strip_prefix("scan=") {
+        Some(l) => (true, l),
+        None => (false, what),
+    };
+    let chs: Option<Vec<u8>> = list.split(',').map(|c| c.parse().ok()).collect();
+    let chs = chs.filter(|c| !c.is_empty())?;
+    Some((
+        t,
+        if scan {
+            pal_osd::params::Cmd::ChannelScan(chs)
+        } else {
+            pal_osd::params::Cmd::Channels(chs)
+        },
+    ))
 }
 
 fn parse() -> Opts {
@@ -182,6 +211,13 @@ fn parse() -> Opts {
                     (Some(t), Some(s)) if t >= 0.0 => o.cal_start = Some((t, s)),
                     _ => die("--cal-start T_S[,power20|power40|cap20|cap40|floor ...]"),
                 }
+            }
+            "--chan-at" => {
+                let v = val();
+                o.chan_at.push(
+                    parse_chan_at(&v)
+                        .unwrap_or_else(|| die("--chan-at T_S:scan[=CH,...] or T_S:CH[,CH...]")),
+                );
             }
             "--params" => o.params = true,
             "--headset-menu" => o.headset_menu = true,
@@ -763,6 +799,13 @@ fn main() {
             } else {
                 pal_osd::params::Cmd::CalSweeps(sweeps)
             });
+        });
+    }
+    for (t, cmd) in o.chan_at.clone() {
+        let tx = cmd_tx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs_f64(t));
+            let _ = tx.send(cmd);
         });
     }
     let (set_res_tx, set_res_rx) = mpsc::sync_channel(8);
