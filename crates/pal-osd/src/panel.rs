@@ -1011,12 +1011,11 @@ fn channels_button(ui: &mut Ui, prefs: &HudPrefs, set: &[u8], h: f32) -> Option<
 }
 
 /// Opening the channel menu scans only on a spare card, and never restarts
-/// a scan that is running. On one card a scan step takes the link card off
-/// the video for about 30 ms every 120 ms (two 10 ms dwells plus retunes and
-/// register reads): measured on the bench, 19-27 % of the drone's frames
-/// lost for the 6 s of the scan and the link down to its lowest rung. Menu
-/// visits in a row restarted it each time and the session dropped. There it
-/// waits for the operator's "scan".
+/// a scan that is running. On one card every dwell is a hole in the drone's
+/// frames (op_scan::ONE_CARD: one 12 ms dwell every 250 ms for 12.5 s): on the
+/// bench 5 % of the frames lost on average, 16 truncated frames and 18
+/// keyframe requests per scan. Menu visits in a row restarted it each time and
+/// the session dropped. There it waits for the operator's "scan".
 fn scan_on_open(cards: usize, running: bool) -> bool {
     cards >= 2 && !running
 }
@@ -1077,7 +1076,7 @@ fn channel_menu(
         Some(s) if s.running => format!("scanning, pass {} of {}", s.pass + 1, s.passes),
         Some(_) => "scan done".to_string(),
         None if cards < 2 => {
-            "no scan yet: \"scan\" takes this card off the video for 6 s".to_string()
+            "no scan yet: \"scan\" costs this card's video some frames for 12 s".to_string()
         }
         None => "no scan (no link core yet)".to_string(),
     };
@@ -1135,8 +1134,8 @@ fn channel_menu(
         RichText::new(format!(
             "{mode} A change moves the link by a hop, without restarting it. The link \
              channel's reading includes the link itself. With one card the scan takes the \
-             link card off the video about a quarter of the time for 6 s: about 20 % of the \
-             frames are lost and the link drops to its lowest rung, so scan on the ground. \
+             link card off the video in short holes for about 12 s: about 5 % of the frames \
+             are lost and the picture breaks up a dozen times, so scan on the ground. \
              With two cards the spare card scans and the video is not touched."
         ))
         .small()

@@ -1560,8 +1560,17 @@ impl ChannelCore {
         } else {
             set.to_vec()
         };
-        self.op_scan.start(&set, self.now_ms_cur);
-        self.log(format!("maburgs channel: operator scan of {set:?}"));
+        // With one card every dwell is the link's loss (op_scan::ONE_CARD).
+        let pace = if self.n_cards >= 2 {
+            op_scan::SPARE_CARD
+        } else {
+            op_scan::ONE_CARD
+        };
+        self.op_scan.start(&set, self.now_ms_cur, pace);
+        self.log(format!(
+            "maburgs channel: operator scan of {set:?} ({} dwell every {} ms, {} passes)",
+            pace.per_step, pace.step_ms, pace.passes
+        ));
     }
 
     /// The scan's view for the UI line; None before the first scan.
