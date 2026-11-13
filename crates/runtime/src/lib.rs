@@ -407,6 +407,7 @@ impl CoreLoop {
         self.hand_cal_log_dir();
         self.core.tick(now, &mut self.sink);
         self.log_chan_records(now);
+        self.log_core_records(now);
         self.log_fec_rows();
         self.publish_params(now);
         self.step_idr(now);
@@ -506,6 +507,21 @@ impl CoreLoop {
 
     fn log_chan_records(&mut self, now: u64) {
         let recs = self.core.take_chan_records();
+        self.log_records(now, recs);
+    }
+
+    /// The core's own flight-log records (`GsCore::take_log_records`), taken every tick with or
+    /// without a log so the core's queue stays short.
+    fn log_core_records(&mut self, now: u64) {
+        let recs = self.core.take_log_records();
+        self.log_records(now, recs);
+    }
+
+    /// Each record under the event name in its `ev` (chan when it has none).
+    fn log_records(&mut self, now: u64, recs: Vec<String>) {
+        if recs.is_empty() {
+            return;
+        }
         let Some(l) = self.sink.log.as_mut() else {
             return;
         };
@@ -566,6 +582,7 @@ impl CoreLoop {
             self.log_rung_reason(now, l);
         }
         let scan = json(self.core.chan_scan_json());
+        let drone = json(self.core.drone_json());
         let cal = self.cal_line();
         let log_err = self.log_err();
         let off = (!off.is_empty()).then(|| off.into());
@@ -575,6 +592,7 @@ impl CoreLoop {
                 [
                     ("ladder", ladder),
                     ("chscan", scan),
+                    ("drone", drone),
                     ("log_err", log_err),
                     ("card_off_us", off),
                     ("rf_sim", rf_sim::active().map(|s| s.snapshot())),

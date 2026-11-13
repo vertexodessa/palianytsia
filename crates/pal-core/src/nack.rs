@@ -62,6 +62,29 @@ pub struct NackWindow {
 
 pub const MAX_FILL_SAMPLES: usize = 4096;
 
+/// A request answered by the symbol's own first copy (`late_fill`), kept for the flight log
+/// only: mabur's tracker counts them and WebGs has no home for the detail. The drone sends in
+/// order with no MAC retries (No-Ack broadcast), so a gap entry's copy arriving late means the
+/// ground reordered it (two cards' USB batches), and a tail entry's means the drone's queue or
+/// the air held it past the settle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LateFill {
+    pub t_ms: u64,
+    pub seq: u32,
+    pub from_tail: bool,
+    pub tries: i32,
+    /// From first missing (gap: the decoder saw it missing; tail: the frame's last progress)
+    /// to the copy.
+    pub late_ms: u32,
+    /// From the first request to the copy.
+    pub after_req_ms: u32,
+    pub settle_ms: i32,
+}
+
+/// Late fills kept between two takes. The loop takes them every tick; the cap only bounds a
+/// loop that stopped taking (8-108 per 27 s arm under the bench jam, 2026-11-13).
+pub const LATE_FILL_CAP: usize = 64;
+
 #[derive(Clone, Copy, Default)]
 struct Entry {
     first_missing_ms: u64,
@@ -81,6 +104,8 @@ pub struct NackTracker {
     counter: u32,
     stats: NackStats,
     win: NackWindow,
+    late_fills: Vec<LateFill>,
+    late_fills_dropped: u64,
 }
 
 impl NackTracker {
@@ -94,6 +119,8 @@ impl NackTracker {
             counter: 0,
             stats: NackStats::default(),
             win: NackWindow::default(),
+            late_fills: Vec::new(),
+            late_fills_dropped: 0,
         }
     }
 
@@ -119,6 +146,11 @@ impl NackTracker {
     }
     pub fn take_window(&mut self) -> NackWindow {
         core::mem::take(&mut self.win)
+    }
+    /// The late fills since the last take, and how many the cap dropped.
+    pub fn take_late_fills(&mut self) -> (Vec<LateFill>, u64) {
+        let d = core::mem::take(&mut self.late_fills_dropped);
+        (core::mem::take(&mut self.late_fills), d)
     }
 
     fn note_late(&mut self, now: u64, late_ms: u32) {
@@ -175,6 +207,19 @@ impl NackTracker {
                 SourceState::Direct => {
                     if e.tries > 0 {
                         self.stats.late_fill += 1;
+                        if self.late_fills.len() < LATE_FILL_CAP {
+                            self.late_fills.push(LateFill {
+                                t_ms: now,
+                                seq: s,
+                                from_tail: e.from_tail,
+                                tries: e.tries,
+                                late_ms: now.wrapping_sub(e.first_missing_ms) as u32,
+                                after_req_ms: now.wrapping_sub(e.first_sent_ms) as u32,
+                                settle_ms: self.settle_ms,
+                            });
+                        } else {
+                            self.late_fills_dropped += 1;
+                        }
                     } else {
                         self.note_late(now, now.wrapping_sub(e.first_missing_ms) as u32);
                     }
@@ -426,5 +471,67 @@ mod tests {
         assert!(t.poll(20, &inp).is_none());
         assert_eq!(t.stats().suppressed, 1);
         assert_eq!(t.outstanding(), 0);
+    }
+
+    /// A requested gap seq and a requested tail seq whose own copies then arrive: two
+    /// `late_fill`s, each kept with its kind and timing; the take empties the list.
+    #[test]
+    fn late_fills_keep_kind_and_timing() {
+        let mut t = NackTracker::new(NackCfg {
+            enable: true,
+            ..NackCfg::default()
+        });
+        let st = RefCell::new(BTreeMap::from([
+            (7u32, SourceState::Unknown),
+            (21, SourceState::Unknown),
+        ]));
+        let gap_open = RefCell::new(true);
+        let missing = || {
+            if *gap_open.borrow() {
+                vec![7u32]
+            } else {
+                Vec::new()
+            }
+        };
+        let state = |s: u32| *st.borrow().get(&s).unwrap_or(&SourceState::Direct);
+        // Frame promises 4 fragments, 2 arrived (max_idx 1 at seq 19): 20 and 21 are the tail;
+        // 20 already arrived (Direct), so only 21 is asked.
+        let tail = || {
+            Some(NackTailView {
+                count: 4,
+                max_idx: 1,
+                seq_at_max: 19,
+                last_progress_ms: 995,
+            })
+        };
+        let util = || 0.0;
+        let inp = NackInputs {
+            missing: &missing,
+            state: &state,
+            tail: &tail,
+            util: &util,
+            down_util: 0.35,
+            gap_timeout_ms: 80,
+        };
+        assert!(t.poll(1000, &inp).is_none());
+        let n = t
+            .poll(1012, &inp)
+            .expect("request after the 12 ms settle seed");
+        assert_eq!(n.e[0].first_seq, 7);
+        *gap_open.borrow_mut() = false;
+        st.borrow_mut().insert(7, SourceState::Direct);
+        st.borrow_mut().insert(21, SourceState::Direct);
+        t.poll(1030, &inp);
+        assert_eq!(t.stats().late_fill, 2, "7 and 21");
+        let (rows, dropped) = t.take_late_fills();
+        assert_eq!(dropped, 0);
+        let gap = rows.iter().find(|r| r.seq == 7).expect("gap row");
+        assert_eq!(
+            (gap.from_tail, gap.tries, gap.late_ms, gap.after_req_ms),
+            (false, 1, 30, 18)
+        );
+        let tl = rows.iter().find(|r| r.seq == 21).expect("tail row");
+        assert_eq!((tl.from_tail, tl.late_ms, tl.settle_ms), (true, 35, 12));
+        assert!(t.take_late_fills().0.is_empty());
     }
 }

@@ -36,6 +36,9 @@ pub struct Snapshot {
     /// The card the uplink transmits on (two or more cards only).
     pub tx_card: Option<u64>,
     pub drone_temp_c: Option<i64>,
+    /// How long the drone has been shedding the enh layer for its full transmit queue (every
+    /// other frame dropped, about 30 fps); None while it is not (`GsCore::drone_json`).
+    pub drone_shed_ms: Option<u64>,
     /// NACK repairs: symbols filled so far, and the current rate.
     pub nack_fill: u64,
     pub nack_fill_pps: Option<f64>,
@@ -173,6 +176,10 @@ impl Snapshot {
             cards: cards_of(&v),
             tx_card: v.get("tx_card").and_then(Value::as_u64),
             drone_temp_c: opt_i64(&v, "drone_temp_c"),
+            drone_shed_ms: v
+                .get("drone")
+                .and_then(|d| d.get("shed_ms"))
+                .and_then(Value::as_u64),
             nack_fill: v.get("nack").map_or(0, |n| u64_or(n, "fill", 0)),
             nack_fill_pps: v.get("nack").and_then(|n| opt_f64(n, "fill_pps")),
             ladder: v.get("ladder").and_then(Ladder::parse),
@@ -455,6 +462,11 @@ const UP_WIDTH: usize = 46;
 /// count from which it shows.
 const KEYFRAME_WINDOW_S: f64 = 10.0;
 const KEYFRAME_STORM: u64 = 5;
+/// What the shed chip means: mabur's congestion guard (RcAgent::run_congestion_guard) drops the
+/// enh layer while the drone's transmit queue is at half its cap, and recovers after 2 s clean.
+const SHED_HOVER: &str = "The drone is dropping every other frame because its transmit queue \
+    is half full: the air is busy (a neighbour it waits for) or the rate is too high for it. \
+    The rung does not show this.";
 
 /// How long the signal chip keeps the last rssi/SNR through null windows.
 pub(crate) const SIGNAL_HOLD_S: f64 = 1.5;
@@ -593,6 +605,15 @@ pub fn chips(
             }
             // "rendezvous  100 C"
             chip("drone", 17, &t, c, None);
+        }
+        if let Some(ms) = s.drone_shed_ms {
+            chip(
+                "shed",
+                19, // "half fps: air 999 s"
+                &format!("half fps: air {:>3} s", ms / 1000),
+                WARN,
+                Some(SHED_HOVER.to_string()),
+            );
         }
         if s.mode == "gs" {
             let mut up = match s.uplink_pct {
@@ -864,6 +885,10 @@ mod tests {
             .unwrap();
         assert_eq!((two.cards[0].frames, two.cards[1].crc_fail), (10, 1));
         assert_eq!(two.log_err, None);
+        assert_eq!(two.drone_shed_ms, None);
+        let shed = |l: &str| Snapshot::parse(l).unwrap().drone_shed_ms;
+        assert_eq!(shed(r#"{"drone":{"shed_ms":12500}}"#), Some(12500));
+        assert_eq!(shed(r#"{"drone":{"shed_ms":null}}"#), None);
         let stopped =
             Snapshot::parse(r#"{"log_err":"No space left on device (os error 28)"}"#).unwrap();
         assert_eq!(

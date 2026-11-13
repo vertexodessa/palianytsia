@@ -186,6 +186,18 @@ pub trait GsCore {
     fn take_fec_rows(&mut self) -> Vec<String> {
         Vec::new()
     }
+    /// Flight-log records WebGs has no home for (drone shed episodes, ground reorder windows,
+    /// NACK requests their own copy answered), one JSON object each with the event name in
+    /// `ev`; taken every tick. The oracle has none: empty.
+    fn take_log_records(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// What the drone's last Telem says that the webgs line does not show (`shed_ms`: how long
+    /// the drone has been shedding the enh layer, null when it is not), as one JSON object; None
+    /// without fresh Telem. UI only, like `ladder_json`.
+    fn drone_json(&self) -> Option<String> {
+        None
+    }
     /// The run's state and result table as one JSON object (`cal::status_json`).
     fn cal_json(&self) -> Option<String> {
         None

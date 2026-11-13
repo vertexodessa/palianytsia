@@ -37,9 +37,11 @@ use pal_wire::frame_wire::FrameHdr;
 use pal_wire::{rc, sbi, sw};
 
 mod cal_lane;
+mod diag_lane;
 mod nack_lane;
 mod param_lane;
 use cal_lane::CalLane;
+use diag_lane::{DiagLane, ShedEdge};
 use nack_lane::NackLane;
 use param_lane::{params_json, ParamLane};
 
@@ -296,11 +298,17 @@ pub struct RustCore {
     chan_recs: Arc<std::sync::Mutex<ChanRecords>>,
     /// Closed loss episodes as fec.log rows, until the loop takes them.
     fec_rows: std::collections::VecDeque<String>,
+    /// Flight-log records outside the webgs line (`GsCore::take_log_records`).
+    diag: DiagLane,
 }
 
 /// Rows kept for a loop that never takes them (no flight log): about a
 /// minute of a bad link, oldest dropped.
 const FEC_ROWS_CAP: usize = 4096;
+/// Telem flags bit4 (mabur rc_proto): the drone sheds the enh layer for TxQueue pressure.
+const TELEM_CONGESTION_SHED: u8 = 0x10;
+/// Telem older than this says nothing about the drone now (WebGs's drone_lp staleness).
+const TELEM_STALE_US: u64 = 3_000_000;
 
 /// What `with_cards` needs beyond the config: the cards and the channel
 /// core's clock (real time when threaded; the tick clock otherwise).
@@ -638,12 +646,35 @@ impl RustCore {
             stored_ch,
             chan_recs,
             fec_rows: std::collections::VecDeque::new(),
+            diag: DiagLane::default(),
         })
     }
 
     /// The channel the channel core last asked to remember.
     pub fn stored_channel(&self) -> Option<u8> {
         Some(self.stored_ch.load(Ordering::Relaxed)).filter(|&c| c != 0)
+    }
+
+    /// The drone's congestion shed as `drone_shed` episodes in the flight log (f9hc: the enh
+    /// layer was shed for a whole 30 s jam and nothing on the ground said so).
+    fn note_shed(&mut self, shed: bool, txq_wait_ms: u16, now_ms: u64) {
+        let mut o = J::obj();
+        match self.diag.shed.on_telem(shed, txq_wait_ms, now_ms) {
+            Some(ShedEdge::Began { txq_wait_ms }) => {
+                o.set("on", true);
+                o.set("txq_wait_ms", u64::from(txq_wait_ms));
+            }
+            Some(ShedEdge::Ended {
+                dur_ms,
+                txq_wait_max_ms,
+            }) => {
+                o.set("on", false);
+                o.set("dur_ms", dur_ms);
+                o.set("txq_wait_max_ms", u64::from(txq_wait_max_ms));
+            }
+            None => return,
+        }
+        self.diag.push("drone_shed", o);
     }
 
     fn reset_video(&mut self, io: &mut dyn CoreIo) {
@@ -675,6 +706,11 @@ impl RustCore {
             if let Some(t) = rc::parse_telem(body) {
                 let (seq, state, flags) = (t.tlm_seq, t.state, t.flags);
                 self.telem_rx_us = us;
+                self.note_shed(
+                    flags & TELEM_CONGESTION_SHED != 0,
+                    t.txq_wait_max_ms,
+                    us / 1000,
+                );
                 // A maburd restart (new seqs, frame_ids from 0) is the one
                 // discontinuity a spotter can see.
                 if self.gs.is_none() && self.restart.on_telem(seq, us as f64 / 1000.0) {
@@ -875,6 +911,11 @@ impl GsCore for RustCore {
         let is_video = rc::frame_type(&m.body).is_none()
             && sid != Some(sbi::MSP_STREAM_ID)
             && sid != Some(sbi::PROBE_STREAM_ID);
+        if is_video {
+            self.diag
+                .order
+                .on_frame(m.mac_seq, m.card_id, self.now_us / 1000);
+        }
         if let (true, Some(g)) = (is_video, self.gs.as_mut()) {
             // Only real video heard where the link lives refreshes the
             // rendezvous silence timer (ChannelPlan::is_link_video).
@@ -941,6 +982,25 @@ impl GsCore for RustCore {
             self.poll_nack(now_ms, io);
             if let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) {
                 n.win.drain(now_ms, &mut n.t);
+                let (rows, capped) = n.t.take_late_fills();
+                if !rows.is_empty() || capped > 0 {
+                    let dq = self
+                        .telem
+                        .filter(|_| self.now_us.wrapping_sub(self.telem_rx_us) <= TELEM_STALE_US)
+                        .map(|t| t.txq_wait_max_ms);
+                    self.diag.late_fills(&rows, capped, dq);
+                }
+            }
+        }
+        self.diag.order_window(now_ms);
+        if self.now_us.wrapping_sub(self.telem_rx_us) > TELEM_STALE_US {
+            if let Some(dur) = self.diag.shed.active_ms(now_ms) {
+                self.diag.shed.forget();
+                let mut o = J::obj();
+                o.set("on", false);
+                o.set("dur_ms", dur);
+                o.set("telem_lost", true);
+                self.diag.push("drone_shed", o);
             }
         }
         let now_us = self.now_us;
@@ -1128,6 +1188,19 @@ impl GsCore for RustCore {
 
     fn take_fec_rows(&mut self) -> Vec<String> {
         self.fec_rows.drain(..).collect()
+    }
+
+    fn take_log_records(&mut self) -> Vec<String> {
+        self.diag.take()
+    }
+
+    fn drone_json(&self) -> Option<String> {
+        if self.telem.is_none() || self.now_us.wrapping_sub(self.telem_rx_us) > TELEM_STALE_US {
+            return None;
+        }
+        let mut o = J::obj();
+        o.set("shed_ms", self.diag.shed.active_ms(self.now_us / 1000));
+        Some(o.dump())
     }
 
     fn cal_abort(&mut self) {
@@ -1774,6 +1847,60 @@ mod tests {
         clk.advance(2);
         core.tick(us(&clk), &mut io);
         assert_eq!(card.s().width_mhz, 20, "given back when the run ends");
+    }
+
+    /// Telem flags bit4 opens a `drone_shed` episode, `drone_json` shows its age while Telem
+    /// keeps coming, the first Telem without it closes it with the worst queue wait, and Telem
+    /// gone past 3 s closes one too. None of it reaches the webgs stats line.
+    #[test]
+    fn the_drone_shed_becomes_episodes_and_a_ui_view() {
+        let mut core = RustCore::new(&bundle(), opts(40)).unwrap();
+        let mut io = Io::default();
+        let mut seq = 0u16;
+        let mut telem = |core: &mut RustCore, io: &mut Io, ms: u64, flags: u8, wait: u16| {
+            seq += 1;
+            let body = rc::pack_telem(&rc::Telem {
+                tlm_seq: seq,
+                flags,
+                txq_wait_max_ms: wait,
+                ..rc::Telem::default()
+            });
+            core.on_rx(
+                &RxBody {
+                    crc_ok: true,
+                    mono_us: ms * 1000,
+                    body,
+                    ..RxBody::default()
+                },
+                io,
+            );
+            core.tick(ms * 1000, io);
+        };
+        assert_eq!(core.drone_json(), None, "no Telem yet");
+        telem(&mut core, &mut io, 1000, 0, 2);
+        assert_eq!(core.drone_json().as_deref(), Some(r#"{"shed_ms":null}"#));
+        telem(&mut core, &mut io, 1100, 0x10, 40);
+        telem(&mut core, &mut io, 1600, 0x10, 97);
+        assert_eq!(core.drone_json().as_deref(), Some(r#"{"shed_ms":500}"#));
+        telem(&mut core, &mut io, 3100, 0, 5);
+        telem(&mut core, &mut io, 3200, 0x10, 60);
+        core.tick(6300 * 1000, &mut io);
+        assert_eq!(core.drone_json(), None, "Telem stale");
+        let shed: Vec<String> = core
+            .take_log_records()
+            .into_iter()
+            .filter(|r| r.contains("drone_shed"))
+            .collect();
+        assert_eq!(
+            shed,
+            [
+                r#"{"ev":"drone_shed","on":true,"txq_wait_ms":40}"#,
+                r#"{"dur_ms":2000,"ev":"drone_shed","on":false,"txq_wait_max_ms":97}"#,
+                r#"{"ev":"drone_shed","on":true,"txq_wait_ms":60}"#,
+                r#"{"dur_ms":3100,"ev":"drone_shed","on":false,"telem_lost":true}"#,
+            ]
+        );
+        assert!(!core.stats_json().contains("shed"));
     }
 
     #[test]
