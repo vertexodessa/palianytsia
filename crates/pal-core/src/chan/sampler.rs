@@ -212,6 +212,14 @@ impl WindowSampler {
         self.publish(self.sample_once(now_ms));
     }
 
+    /// A pass stamped `stamp_ms` whose reads land now, the cadence
+    /// restarted from `now_ms`: the threaded pass that stamps, then waits on
+    /// a card's device-use lock held by a dwell burst (the core's test seam).
+    pub fn step_stamped(&self, stamp_ms: u64, now_ms: u64) {
+        self.last_ms.store(now_ms, Relaxed);
+        self.publish(self.sample_once(stamp_ms));
+    }
+
     /// Threaded mode: sleep(window_ms) between passes.
     pub fn start(self: &Arc<Self>, now_ms: NowMsFn, sleep_ms: SleepMsFn) {
         if self.run.swap(true, AcqRel) {

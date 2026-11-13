@@ -76,6 +76,8 @@ struct Rig {
     gate_obs: Arc<Mutex<Vec<(bool, bool)>>>,
     /// decode_one(): per-card next mac_seq.
     seq_next: Vec<u16>,
+    /// Linked ticks feed link video (mabur Rig::video).
+    video: bool,
 }
 
 fn junk_body(card: u8, seq: u16) -> crate::RxBody {
@@ -175,6 +177,7 @@ impl Rig {
             core,
             gate_obs,
             seq_next: Vec::new(),
+            video: true,
         }
     }
     fn auto(n: usize) -> Self {
@@ -184,6 +187,11 @@ impl Rig {
         self.clk.ms() as f64
     }
     fn tick_tx(&mut self, session: bool, tx: usize) -> ChannelTickOut {
+        // A linked tick carries link video, as on the air; video = false is
+        // a session a DISC_ACK alone opened (the drone's encoder not up yet).
+        if session && self.video {
+            self.vrx.on_video(self.ms());
+        }
         let inp = ChannelTickIn {
             now_ms: self.ms(),
             in_session: session,
@@ -715,6 +723,38 @@ fn pinned_one_card_never_hops_on_interference() {
     assert!(g.rec().hops.is_empty());
     assert_eq!(g.ch(0), 40);
     assert_eq!(g.pump_rcf().unwrap().hop_ch, 0);
+}
+
+/// mabur boot_relocate_waits_for_video_on_a_disc_only_session: a freshly
+/// booted drone acks DISC before its encoder runs; the relocate waits for a
+/// video run, and a trickle (one body every 660 ms) is not one.
+#[test]
+fn boot_relocate_waits_for_video_on_a_disc_only_session() {
+    let mut g = Rig::new(2, true, 40);
+    g.video = false;
+    g.session_opened_on(64, 64);
+    assert_eq!(g.core.op(), 64);
+    for _ in 0..90 {
+        g.tick(true);
+    }
+    assert!(!g.has_line("relocate 64 -> 40 placed"));
+    for i in 0..200 {
+        if i % 66 == 0 {
+            let now = g.ms();
+            g.vrx.on_video(now);
+        }
+        g.tick(true);
+    }
+    assert!(!g.has_line("relocate 64 -> 40 placed"));
+    assert!(!g.has_line("did not land"));
+    g.video = true;
+    for _ in 0..100 {
+        if g.has_line("relocate 64 -> 40 placed") {
+            break;
+        }
+        g.tick(true);
+    }
+    assert!(g.has_line("relocate 64 -> 40 placed"));
 }
 
 /// The relocation onto the pin landed, then the verify window read the pin
@@ -1785,4 +1825,618 @@ fn set_cal_width_on_a_40_mhz_link_touches_no_card() {
     assert!(!g.cards.iter().any(|c| called_set_width(c)));
     g.core.set_cal_width(0);
     assert!(!g.cards.iter().any(|c| called_set_width(c)));
+}
+
+// ---- scan.members and the observe lease (mabur test_channel_core.cpp, #122) ----
+
+impl Rig {
+    /// Live ticks for `ms` of rig time, renewing with observe(3000) every
+    /// 1000 ms the way a picker does while it stays open.
+    fn lease_ticks(&mut self, ms: u64, renew: bool) {
+        let end = self.clk.ms() + ms;
+        let mut last = self.clk.ms();
+        while self.clk.ms() < end {
+            if renew && self.clk.ms() - last >= 1000 {
+                self.core.observe(3000);
+                last = self.clk.ms();
+            }
+            self.live_tick(0);
+        }
+    }
+    /// Dwells on `card` per member since record `from`.
+    fn card_dwell_counts(&self, card: usize, from: usize, chs: &[u8]) -> Vec<usize> {
+        let r = self.rec();
+        chs.iter()
+            .map(|&ch| {
+                r.dwells[from..]
+                    .iter()
+                    .filter(|(c, d)| *c == card && d.ch == ch)
+                    .count()
+            })
+            .collect()
+    }
+    fn dwells(&self) -> usize {
+        self.rec().dwells.len()
+    }
+    fn member(&self, ch: u8) -> StatsScanMemberIn {
+        self.core
+            .snapshot(0)
+            .members
+            .into_iter()
+            .find(|m| m.ch == ch)
+            .expect("a member")
+    }
+    fn linked_frozen(&mut self, ticks: usize) {
+        self.freeze_auto();
+        self.link_up();
+        for _ in 0..ticks {
+            self.live_tick(0);
+        }
+    }
+}
+
+fn near(v: Option<f64>, want: f64) -> bool {
+    v.is_some_and(|v| (v - want).abs() < 1.0)
+}
+
+#[test]
+fn members_export_every_member_in_config_order() {
+    let g = Rig::auto(2);
+    let m = g.core.snapshot(0).members;
+    assert_eq!(m.len(), 4);
+    assert_eq!((m[0].ch, m[3].ch), (40, 144));
+    assert_eq!((m[3].pair_lo, m[3].pair_hi), (Some(140), Some(144)));
+    assert!(m[1].busy_pct.is_none() && m[1].src.is_empty() && m[1].age_ms.is_none());
+    assert!(m[0].is_op && !m[0].is_pin);
+}
+
+#[test]
+fn members_have_no_pair_at_width_20() {
+    let g = Rig::build(2, false, 0, &[], 20);
+    for m in g.core.snapshot(0).members {
+        assert!(m.pair_lo.is_none() && m.pair_hi.is_none());
+    }
+}
+
+/// A boot-scout dwell with an NHM reading lands in the table; newest wins.
+#[test]
+fn members_take_the_newest_dwell_reading() {
+    let mut g = Rig::auto(2);
+    g.cards[1].s().nhm_busy_pct_on[112] = 40;
+    let count_112 = |g: &Rig| {
+        g.rec()
+            .dwells
+            .iter()
+            .filter(|(c, d)| *c == 1 && d.ch == 112 && d.busy_valid)
+            .count()
+    };
+    for _ in 0..40 {
+        if count_112(&g) > 0 {
+            break;
+        }
+        g.tick(false);
+    }
+    assert!(count_112(&g) > 0);
+    let m = g.member(112);
+    assert_eq!(m.src, "scan");
+    assert_eq!(m.busy_pct, Some(40.0));
+    assert!(m.blocked); // 40 >= radio.scan.busy.blocked_pct (30)
+    g.cards[1].s().nhm_busy_pct_on[112] = 5;
+    let had = count_112(&g);
+    for _ in 0..40 {
+        if count_112(&g) > had {
+            break;
+        }
+        g.tick(false);
+    }
+    assert!(count_112(&g) > had);
+    let m = g.member(112);
+    assert_eq!(m.busy_pct, Some(5.0));
+    assert!(!m.blocked);
+}
+
+/// Linked: op's figure is the window's foreign busy, the best card's.
+#[test]
+fn members_op_reads_the_verdict_window_min_across_cards() {
+    let mut g = Rig::auto(2);
+    g.freeze_auto();
+    g.link_up();
+    g.cards[0].s().nhm_busy_pct_on[40] = 25;
+    g.cards[1].s().nhm_busy_pct_on[40] = 60;
+    // mabur's live_tick decodes a body each tick: a window with no seq
+    // walk gives no busy reading.
+    for _ in 0..2 * (g.cfg.hop.window_ms / 10) + 30 {
+        g.decode_one();
+        g.live_tick(0);
+    }
+    let m = g.member(40);
+    assert_eq!(m.src, "op");
+    assert!(near(m.busy_pct, 25.0), "{:?}", m.busy_pct);
+}
+
+/// A retune that fails never lands a reading.
+#[test]
+fn members_skip_a_failed_retune_dwell() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(10);
+    g.cards[1].s().nhm_busy_pct_on[112] = 40;
+    g.cards[1].s().retune_ok = false;
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    g.lease_ticks(1000, true);
+    assert!(g.dwells() > 0);
+    let m = g.member(112);
+    assert!(m.busy_pct.is_none() && m.src.is_empty());
+}
+
+/// Auto, two cards, linked, pick closed: rounds run back to back, every
+/// member but op at the link width, and nothing moves.
+#[test]
+fn lease_two_card_rounds_run_back_to_back_auto() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(10);
+    let d0 = g.dwells();
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    assert!(g.core.observing());
+    g.lease_ticks(2000, true);
+    let n = g.card_dwell_counts(1, d0, &[40, 64, 112, 144]);
+    assert_eq!(n[0], 0, "op never dwelt on");
+    assert!(n[1] >= 2 && n[2] >= 2 && n[3] >= 2, "{n:?}");
+    for (c, d) in &g.rec().dwells[d0..] {
+        assert_eq!(*c, 1);
+        assert_eq!(d.width_mhz, 40);
+        assert!(d.observe_ms > 0);
+    }
+    assert!(!g.has_hop("relocate") && !g.has_hop("order"));
+    assert_eq!(g.core.op(), 40);
+    assert!(g.has_line("maburgs channel: observe lease 3000 (two_card)"));
+}
+
+/// Pinned: the lease freezes the scout and turns measuring on for its
+/// rounds, never unpins, and hands the card back once it lapses.
+#[test]
+fn lease_two_card_rounds_run_pinned() {
+    let mut g = Rig::new(2, true, 40);
+    g.link_up();
+    for _ in 0..10 {
+        g.live_tick(0);
+    }
+    let d0 = g.dwells();
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    g.lease_ticks(2000, true);
+    let n = g.card_dwell_counts(1, d0, &[40, 64, 112, 144]);
+    assert_eq!(n[0], 0);
+    assert!(n[1] >= 1 && n[2] >= 1 && n[3] >= 1, "{n:?}");
+    assert!(g.core.pinned());
+    assert_eq!(g.core.op(), 40);
+    g.lease_ticks(4000, false);
+    assert!(!g.core.observing());
+    assert!(!g.core.scout_owns_card(1));
+    assert_eq!(g.ch(1), 40);
+    // A link loss later: the pinned search dwells on the members, no observe.
+    let d1 = g.dwells();
+    for _ in 0..1200 {
+        if g.dwells() >= d1 + 4 {
+            break;
+        }
+        g.tick(false);
+    }
+    assert!(g.dwells() >= d1 + 4);
+    for (_, d) in &g.rec().dwells[d1..] {
+        assert_eq!(d.observe_ms, 0);
+    }
+}
+
+#[test]
+fn lease_lapses_without_renewal() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(10);
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    g.lease_ticks(3500, false);
+    assert!(!g.core.observing());
+    for _ in 0..20 {
+        if !g.core.scout_owns_card(1) {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert!(!g.core.scout_owns_card(1));
+    let d = g.dwells();
+    g.lease_ticks(2000, false);
+    assert_eq!(g.dwells(), d);
+    assert_eq!(g.count_lines("observe lease lapsed"), 1);
+}
+
+/// A lease that runs out mid-round lets that round finish.
+#[test]
+fn lease_lapse_mid_round_lets_the_round_finish() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(10);
+    let d0 = g.dwells();
+    assert_eq!(g.core.observe(500), LeaseState::TwoCard);
+    g.live_tick(0);
+    assert!(g.core.scout_owns_card(1));
+    for _ in 0..20 {
+        if !g.core.scout_owns_card(1) {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert!(!g.core.observing());
+    assert!(!g.core.scout_owns_card(1));
+    let n = g.card_dwell_counts(1, d0, &[40, 64, 112, 144]);
+    assert_eq!(n, vec![0, 1, 1, 1]);
+}
+
+#[test]
+fn lease_observe_zero_releases_on_the_next_tick() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(10);
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    for _ in 0..3 {
+        g.live_tick(0);
+    }
+    assert!(g.core.scout_owns_card(1));
+    assert_eq!(g.core.observe(0), LeaseState::None);
+    assert!(!g.core.observing());
+    g.live_tick(0);
+    assert!(!g.core.scout_owns_card(1));
+    let d = g.dwells();
+    for _ in 0..50 {
+        g.live_tick(0);
+    }
+    assert_eq!(g.dwells(), d);
+}
+
+#[test]
+fn lease_clamps_to_500_and_5000() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(5);
+    g.core.observe(100);
+    g.clk.advance(499);
+    assert!(g.core.observing());
+    g.clk.advance(2);
+    assert!(!g.core.observing());
+    g.core.observe(60000);
+    g.clk.advance(4999);
+    assert!(g.core.observing());
+    g.clk.advance(2);
+    assert!(!g.core.observing());
+}
+
+/// A round starting on the tick BootPick hands out a relocate would hide
+/// it from the controller: none starts while one is due or flying.
+#[test]
+fn lease_round_never_starts_with_a_relocate_due() {
+    let mut g = Rig::new(2, true, 40);
+    g.session_opened_on(64, 64);
+    g.link_up();
+    g.live_tick(0);
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    for _ in 0..200 {
+        if g.has_line("relocate 64 -> 40 placed") {
+            break;
+        }
+        g.live_tick(0);
+        assert!(!g.core.scout_owns_card(1));
+    }
+    assert!(g.has_line("relocate 64 -> 40 placed"));
+    assert!(!g.core.scout_owns_card(1));
+}
+
+#[test]
+fn lease_none_while_calibration_owns_the_scout() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(10);
+    g.tick_cal(true, true);
+    assert_eq!(g.core.lease_state(), LeaseState::None);
+    assert_eq!(g.core.observe(3000), LeaseState::None);
+    g.core.observe(0);
+    for _ in 0..5 {
+        g.live_tick(0);
+    }
+    // A calibration pick arriving while a lease round runs ends the lease.
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    for _ in 0..3 {
+        g.live_tick(0);
+    }
+    assert!(g.core.scout_owns_card(1));
+    let now = g.ms();
+    g.core.begin_cal_measure(now);
+    assert!(!g.core.observing());
+    assert_eq!(g.core.lease_state(), LeaseState::None);
+    for _ in 0..50 {
+        if g.core.cal_measure_best().is_some() {
+            break;
+        }
+        g.core.observe(3000); // the picker still renewing: no effect
+        g.live_tick(0);
+    }
+    assert!(g.has_line("calibration measure round on card 1"));
+    assert!(g.core.cal_measure_best().is_some());
+    g.core.cancel_cal_measure();
+}
+
+#[test]
+fn lease_none_while_boot_pick_open() {
+    let mut g = Rig::auto(2);
+    g.tick(false);
+    assert!(g.core.pick_open());
+    assert_eq!(g.core.observe(3000), LeaseState::None);
+    let d = g.dwells();
+    for _ in 0..5 {
+        g.tick(false);
+    }
+    assert!(g.core.pick_open());
+    assert!(g.core.observing());
+    assert!(!g.has_line("observe lease 3000"));
+    assert!(g.dwells() > d, "the boot scout measures anyway");
+}
+
+#[test]
+fn lease_state_follows_the_roster() {
+    let mut g = Rig::auto(2);
+    g.freeze_auto(); // unlinked, pick frozen, scout searching
+    assert_eq!(g.core.lease_state(), LeaseState::Search);
+    g.link_up();
+    g.live_tick(0);
+    assert_eq!(g.core.lease_state(), LeaseState::TwoCard);
+    let mut g = Rig::auto(1);
+    g.freeze_auto(); // links too
+    g.live_tick(0);
+    assert_eq!(g.core.lease_state(), LeaseState::OneCard);
+    assert_eq!(LeaseState::None.as_str(), "none");
+    assert_eq!(LeaseState::TwoCard.as_str(), "two_card");
+    assert_eq!(LeaseState::OneCard.as_str(), "one_card");
+    assert_eq!(LeaseState::Search.as_str(), "search");
+}
+
+/// Pinned: a calibration run starts without a measure round, so its first
+/// tick cancels the open lease round, and none starts while it runs.
+#[test]
+fn lease_round_cancelled_when_a_pinned_calibration_run_starts() {
+    let mut g = Rig::new(2, true, 40);
+    g.link_up();
+    for _ in 0..10 {
+        g.live_tick(0);
+    }
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    for _ in 0..2 {
+        g.live_tick(0);
+    }
+    assert!(g.core.scout_owns_card(1));
+    let d1 = g.dwells();
+    g.tick_cal(true, true);
+    assert!(!g.core.observing());
+    g.tick_cal(true, true);
+    assert!(!g.core.scout_owns_card(1));
+    assert_eq!(g.ch(1), 40);
+    assert!(g.dwells() <= d1 + 1);
+    let d = g.dwells();
+    for i in 0..100 {
+        if i % 50 == 0 {
+            assert_eq!(g.core.observe(3000), LeaseState::None);
+        }
+        g.tick_cal(true, true);
+        assert!(!g.core.scout_owns_card(1));
+    }
+    assert_eq!(g.dwells(), d);
+}
+
+#[test]
+fn lease_round_released_when_scout_card_dies() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(10);
+    assert_eq!(g.core.observe(3000), LeaseState::TwoCard);
+    for _ in 0..3 {
+        g.live_tick(0);
+    }
+    assert!(g.core.scout_owns_card(1));
+    g.cards[1].s().is_alive = false;
+    g.core.on_card_died(1);
+    g.live_tick(0);
+    assert!(!g.core.scout_owns_card(1));
+    let d = g.dwells();
+    g.lease_ticks(2000, true);
+    assert_eq!(g.dwells(), d, "no round on a dead card");
+    assert!(!g.core.scout_owns_card(1));
+}
+
+fn one_card_lease_bursts_three_times_in_2500_ms(g: &mut Rig) {
+    for _ in 0..10 {
+        g.live_tick(0);
+    }
+    let d0 = g.dwells();
+    assert_eq!(g.core.observe(3000), LeaseState::OneCard);
+    g.lease_ticks(2500, true);
+    let n = g.card_dwell_counts(0, d0, &[40, 64, 112, 144]);
+    assert_eq!(n, vec![0, 3, 3, 3]);
+    assert_eq!(g.ch(0), 40);
+    assert_eq!(g.core.op(), 40);
+}
+
+#[test]
+fn lease_one_card_bursts_once_per_period_auto_and_pinned() {
+    let mut g = Rig::auto(1);
+    g.freeze_auto();
+    one_card_lease_bursts_three_times_in_2500_ms(&mut g);
+    let mut g = Rig::new(1, true, 40);
+    g.link_up();
+    one_card_lease_bursts_three_times_in_2500_ms(&mut g);
+    assert!(g.core.pinned());
+}
+
+/// The burst pacing belongs to one lease: a lease taken again inside one
+/// period bursts at once.
+#[test]
+fn lease_one_card_reopened_within_a_period_bursts_at_once() {
+    let mut g = Rig::auto(1);
+    g.freeze_auto();
+    for _ in 0..10 {
+        g.live_tick(0);
+    }
+    let d0 = g.dwells();
+    assert_eq!(g.core.observe(500), LeaseState::OneCard);
+    let t0 = g.clk.ms();
+    g.live_tick(0);
+    assert!(g.dwells() > d0);
+    for _ in 0..100 {
+        if g.has_line("observe lease lapsed") {
+            break;
+        }
+        g.live_tick(0);
+    }
+    assert!(g.has_line("maburgs channel: observe lease lapsed"));
+    assert!(g.clk.ms() - t0 < g.cfg.hop.lease_sweep_period_ms as u64);
+    let d1 = g.dwells();
+    assert_eq!(g.core.observe(3000), LeaseState::OneCard);
+    g.live_tick(0);
+    assert!(g.dwells() > d1);
+}
+
+/// A lease burst's visits never reach HopRanker, while its dwells land in
+/// scan.members.
+#[test]
+fn lease_one_card_feeds_no_hop_ranker_visit() {
+    let mut g = Rig::auto(1);
+    g.freeze_auto();
+    {
+        let mut s = g.cards[0].s();
+        s.nhm_busy_pct_on[64] = 8;
+        s.nhm_busy_pct_on[112] = 40;
+        s.nhm_busy_pct_on[144] = 2;
+    }
+    for _ in 0..10 {
+        g.live_tick(0);
+    }
+    let before = g.core.hop_ranker().ranking(g.ms());
+    let d0 = g.dwells();
+    assert_eq!(g.core.observe(3000), LeaseState::OneCard);
+    g.live_tick(0);
+    let n = g.card_dwell_counts(0, d0, &[40, 64, 112, 144]);
+    assert_eq!(n, vec![0, 1, 1, 1]);
+    let after = g.core.hop_ranker().ranking(g.ms());
+    assert_eq!(after.len(), before.len());
+    for (a, b) in after.iter().zip(&before) {
+        assert_eq!((a.ch, a.visits, a.ranked), (b.ch, b.visits, b.ranked));
+    }
+    let m = g.core.snapshot(0).members;
+    assert!(m[0].is_op && m[0].src != "scan");
+    assert!(m[1].src == "scan" && near(m[1].busy_pct, 8.0) && !m[1].blocked);
+    assert!(m[2].src == "scan" && near(m[2].busy_pct, 40.0) && m[2].blocked);
+    assert!(m[3].src == "scan" && near(m[3].busy_pct, 2.0));
+}
+
+/// The sampler stamps a pass before it takes the card's lock, so a pass
+/// started mid-burst reads its counters after the burst: the masked
+/// record re-seeds from the burst's end, and the next window's own airtime
+/// is not spread over the burst. Half the air is ours here: 50 %.
+#[test]
+fn lease_one_card_record_stamped_mid_burst_reseeds_from_the_burst_end() {
+    let mut g = Rig::auto(1);
+    g.freeze_auto();
+    let own_tick = |g: &mut Rig| {
+        g.cards[0].s().fr.own_air_us += 5000; // 5 of every 10 ms
+        g.live_tick(0);
+    };
+    for _ in 0..30 {
+        own_tick(&mut g);
+    }
+    assert_eq!(g.core.observe(3000), LeaseState::OneCard);
+    let d0 = g.dwells();
+    let t_burst = g.clk.ms();
+    own_tick(&mut g); // the burst runs inside this tick
+    assert_eq!(g.dwells(), d0 + 3);
+    let end = g.clk.ms() - 10;
+    assert!(end >= t_burst + 30);
+    let r = g.clk.ms();
+    g.core.run_sampler_step_stamped(t_burst + 1);
+    while g.clk.ms() <= r + 160 {
+        own_tick(&mut g);
+    }
+    let e = g.core.snapshot(0).energy[0].unwrap();
+    let own = e.own_air_pct.unwrap();
+    assert!((own - 50.0).abs() < 0.5, "{own}");
+}
+
+#[test]
+fn lease_one_card_at_width_20_bursts_without_a_width_switch() {
+    let mut g = Rig::build(1, false, 0, &[], 20);
+    g.freeze_auto();
+    for _ in 0..10 {
+        g.live_tick(0);
+    }
+    g.cards[0].s().calls.clear();
+    let d0 = g.dwells();
+    assert_eq!(g.core.observe(3000), LeaseState::OneCard);
+    g.live_tick(0);
+    let n = g.card_dwell_counts(0, d0, &[40, 64, 112, 144]);
+    assert_eq!(n, vec![0, 1, 1, 1]);
+    for (_, d) in &g.rec().dwells[d0..] {
+        assert_eq!(d.width_mhz, 20);
+    }
+    let s = g.cards[0].s();
+    assert!(!s.calls.iter().any(|c| c.starts_with("set_width")));
+    assert_eq!((s.width_mhz, s.ch), (20, 40));
+}
+
+/// Unlinked and frozen, the scout searches: a held lease turns its search
+/// dwells into observes, filling scan.members with no link at all; with no
+/// lease every member stays unmeasured.
+#[test]
+fn lease_search_observes_while_unlinked_and_frozen() {
+    let jam = |g: &Rig| {
+        for c in &g.cards {
+            let mut s = c.s();
+            s.nhm_busy_pct_on[64] = 8;
+            s.nhm_busy_pct_on[112] = 40;
+            s.nhm_busy_pct_on[144] = 2;
+        }
+    };
+    let mut g = Rig::new(2, true, 40);
+    jam(&g);
+    assert!(!g.core.pick_open());
+    assert_eq!(g.core.lease_state(), LeaseState::Search);
+    for _ in 0..400 {
+        g.tick(false);
+    }
+    for m in g.core.snapshot(0).members {
+        if !m.is_op {
+            assert!(m.busy_pct.is_none(), "{m:?}");
+        }
+    }
+    let mut g = Rig::new(2, true, 40);
+    jam(&g);
+    assert_eq!(g.core.observe(3000), LeaseState::Search);
+    assert!(g.has_line("maburgs channel: observe lease 3000 (search)"));
+    let mut last = g.clk.ms();
+    for _ in 0..400 {
+        if g.clk.ms() - last >= 2000 {
+            g.core.observe(3000);
+            last = g.clk.ms();
+        }
+        g.tick(false);
+    }
+    let m = g.core.snapshot(0).members;
+    assert!(m[1].src == "scan" && near(m[1].busy_pct, 8.0) && !m[1].blocked);
+    assert!(m[2].src == "scan" && near(m[2].busy_pct, 40.0) && m[2].blocked);
+    assert!(m[3].src == "scan" && near(m[3].busy_pct, 2.0));
+}
+
+#[test]
+fn observe_verb_replies() {
+    let mut g = Rig::auto(2);
+    g.linked_frozen(5);
+    assert_eq!(g.core.observe_verb("3000"), "ok observe two_card");
+    assert!(g.core.observing());
+    assert_eq!(g.core.observe_verb("0"), "ok observe none");
+    assert!(!g.core.observing());
+    for bad in ["x", "", "-5", "3000 1"] {
+        assert_eq!(g.core.observe_verb(bad), "err usage: observe <ms>");
+    }
+    assert_eq!(
+        g.core.observe_verb("99999999999999999999"),
+        "ok observe two_card"
+    );
+    g.clk.advance(5001);
+    assert!(!g.core.observing());
 }

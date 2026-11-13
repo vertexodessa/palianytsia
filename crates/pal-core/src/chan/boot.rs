@@ -16,6 +16,8 @@ pub struct BootPickIn {
     /// radio.scan.max_ms
     pub max_ms: i32,
     pub in_session: bool,
+    /// Link video is flowing (VrxController::video_flowing).
+    pub video: bool,
     /// A calibration run counts as linked.
     pub cal_running: bool,
     pub one_card: bool,
@@ -47,6 +49,7 @@ impl Default for BootPickIn {
             since_start_ms: 0,
             max_ms: 30000,
             in_session: false,
+            video: false,
             cal_running: false,
             one_card: false,
             scout_mature: false,
@@ -213,7 +216,11 @@ impl BootPick {
             }
         }
 
+        // Video, not the session: a freshly booted drone acks DISC before its
+        // encoder runs, and that session lapses within link_lost_ms, so an
+        // order placed on it rides RCFs that stop.
         if k.in_session
+            && k.video
             && k.relocate_due
             && !self.tried
             && !self.relocating
@@ -301,6 +308,7 @@ mod tests {
     fn linked(k: BootPickIn) -> BootPickIn {
         BootPickIn {
             in_session: true,
+            video: true,
             hop_active: true,
             ..k
         }
@@ -556,6 +564,23 @@ mod tests {
             relocate_due: true,
             ..linked(base())
         }
+    }
+
+    /// mabur test_boot_pick relocation_waits_for_video: a DISC-only session
+    /// waits, and waiting is not trying.
+    #[test]
+    fn relocation_waits_for_video() {
+        let mut b = BootPick::new(false);
+        let mut k = BootPickIn {
+            video: false,
+            ..off_pin()
+        };
+        for _ in 0..5 {
+            assert_eq!(b.tick(&k), BootPickOut::None);
+        }
+        assert!(b.relocation_pending(&k));
+        k.video = true;
+        assert_eq!(b.tick(&k), BootPickOut::Relocate(40));
     }
 
     #[test]

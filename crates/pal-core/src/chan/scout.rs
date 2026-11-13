@@ -228,6 +228,8 @@ pub struct ChannelScout<R: ScoutRadio + ?Sized> {
     op: AtomicU8,
     tx_frames: AtomicU64,
     search: AtomicBool,
+    /// An observe lease while unlinked: search dwells read NHM too.
+    search_observe: AtomicBool,
     frozen: AtomicBool,
     stop: AtomicBool,
     working: AtomicBool,
@@ -238,6 +240,10 @@ pub struct ChannelScout<R: ScoutRadio + ?Sized> {
     done: AtomicBool,
     rounds: AtomicU64,
     round: AtomicU8,
+    /// Boot value `cfg.measure`; set_measure() switches it live.
+    measure: AtomicBool,
+    /// set_measure(): the run thread rebuilds its schedule.
+    resched: AtomicBool,
     /// The card's width (`cfg.link_width_mhz` at construction).
     link_width: AtomicU8,
 }
@@ -279,6 +285,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             op: AtomicU8::new(first),
             tx_frames: AtomicU64::new(0),
             search: AtomicBool::new(false),
+            search_observe: AtomicBool::new(false),
             frozen: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             working: AtomicBool::new(false),
@@ -288,6 +295,8 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             prelude_ack: AtomicBool::new(!prelude),
             done: AtomicBool::new(false),
             rounds: AtomicU64::new(0),
+            measure: AtomicBool::new(cfg.measure),
+            resched: AtomicBool::new(false),
             round: AtomicU8::new(ROUND_IDLE),
             link_width: AtomicU8::new(cfg.link_width_mhz),
             cfg,
@@ -305,6 +314,14 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     }
     pub fn set_search(&self, on: bool) {
         self.search.store(on, Release);
+    }
+    /// An observe lease while unlinked: each search dwell also reads NHM
+    /// busy, feeding scan.members through the usual dwell record. The dwell
+    /// lands in this scout's own ranker too, which nothing picks from while
+    /// the pick is closed and which unfreeze(), set_measure() and
+    /// begin_round() rebuild. A no-op while search is off.
+    pub fn set_search_observe(&self, on: bool) {
+        self.search_observe.store(on, Release);
     }
     pub fn set_tx_frames(&self, cumulative: u64) {
         self.tx_frames.store(cumulative, Release);
@@ -370,7 +387,12 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         self.search.load(Acquire) || self.measuring()
     }
     fn measuring(&self) -> bool {
-        self.cfg.measure && (!self.frozen.load(Acquire) || self.round_measuring())
+        self.measure.load(Acquire) && (!self.frozen.load(Acquire) || self.round_measuring())
+    }
+    /// search_observe, gated on search itself: one held from a stale lease
+    /// (search just turned off) must not observe.
+    fn search_observe_on(&self) -> bool {
+        self.search_observe.load(Acquire) && self.search.load(Acquire)
     }
 
     // ---- one measure round (a calibration run's channel pick) ----
@@ -379,6 +401,25 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     /// (the core checks both). A fresh ranker: the round ranks only what it
     /// measures. round_open() reads true from here until the scout has
     /// parked again, so the core never touches the card in between.
+    /// Measuring on or off live (an observe lease on a pinned scout). A
+    /// fresh ranker and schedule either way.
+    pub fn set_measure(&self, on: bool) {
+        if self.measure.load(Acquire) == on {
+            return;
+        }
+        {
+            let mut sh = self.sh.lock().unwrap();
+            self.measure.store(on, Release);
+            sh.ranker = ChannelRanker::new(
+                &self.cfg.channels,
+                self.cfg.min_rounds,
+                self.cfg.pick_margin_pct,
+                self.cfg.blocked_pct,
+            );
+        }
+        self.resched.store(true, Release);
+    }
+
     pub fn begin_round(&self) {
         {
             let mut sh = self.sh.lock().unwrap();
@@ -542,6 +583,10 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     pub fn run_once(&self) -> bool {
         let mut rs = self.run.lock().unwrap();
         let t0 = *rs.t0.get_or_insert_with(|| (self.now)());
+        if self.resched.swap(false, AcqRel) {
+            rs.sched = FlatScheduler::new(&self.cfg.channels);
+            self.rounds.store(rs.sched.rounds, Release);
+        }
         // The grid waits grid_after_rounds passes from the search's start.
         let search = self.search.load(Acquire);
         if (search && !rs.searching) || rs.sched.rounds < rs.search_round0 {
@@ -590,7 +635,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
             return self.grid_dwell(&mut rs);
         }
         rs.grid_turn = true;
-        let observe = self.measuring();
+        let observe = self.measuring() || self.search_observe_on();
         self.step_dwell(&mut rs, true, observe)
     }
 
@@ -617,7 +662,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
     fn grid_dwell(&self, rs: &mut RunState) -> bool {
         let grid = self.grid_channels();
         if grid.is_empty() {
-            let observe = self.measuring();
+            let observe = self.measuring() || self.search_observe_on();
             return self.step_dwell(rs, true, observe);
         }
         let ch = grid[rs.grid_i % grid.len()];

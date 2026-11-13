@@ -37,12 +37,21 @@ const KEY_MISMATCH_MS: f64 = 1000.0;
 const KEY_MISMATCH_BEACONS: i32 = 3;
 const LINK_LOST_MS: f64 = 1000.0;
 const BEACON_PERIOD_MS: f64 = 20.0;
+// video_flowing(): link video bodies with no gap above VIDEO_GAP_MS for at
+// least VIDEO_RUN_MS. The lowest encoder rate (low-power 30 fps) spaces
+// frames 33 ms apart; the first frames of a booting encoder (~1.5 fps)
+// never qualify.
+const VIDEO_GAP_MS: f64 = 100.0;
+const VIDEO_RUN_MS: f64 = 200.0;
 
 /// SESSION: we hold the drone's vtx_nonce and may send RCFs. KEY_MISMATCH:
 /// a run of flagged acks at least 1 s old with 3 of our DISCs unanswered.
 pub struct VrxRendezvous {
     state: VrxState,
     last_video_ms: f64,
+    // The current run of link video for video_flowing(): never touched by an ack.
+    last_real_video_ms: f64,
+    video_run_start_ms: f64,
     last_beacon_ms: f64,
     seq: u16,
     nonce: u32,
@@ -79,6 +88,8 @@ impl VrxRendezvous {
         Self {
             state: VrxState::Beaconing,
             last_video_ms: 0.0,
+            last_real_video_ms: -1e18,
+            video_run_start_ms: 0.0,
             last_beacon_ms: -1e18,
             seq: 0,
             nonce: if nonce != 0 { nonce } else { random_nonce() },
@@ -91,6 +102,10 @@ impl VrxRendezvous {
     }
     fn feed_video(&mut self, now: f64) {
         self.last_video_ms = now;
+        if now - self.last_real_video_ms > VIDEO_GAP_MS {
+            self.video_run_start_ms = now;
+        }
+        self.last_real_video_ms = now;
         if self.state == VrxState::Beaconing && self.vtx_nonce.is_some() {
             self.state = VrxState::Session;
         }
@@ -150,6 +165,14 @@ impl VrxRendezvous {
     }
     pub fn state(&self) -> VrxState {
         self.state
+    }
+    /// Real link video is flowing (feed_video only). SESSION alone is not:
+    /// a DISC_ACK opens it and refreshes the silence timer with no video, so
+    /// a freshly booted drone whose encoder is not up yet holds SESSION for
+    /// LINK_LOST_MS and then drops back to BEACONING, taking the RCFs with it.
+    pub fn video_flowing(&self, now: f64) -> bool {
+        now - self.last_real_video_ms <= VIDEO_GAP_MS
+            && self.last_real_video_ms - self.video_run_start_ms >= VIDEO_RUN_MS
     }
     pub fn nonce(&self) -> u32 {
         self.nonce
@@ -442,6 +465,10 @@ impl VrxController {
     }
     pub fn link_state(&self) -> VrxState {
         self.rz.state()
+    }
+    /// VrxRendezvous::video_flowing: link video is flowing, not just a session.
+    pub fn video_flowing(&self, now: f64) -> bool {
+        self.rz.video_flowing(now)
     }
     pub fn rcf_seq(&self) -> u16 {
         self.seq32 as u16

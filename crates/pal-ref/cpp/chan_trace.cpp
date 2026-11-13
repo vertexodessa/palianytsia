@@ -353,6 +353,11 @@ void pal_ctrace_on_card_reopened(pal_ctrace* t, int card) { t->core->on_card_reo
 int pal_ctrace_may_send(pal_ctrace* t, int card) { return t->core->may_send(card); }
 uint8_t pal_ctrace_op(const pal_ctrace* t) { return t->core->op(); }
 int pal_ctrace_pick_open(const pal_ctrace* t) { return t->core->pick_open(); }
+// The observe lease: the state word, as the verb replies it.
+const char* pal_ctrace_observe(pal_ctrace* t, int ms) {
+  return maburgs::lease_state_name(t->core->observe(ms));
+}
+int pal_ctrace_observing(const pal_ctrace* t) { return t->core->observing(); }
 
 size_t pal_ctrace_disc_targets(const pal_ctrace* t, int tx, int* out, size_t cap) {
   const auto v = t->core->disc_targets(tx);
@@ -394,6 +399,13 @@ void pal_ctrace_snapshot(pal_ctrace* t, int tx) {
   l += " dwell=";
   for (const auto& d : s.dwell)
     l += d ? fmt("%u:%u:%u;", d->visits, d->score, d->cost_us) : std::string("-;");
+  l += " members=";
+  for (const auto& m : s.members)
+    l += fmt("%d:%s:%s:%s:%s:%s:%d%d%d;", m.ch, m.pair_lo ? fmt("%d", *m.pair_lo).c_str() : "-",
+             m.pair_hi ? fmt("%d", *m.pair_hi).c_str() : "-", opt_d(m.busy_pct).c_str(),
+             m.src.empty() ? "-" : m.src.c_str(),
+             m.age_ms ? fmt("%llu", static_cast<unsigned long long>(*m.age_ms)).c_str() : "-",
+             m.blocked, m.is_op, m.is_pin);
   t->sink->emit(l);
 }
 

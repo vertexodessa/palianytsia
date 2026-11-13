@@ -127,6 +127,8 @@ extern "C" {
     fn pal_ctrace_may_send(t: *mut Raw, card: c_int) -> c_int;
     fn pal_ctrace_op(t: *const Raw) -> u8;
     fn pal_ctrace_pick_open(t: *const Raw) -> c_int;
+    fn pal_ctrace_observe(t: *mut Raw, ms: c_int) -> *const std::ffi::c_char;
+    fn pal_ctrace_observing(t: *const Raw) -> c_int;
     fn pal_ctrace_disc_targets(t: *const Raw, tx: c_int, out: *mut c_int, cap: usize) -> usize;
     fn pal_ctrace_disc_for_card(
         t: *const Raw,
@@ -481,6 +483,16 @@ impl CppTrace {
         out
     }
     /// The snapshot as one "P ..." line, into the line stream.
+    /// ChannelCore::observe: the lease state's word.
+    pub fn observe(&mut self, ms: i32) -> String {
+        // SAFETY: a static C string from lease_state_name.
+        unsafe { std::ffi::CStr::from_ptr(pal_ctrace_observe(self.raw, ms)) }
+            .to_string_lossy()
+            .into_owned()
+    }
+    pub fn observing(&self) -> bool {
+        unsafe { pal_ctrace_observing(self.raw) != 0 }
+    }
     pub fn snapshot(&mut self, tx: usize) {
         unsafe { pal_ctrace_snapshot(self.raw, tx as c_int) }
     }

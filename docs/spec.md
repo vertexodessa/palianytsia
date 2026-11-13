@@ -125,6 +125,20 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   calibration logs on disk (158 rows of 20 sweeps): 23 walls change, all upward. Not done: a
   calibration on the air with the new rule, and the ticket's lesser item (the -45 dBm "saturated"
   threshold). The drone side is unchanged (the rule runs on the GS), so no maburd rebuild.
+- mabur pin, 2026-11-13 (pal-444x): `palianytsia/base-v2` rebased onto upstream master with
+  PR #120-#123 (the old line kept as branch `palianytsia/base-v2-pre-2026-11-13`). Two GS changes
+  reach the Rust core. #123: the boot or pin relocate goes out only once link video flows (no gap
+  over 100 ms for 200 ms, `VrxRendezvous::video_flowing`), not on a session a DISC_ACK alone opened;
+  upstream saw "relocation did not land" on about 2 of 7 bench boots without it. #122: the observe
+  lease (`ChannelCore::observe`, the goggles' channel picker in maburplay): while it is held the
+  core measures the set for the picker: back-to-back scout rounds with two cards, one in-flight
+  burst per `hop.lease_sweep_period_ms` (new key, 1000) with one card, its windows masked from the
+  hop verdict, and NHM reads on the search dwells while unlinked. Every member's newest busy
+  reading goes out as `ChannelSnapshot::members` (mabur `scan.members`). Not ported: the relay
+  lease and the live pin's relocate state (`scan.relocate`), since the Rust core has no relay cards
+  and no live `set_pin`. `chan_trace` checks the video gate, four lease scripts and the members row
+  against the C++ core; nothing in the apps calls `observe` yet. The rebase also merged our grid
+  search with #122's search observe in `channel_scout`.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.13.1, signed APKs; v0.13.1, 2026-11-13: the channel menu in the desktop app (the apps' link pick at start, `Cmd::Channels` on the live link), maburd and apps as v0.13, bench only; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):

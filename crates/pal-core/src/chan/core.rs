@@ -24,7 +24,7 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
-use pal_wire::ht40::GRID_5G;
+use pal_wire::ht40::{ht40_pair_other, GRID_5G};
 use pal_wire::rc::{self, DiscAck, LinkKey};
 
 use super::boot::{BootPick, BootPickIn, BootPickOut};
@@ -181,6 +181,64 @@ pub struct StatsEnergyIn {
     pub own_air_pct: Option<f64>,
 }
 
+/// One channel-set member's row on the sideport's scan.members[] (mabur
+/// StatsScanMemberIn): every member, config order. pair_lo/pair_hi are None
+/// at 20 MHz or without a standard HT40 pair; busy_pct/src/age_ms are None
+/// while the member has never been measured.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StatsScanMemberIn {
+    pub ch: u8,
+    pub pair_lo: Option<u8>,
+    pub pair_hi: Option<u8>,
+    pub busy_pct: Option<f64>,
+    /// "scan" (a dwell) | "op" (the verdict window's own figure while
+    /// linked) | "" (never measured)
+    pub src: &'static str,
+    pub age_ms: Option<u64>,
+    pub blocked: bool,
+    pub is_op: bool,
+    pub is_pin: bool,
+}
+
+/// Which measurer an observe lease engages (mabur LeaseState; no relay
+/// cards here, so no Relay).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LeaseState {
+    #[default]
+    None,
+    TwoCard,
+    OneCard,
+    Search,
+}
+
+impl LeaseState {
+    /// The `observe` verb's reply word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeaseState::None => "none",
+            LeaseState::TwoCard => "two_card",
+            LeaseState::OneCard => "one_card",
+            LeaseState::Search => "search",
+        }
+    }
+}
+
+/// The newest NHM busy reading landed on a member from any dwell.
+#[derive(Clone, Copy, Debug)]
+struct MemberFig {
+    busy_pct: f64,
+    t_ms: u64,
+}
+
+/// scan.members[]'s figure for op while linked: the best card's (busy -
+/// own airtime) this window, stamped with the window and the op it read.
+#[derive(Clone, Copy, Debug)]
+struct OpFig {
+    pct: f64,
+    t_ms: u64,
+    ch: u8,
+}
+
 /// One card's in-flight scouting: visits cumulative, score and cost the
 /// last dwell's (score only from a successful dwell).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -234,6 +292,8 @@ pub struct ChannelSnapshot {
     pub energy: Vec<Option<StatsEnergyIn>>,
     pub dwell: Vec<Option<StatsDwellIn>>,
     pub scout_gated_sends: u64,
+    /// Every channel-set member's row, config order (mabur scan.members).
+    pub members: Vec<StatsScanMemberIn>,
 }
 
 pub type MsClock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -584,6 +644,32 @@ pub struct ChannelCore {
     /// op, foreign frames scaled to radio.scan.dwell_ms.
     op_live: Option<CalReading>,
     op_live_ms: f64,
+    /// scan.members[]'s own figure for op while linked; reset on every
+    /// hop_active edge.
+    op_fig: Option<OpFig>,
+    /// Newest busy reading per member (index = cfg.radio.channels), from
+    /// any dwell; overwritten, never merged.
+    member_figs: Vec<Option<MemberFig>>,
+
+    // ---- the observe lease (mabur channel_core.h) ----
+    /// Deadline on the now_ms clock; 0 = none held.
+    lease_until: f64,
+    /// A scout round the lease began is open.
+    lease_round: bool,
+    /// The lease turned a pinned scout's measuring on; off again once the
+    /// lease has lapsed and no round is open.
+    lease_forced_measure: bool,
+    /// The engaged state last logged.
+    lease_logged: LeaseState,
+    /// The last one-card lease burst's start (tick time).
+    last_lease_burst_ms: f64,
+    /// Sampler records stamped in (from, until] are masked from the hop
+    /// verdict; until < from = none yet.
+    lease_mask_from_ms: f64,
+    lease_mask_until_ms: f64,
+    /// The last one-card lease burst's end: a masked record stamped before
+    /// it read its counters after it, so the re-seeded span starts here.
+    lease_burst_end_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -822,6 +908,16 @@ impl ChannelCore {
             cal_reloc_tick: false,
             op_live: None,
             op_live_ms: -1.0,
+            op_fig: None,
+            member_figs: vec![None; cfg.radio.channels.len()],
+            lease_until: 0.0,
+            lease_round: false,
+            lease_forced_measure: false,
+            lease_logged: LeaseState::None,
+            last_lease_burst_ms: -1e18,
+            lease_mask_from_ms: 0.0,
+            lease_mask_until_ms: -1.0,
+            lease_burst_end_ms: -1.0,
             now_ms_u_cur: 0,
             cal_running_cur: false,
             cfg,
@@ -882,6 +978,62 @@ impl ChannelCore {
             energy: self.energy_last.clone(),
             dwell: self.dwell_stats.clone(),
             scout_gated_sends: self.scout_gated_sends(),
+            members: self.members(),
+        }
+    }
+
+    /// scan.members[]: built fresh from member_figs and op_fig.
+    fn members(&self) -> Vec<StatsScanMemberIn> {
+        let linked = hop_active(self.in_session_cur, self.cal_running_cur);
+        let now = (self.now_ms)();
+        let op = self.plan.op();
+        let mut out = Vec::with_capacity(self.cfg.radio.channels.len());
+        for (i, &ch) in self.cfg.radio.channels.iter().enumerate() {
+            let mut m = StatsScanMemberIn {
+                ch,
+                is_op: ch == op,
+                is_pin: self.pinned && self.frozen_pick == Some(ch),
+                ..Default::default()
+            };
+            if self.width_mhz == 40 {
+                let other = ht40_pair_other(ch);
+                if other != 0 {
+                    m.pair_lo = Some(ch.min(other));
+                    m.pair_hi = Some(ch.max(other));
+                }
+            }
+            let mut fig = None;
+            if linked && m.is_op {
+                if let Some(f) = self.op_fig.filter(|f| f.ch == ch) {
+                    m.src = "op";
+                    fig = Some((f.pct, f.t_ms));
+                }
+            } else if let Some(f) = self.member_figs[i] {
+                m.src = "scan";
+                fig = Some((f.busy_pct, f.t_ms));
+            }
+            if let Some((pct, t)) = fig {
+                m.busy_pct = Some(pct);
+                m.age_ms = Some(now.saturating_sub(t));
+                m.blocked = pct >= self.cfg.radio.scan.busy.blocked_pct;
+            }
+            out.push(m);
+        }
+        out
+    }
+
+    /// Every dwell record's one way to the sink: logged, then a usable
+    /// busy reading lands in member_figs against the member it read.
+    fn emit_dwell(&mut self, now_ms: f64, card: usize, d: &ScoutDwell) {
+        self.sink.dwell(now_ms, card, d);
+        if !d.busy_valid || d.flags & FLAG_RETUNE_FAILED != 0 {
+            return;
+        }
+        if let Some(i) = self.cfg.radio.channels.iter().position(|&c| c == d.ch) {
+            self.member_figs[i] = Some(MemberFig {
+                busy_pct: d.busy_pct,
+                t_ms: now_ms as u64,
+            });
         }
     }
     pub fn op(&self) -> u8 {
@@ -1036,6 +1188,11 @@ impl ChannelCore {
         }
         self.scout_search_req = false;
         s.set_search(false);
+        // A lease round on the dead card ends now, straight to idle.
+        if self.lease_round && s.round_open() {
+            s.cancel_round(true);
+            self.lease_round = false;
+        }
     }
 
     /// Reopen succeeded: resync cur_ch / width_tried.
@@ -1129,8 +1286,16 @@ impl ChannelCore {
         self.live.inflight_body();
     }
     /// WindowSampler::step_now() at the tick's time.
+    pub fn hop_ranker(&self) -> &HopRanker {
+        &self.ranker
+    }
     pub fn run_sampler_step(&self) {
         self.live.sampler.step_now(self.now_ms_u_cur);
+    }
+    /// A sampler pass stamped `stamp_ms` whose reads land now (the clock),
+    /// the cadence restarted from now.
+    pub fn run_sampler_step_stamped(&self, stamp_ms: u64) {
+        self.live.sampler.step_stamped(stamp_ms, (self.now_ms)());
     }
 
     // ---- the per-tick block ----
@@ -1161,11 +1326,12 @@ impl ChannelCore {
         self.plan
             .tick(inp.now_ms, inp.in_session || inp.cal_running);
         self.step_scout_inputs();
-        self.step_boot_pick(inp);
+        self.step_boot_pick(inp, vrx);
         self.step_store(vrx);
         self.step_gates();
         self.step_hop_edge_and_window(inp, vrx);
         self.step_cal(inp);
+        self.step_lease(inp);
         self.step_controller(inp, vrx);
         self.step_op_scan(inp);
         self.step_move_edge(inp.now_ms, vrx);
@@ -1455,7 +1621,7 @@ impl ChannelCore {
             self.cur_ch[card] = fe.channel();
         }
         for d in &recs {
-            self.sink.dwell(now, card, d);
+            self.emit_dwell(now, card, d);
         }
     }
 
@@ -1495,7 +1661,7 @@ impl ChannelCore {
         ));
     }
 
-    fn step_boot_pick(&mut self, inp: &ChannelTickIn) {
+    fn step_boot_pick(&mut self, inp: &ChannelTickIn, vrx: &VrxController) {
         let now_ms = inp.now_ms;
         self.steer_into_use(inp);
         let mut bi = BootPickIn {
@@ -1503,6 +1669,7 @@ impl ChannelCore {
             since_start_ms: self.now_ms_u_cur.wrapping_sub(self.gs_start_ms),
             max_ms: self.cfg.radio.scan.max_ms,
             in_session: inp.in_session,
+            video: vrx.video_flowing(now_ms),
             cal_running: inp.cal_running,
             one_card: self.one_card,
             scout_owns: self.scout_owns(),
@@ -1617,6 +1784,7 @@ impl ChannelCore {
                 let act = self.hopc.on_session_lost(now_ms, self.plan.op());
                 self.dispatch_hop_action(&act, false, now_ms, vrx);
             }
+            self.op_fig = None;
             self.verdict.reset();
             self.last_verdict = Verdict::Healthy;
             self.last_verdict_out = VerdictOut::default();
@@ -1647,6 +1815,32 @@ impl ChannelCore {
         };
         // The sample instant: every per-window span is measured to it.
         let t_ms = rec.t_ms;
+        if self.lease_mask_from_ms < t_ms as f64 && t_ms as f64 <= self.lease_mask_until_ms {
+            // A window overlapping a one-card lease burst, or the one after
+            // it: the sole card was off op, so its airtime, delivery and loss
+            // describe the burst, not the channel. Not classified and not
+            // read for op's figure; its counters become the baselines, and
+            // the loss windows swallow the gap. A record stamped inside the
+            // burst read its counters once the burst let go of the card, so
+            // its span starts at the burst's end.
+            let span0 = t_ms.max(self.lease_burst_end_ms.max(0.0) as u64);
+            for (si, cs) in rec.cards.iter().enumerate().take(self.n_cards) {
+                self.window_prev_ok[si] = cs.valid && cs.channel == self.plan.op();
+                if !self.window_prev_ok[si] {
+                    continue;
+                }
+                let ct = inp.agg.map(|a| &a.cards()[si]);
+                self.window_prev[si] = cs.frames;
+                self.window_prev_crc[si] = ct.map_or(0, |c| c.crc_fail);
+                self.window_prev_seq_exp[si] = ct.map_or(0, |c| c.seq_expected);
+                self.window_prev_seq_rcv[si] = ct.map_or(0, |c| c.seq_received);
+                self.window_prev_ms[si] = span0;
+            }
+            self.recovered_prev_window = Self::recovered_total(inp.agg);
+            self.s1_hop_loss.blank_until(self.lease_mask_until_ms);
+            self.enh_hop_loss.blank_until(self.lease_mask_until_ms);
+            return;
+        }
         let mut vc = vec![VerdictCardIn::default(); self.n_cards];
         // The worst valid card's reading of op this window.
         let mut op_read: Option<CalReading> = None;
@@ -1746,6 +1940,20 @@ impl ChannelCore {
             self.op_live = op_read;
             self.op_live_ms = now_ms;
         }
+        // scan.members[]'s figure for op: the best card this window, unlike
+        // op_read's worst (the calibration pick wants that one).
+        let op_fig = vc
+            .iter()
+            .filter(|c| c.valid && c.busy_valid)
+            .map(|c| (c.nhm_busy_pct - c.own_air_pct).max(0.0))
+            .reduce(f64::min);
+        if let Some(pct) = op_fig {
+            self.op_fig = Some(OpFig {
+                pct,
+                t_ms,
+                ch: self.plan.op(),
+            });
+        }
         let recovered_now = Self::recovered_total(inp.agg);
         let vl = VerdictLinkIn {
             pre_fec_loss: hop_verdict_link_loss(
@@ -1802,7 +2010,7 @@ impl ChannelCore {
         }
         self.cur_ch[card] = live.cards[card].channel();
         for d in &recs {
-            self.sink.dwell(now_ms, card, d);
+            self.emit_dwell(now_ms, card, d);
         }
     }
 
@@ -1981,6 +2189,9 @@ impl ChannelCore {
     /// Arms one measure round (restarts nothing while one is pending or
     /// running). Not measurable: a no-op, cal_measure_best() is op.
     pub fn begin_cal_measure(&mut self, now_ms: f64) {
+        // Calibration is the operator's explicit action: it pre-empts the
+        // picker.
+        self.end_lease();
         if !matches!(
             self.cal_reloc.s,
             CalRelocState::Waiting | CalRelocState::InFlight
@@ -2213,6 +2424,224 @@ impl ChannelCore {
         self.cal_meas.best = pick.best;
     }
 
+    // ---- the observe lease ----
+
+    /// Keep measuring for `ms` more (clamped to [500, 5000]); returns
+    /// lease_state() as of now. ms <= 0 releases the lease (its open round
+    /// is cancelled) and returns None.
+    pub fn observe(&mut self, ms: i32) -> LeaseState {
+        if ms <= 0 {
+            self.end_lease();
+            return LeaseState::None;
+        }
+        let ms = ms.clamp(500, 5000);
+        self.lease_until = (self.now_ms)() as f64 + f64::from(ms);
+        let st = self.lease_state();
+        if st != self.lease_logged {
+            self.lease_logged = st;
+            self.log(format!(
+                "maburgs channel: observe lease {ms} ({})",
+                st.as_str()
+            ));
+        }
+        st
+    }
+
+    /// A lease is held: now is before its deadline.
+    pub fn observing(&self) -> bool {
+        ((self.now_ms)() as f64) < self.lease_until
+    }
+
+    /// The measurer a lease engages, held or not; first match: calibration
+    /// owns the scout -> None; the boot pick open -> None; unlinked ->
+    /// Search while the scout searches, else None; linked: two or more
+    /// cards -> TwoCard, one card -> OneCard.
+    pub fn lease_state(&self) -> LeaseState {
+        if self.cal_running_cur
+            || matches!(
+                self.cal_meas.s,
+                CalMeasureState::Waiting | CalMeasureState::Running
+            )
+            || matches!(
+                self.cal_reloc.s,
+                CalRelocState::Waiting | CalRelocState::InFlight
+            )
+            || self.boot_pick.open()
+            || self.scout.is_none()
+        {
+            return LeaseState::None;
+        }
+        if !self.in_session_cur {
+            return if self.scout_search_req {
+                LeaseState::Search
+            } else {
+                LeaseState::None
+            };
+        }
+        if self.n_cards >= 2 {
+            LeaseState::TwoCard
+        } else {
+            LeaseState::OneCard
+        }
+    }
+
+    /// The whole `observe <rest>` verb: "ok observe <state>", or the usage
+    /// error unless rest is a bare non-negative integer.
+    pub fn observe_verb(&mut self, rest: &str) -> String {
+        const USAGE: &str = "err usage: observe <ms>";
+        if rest.is_empty() || !rest.bytes().all(|c| c.is_ascii_digit()) {
+            return USAGE.into();
+        }
+        // Anything past nine digits is far over the clamp anyway.
+        let ms = if rest.len() > 9 {
+            5000
+        } else {
+            rest.parse().unwrap_or(5000)
+        };
+        format!("ok observe {}", self.observe(ms).as_str())
+    }
+
+    /// Drops the deadline, logging the lapse once, and resets the burst
+    /// pacing so the next lease's first burst goes at once; an open round
+    /// is left to finish.
+    fn lapse_lease(&mut self) {
+        if self.lease_until <= 0.0 {
+            return;
+        }
+        self.lease_until = 0.0;
+        self.lease_logged = LeaseState::None;
+        self.last_lease_burst_ms = -1e18;
+        self.log("maburgs channel: observe lease lapsed".into());
+    }
+
+    /// lapse_lease, and the open lease round is cancelled.
+    fn end_lease(&mut self) {
+        self.lapse_lease();
+        if self.lease_round {
+            if let Some(s) = &self.scout {
+                if s.round_open() {
+                    s.cancel_round(!self.scout_started);
+                }
+            }
+        }
+        self.lease_round = false;
+    }
+
+    fn step_lease(&mut self, inp: &ChannelTickIn) {
+        let Some(scout) = self.scout.clone() else {
+            return;
+        };
+        // Unconditional, so it also turns off the tick the lease lapses or
+        // the state leaves Search.
+        scout.set_search_observe(self.observing() && self.lease_state() == LeaseState::Search);
+        // A calibration run pre-empts the lease: a run started without a
+        // measure round cancels an open lease round on its first tick.
+        if inp.cal_running && self.lease_round {
+            self.end_lease();
+        }
+        if self.lease_until > 0.0 && !self.observing() {
+            self.lapse_lease(); // ran out: the open round runs to its end
+        }
+        if self.lease_round && !scout.round_open() {
+            self.lease_round = false;
+        }
+        if !self.observing() {
+            if self.lease_forced_measure && !scout.round_open() {
+                scout.set_measure(false);
+                self.lease_forced_measure = false;
+            }
+            return;
+        }
+        let st = self.lease_state();
+        if st == LeaseState::OneCard {
+            self.step_lease_one_card(inp);
+            return;
+        }
+        if st != LeaseState::TwoCard || self.lease_round {
+            return;
+        }
+        // step_cal's round-start conditions, plus no relocate handed out
+        // or due: a round started then would hide it from the controller.
+        if !hop_active(inp.in_session, inp.cal_running)
+            || !self.scout_started
+            || self.scout_card_down
+            || self.scout_owns()
+            || self.boot_pick.open()
+            || self.boot_pick.relocating()
+            || self.plan.hopping()
+            || self.dwell_busy()
+            || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
+            || self.pending_relocate.is_some()
+            || self.boot_pick.relocation_pending(&self.last_bi)
+        {
+            return;
+        }
+        if self.pinned && !self.lease_forced_measure {
+            // A pinned scout does not measure: freeze first, or measuring
+            // would reopen the pick.
+            scout.freeze();
+            scout.set_measure(true);
+            self.lease_forced_measure = true;
+        }
+        {
+            // As step_cal: inflight then the card's device-use lock.
+            let sci = self.scout_card.expect("a scout has a card");
+            let live = self.live.clone();
+            let _ilk = live.inflight.lock().unwrap();
+            let _hold = live.sampler.hold_card(sci);
+            scout.begin_round();
+            self.live.scout_working.store(true, Relaxed);
+            self.step_gates();
+        }
+        self.lease_round = true;
+    }
+
+    /// The one-card lease: one in-flight burst on the sole card per
+    /// hop.lease_sweep_period_ms, only while no hop or relocate is in
+    /// flight or due, no reactive hop is being decided (trigger live or the
+    /// verdict's references frozen), and nothing else holds the card. The
+    /// burst's windows are masked from the verdict.
+    fn step_lease_one_card(&mut self, inp: &ChannelTickIn) {
+        let now_ms = inp.now_ms;
+        if now_ms - self.last_lease_burst_ms < f64::from(self.cfg.hop.lease_sweep_period_ms) {
+            return;
+        }
+        let Some(card) = self.scout_card else { return };
+        let lv = &self.last_verdict_out;
+        if self.live.inflight.lock().unwrap().is_none()
+            || !hop_active(inp.in_session, inp.cal_running)
+            || self.plan.hopping()
+            || (self.reactive && (lv.trigger || lv.ref_frozen))
+            || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
+            || self.pending_relocate.is_some()
+            || self.boot_pick.relocation_pending(&self.last_bi)
+            || self.scout_owns()
+            || self.burst_inflight
+            || self.dwell_busy()
+            || !self.live.cards[card].ready()
+        {
+            return;
+        }
+        self.last_lease_burst_ms = now_ms;
+        let mut recs = Vec::new();
+        let start_ms = (self.now_ms)() as f64;
+        {
+            // Synchronous, on the core thread; its visits are dropped: the
+            // lease never ranks.
+            let live = self.live.clone();
+            let ilk = live.inflight.lock().unwrap();
+            let _ = live.burst_on_card(ilk, card, self.plan.op(), &mut recs);
+        }
+        let end_ms = (self.now_ms)() as f64;
+        self.lease_burst_end_ms = end_ms;
+        self.lease_mask_from_ms = start_ms;
+        self.lease_mask_until_ms = end_ms + f64::from(self.cfg.hop.window_ms);
+        self.cur_ch[card] = self.live.cards[card].channel();
+        for d in &recs {
+            self.emit_dwell(now_ms, card, d);
+        }
+    }
+
     fn step_move_edge(&mut self, now_ms: f64, vrx: &mut VrxController) {
         vrx.set_proposal(self.plan.op());
         vrx.set_keepalive_hold(self.hopc.state() == HopState::Ordered);
@@ -2241,7 +2670,7 @@ impl ChannelCore {
     fn step_drains(&mut self) {
         if let (Some(s), Some(sci)) = (self.scout.clone(), self.scout_card) {
             for d in s.take_dwells() {
-                self.sink.dwell(self.now_ms_cur, sci, &d);
+                self.emit_dwell(self.now_ms_cur, sci, &d);
             }
         }
         self.start_inflight_if_due();
@@ -2253,7 +2682,7 @@ impl ChannelCore {
         let mut visits = Vec::new();
         for (card, d, v) in drained.recs {
             self.cur_ch[card] = self.live.cards[card].channel();
-            self.sink.dwell(self.now_ms_cur, card, &d);
+            self.emit_dwell(self.now_ms_cur, card, &d);
             let ok = d.flags & FLAG_RETUNE_FAILED == 0;
             let mut ds = self.dwell_stats[card].unwrap_or_default();
             ds.visits += 1;

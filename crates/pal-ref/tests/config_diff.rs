@@ -299,6 +299,7 @@ fn kind(path: &str) -> Option<Kind> {
         "hop.backoff_ms" => Int(1000, 600000),
         "hop.one_card_repeats" => Int(1, 50),
         "hop.relay_burst_period_ms" => Int(500, 60000),
+        "hop.lease_sweep_period_ms" => Int(500, 60000),
         "hop.verdict.loss_pct" => Num(0.1, 100.0),
         "hop.verdict.recovered_x" => Num(1.0, 100.0),
         "hop.verdict.recovered_min" => Int(0, 1000),

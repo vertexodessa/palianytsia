@@ -289,7 +289,7 @@ class ConfigDump {
     const auto& [window_ms, persist, dwell_observe_ms, dwell_period_ms, burst_period_ms,
                  rank_visits, rank_max_age_ms, confirm_ms, confirm_extend_ms, verify_ms,
                  cooldown_ms, max_hops_per_min, backoff_ms, one_card_repeats,
-                 relay_burst_period_ms, verdict] = h;
+                 relay_burst_period_ms, lease_sweep_period_ms, verdict] = h;
     i("hop.window_ms", window_ms);
     i("hop.persist", persist);
     i("hop.dwell_observe_ms", dwell_observe_ms);
@@ -305,6 +305,7 @@ class ConfigDump {
     i("hop.backoff_ms", backoff_ms);
     i("hop.one_card_repeats", one_card_repeats);
     i("hop.relay_burst_period_ms", relay_burst_period_ms);
+    i("hop.lease_sweep_period_ms", lease_sweep_period_ms);
     const auto& [loss_pct, recovered_x, recovered_min, weak_rssi_dbm, weak_snr_db,
                  occupied_windows, detect_pct, detect_windows, detect_impaired] = verdict;
     d("hop.verdict.loss_pct", loss_pct);

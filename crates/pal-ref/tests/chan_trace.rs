@@ -219,6 +219,21 @@ fn snapshot_line(s: &ChannelSnapshot) -> String {
             Some(d) => l += &format!("{}:{}:{};", d.visits, d.score, d.cost_us),
         }
     }
+    l += " members=";
+    for m in &s.members {
+        l += &format!(
+            "{}:{}:{}:{}:{}:{}:{}{}{};",
+            m.ch,
+            opt(m.pair_lo),
+            opt(m.pair_hi),
+            m.busy_pct.map_or("-".into(), num),
+            if m.src.is_empty() { "-" } else { m.src },
+            opt(m.age_ms),
+            b(m.blocked),
+            b(m.is_op),
+            b(m.is_pin)
+        );
+    }
     l
 }
 
@@ -238,6 +253,8 @@ struct Duo {
     tc: Vec<String>,
     /// decode_one(): the next mac_seq, every card.
     seq_next: u16,
+    /// Linked ticks feed link video on both sides.
+    video: bool,
 }
 
 fn junk_body(card: u8, seq: u16) -> pal_core::RxBody {
@@ -339,6 +356,7 @@ impl Duo {
             tr: Vec::new(),
             tc: Vec::new(),
             seq_next: 100,
+            video: true,
         }
     }
     fn new(n: usize, pin: Option<u8>, start: u8) -> Self {
@@ -413,6 +431,11 @@ impl Duo {
         });
     }
     fn tick_tx(&mut self, session: bool, tx: usize) -> (bool, bool) {
+        // A linked tick carries link video, as on the air (mabur
+        // test_channel_core Rig::video): the boot relocate waits for it.
+        if session && self.video {
+            self.vrx_video();
+        }
         let now = self.ms();
         let inp = ChannelTickIn {
             now_ms: now,
@@ -586,6 +609,34 @@ impl Duo {
             s.nhm_arm_ok = false;
             s.nhm_read = NhmBusyRead::default();
         });
+    }
+    /// The observe lease on both sides: the same state word.
+    fn observe(&mut self, ms: i32) -> String {
+        let r = self.core.observe(ms).as_str();
+        let c = self.cpp.observe(ms);
+        self.sync("observe");
+        assert_eq!(r, c, "observe({ms}) at {}", self.ms());
+        assert_eq!(self.core.observing(), self.cpp.observing());
+        c
+    }
+    /// Linked ticks for `ms` (video and a decoded frame per card each),
+    /// renewing the lease every 1000 ms when `renew`; a snapshot every 250.
+    fn lease_ticks(&mut self, ms: u64, renew: bool) {
+        let end = self.ms() + ms as f64;
+        let mut last = self.ms();
+        let mut i = 0;
+        while self.ms() < end {
+            if renew && self.ms() - last >= 1000.0 {
+                self.observe(3000);
+                last = self.ms();
+            }
+            self.decode_one();
+            self.tick(true);
+            if i % 25 == 0 {
+                self.snapshot(0);
+            }
+            i += 1;
+        }
     }
     fn interfere_until_order(&mut self) {
         for _ in 0..self.occ_lead() + 12 {
@@ -1096,4 +1147,84 @@ fn random_scripts() {
 /// Deterministic per step, the same for both sides.
 fn r_ok(step: u64) -> bool {
     !step.is_multiple_of(7)
+}
+
+// ---- the observe lease (mabur #122) ----
+
+#[test]
+fn lease_two_card_rounds_then_lapse() {
+    let mut d = Duo::new(2, None, 40);
+    d.freeze_auto();
+    d.link_up();
+    d.cards(|i, s| {
+        if i == 1 {
+            s.nhm_busy_pct_on[64] = 8;
+            s.nhm_busy_pct_on[112] = 40;
+            s.nhm_busy_pct_on[144] = 2;
+        }
+    });
+    d.lease_ticks(100, false);
+    assert_eq!(d.observe(3000), "two_card");
+    d.lease_ticks(2000, true);
+    assert!(d.has("observe lease 3000 (two_card)"));
+    d.lease_ticks(4000, false);
+    assert!(d.has("observe lease lapsed"));
+    d.snapshot(0);
+    assert!(d.has(":scan:"), "no member measured");
+}
+
+#[test]
+fn lease_two_card_pinned_and_released() {
+    let mut d = Duo::new(2, Some(40), 40);
+    d.link_up();
+    d.cards(|_, s| s.nhm_busy_pct_on[112] = 40);
+    d.lease_ticks(100, false);
+    assert_eq!(d.observe(3000), "two_card");
+    d.lease_ticks(1500, true);
+    assert_eq!(d.observe(0), "none");
+    d.lease_ticks(1000, false);
+    d.snapshot(0);
+    assert!(d.has(":scan:"), "no member measured");
+}
+
+#[test]
+fn lease_one_card_bursts_and_masks_the_verdict() {
+    let mut d = Duo::new(1, None, 40);
+    d.freeze_auto();
+    d.cards(|_, s| {
+        s.nhm_busy_pct_on[64] = 8;
+        s.nhm_busy_pct_on[112] = 40;
+        s.nhm_busy_pct_on[144] = 2;
+    });
+    d.lease_ticks(500, false);
+    assert_eq!(d.observe(3000), "one_card");
+    d.lease_ticks(2500, true);
+    assert!(d.has("observe lease 3000 (one_card)"));
+    d.lease_ticks(3500, false);
+    d.snapshot(0);
+    assert!(d.has(":scan:"), "no member measured");
+}
+
+#[test]
+fn lease_search_observes_while_unlinked() {
+    let mut d = Duo::new(2, Some(40), 40);
+    d.cards(|_, s| {
+        s.nhm_busy_pct_on[64] = 8;
+        s.nhm_busy_pct_on[112] = 40;
+        s.nhm_busy_pct_on[144] = 2;
+    });
+    assert_eq!(d.observe(3000), "search");
+    let mut last = d.ms();
+    for i in 0..400 {
+        if d.ms() - last >= 2000.0 {
+            d.observe(3000);
+            last = d.ms();
+        }
+        d.tick(false);
+        if i % 50 == 0 {
+            d.snapshot(0);
+        }
+    }
+    d.snapshot(0);
+    assert!(d.has(":scan:"), "no member measured");
 }

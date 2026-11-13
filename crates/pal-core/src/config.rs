@@ -110,6 +110,9 @@ pub struct HopCfg {
     pub backoff_ms: i32,
     pub one_card_repeats: i32,
     pub relay_burst_period_ms: i32,
+    /// An observe lease on a one-USB-card GS: one in-flight burst over every
+    /// member but op, at most one per this (~75 ms off op on 4 members).
+    pub lease_sweep_period_ms: i32,
     pub verdict: HopVerdictCfg,
 }
 
@@ -131,6 +134,7 @@ impl Default for HopCfg {
             backoff_ms: 30000,
             one_card_repeats: 5,
             relay_burst_period_ms: 1000,
+            lease_sweep_period_ms: 1000,
             verdict: HopVerdictCfg::default(),
         }
     }
@@ -1049,6 +1053,7 @@ const HOP_KEYS: &[&str] = &[
     "backoff_ms",
     "one_card_repeats",
     "relay_burst_period_ms",
+    "lease_sweep_period_ms",
     "verdict",
 ];
 const VERDICT_KEYS: &[&str] = &[
@@ -1498,6 +1503,7 @@ pub fn dump(c: &Config) -> String {
         backoff_ms,
         one_card_repeats,
         relay_burst_period_ms,
+        lease_sweep_period_ms,
         verdict,
     } = hop;
     put("hop.window_ms", window_ms.to_string());
@@ -1517,6 +1523,10 @@ pub fn dump(c: &Config) -> String {
     put(
         "hop.relay_burst_period_ms",
         relay_burst_period_ms.to_string(),
+    );
+    put(
+        "hop.lease_sweep_period_ms",
+        lease_sweep_period_ms.to_string(),
     );
     let HopVerdictCfg {
         loss_pct,
@@ -1737,6 +1747,7 @@ fn parse_config(j: &Table) -> R<Config> {
         hc.backoff_ms = get_i32(h, "backoff_ms", 30000, 1000, 600000, "hop")?;
         hc.one_card_repeats = get_i32(h, "one_card_repeats", 5, 1, 50, "hop")?;
         hc.relay_burst_period_ms = get_i32(h, "relay_burst_period_ms", 1000, 500, 60000, "hop")?;
+        hc.lease_sweep_period_ms = get_i32(h, "lease_sweep_period_ms", 1000, 500, 60000, "hop")?;
         if let Some(v) = section(h, "verdict")? {
             let w = "hop.verdict";
             check_keys(v, w, VERDICT_KEYS)?;
