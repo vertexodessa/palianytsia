@@ -666,6 +666,12 @@ impl CoreLoop {
             self.sink.shared.event("peer_rc", e);
         }
         let off = (!off.is_empty()).then(|| off.into());
+        let idr_stuck = self
+            .sink
+            .idr
+            .as_ref()
+            .and_then(|d| d.r.stuck())
+            .map(|n| serde_json::json!({ "retries": n }));
         let ui = match stats {
             Some(s) => stats_line::ui_line(
                 s,
@@ -677,6 +683,7 @@ impl CoreLoop {
                     ("card_off_us", off),
                     ("rf_sim", rf_sim::active().map(|s| s.snapshot())),
                     ("peer_rc", peer_rc),
+                    ("idr_stuck", idr_stuck),
                 ],
                 cal,
             ),

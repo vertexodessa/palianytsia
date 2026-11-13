@@ -12,9 +12,12 @@
 //! Never on enhance damage: nothing references an enhance frame.
 //! Clears on a complete, unsalvaged base AU whose first slice NAL is an
 //! IRAP (16..21). While armed the byte is bumped again, at least `RETRY_MS`
-//! apart and further apart with each try: see `retry_wait_ms`. The C++
-//! requester keeps the fixed `RETRY_MS`; the parity gate is unaffected
-//! because both cores here are driven by this one.
+//! apart and further apart with each try: see `retry_wait_ms`. A request
+//! that `STUCK_AFTER` retries have not healed is stuck (`stuck`): the link
+//! cannot bring a keyframe in whole, so its retries back off to seconds
+//! instead of queueing one keyframe behind the next. The C++ requester
+//! keeps the fixed `RETRY_MS`; the parity gate is unaffected because both
+//! cores here are driven by this one.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
@@ -57,7 +60,8 @@ pub struct Counters {
 }
 
 /// 'I' per bump (a retry repeats the arming reason, `retries` = its
-/// ordinal), 'H' per clearing IRAP (`retries` = how many it took).
+/// ordinal), 'S' once per request when it turns stuck (after that retry's
+/// 'I'), 'H' per clearing IRAP (`retries` = how many it took).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
     pub kind: char,
@@ -75,6 +79,13 @@ pub const RETRY_MAX_MS: u64 = 1000;
 const RETRY_DOUBLINGS: u64 = 1;
 /// Base-layer repairs an IDR carries on top of its bytes, as a share.
 const IDR_FEC_OVERHEAD: f64 = 0.5;
+/// Retries without a heal after which a request is stuck: five keyframes
+/// asked for and none came in whole, where one heals in about 150 ms. On a
+/// fast rung the waits before it are 300 and 600 ms, so this is about 2 s.
+pub const STUCK_AFTER: u64 = 4;
+/// A stuck request's waits: `RETRY_MAX_MS` doubled per retry this many
+/// times (2 s, then 4 s), or the keyframe's span when that is longer.
+const STUCK_DOUBLINGS: u64 = 2;
 
 #[derive(Debug)]
 pub struct RefreshRequester {
@@ -164,14 +175,23 @@ impl RefreshRequester {
     /// IDR requested sooner lands in the queue behind the previous one, and
     /// at MCS0 that is what keeps the queue full and every IDR damaged.
     fn idr_span_ms(&self) -> u64 {
+        self.idr_span_raw_ms().min(RETRY_MAX_MS)
+    }
+
+    /// `idr_span_ms` without the cap: only a stuck request waits this long.
+    fn idr_span_raw_ms(&self) -> u64 {
         if self.link_mbps <= 0.0 {
             return 0;
         }
         let bits = self.irap_bytes as f64 * 8.0 * (1.0 + IDR_FEC_OVERHEAD);
-        ((2.0 * bits / (self.link_mbps * 1000.0)) as u64).min(RETRY_MAX_MS)
+        (2.0 * bits / (self.link_mbps * 1000.0)) as u64
     }
 
     fn retry_wait_ms(&self) -> u64 {
+        if self.retries_this >= STUCK_AFTER {
+            let k = (self.retries_this - STUCK_AFTER + 1).min(STUCK_DOUBLINGS);
+            return (RETRY_MAX_MS << k).max(self.idr_span_raw_ms());
+        }
         let base = RETRY_MS.max(self.idr_span_ms());
         (base << self.retries_this.min(RETRY_DOUBLINGS)).min(RETRY_MAX_MS)
     }
@@ -195,6 +215,15 @@ impl RefreshRequester {
         self.c.retries += 1;
         self.retries_this += 1;
         self.bump(now_ms);
+        if self.retries_this == STUCK_AFTER {
+            self.push(now_ms, 'S', 0);
+        }
+    }
+
+    /// The retries so far of a request that is stuck (see `STUCK_AFTER`),
+    /// None while there is none.
+    pub fn stuck(&self) -> Option<u64> {
+        (self.armed && self.retries_this >= STUCK_AFTER).then_some(self.retries_this)
     }
 
     pub fn epoch(&self) -> u8 {
@@ -231,12 +260,15 @@ impl RefreshRequester {
     fn bump(&mut self, now_ms: u64) {
         self.epoch = self.epoch.wrapping_add(1);
         self.last_bump_ms = now_ms;
+        self.push(now_ms, 'I', 0);
+    }
+    fn push(&mut self, t_ms: u64, kind: char, heal_ms: u64) {
         self.events.push(Event {
-            kind: 'I',
+            kind,
             reason: self.reason,
             epoch: self.epoch,
-            t_ms: now_ms,
-            heal_ms: 0,
+            t_ms,
+            heal_ms,
             retries: self.retries_this,
         });
     }
@@ -251,14 +283,7 @@ impl RefreshRequester {
         let heal = now_ms.saturating_sub(self.armed_since_ms);
         self.c.heals += 1;
         self.c.heal_ms_last = heal;
-        self.events.push(Event {
-            kind: 'H',
-            reason: self.reason,
-            epoch: self.epoch,
-            t_ms: now_ms,
-            heal_ms: heal,
-            retries: self.retries_this,
-        });
+        self.push(now_ms, 'H', heal);
     }
 }
 
@@ -507,12 +532,68 @@ mod tests {
         assert_eq!(r.counters().heal_ms_last, 0);
     }
 
+    /// A keyframe that never arrives whole: 30 s of retries. Without the stuck back-off they
+    /// come every 600 ms from the second on (50 in 30 s); with it the request goes stuck at the
+    /// fourth retry and asks every 4 s after (11 in all), and says so once.
+    #[test]
+    fn a_request_that_does_not_heal_backs_off_and_says_stuck() {
+        let mut r = RefreshRequester::default();
+        r.request(Reason::Hole, 0);
+        let mut bumps = vec![];
+        for t in 0..=30_000 {
+            let e = r.epoch();
+            r.poll(t);
+            if r.epoch() != e {
+                bumps.push(t);
+            }
+        }
+        assert_eq!(
+            bumps,
+            [300, 900, 1500, 2100, 4100, 8100, 12100, 16100, 20100, 24100, 28100]
+        );
+        assert_eq!(r.stuck(), Some(11));
+        let ev = r.take_events();
+        let stuck: Vec<_> = ev.iter().filter(|e| e.kind == 'S').collect();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!((stuck[0].t_ms, stuck[0].retries), (2100, STUCK_AFTER));
+        // The heal ends it; the next request starts with the short waits again.
+        r.note_au(0, true, false, 19, 0, 30_100);
+        assert_eq!(r.stuck(), None);
+        r.request(Reason::Hole, 40_000);
+        r.poll(40_300);
+        assert_eq!(r.counters().retries, 12);
+    }
+
+    /// A stuck request waits for the keyframe's whole span, past the 1 s cap.
+    #[test]
+    fn a_stuck_request_waits_out_a_keyframe_longer_than_its_back_off() {
+        let mut r = RefreshRequester::default();
+        // 400 KB at MCS0 20 MHz: 1476 ms of span, capped at 1 s while not stuck.
+        r.set_irap_bytes(400_000);
+        r.set_link_mbps(6.5);
+        r.request(Reason::Hole, 10_000);
+        for t in [11_000, 12_000, 13_000, 14_000] {
+            r.poll(t);
+        }
+        assert_eq!(r.stuck(), Some(4));
+        r.poll(14_000 + 1999);
+        assert_eq!(r.stuck(), Some(4));
+        r.poll(14_000 + 2000);
+        assert_eq!(r.stuck(), Some(5));
+        // 2 MB: a 7384 ms span outlasts the 4 s back-off.
+        r.set_irap_bytes(2_000_000);
+        r.poll(16_000 + 4000);
+        assert_eq!(r.stuck(), Some(5));
+        r.poll(16_000 + 7384);
+        assert_eq!(r.stuck(), Some(6));
+    }
+
     #[test]
     fn epoch_wraps() {
         let mut r = RefreshRequester::default();
         r.request(Reason::Decoder, 0);
         for i in 1..=255u64 {
-            r.poll(i * RETRY_MAX_MS);
+            r.poll(i * (RETRY_MAX_MS << STUCK_DOUBLINGS));
         }
         assert_eq!(r.epoch(), 0);
         // IdrDriver hands the core the cumulative count, which keeps going.

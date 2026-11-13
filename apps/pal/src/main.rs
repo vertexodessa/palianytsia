@@ -871,12 +871,13 @@ fn print_keyframes(k: &flightlog::keyframes::Keyframes, span_s: f64) {
         .map(|(r, n)| format!("{r} {n} ({:.1}/min)", per_min(*n)))
         .collect();
     println!(
-        "  keyframe requests {} ({:.1}/min): {}; retries {} (most for one request {}); busiest 10 s: {} from {:.1} s",
+        "  keyframe requests {} ({:.1}/min): {}; retries {} (most for one request {}, stuck {}); busiest 10 s: {} from {:.1} s",
         k.requests(),
         per_min(k.requests()),
         if reasons.is_empty() { "-".into() } else { reasons.join(", ") },
         k.retries,
         k.max_retry,
+        k.stuck,
         k.peak_10s.0,
         k.peak_10s.1 as f64 / 1e6
     );

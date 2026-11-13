@@ -42,6 +42,9 @@ pub struct Snapshot {
     /// A drone heard speaking another RC version: (its version, ours). Its frames are not RC to
     /// this app, so the link can never form (`peer_rc` from the runtime).
     pub peer_rc: Option<(u64, u64)>,
+    /// The keyframe request that its retries have not healed: retries so far
+    /// (`idr_stuck` from the runtime, `RefreshRequester::stuck`).
+    pub idr_stuck: Option<u64>,
     /// NACK repairs: symbols filled so far, and the current rate.
     pub nack_fill: u64,
     pub nack_fill_pps: Option<f64>,
@@ -186,6 +189,7 @@ impl Snapshot {
             peer_rc: v
                 .get("peer_rc")
                 .and_then(|p| Some((p.get("ver")?.as_u64()?, p.get("app")?.as_u64()?))),
+            idr_stuck: v.get("idr_stuck").and_then(|p| p.get("retries")?.as_u64()),
             nack_fill: v.get("nack").map_or(0, |n| u64_or(n, "fill", 0)),
             nack_fill_pps: v.get("nack").and_then(|n| opt_f64(n, "fill_pps")),
             ladder: v.get("ladder").and_then(Ladder::parse),
@@ -413,11 +417,13 @@ fn place_chips(
     (h, changed)
 }
 
-/// What the pairing-key banner says, if anything (F5): a drone on another
+/// What the banner over the video says, if anything (F5): a drone on another
 /// RC version and a key mismatch are errors (no link can form, or the drone
-/// ignores us), the default key a standing warning (anyone holding
-/// `mabur-default-00` can command the drone). The version comes first: the
-/// key cannot even be checked across versions.
+/// ignores us); a keyframe request its retries do not heal is a warning that
+/// the damaged picture stays (the link cannot bring a keyframe in whole);
+/// the default key a standing warning (anyone holding `mabur-default-00` can
+/// command the drone), shown when nothing else is. The version comes first:
+/// the key cannot even be checked across versions.
 pub fn key_warning(s: &Snapshot) -> Option<(String, bool)> {
     if let Some((drone, app)) = s.peer_rc {
         let fix = if drone > app {
@@ -436,6 +442,14 @@ pub fn key_warning(s: &Snapshot) -> Option<(String, bool)> {
                 s.key_fp
             ),
             true,
+        ))
+    } else if let Some(n) = s.idr_stuck {
+        Some((
+            format!(
+                "PICTURE CANNOT HEAL: {} keyframes asked for, none came in whole",
+                n + 1
+            ),
+            false,
         ))
     } else if s.key_fp == "default" {
         Some((
@@ -958,6 +972,21 @@ mod tests {
         );
         let older = Snapshot::parse(r#"{"peer_rc":{"ver":17,"app":18}}"#).expect("parse");
         assert!(key_warning(&older).unwrap().0.ends_with("UPDATE THE DRONE"));
+        // A stuck keyframe request covers the default-key warning, not a key error.
+        let stuck =
+            Snapshot::parse(r#"{"key_fp":"default","idr_stuck":{"retries":5}}"#).expect("parse");
+        assert_eq!(
+            key_warning(&stuck),
+            Some((
+                "PICTURE CANNOT HEAL: 6 keyframes asked for, none came in whole".into(),
+                false
+            ))
+        );
+        let both = Snapshot {
+            key_mismatch: true,
+            ..stuck
+        };
+        assert!(key_warning(&both).unwrap().1);
     }
 
     #[test]

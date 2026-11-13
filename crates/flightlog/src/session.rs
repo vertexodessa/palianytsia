@@ -411,7 +411,8 @@ impl Session {
         write_event(&mut self.events, t_us, ev, detail)
     }
 
-    /// IDR request path: `idr_req` per epoch bump, `idr_heal` per clearing IRAP.
+    /// IDR request path: `idr_req` per epoch bump, `idr_stuck` once per request that its
+    /// retries do not heal, `idr_heal` per clearing IRAP.
     pub fn refresh_events(&mut self, evs: &[pal_core::refresh::Event]) -> io::Result<()> {
         if evs.is_empty() {
             return Ok(());
@@ -435,22 +436,25 @@ impl Session {
     fn write_refresh_events(&mut self, evs: &[pal_core::refresh::Event]) -> io::Result<()> {
         for e in evs {
             // fec.log's `I` / `H` lines (FecLog::request / heal) beside the
-            // episodes they answer.
-            if e.kind == 'H' {
-                writeln!(self.fec, "H {} {} {}", e.t_ms, e.heal_ms, e.retries)?;
-            } else {
-                writeln!(self.fec, "I {} {} {}", e.t_ms, e.reason.as_str(), e.epoch)?;
+            // episodes they answer; mabur's fec.log has no stuck line.
+            match e.kind {
+                'H' => writeln!(self.fec, "H {} {} {}", e.t_ms, e.heal_ms, e.retries)?,
+                'I' => writeln!(self.fec, "I {} {} {}", e.t_ms, e.reason.as_str(), e.epoch)?,
+                _ => {}
             }
-            let (ev, d) = if e.kind == 'H' {
-                (
+            let (ev, d) = match e.kind {
+                'H' => (
                     "idr_heal",
                     json!({"reason": e.reason.as_str(), "epoch": e.epoch, "heal_ms": e.heal_ms, "retries": e.retries}),
-                )
-            } else {
-                (
+                ),
+                'S' => (
+                    "idr_stuck",
+                    json!({"reason": e.reason.as_str(), "epoch": e.epoch, "retries": e.retries}),
+                ),
+                _ => (
                     "idr_req",
                     json!({"reason": e.reason.as_str(), "epoch": e.epoch, "retry": e.retries}),
-                )
+                ),
             };
             self.write_event(e.t_ms * 1000, ev, d)?;
         }
@@ -1047,7 +1051,7 @@ mod tests {
             heal_ms: 350,
             retries: 1,
         };
-        s.refresh_events(&[ev('I', 1250), ev('H', 1600)])
+        s.refresh_events(&[ev('I', 1250), ev('S', 1250), ev('H', 1600)])
             .expect("refresh");
         let dir = s.dir().to_path_buf();
         drop(s);
@@ -1056,6 +1060,9 @@ mod tests {
         assert_eq!(lines[0], "feclog 4");
         assert_eq!(lines[4], "I 1250 lost 4");
         assert_eq!(lines[5], "H 1600 350 1");
+        assert_eq!(lines.len(), 6, "no fec.log line for a stuck request");
+        let events = fs::read_to_string(dir.join(EVENTS_FILE)).expect("events");
+        assert!(events.contains(r#""ev":"idr_stuck""#), "{events}");
         let fec = summarize(&dir).expect("summary").fec.expect("fec totals");
         assert_eq!(fec[0].episodes, 2);
         assert_eq!(fec[0].by_missing, [1, 0, 0, 1, 0]);

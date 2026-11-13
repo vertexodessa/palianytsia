@@ -13,6 +13,8 @@ pub struct Keyframes {
     pub retries: u64,
     /// The highest retry number one request reached.
     pub max_retry: u64,
+    /// Requests their retries did not heal (`idr_stuck`).
+    pub stuck: u64,
     /// Request to clearing IRAP, per heal, sorted.
     pub heal_ms: Vec<u64>,
     /// IRAP sizes by the rung of the stats row before them, sorted by rung;
@@ -66,6 +68,7 @@ impl Keyframes {
                 }
             }
             "idr_heal" => self.heal_ms.push(u("heal_ms")),
+            "idr_stuck" => self.stuck += 1,
             _ => {}
         }
     }
@@ -129,6 +132,7 @@ mod tests {
             "idr_req",
             &json!({"t_us": 1_900_000, "reason": "lost", "retry": 2}),
         );
+        k.event("idr_stuck", &json!({"reason": "lost", "retries": 4}));
         k.event("idr_heal", &json!({"heal_ms": 900}));
         k.idr(1_950_000, 30_000);
         k.idr(2_500_000, 60_000);
@@ -144,7 +148,10 @@ mod tests {
         k.event("idr_heal", &json!({"heal_ms": 100}));
         k.finish();
         assert_eq!(k.by_reason, vec![("lost".into(), 2), ("hole".into(), 1)]);
-        assert_eq!((k.requests(), k.retries, k.max_retry), (3, 2, 2));
+        assert_eq!(
+            (k.requests(), k.retries, k.max_retry, k.stuck),
+            (3, 2, 2, 1)
+        );
         assert_eq!(k.heal_ms, vec![100, 900]);
         assert_eq!(
             k.bytes_by_rung,
