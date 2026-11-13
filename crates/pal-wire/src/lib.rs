@@ -10,6 +10,7 @@ pub mod crc16;
 pub mod dot11;
 pub mod frame_wire;
 pub mod ht40;
+pub mod maint;
 pub mod mavlink;
 pub mod probe;
 pub mod profile;

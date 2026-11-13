@@ -116,6 +116,10 @@ pairing key.
   for a dry run (package as an artifact, nothing published).
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.
 - `tools/telem.py <capture>`: the drone's own RX counters (rx_own etc.) from T_TELEM in a capture.
+- The drone's shell over the air (maintenance lane, gs mode): `pal live ... --exec CMD` (exits with
+  CMD's status), `--shell`, `--input FILE` (CMD's stdin), `--video-off`; `--update-drone DIR`
+  installs DIR/{maburd,mabur.toml,S96mabur} with no PC (trial from RAM, commit to flash,
+  `release/drone/mabur-swap.sh`). The drone's maburd must already have the lane.
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `tools/retxmark.py in.bin out.bin [every]`: a capture copy with base bodies re-marked as NACK retransmits (the m1 retx case; a capture's own retransmits change no rung in replay).
 - Capture analysis (`tools/palcap.py` reads `palcap 1` + SBI/FEC envelopes): `tools/losstrace.py bodies.bin [--json f]`

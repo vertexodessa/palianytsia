@@ -14,6 +14,8 @@ use pal_wire::dot11;
 
 pub mod cam_fps;
 pub mod dev_card;
+pub mod drone_update;
+pub mod maint;
 pub mod panic_hook;
 pub mod rf_sim;
 pub mod stats_line;
@@ -69,6 +71,8 @@ pub struct Shared {
     /// Telems heard from a drone on another RC version: the RX threads count them, since the
     /// core takes such a frame for no RC at all.
     pub peer_rc: PeerRc,
+    /// The maintenance lane: shell sessions on the drone, the video-off wish.
+    pub maint: maint::Hub,
 }
 
 /// A drone's Telem in another RC version (`rc::foreign_rc_version`), counted on the RX thread.
@@ -462,6 +466,10 @@ impl CoreLoop {
         if let Some(l) = self.sink.log.as_mut() {
             let _ = l.body(b);
         }
+        // Not an RC frame: the core would take it for video.
+        if b.crc_ok && self.sink.shared.maint.on_body(&b.body, b.mono_us / 1000) {
+            return;
+        }
         self.core.on_rx(b, &mut self.sink);
     }
     /// One pass of the core loop: each step does what is due at `now`.
@@ -475,6 +483,7 @@ impl CoreLoop {
         }
         self.hand_cal_log_dir();
         self.core.tick(now, &mut self.sink);
+        self.pump_maint(now);
         self.log_chan_records(now);
         self.log_core_records(now);
         self.log_fec_rows();
@@ -482,6 +491,13 @@ impl CoreLoop {
         self.step_idr(now);
         self.publish_stats(now);
         self.report_lat(now);
+    }
+
+    /// The maintenance lane's frames go out through the core's TX card.
+    fn pump_maint(&mut self, now: u64) {
+        for f in self.sink.shared.maint.poll(now / 1000) {
+            self.sink.send(&f);
+        }
     }
 
     fn drain_mav_udp(&mut self) {

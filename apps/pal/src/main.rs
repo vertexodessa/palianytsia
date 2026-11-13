@@ -7,6 +7,12 @@
 //!              [--card N] [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
 //!              [--log-dir DIR [--capture-mb N]] [--core ref|rust] [--param-set T_S,ROW,TEXT ...]
 //!              [--rf-sim SPEC]   bench RF loss simulator (`runtime::rf_sim`), e.g. atten=50,fade=8/300
+//!              [--exec CMD | --shell] [--video-off]   the drone's shell over the maintenance
+//!              lane (gs mode): run CMD and exit with its status, or a shell on stdin/stdout;
+//!              --video-off holds the drone's video off while pal runs; --input FILE streams FILE
+//!              to CMD's stdin
+//!              [--update-drone DIR]   install DIR/{maburd,mabur.toml,S96mabur} on the drone over
+//!              the lane: trial from RAM, commit to flash once video comes from the new maburd
 //!   pal replay <bodies.bin>...|<fl-NNNN_...> -c gs.toml [--mode gs|spotter] [--dump out.h265]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
@@ -62,6 +68,15 @@ struct Opts {
     panic_after: Option<u64>,
     /// Live: IDR requests on (`--no-idr` off). Replay: off (`--idr` on).
     idr: Option<bool>,
+    /// Live: a command for the drone's shell over the maintenance lane
+    /// (`--exec CMD`; `--shell` = an interactive shell on stdin/stdout).
+    exec: Option<String>,
+    /// Live: the drone's video off while `pal` runs (`--video-off`).
+    video_off: bool,
+    /// Live: a file streamed to the `--exec` command's stdin (`--input FILE`).
+    input: Option<PathBuf>,
+    /// Live: update the drone from a release's drone/ directory (`--update-drone DIR`).
+    update_drone: Option<PathBuf>,
     pos: Vec<PathBuf>,
 }
 
@@ -105,6 +120,11 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
                     x.to_string(),
                 ));
             }
+            "--exec" => o.exec = Some(val()),
+            "--shell" => o.exec = Some(String::new()),
+            "--video-off" => o.video_off = true,
+            "--input" => o.input = Some(val().into()),
+            "--update-drone" => o.update_drone = Some(val().into()),
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
             "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
@@ -366,6 +386,7 @@ struct Live {
     rssi_sum: f64,
     rssi_n: u64,
     mcs: u8,
+    shared: Arc<runtime::Shared>,
 }
 
 impl runtime::BodyLoop for Live {
@@ -384,6 +405,9 @@ impl runtime::BodyLoop for Live {
         self.sink.now_us = b.mono_us;
         if let Some(l) = self.sink.log.as_mut() {
             l.body(b).unwrap();
+        }
+        if b.crc_ok && self.shared.maint.on_body(&b.body, b.mono_us / 1000) {
+            return;
         }
         self.core.on_rx(b, &mut self.sink);
     }
@@ -409,6 +433,169 @@ impl runtime::BodyLoop for Live {
         }
         self.sink.idr_step(now, &mut *self.core);
         self.sink.log_stats(now, &mut self.last_stats, &*self.core);
+        self.shared.frames.store(self.sink.aus, Ordering::Relaxed);
+        // Straight to the card: the maintenance lane is not in `--sends`.
+        for f in self.shared.maint.poll(now / 1000) {
+            if let Some(c) = &self.sink.card {
+                c.send_control(&f);
+            }
+        }
+    }
+}
+
+/// `--update-drone`: the whole update over the lane, steps on stderr; `done`
+/// gets 0 or 1. Video counts as steady while AUs keep arriving.
+fn update_drone(
+    shared: Arc<runtime::Shared>,
+    dir: PathBuf,
+    done: Arc<std::sync::atomic::AtomicI32>,
+) {
+    use runtime::drone_update as du;
+    struct Steps(Instant, u64);
+    impl du::Progress for Steps {
+        fn step(&mut self, what: &str) {
+            eprintln!(
+                "pal: update {:>5.1}s: {what}",
+                self.0.elapsed().as_secs_f64()
+            );
+        }
+        fn bytes(&mut self, d: u64, total: u64) {
+            if d >= self.1 + 256 * 1024 || d == total {
+                self.1 = if d == total { 0 } else { d };
+                eprintln!(
+                    "pal: update {:>5.1}s:   {d}/{total} bytes",
+                    self.0.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+    let code = match du::Payload::from_dir(&dir) {
+        Err(e) => {
+            eprintln!("pal: update: {e}");
+            1
+        }
+        Ok(pl) => {
+            let last = std::cell::Cell::new((0u64, Instant::now()));
+            let link_ok = || {
+                let n = shared.frames.load(Ordering::Relaxed);
+                let (seen, at) = last.get();
+                if n != seen {
+                    last.set((n, Instant::now()));
+                    return true;
+                }
+                at.elapsed() < Duration::from_millis(500)
+            };
+            match du::run(&shared.maint, &pl, &link_ok, &mut Steps(Instant::now(), 0)) {
+                Ok(r) => {
+                    eprintln!(
+                        "pal: update done in {:.1} s: maburd {} -> {}",
+                        r.secs,
+                        &r.old_sha[..r.old_sha.len().min(16)],
+                        &r.new_sha[..16]
+                    );
+                    for c in &r.config_changes {
+                        eprintln!("pal: update: mabur.toml: {c}");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("pal: update failed: {e}");
+                    1
+                }
+            }
+        }
+    };
+    done.store(code, Ordering::Relaxed);
+}
+
+/// `--exec` / `--shell`: one session on the drone, its output to stdout. The
+/// status lands in `done` (the command's exit status, or 255 when the drone
+/// refused or ended the session, 124 when it never answered).
+fn maint_session(
+    shared: Arc<runtime::Shared>,
+    cmd: String,
+    input: Option<Vec<u8>>,
+    done: Arc<std::sync::atomic::AtomicI32>,
+) {
+    use runtime::maint::State;
+    let hub = &shared.maint;
+    let t0 = Instant::now();
+    let id = hub.open(&cmd);
+    let sent = input.as_ref().map_or(0, Vec::len);
+    if let Some(data) = input {
+        let sh = shared.clone();
+        std::thread::spawn(move || {
+            let mut off = 0;
+            while off < data.len() {
+                off += sh.maint.write(id, &data[off..]);
+                if off < data.len() {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            sh.maint.finish(id);
+        });
+    } else if cmd.is_empty() {
+        let sh = shared.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let mut stdin = std::io::stdin();
+            while let Ok(n) = stdin.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let mut off = 0;
+                while off < n {
+                    off += sh.maint.write(id, &buf[off..n]);
+                    if off < n {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+            sh.maint.finish(id);
+        });
+    } else {
+        hub.finish(id);
+    }
+    let mut out = Vec::new();
+    let mut stdout = std::io::stdout();
+    loop {
+        std::thread::sleep(Duration::from_millis(5));
+        out.clear();
+        hub.read(id, &mut out);
+        if !out.is_empty() {
+            let _ = stdout.write_all(&out);
+            let _ = stdout.flush();
+        }
+        let Some(i) = hub.info(id) else { return };
+        let code = match i.state {
+            State::Opening if i.quiet_ms > 10_000 => {
+                eprintln!("pal: the drone does not answer on the maintenance lane");
+                124
+            }
+            State::Exited(st) => i32::from(st),
+            State::Closed(st) => {
+                eprintln!("pal: the drone ended the session (status {st})");
+                255
+            }
+            State::Open if i.quiet_ms > 30_000 => {
+                eprintln!("pal: the drone went quiet");
+                124
+            }
+            _ => continue,
+        };
+        out.clear();
+        hub.read(id, &mut out);
+        let _ = stdout.write_all(&out);
+        let _ = stdout.flush();
+        eprintln!(
+            "pal: session ended in {} ms: status {code}, {sent} bytes in, {} resends",
+            t0.elapsed().as_millis(),
+            i.resends
+        );
+        hub.close(id);
+        done.store(code, Ordering::Relaxed);
+        return;
     }
 }
 
@@ -472,7 +659,22 @@ fn live(o: Opts) {
         rssi_sum: 0.0,
         rssi_n: 0,
         mcs: 255,
+        shared: shared.clone(),
     };
+    shared.maint.set_video_off(o.video_off);
+    let done = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+    if let Some(cmd) = o.exec.clone() {
+        let input = o
+            .input
+            .as_ref()
+            .map(|p| std::fs::read(p).unwrap_or_else(|e| die(&format!("--input: {e}"))));
+        let (sh, d) = (shared.clone(), done.clone());
+        std::thread::spawn(move || maint_session(sh, cmd, input, d));
+    } else if let Some(dir) = o.update_drone.clone() {
+        let (sh, d) = (shared.clone(), done.clone());
+        std::thread::spawn(move || update_drone(sh, dir, d));
+    }
+    let mut close_ticks = 0u32;
     let end = Duration::from_secs(o.secs);
     let mut next_report = t0 + Duration::from_secs(1);
     let mut last_aus = 0u64;
@@ -503,6 +705,11 @@ fn live(o: Opts) {
                 l.rssi_sum = 0.0;
                 l.rssi_n = 0;
             }
+            // A finished --exec ends the run once its CLOSE has gone out.
+            if done.load(Ordering::Relaxed) >= 0 {
+                close_ticks += 1;
+                return Ok(close_ticks < 50);
+            }
             Ok(l.t0.elapsed() < end)
         },
     )
@@ -527,6 +734,14 @@ fn live(o: Opts) {
         live.sink.send_fail,
         live.core.stats_json()
     );
+    match done.load(Ordering::Relaxed) {
+        -1 if o.exec.is_some() || o.update_drone.is_some() => {
+            eprintln!("pal: --secs ran out before the drone's command ended");
+            std::process::exit(124)
+        }
+        -1 => {}
+        code => std::process::exit(code.clamp(0, 255)),
+    }
 }
 
 fn replay(o: Opts) {

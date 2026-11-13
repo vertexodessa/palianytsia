@@ -16,3 +16,4 @@ serde_json.workspace = true
 pal-build.workspace = true
 log = "0.4"
 libc.workspace = true
+sha2 = "0.10"
