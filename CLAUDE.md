@@ -63,7 +63,11 @@ pairing key.
   simulates one: `--rf-sim SPEC` (`pal live`, `pal-desktop`) or property `debug.pal.rf_sim`
   (APKs, read at link start), spec keys in `crates/runtime/src/rf_sim.rs` (attenuation
   with MCS-dependent loss, fades, flat loss, FCS-bad deliveries, uplink loss); a flight log
-  taken under it carries `rf_sim` events. The bench reads about -28 dBm, so `atten=45`
+  taken under it carries `rf_sim` events. On the APKs `debug.pal.channel` (a fixed channel, so a
+  jam is not escaped by a hop) and `debug.pal.nack_residual` (filled/all/timely) are read at link
+  start too (`crates/pal-android/src/link.rs` `picked_toml`, logcat "bench property applied").
+  For real interference with the Quest as the GS, the host card jams with mabur
+  `tools/bench/benchjam.sh` (foreign SA). The bench reads about -28 dBm, so `atten=45`
   leaves MCS 0 at 40 MHz ~16 dB of margin and `atten=60` about 1 dB.
 
 ## Helpers

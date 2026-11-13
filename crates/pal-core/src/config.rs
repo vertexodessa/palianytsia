@@ -1021,6 +1021,12 @@ fn with_link_key(text: &str, key: &str, v: Value) -> R<String> {
     finish_edit(&j)
 }
 
+/// `link.nack_residual` set to `mode` (filled, all, timely), checked by the
+/// config parser.
+pub fn with_nack_residual(text: &str, mode: &str) -> R<String> {
+    with_link_key(text, "nack_residual", Value::String(mode.into()))
+}
+
 /// `radio.channel` set to `ch` (a member of radio.channels), or "auto" for
 /// 0. A fixed channel never measures and never hops; the channel core still
 /// searches the whole set for the drone and relocates it onto the pin.
@@ -2265,6 +2271,18 @@ mod tests {
         let a = parse_config_str(&with_channel(&pinned, 0).unwrap()).unwrap();
         assert_eq!(a.radio.pin, None);
         assert!(with_channel(&text, 36).is_err(), "not a member");
+    }
+
+    #[test]
+    fn nack_residual_is_set_by_name_and_a_wrong_name_is_refused() {
+        let text = std::fs::read_to_string(repo("configs/gs-auto.toml")).unwrap();
+        let rule = |m: &str| {
+            parse_config_str(&with_nack_residual(&text, m).unwrap()).map(|c| c.link.nack_residual)
+        };
+        assert_eq!(rule("all").unwrap(), NackResidual::All);
+        assert_eq!(rule("timely").unwrap(), NackResidual::Timely);
+        assert_eq!(rule("filled").unwrap(), NackResidual::Filled);
+        assert!(with_nack_residual(&text, "sometimes").is_err());
     }
 
     #[test]

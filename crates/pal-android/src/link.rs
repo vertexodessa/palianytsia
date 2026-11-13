@@ -65,14 +65,61 @@ fn link_radio(
     toml: &str,
     pick: pal_core::config::LinkPick,
 ) -> Result<(pal_core::config::Config, u8, u8), String> {
-    let (toml, skipped) = pal_core::config::with_link_pick(toml, pick);
-    for s in skipped {
-        log::warn!("{s}");
-    }
+    let toml = picked_toml(toml, pick, true);
     let cfg = pal_core::config::parse_config_str(&toml).map_err(|e| e.to_string())?;
     let ch = cfg.start_channel().ok_or("config: no channel")?;
     let width = cfg.rx_width();
     Ok((cfg, ch, width))
+}
+
+/// The config text a link runs: `toml` with the operator's picks, then the
+/// bench properties, read at each link start (unset or empty = untouched; a
+/// value the config refuses is logged and skipped):
+/// - `debug.pal.channel`: a fixed channel (`with_channel`), so an interferer
+///   on it is not escaped by a hop; `auto` = 0.
+/// - `debug.pal.nack_residual`: `link.nack_residual` (filled, all, timely),
+///   to compare the ladder's NACK rules on one APK without root.
+fn picked_toml(toml: &str, pick: pal_core::config::LinkPick, log: bool) -> String {
+    let (mut out, mut skipped) = pal_core::config::with_link_pick(toml, pick);
+    let mut applied = Vec::new();
+    let prop = |n: &std::ffi::CStr| {
+        decode::mediacodec::prop(n)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(v) = prop(c"debug.pal.channel") {
+        let ch = if v == "auto" {
+            Some(0)
+        } else {
+            v.parse::<u8>().ok()
+        };
+        match ch.map(|ch| pal_core::config::with_channel(&out, ch)) {
+            Some(Ok(t)) => {
+                out = t;
+                applied.push(format!("debug.pal.channel {v}"));
+            }
+            Some(Err(e)) => skipped.push(format!("debug.pal.channel {v} not applied: {e}")),
+            None => skipped.push(format!("debug.pal.channel {v}: not a channel")),
+        }
+    }
+    if let Some(v) = prop(c"debug.pal.nack_residual") {
+        match pal_core::config::with_nack_residual(&out, &v) {
+            Ok(t) => {
+                out = t;
+                applied.push(format!("debug.pal.nack_residual {v}"));
+            }
+            Err(e) => skipped.push(format!("debug.pal.nack_residual {v} not applied: {e}")),
+        }
+    }
+    if log {
+        for a in applied {
+            log::info!("bench property applied: {a}");
+        }
+        for s in skipped {
+            log::warn!("{s}");
+        }
+    }
+    out
 }
 
 /// Opens the cards behind `fds` where a link on `toml` + `pick` starts, so
@@ -182,7 +229,7 @@ impl Link {
             String::from_utf8(n.to_vec()).ok()
         });
         // The text the core parsed: the config with the operator's picks.
-        let (picked, _) = pal_core::config::with_link_pick(&c.toml, c.pick.clone());
+        let picked = picked_toml(&c.toml, c.pick.clone(), false);
         let run = flightlog::session::Run {
             app: app.as_deref().unwrap_or("pal-android"),
             core: "rust",
