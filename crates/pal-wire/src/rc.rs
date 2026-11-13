@@ -568,6 +568,14 @@ pub fn frame_type(b: &[u8]) -> Option<u8> {
     Some(b[3])
 }
 
+/// The RC version of a drone that speaks another one, from its Telem: the drone sends one a
+/// second in every state, linked or not, so this is what a GS of the wrong version can still
+/// hear. Only the magic and the Telem type are taken as proof; the rest of the frame is the
+/// other version's and is not read. None for this version's frames and for anything else.
+pub fn foreign_rc_version(b: &[u8]) -> Option<u8> {
+    (b.len() >= 4 && g16(b, 0) == RC_MAGIC && b[2] != RC_VERSION && b[3] == T_TELEM).then(|| b[2])
+}
+
 /// `default` for the shipped key, else 4 hex chars of SipHash("mabur.key").
 pub fn key_fingerprint(k: &LinkKey) -> alloc::string::String {
     if *k == DEFAULT_LINK_KEY {

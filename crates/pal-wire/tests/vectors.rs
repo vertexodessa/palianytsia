@@ -152,6 +152,19 @@ fn rc_telem_golden() {
     let mut flip = unhex(g);
     flip[20] ^= 0xFF;
     assert!(parse_telem(&flip).is_none());
+
+    // The same Telem from a drone one RC version up or down is that version, and nothing else
+    // is: this version's Telem, another version's RCF, a short body.
+    assert_eq!(foreign_rc_version(&unhex(g)), None);
+    for v in [RC_VERSION - 1, RC_VERSION + 1] {
+        let mut other = unhex(g);
+        other[2] = v;
+        assert_eq!(foreign_rc_version(&other), Some(v));
+        assert!(parse_telem(&other).is_none());
+        other[3] = T_RCF;
+        assert_eq!(foreign_rc_version(&other), None);
+        assert_eq!(foreign_rc_version(&other[..3]), None);
+    }
 }
 
 #[test]

@@ -62,6 +62,63 @@ pub struct Shared {
     /// The camera's frame rate x10 from AU capture stamps (`cam_fps`); 0
     /// until known. Not in the stats line: M1 compares that byte for byte.
     pub cam_fps_x10: AtomicU32,
+    /// Telems heard from a drone on another RC version: the RX threads count them, since the
+    /// core takes such a frame for no RC at all.
+    pub peer_rc: PeerRc,
+}
+
+/// A drone's Telem in another RC version (`rc::foreign_rc_version`), counted on the RX thread.
+#[derive(Default)]
+pub struct PeerRc {
+    pub ver: AtomicU8,
+    pub frames: AtomicU64,
+}
+
+impl PeerRc {
+    pub fn note(&self, ver: u8) {
+        self.ver.store(ver, Ordering::Relaxed);
+        self.frames.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// The loop's view of `PeerRc`: the UI shows the other version while its Telems keep coming
+/// (one a second; the view lasts `PEER_RC_HOLD_US` past the last), the flight log gets one
+/// event per version heard.
+#[derive(Default)]
+struct PeerRcWatch {
+    seen: u64,
+    heard_us: Option<u64>,
+    logged: Option<u8>,
+}
+
+const PEER_RC_HOLD_US: u64 = 5_000_000;
+
+impl PeerRcWatch {
+    /// (the UI view, an event for the flight log) for this stats pass.
+    fn pass(
+        &mut self,
+        now: u64,
+        ver: u8,
+        frames: u64,
+    ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+        let view = |v: u8| serde_json::json!({"ver": v, "app": pal_wire::rc::RC_VERSION});
+        let mut event = None;
+        if frames > self.seen {
+            self.seen = frames;
+            self.heard_us = Some(now);
+            if self.logged != Some(ver) {
+                self.logged = Some(ver);
+                let mut e = view(ver);
+                e["frames"] = frames.into();
+                event = Some(e);
+            }
+        }
+        let ui = self
+            .heard_us
+            .filter(|&t| now.saturating_sub(t) < PEER_RC_HOLD_US)
+            .map(|_| view(ver));
+        (ui, event)
+    }
 }
 
 impl Shared {
@@ -261,6 +318,7 @@ pub struct CoreLoop {
     params: ParamLog,
     /// The cards the core drives, in card order (`watch_cards`).
     taps: Vec<Arc<dyn RxTap>>,
+    peer_rc: PeerRcWatch,
 }
 
 /// The loop's channels to the UI.
@@ -303,6 +361,7 @@ impl CoreLoop {
             log_err_told: false,
             params: ParamLog::default(),
             taps: Vec::new(),
+            peer_rc: PeerRcWatch::default(),
         }
     }
 
@@ -585,6 +644,15 @@ impl CoreLoop {
         let drone = json(self.core.drone_json());
         let cal = self.cal_line();
         let log_err = self.log_err();
+        let pr = &self.sink.shared.peer_rc;
+        let (peer_rc, ev) = self.peer_rc.pass(
+            now,
+            pr.ver.load(Ordering::Relaxed),
+            pr.frames.load(Ordering::Acquire),
+        );
+        if let Some(e) = ev {
+            self.sink.shared.event("peer_rc", e);
+        }
         let off = (!off.is_empty()).then(|| off.into());
         let ui = match stats {
             Some(s) => stats_line::ui_line(
@@ -596,6 +664,7 @@ impl CoreLoop {
                     ("log_err", log_err),
                     ("card_off_us", off),
                     ("rf_sim", rf_sim::active().map(|s| s.snapshot())),
+                    ("peer_rc", peer_rc),
                 ],
                 cal,
             ),
@@ -1114,6 +1183,12 @@ impl CardSet {
                     return;
                 };
                 if let dot11::Verdict::Body(p) = v {
+                    if !f.crc_err {
+                        if let Some(ver) = pal_wire::rc::foreign_rc_version(&f.frame[p.body_off..])
+                        {
+                            r.shared.peer_rc.note(ver);
+                        }
+                    }
                     r.shared.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
                     if r.tx.try_send(rx_body(card_id, f, &p, now, ch)).is_err() {
                         r.shared.lat.rx_full.fetch_add(1, Ordering::Relaxed);
@@ -1373,6 +1448,28 @@ pub fn pump<L: BodyLoop>(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Nothing until a foreign Telem is counted; then the UI view while they keep coming and
+    /// for 5 s after the last, and one event per version, not per Telem.
+    #[test]
+    fn a_drone_on_another_rc_version_shows_while_heard_and_logs_once() {
+        let app = u64::from(pal_wire::rc::RC_VERSION);
+        let mut w = PeerRcWatch::default();
+        assert_eq!(w.pass(1_000_000, 0, 0), (None, None));
+        let (ui, ev) = w.pass(2_000_000, 19, 1);
+        assert_eq!(ui, Some(serde_json::json!({"ver": 19, "app": app})));
+        assert_eq!(ev.expect("first Telem logs")["frames"], 1);
+        assert_eq!(
+            w.pass(3_000_000, 19, 2).1,
+            None,
+            "same version: no new event"
+        );
+        assert!(w.pass(7_900_000, 19, 2).0.is_some(), "4.9 s after the last");
+        assert_eq!(w.pass(8_000_000, 19, 2).0, None, "5 s after the last");
+        let (ui, ev) = w.pass(9_000_000, 17, 3);
+        assert_eq!(ui.expect("heard again")["ver"], 17);
+        assert_eq!(ev.expect("another version logs")["ver"], 17);
+    }
 
     fn table(list: &str, min_iqp: Option<&str>) -> String {
         serde_json::json!({"list": list, "rows": [

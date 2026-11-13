@@ -39,6 +39,9 @@ pub struct Snapshot {
     /// How long the drone has been shedding the enh layer for its full transmit queue (every
     /// other frame dropped, about 30 fps); None while it is not (`GsCore::drone_json`).
     pub drone_shed_ms: Option<u64>,
+    /// A drone heard speaking another RC version: (its version, ours). Its frames are not RC to
+    /// this app, so the link can never form (`peer_rc` from the runtime).
+    pub peer_rc: Option<(u64, u64)>,
     /// NACK repairs: symbols filled so far, and the current rate.
     pub nack_fill: u64,
     pub nack_fill_pps: Option<f64>,
@@ -180,6 +183,9 @@ impl Snapshot {
                 .get("drone")
                 .and_then(|d| d.get("shed_ms"))
                 .and_then(Value::as_u64),
+            peer_rc: v
+                .get("peer_rc")
+                .and_then(|p| Some((p.get("ver")?.as_u64()?, p.get("app")?.as_u64()?))),
             nack_fill: v.get("nack").map_or(0, |n| u64_or(n, "fill", 0)),
             nack_fill_pps: v.get("nack").and_then(|n| opt_f64(n, "fill_pps")),
             ladder: v.get("ladder").and_then(Ladder::parse),
@@ -406,11 +412,23 @@ fn place_chips(
     (h, changed)
 }
 
-/// What the pairing-key banner says, if anything (F5): a mismatch is an
-/// error (the drone ignores us), the default key a standing warning
-/// (anyone holding `mabur-default-00` can command the drone).
+/// What the pairing-key banner says, if anything (F5): a drone on another
+/// RC version and a key mismatch are errors (no link can form, or the drone
+/// ignores us), the default key a standing warning (anyone holding
+/// `mabur-default-00` can command the drone). The version comes first: the
+/// key cannot even be checked across versions.
 pub fn key_warning(s: &Snapshot) -> Option<(String, bool)> {
-    if s.key_mismatch {
+    if let Some((drone, app)) = s.peer_rc {
+        let fix = if drone > app {
+            "UPDATE THE APP"
+        } else {
+            "UPDATE THE DRONE"
+        };
+        Some((
+            format!("DRONE SPEAKS RC {drone}, THIS APP RC {app}: {fix}"),
+            true,
+        ))
+    } else if s.key_mismatch {
         Some((
             format!(
                 "KEY MISMATCH: the drone answers under another pairing key (ours {})",
@@ -916,6 +934,17 @@ mod tests {
             ..s
         };
         assert!(key_warning(&own).is_none());
+        let newer = Snapshot::parse(r#"{"key_fp":"default","peer_rc":{"ver":19,"app":18}}"#)
+            .expect("parse");
+        assert_eq!(
+            key_warning(&newer),
+            Some((
+                "DRONE SPEAKS RC 19, THIS APP RC 18: UPDATE THE APP".into(),
+                true
+            ))
+        );
+        let older = Snapshot::parse(r#"{"peer_rc":{"ver":17,"app":18}}"#).expect("parse");
+        assert!(key_warning(&older).unwrap().0.ends_with("UPDATE THE DRONE"));
     }
 
     #[test]
