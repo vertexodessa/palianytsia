@@ -734,6 +734,9 @@ impl eframe::App for App {
                         fps: self.fps,
                         kbps: self.shared.rx_kbps(),
                         dec_errors: self.shared.dec_errors.load(Ordering::Relaxed),
+                        // The desktop decoder counts no stale or refused
+                        // frames; its AU drops are the part it has.
+                        dec_dropped: self.shared.au_dropped.load(Ordering::Relaxed),
                     },
                 );
             });

@@ -39,6 +39,31 @@ pub struct OverlayIn {
     pub fps: f64,
     pub kbps: f64,
     pub dec_errors: u64,
+    /// Frames and AUs the decoder side threw away so far
+    /// (`runtime::Shared::dec_dropped`, or the AU drops where only those are counted).
+    pub dec_dropped: u64,
+}
+
+/// How long the video chip stays coloured after the decoder side last threw video away.
+const DEC_DROP_HOLD_S: f64 = 10.0;
+
+/// The decoder side's drop total as the overlay sees it: the total while it rose within the
+/// last `DEC_DROP_HOLD_S`, else None.
+#[derive(Default)]
+struct DropWatch {
+    seen: u64,
+    rose_at: Option<f64>,
+}
+
+impl DropWatch {
+    fn note(&mut self, total: u64, now: f64) -> Option<u64> {
+        if total > self.seen {
+            (self.seen, self.rose_at) = (total, Some(now));
+        }
+        self.rose_at
+            .is_some_and(|t| now - t < DEC_DROP_HOLD_S)
+            .then_some(self.seen)
+    }
 }
 
 pub struct Console {
@@ -56,6 +81,7 @@ pub struct Console {
     /// relink leaves the old picture up, and that picture is still stale.
     age: FrameAge,
     stall: Stall,
+    dropped: DropWatch,
 }
 
 impl Console {
@@ -73,6 +99,7 @@ impl Console {
             fps: (0.0, 0, Instant::now()),
             age: FrameAge::default(),
             stall: Stall::None,
+            dropped: DropWatch::default(),
         }
     }
 
@@ -160,6 +187,7 @@ impl Console {
     /// the key banner. True when the operator moved a chip.
     pub fn overlay(&mut self, ui: &mut egui::Ui, now: f64, o: OverlayIn) -> bool {
         let r = o.hud;
+        let dropping = self.dropped.note(o.dec_dropped, now);
         let hud_band = crate::hud::hud(
             ui,
             r,
@@ -192,6 +220,7 @@ impl Console {
                         o.fps,
                         o.kbps,
                         o.dec_errors,
+                        dropping,
                     );
                 }
                 crate::key_banner(ui, &self.hist);
@@ -278,6 +307,19 @@ impl Console {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// Quiet until the total rises; then shown for 10 s after the last rise, and a later
+    /// rise starts the 10 s again.
+    #[test]
+    fn the_video_chip_warns_for_ten_seconds_after_a_drop() {
+        let mut w = DropWatch::default();
+        assert_eq!(w.note(0, 1.0), None);
+        assert_eq!(w.note(3, 2.0), Some(3));
+        assert_eq!(w.note(3, 11.9), Some(3));
+        assert_eq!(w.note(3, 12.0), None);
+        assert_eq!(w.note(5, 20.0), Some(5));
+        assert_eq!(w.note(5, 29.0), Some(5));
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("pal-console-{}-{name}", std::process::id()));

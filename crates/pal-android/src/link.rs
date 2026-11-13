@@ -607,6 +607,8 @@ fn decode_loop(
                 starved = Some(t);
             }
             let drops = sh.au_dropped.load(Ordering::Relaxed);
+            sh.dec_dropped
+                .store(tot.stale + tot.no_input + drops, Ordering::Relaxed);
             let ages = dec.as_ref().map(|d| d.take_ages()).unwrap_or_default();
             if let Some(r) = decoder_record(aus, tot, last, drops - last_drops, wait_max_us, ages) {
                 sh.event("decoder", r);

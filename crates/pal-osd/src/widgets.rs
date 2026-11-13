@@ -495,6 +495,7 @@ pub(crate) const SIGNAL_HOLD_S: f64 = 1.5;
 /// rows' height is allocated in `ui`, so what the caller adds next lands
 /// below them. Returns true when the operator moved a chip: save the prefs.
 /// `kbps`: the received video bitrate (runtime::Shared::rx_kbps).
+/// `dec_dropped`: the decoder side's drop total while it rose in the last 10 s, else None.
 pub fn chips(
     ui: &mut Ui,
     pos: &mut std::collections::BTreeMap<String, [f32; 2]>,
@@ -502,6 +503,7 @@ pub fn chips(
     fps: f64,
     kbps: f64,
     dec_errors: u64,
+    dec_dropped: Option<u64>,
 ) -> bool {
     let mut out: Vec<Chip> = Vec::new();
     let mut chip =
@@ -591,8 +593,12 @@ pub fn chips(
                 kbps / 1000.0,
                 dec_errors
             ),
-            OK,
-            None,
+            // Stale frames, refused or dropped AUs: the picture skips while
+            // the bitrate and the error count look fine.
+            if dec_dropped.is_some() { WARN } else { OK },
+            dec_dropped.map(|n| {
+                format!("the decoder side threw video away in the last 10 s ({n} frames and AUs so far)")
+            }),
         );
         // A keyframe storm: one request with its retries sends up to about
         // 10 in 10 s at the longest retry gap (1 s), so 5 or more is either
@@ -775,7 +781,7 @@ mod tests {
                 .frame(egui::Frame::NONE)
                 .show(ctx, |ui| {
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(region), |ui| {
-                        moved = chips(ui, pos, h, 120.0, 9000.0, 0);
+                        moved = chips(ui, pos, h, 120.0, 9000.0, 0, None);
                     });
                 });
         });

@@ -185,6 +185,7 @@ pub fn run(o: OsdIn) {
         };
         ctx.set_pixels_per_point(ppp);
         let dec_errors = o.shared.dec_errors.load(Ordering::Relaxed);
+        let dec_dropped = o.shared.dec_dropped.load(Ordering::Relaxed);
         let mut pout = pal_osd::panel::PanelOut::default();
         let mut chips_moved = false;
         let out = ctx.run(input, |ctx| {
@@ -230,6 +231,7 @@ pub fn run(o: OsdIn) {
                             fps,
                             kbps: o.shared.rx_kbps(),
                             dec_errors,
+                            dec_dropped,
                         },
                     );
                 });

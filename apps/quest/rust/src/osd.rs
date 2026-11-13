@@ -416,6 +416,10 @@ impl Osd {
             .link
             .as_ref()
             .map_or(0, |l| l.shared.dec_errors.load(Ordering::Relaxed));
+        let dec_dropped = self
+            .link
+            .as_ref()
+            .map_or(0, |l| l.shared.dec_dropped.load(Ordering::Relaxed));
         let mut chips_moved = false;
         self.hud.draw(events, |ctx| {
             egui::CentralPanel::default()
@@ -441,6 +445,7 @@ impl Osd {
                             fps,
                             kbps,
                             dec_errors,
+                            dec_dropped,
                         },
                     );
                 });

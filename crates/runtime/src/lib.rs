@@ -62,6 +62,10 @@ pub struct Shared {
     /// The camera's frame rate x10 from AU capture stamps (`cam_fps`); 0
     /// until known. Not in the stats line: M1 compares that byte for byte.
     pub cam_fps_x10: AtomicU32,
+    /// Video the decoder side threw away so far: stale frames, AUs refused for want of an input
+    /// buffer, AUs dropped before the decoder. The Android decode loop stores it once a second;
+    /// the OSD colours the video chip while it rises.
+    pub dec_dropped: AtomicU64,
     /// Telems heard from a drone on another RC version: the RX threads count them, since the
     /// core takes such a frame for no RC at all.
     pub peer_rc: PeerRc,
