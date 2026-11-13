@@ -114,6 +114,17 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   top sixth, and with the refresh off nothing heals until a keyframe). Each set restarts the video
   (625 to 708 ms). Checked: both rows set and read back over the link, `pal-desktop --panel picture
   --params` snapshots against that build. Not yet seen: the switch in the headset.
+- mabur pin, 2026-11-13 (pal-ajcs): the calibration wall rule passes one failing cell when the three
+  cells right above it deliver (`bridge_clean`, flag `bridged` = 1024), and a wall that sits under a
+  faster rate's wall is flagged (`under_faster` = 2048, the wall stays as measured). Both in mabur's
+  GS (`cal_analysis`) and the Rust port (`pal-core` `cal/analysis.rs`, unit tests mirror the C++
+  ones; calibration is outside the ref==rust replay gates); the panel names the flags "dip passed"
+  and "under a faster rate". The case: a 40 MHz mcs5 row of a field run that delivered 19-20 of 20
+  up to index 31 except one cell at -12 (15 of 20) got its wall at -13, and the table went to the
+  drone 44 indices low unflagged; both implementations now give 31. Replayed over the 10
+  calibration logs on disk (158 rows of 20 sweeps): 23 walls change, all upward. Not done: a
+  calibration on the air with the new rule, and the ticket's lesser item (the -45 dBm "saturated"
+  threshold). The drone side is unchanged (the rule runs on the GS), so no maburd rebuild.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.13.1, signed APKs; v0.13.1, 2026-11-13: the channel menu in the desktop app (the apps' link pick at start, `Cmd::Channels` on the live link), maburd and apps as v0.13, bench only; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):

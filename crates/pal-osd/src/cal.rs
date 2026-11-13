@@ -171,6 +171,8 @@ fn flag_words(wall: u64, cap: u64) -> String {
         (4, "narrow"),
         (8, "saturated"),
         (16, "cards disagree"),
+        (1024, "dip passed"),
+        (2048, "under a faster rate"),
     ] {
         if wall & bit != 0 {
             w.push(name);

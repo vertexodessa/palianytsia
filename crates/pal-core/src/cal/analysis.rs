@@ -39,12 +39,20 @@ pub const FLAG_LOSSY: u32 = 1 << 7;
 pub const FLAG_LOST: u32 = 1 << 8;
 /// Too few frames or too short a span to time: eff over the dwell.
 pub const FLAG_SHORT_SPAN: u32 = 1 << 9;
+/// The run passed a single failing cell that had clean cells above it.
+pub const FLAG_BRIDGED: u32 = 1 << 10;
+/// The wall sits under a faster rate's wall (`mark_under_faster`).
+pub const FLAG_UNDER_FASTER: u32 = 1 << 11;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CalThresholds {
     pub deliver_pct: f64,
     pub sat_rssi_dbm: f64,
     pub narrow_span: i32,
+    /// A single failing cell does not end the run when this many cells right
+    /// above it deliver: more power delivered again, so the cell lost its
+    /// frames to the channel, not to the PA. 0 = every failing cell ends it.
+    pub bridge_clean: usize,
     pub card_disagree: i32,
     pub tx_bound_blocked_pct: i32,
     pub lossy_ratio: f64,
@@ -59,6 +67,7 @@ impl Default for CalThresholds {
             deliver_pct: 90.0,
             sat_rssi_dbm: -45.0,
             narrow_span: 4,
+            bridge_clean: 3,
             card_disagree: 2,
             tx_bound_blocked_pct: 50,
             lossy_ratio: 0.9,
@@ -95,25 +104,40 @@ fn delivery_pct(c: &CalCell, card: usize) -> f64 {
     100.0 * f64::from(c.received[card]) / f64::from(c.expected)
 }
 
-/// (floor_idx, wall) of the first contiguous run at or above `pct`.
-fn first_run(cells: &[CalCell], card: usize, pct: f64) -> (i32, i32) {
-    let Some(i) = cells.iter().position(|c| delivery_pct(c, card) >= pct) else {
-        return (NO_WALL, NO_WALL);
+/// (floor_idx, wall, bridged) of the first contiguous run at or above `pct`;
+/// `bridged` counts the single failing cells it passed over because the
+/// `bridge_clean` cells right above each delivered.
+fn first_run(cells: &[CalCell], card: usize, pct: f64, bridge_clean: usize) -> (i32, i32, u32) {
+    let ok = |c: &CalCell| delivery_pct(c, card) >= pct;
+    let Some(mut i) = cells.iter().position(ok) else {
+        return (NO_WALL, NO_WALL, 0);
     };
     let floor = cells[i].idx;
-    let wall = cells[i..]
-        .iter()
-        .take_while(|c| delivery_pct(c, card) >= pct)
-        .last()
-        .map_or(floor, |c| c.idx);
-    (floor, wall)
+    let (mut wall, mut bridged) = (floor, 0);
+    while i < cells.len() {
+        if ok(&cells[i]) {
+            wall = cells[i].idx;
+        } else if bridge_clean > 0
+            && i + bridge_clean < cells.len()
+            && cells[i + 1..=i + bridge_clean].iter().all(ok)
+        {
+            bridged += 1;
+        } else {
+            break;
+        }
+        i += 1;
+    }
+    (floor, wall, bridged)
 }
 
 /// `cells` sorted ascending by idx. The wall is the END OF THE FIRST
 /// CONTIGUOUS run at or above `deliver_pct`: past the first dip delivery
-/// is a comb, and an island there is not headroom. Scored on the best
-/// single card, never the union (diversity does not protect against PA
-/// compression).
+/// is a comb, and an island there is not headroom. One exception: a single
+/// failing cell with `bridge_clean` delivering cells right above it does not
+/// end the run (`FLAG_BRIDGED`); with 20 frames a cell three frames lost to
+/// the channel fail it, and the comb never shows three clean cells in a row
+/// straight after its first dip. Scored on the best single card, never the
+/// union (diversity does not protect against PA compression).
 pub fn analyze_rate(cells: &[CalCell], th: &CalThresholds) -> RateWall {
     let mut out = RateWall::default();
     if cells.is_empty() {
@@ -139,8 +163,11 @@ pub fn analyze_rate(cells: &[CalCell], th: &CalThresholds) -> RateWall {
     if peak != RSSI_NONE && f64::from(peak) > th.sat_rssi_dbm {
         out.flags |= FLAG_SATURATED;
     }
-    let (floor, wall) = first_run(cells, best, th.deliver_pct);
+    let (floor, wall, bridged) = first_run(cells, best, th.deliver_pct, th.bridge_clean);
     out.floor_idx = floor;
+    if bridged > 0 {
+        out.flags |= FLAG_BRIDGED;
+    }
     if floor == NO_WALL {
         out.flags |= FLAG_UNDETERMINED;
         return out;
@@ -157,13 +184,31 @@ pub fn analyze_rate(cells: &[CalCell], th: &CalThresholds) -> RateWall {
     }
     let other = 1 - best;
     if cells.iter().any(|c| c.received[other] > 0) {
-        let (ofloor, owall) = first_run(cells, other, th.deliver_pct);
+        let (ofloor, owall, _) = first_run(cells, other, th.deliver_pct, th.bridge_clean);
         // Compared against the raw run end, as the C++ does.
         if ofloor != NO_WALL && (owall - wall).abs() > th.card_disagree {
             out.flags |= FLAG_CARD_DISAGREE;
         }
     }
     out
+}
+
+/// A slower rate tolerates more transmitter distortion than a faster one, so
+/// its compression wall cannot be the lower of the two: a wall under a
+/// faster rate's wall was cut short by loss that had nothing to do with
+/// power. Such rows get `FLAG_UNDER_FASTER`; the walls stay as measured.
+pub fn mark_under_faster(walls: &mut [RateWall]) {
+    // The highest wall among the rates above the current one.
+    let mut faster = NO_WALL;
+    for w in walls.iter_mut().rev() {
+        if w.wall == NO_WALL {
+            continue;
+        }
+        if faster != NO_WALL && w.wall < faster {
+            w.flags |= FLAG_UNDER_FASTER;
+        }
+        faster = faster.max(w.wall);
+    }
 }
 
 /// One capacity dwell at a single (mcs, bw), per card.
@@ -360,6 +405,109 @@ mod tests {
     }
 
     const BITS: u64 = 1435 * 8;
+
+    /// A row from frames received out of 20 per cell, starting at idx -41.
+    fn row20(got: &[i32]) -> Vec<CalCell> {
+        got.iter()
+            .enumerate()
+            .map(|(i, g)| c(-41 + i as i32, g * 5))
+            .collect()
+    }
+
+    /// 40 MHz mcs5 of a field run, a room between the pair: every cell 19 or
+    /// 20 of 20 up to idx 31 except idx -12, which got 15; delivery ends at 32.
+    #[rustfmt::skip]
+    const FIELD_MCS5: [i32; 105] = [
+        20, 20, 20, 20, 20, 20, 19, 20, 19, 20, 20, 20, 20, 20, 20, 19, 20, 20, 20, 18, 20, // -41..-21
+        20, 20, 19, 20, 20, 20, 19, 20, 15, 20, 20, 19, 20, 20, 20, 19, 20, 20, 20, 20,     // -20..-1
+        20, 20, 20, 20, 20, 20, 20, 19, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 20, 20, 19, // 0..20
+        20, 20, 20, 20, 20, 20, 20, 19, 19, 20, 19, 10, 7, 8, 3, 1, 0, 0, 0, 0,             // 21..40
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,                         // 41..60
+        0, 0, 0,                                                                            // 61..63
+    ];
+
+    #[test]
+    fn a_single_failing_cell_with_clean_cells_above_does_not_end_the_run() {
+        let cells = row20(&FIELD_MCS5);
+        let w = analyze_rate(&cells, &th());
+        assert_eq!((w.wall, w.floor_idx), (31, -41));
+        assert_ne!(w.flags & FLAG_BRIDGED, 0);
+        assert_eq!(w.flags & FLAG_NO_DIP, 0);
+        // With the exception off the old wall comes back.
+        let strict = CalThresholds {
+            bridge_clean: 0,
+            ..th()
+        };
+        let old = analyze_rate(&cells, &strict);
+        assert_eq!(old.wall, -13);
+        assert_eq!(old.flags & FLAG_BRIDGED, 0);
+    }
+
+    #[test]
+    fn a_dip_at_the_edge_still_ends_the_run() {
+        // 20 MHz mcs6 of the same run: 19 16 20 13 10 from idx 25 on.
+        let mut got = vec![20; 66];
+        got.extend([19, 16, 20, 13, 10, 12, 10]);
+        got.resize(105, 0);
+        let w = analyze_rate(&row20(&got), &th());
+        assert_eq!(w.wall, 25);
+        assert_eq!(w.flags & FLAG_BRIDGED, 0);
+    }
+
+    #[test]
+    fn two_failing_cells_in_a_row_end_the_run() {
+        let mut got = [20; 105];
+        got[30] = 15;
+        got[31] = 15;
+        let w = analyze_rate(&row20(&got), &th());
+        assert_eq!(w.wall, -12);
+        assert_eq!(w.flags & (FLAG_BRIDGED | FLAG_NO_DIP), 0);
+    }
+
+    #[test]
+    fn a_failing_cell_near_the_top_of_the_sweep_ends_the_run() {
+        let mut got = [20; 105];
+        got[102] = 15; // idx 61, two cells above it
+        let w = analyze_rate(&row20(&got), &th());
+        assert_eq!(w.wall, 60);
+        assert_eq!(w.flags & (FLAG_BRIDGED | FLAG_NO_DIP), 0);
+        got[102] = 20;
+        got[101] = 15; // idx 60, three clean cells above it
+        let w = analyze_rate(&row20(&got), &th());
+        assert_eq!(w.wall, RAIL_REL);
+        assert_eq!(
+            w.flags & (FLAG_BRIDGED | FLAG_NO_DIP),
+            FLAG_BRIDGED | FLAG_NO_DIP
+        );
+    }
+
+    #[test]
+    fn a_wall_under_a_faster_rates_wall_is_marked() {
+        let wall = |wall| RateWall {
+            wall,
+            ..RateWall::default()
+        };
+        let mut w = [63, 63, 63, 63, 44, -13, 30, 25].map(wall);
+        w[7].flags = FLAG_SATURATED;
+        mark_under_faster(&mut w);
+        for (r, x) in w.iter().enumerate() {
+            assert_eq!(x.flags & FLAG_UNDER_FASTER != 0, r == 5, "rate {r}");
+        }
+        assert_ne!(w[7].flags & FLAG_SATURATED, 0);
+        // An undetermined rate is neither marked nor a reference; equal walls pass.
+        let mut u = [20, NO_WALL, 20, NO_WALL].map(wall);
+        mark_under_faster(&mut u);
+        assert!(u.iter().all(|x| x.flags & FLAG_UNDER_FASTER == 0));
+        u[1].wall = 10;
+        mark_under_faster(&mut u);
+        assert_ne!(u[1].flags & FLAG_UNDER_FASTER, 0);
+        assert_eq!(u[0].flags & FLAG_UNDER_FASTER, 0);
+    }
+
+    #[test]
+    fn flag_bits_match_the_cal_log() {
+        assert_eq!((FLAG_BRIDGED, FLAG_UNDER_FASTER), (1024, 2048));
+    }
 
     #[test]
     fn efficiency_is_delivered_over_the_receive_span() {

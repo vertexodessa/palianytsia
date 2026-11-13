@@ -30,8 +30,8 @@ use pal_wire::cal::{
 use pal_wire::rc::TagCtx;
 
 use super::analysis::{
-    analyze_capacity, analyze_rate, CalCell, CalThresholds, CapCell, CapResult, RateWall,
-    FLAG_LOST, FLAG_NO_DIP, FLAG_TX_BOUND, NO_WALL,
+    analyze_capacity, analyze_rate, mark_under_faster, CalCell, CalThresholds, CapCell, CapResult,
+    RateWall, FLAG_LOST, FLAG_NO_DIP, FLAG_TX_BOUND, NO_WALL,
 };
 use super::log::CalLog;
 use super::picker::{CalPicker, Mode};
@@ -1108,8 +1108,10 @@ impl CalSession {
         let mut any = false;
         let mut walls = [RateWall::default(); 8];
         for (r, row) in rows.iter().enumerate() {
-            let rw = analyze_rate(row, &self.cfg.th);
-            walls[r] = rw;
+            walls[r] = analyze_rate(row, &self.cfg.th);
+        }
+        mark_under_faster(&mut walls);
+        for (r, rw) in walls.into_iter().enumerate() {
             self.log.wall(r as u8, &rw);
             // An undetermined wall is left alone: never a fabricated number
             // over a real measurement.
