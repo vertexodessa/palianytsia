@@ -134,6 +134,18 @@ CFG_NOIQP = "[venc]\nfps = 60\n[fec]\nwindow = 64\n"
 CFG_NOIQP_FIXED = "[venc]\nmin_iqp = 42\nfps = 60\n[fec]\nwindow = 64\n"
 CFG_NOVENC = "[fec]\nwindow = 64"
 CFG_NOVENC_FIXED = "[fec]\nwindow = 64\n[venc]\nmin_iqp = 42\n"
+# A-MPDU off, margin 6 and the single-frame tables: all forced on an uncalibrated drone; a
+# calibrated one (power_mode "offset") keeps its own tables and is told to calibrate again.
+SHIP_ALL = ('[radio]\npower_mode = "none"\nwall_margin_db = 6.0\n[venc]\nmin_iqp = 42\n[ampdu]\nmax_num = 0\n'
+            '[air_clock]\nefficiency_20 = [0.90, 0.87]\nefficiency_40 = [0.87, 0.81]\n[fec]\nwindow = 64\n')
+CFG_OLD = ('[radio]\npower_mode = "none"\nwall_margin_db = 1.0\n[venc]\nmin_iqp = 34\n[ampdu]\nmax_num = 6\n'
+           '[air_clock]\nefficiency_20 = [0.93, 0.88]  # old\nefficiency_40 = [0.77, 0.75]\n[fec]\nwindow = 64\n')
+CFG_OLD_FIXED = ('[radio]\npower_mode = "none"\nwall_margin_db = 6.0\n[venc]\nmin_iqp = 42\n[ampdu]\nmax_num = 0\n'
+                 '[air_clock]\nefficiency_20 = [0.90, 0.87]  # old\nefficiency_40 = [0.87, 0.81]\n[fec]\nwindow = 64\n')
+CFG_CAL = CFG_OLD.replace('"none"', '"offset"')
+CFG_CAL_FIXED = CFG_CAL.replace("1.0", "6.0").replace("= 34", "= 42").replace("max_num = 6", "max_num = 0")
+CFG_MULTI = CFG_OLD.replace("[0.93, 0.88]  # old", "[\n  0.93,\n  0.88]")
+CFG_MULTI_FIXED = CFG_OLD_FIXED.replace("[0.90, 0.87]  # old", "[\n  0.93,\n  0.88]")
 # The check: a key this maburd lacks, a value of the wrong type, a key the file lacks and a tuned value.
 SHIP_CHECK = "[venc]\nmin_iqp = 42\nfps = 60\n[fec]\nwindow = 64\nsymbol_size = 332\n"
 CFG_CHECK = '[venc]\nmin_iqp = 42\nfps = "60"\nbogus_knob = 1\n[fec]\nwindow = 32\n'
@@ -308,6 +320,22 @@ SCENARIOS = [
     S("forced_min_iqp_already_shipped_value_changes_nothing", drone=dict(bin_=BIN_NEW, cfg=CFG_IQP42),
       pkg=dict(cfg=SHIP_IQP),
       rc=0, toml=CFG_IQP42, changes={}, backup=None, says=["== already installed, nothing to do"]),
+    S("uncalibrated_drone_gets_ampdu_off_margin_and_tables", drone=dict(bin_=BIN_NEW, cfg=CFG_OLD),
+      pkg=dict(cfg=SHIP_ALL),
+      rc=0, toml=CFG_OLD_FIXED, changes={"etc/mabur.toml": CFG_OLD_FIXED},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_OLD, "maburd": "BIN_NEW"},
+      says=["ampdu.max_num 6 set to 0", "radio.wall_margin_db 1.0 set to 6.0",
+            "air_clock.efficiency_20 [0.93, 0.88] set to [0.90, 0.87]"]),
+    S("calibrated_drone_keeps_its_tables_and_is_told_to_calibrate", drone=dict(bin_=BIN_NEW, cfg=CFG_CAL),
+      pkg=dict(cfg=SHIP_ALL),
+      rc=0, toml=CFG_CAL_FIXED, changes={"etc/mabur.toml": CFG_CAL_FIXED},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_CAL, "maburd": "BIN_NEW"},
+      says=["measured with A-MPDU on; calibrate again"]),
+    S("table_over_several_lines_is_left_and_reported", drone=dict(bin_=BIN_NEW, cfg=CFG_MULTI),
+      pkg=dict(cfg=SHIP_ALL),
+      rc=0, toml=CFG_MULTI_FIXED, changes={"etc/mabur.toml": CFG_MULTI_FIXED},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_MULTI, "maburd": "BIN_NEW"},
+      says=["air_clock.efficiency_20 spans several lines; left as it is"]),
     S("update_reports_what_the_kept_config_gets_wrong", drone=dict(bin_=BIN_NEW, cfg=CFG_CHECK),
       pkg=dict(bin_=BIN_NEW2, cfg=SHIP_CHECK),
       rc=0, toml=CFG_CHECK, changes={"usr/bin/maburd": "BIN_NEW2"},

@@ -99,7 +99,7 @@ On a drone that already runs maburd (update) it:
 
 1. shows the sha256 of what runs now and of what is about to go in, and stops if they already match;
 2. saves the current `maburd` and `mabur.toml` to `./drone-backup-<date>/` on the PC;
-3. keeps the drone's `mabur.toml` (`--config` replaces it with the one in this folder), except for the keys whose shipped value a release requires on every drone: `venc.min_iqp` (the keyframe size floor; 34 and below make keyframes of 200 kB and more) is set to the value in this folder's `drone/mabur.toml`, and the script says so;
+3. keeps the drone's `mabur.toml` (`--config` replaces it with the one in this folder), except for the keys whose shipped value a release requires on every drone, which are set to the values in this folder's `drone/mabur.toml`, each change printed: `venc.min_iqp` (the keyframe size floor; 34 and below make keyframes of 200 kB and more), `ampdu.max_num` (0, A-MPDU off), `radio.wall_margin_db` (6) and, on a drone not calibrated yet (`power_mode` not `"offset"`), the capacity tables `air_clock.efficiency_20/_40`; a calibrated drone keeps its own tables and is told to calibrate again when they were measured with A-MPDU on;
 4. checks the kept file against this folder's `drone/mabur.toml` and lists what needs a look (keys this maburd does not know and would not start on, values of the wrong type, keys the file lacks, for which maburd runs its built-in value) and the values set apart from the shipped ones;
 5. stops the service, swaps the binary and starts it again.
 

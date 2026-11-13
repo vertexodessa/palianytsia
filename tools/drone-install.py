@@ -69,10 +69,24 @@ FEC_WINDOW = 64  # the window the frame-tail repair rule is measured with
 REMOVED_KEY = b"repairs_with_frame"  # [fec], gone with the frame-tail rule
 FRAME_TAIL_MARK = b"frame_end_us/rep="  # a log format only that rule's builds print
 MODULE = "sensor_imx415_star6e.ko"
-# Keys an update sets to the shipped value whatever the drone's file holds.
+# Keys an update sets to the shipped value whatever the drone's file holds;
+# "uncalibrated" ones only on a drone that has not been calibrated
+# (power_mode is not "offset"), since calibration writes them for its card.
 # venc.min_iqp: the keyframe QP floor; 34 and below make keyframes of 200 kB
 # and more at the fast rungs, a quarter of a second of air each.
-FORCED = (("venc", "min_iqp"),)
+# ampdu.max_num 0: A-MPDU off; aggregates of 6 lost 11 symbols or more of the
+# base stream several times a minute on the bench, singles none.
+# radio.wall_margin_db 6: at 1 dB a calibrated card parks rates where frames
+# already drop.
+# air_clock.efficiency_20/_40: the single-frame capacity tables that go with
+# A-MPDU off; the older shipped ones were measured with aggregates.
+FORCED = (
+    ("venc", "min_iqp", "always"),
+    ("ampdu", "max_num", "always"),
+    ("radio", "wall_margin_db", "always"),
+    ("air_clock", "efficiency_20", "uncalibrated"),
+    ("air_clock", "efficiency_40", "uncalibrated"),
+)
 
 # These three run on the drone, which has busybox sh and no Python.
 REMOVE_SH = r'''for s in S00mabur S96mabur; do [ -x /etc/init.d/$s ] && /etc/init.d/$s stop >/dev/null 2>&1; done
@@ -371,12 +385,23 @@ def shipped_value(text, section, key):
     return None
 
 
+def _number(raw):
+    try:
+        return float(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
 def force_keys(text, bundle):
     """Sets each FORCED key to the bundle's value: replaced in place (the
     line's comment stays), added under its section, or added with a new
     section at the end. Returns (text, changes, warnings)."""
     changes, warnings = [], []
-    for section, key in FORCED:
+    calibrated = shipped_value(text, "radio", "power_mode") == b'"offset"'
+    old_agg = _number(shipped_value(text, "ampdu", "max_num"))
+    for section, key, when in FORCED:
+        if when == "uncalibrated" and calibrated:
+            continue
         value = shipped_value(bundle, section, key)
         if value is None:
             warnings.append(f"{section}.{key}: the shipped mabur.toml has no value to set it to")
@@ -393,7 +418,10 @@ def force_keys(text, bundle):
             if m:
                 done = True
                 old = m[2].strip()
-                if old != value:
+                if old.startswith(b"[") and not old.endswith(b"]"):
+                    warnings.append(f"{section}.{key} spans several lines; left as it is, set it to "
+                                    f"{value.decode(errors='replace')} by hand")
+                elif old != value:
                     lines[i] = m[1] + value + m[3] + line[len(bare):]
                     changes.append(f"{section}.{key} {old.decode(errors='replace')} set to "
                                    f"{value.decode(errors='replace')}, the value this release ships for every drone")
@@ -409,6 +437,10 @@ def force_keys(text, bundle):
             changes.append(f"{section}.{key} added at {value.decode(errors='replace')}, "
                            "the value this release ships for every drone")
         text = b"".join(lines)
+    new_agg = _number(shipped_value(text, "ampdu", "max_num"))
+    if calibrated and old_agg and new_agg == 0:
+        warnings.append("air_clock.efficiency_20/_40 are this drone's calibration, measured with A-MPDU on; "
+                        "calibrate again (Link tab) so they hold single frames")
     return text, changes, warnings
 
 
