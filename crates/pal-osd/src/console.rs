@@ -250,6 +250,7 @@ impl Console {
                 log_info,
                 cal: self.hist.last().and_then(|s| s.cal.as_ref()),
                 scan: self.hist.last().and_then(|s| s.chscan.as_ref()),
+                cards: self.hist.last().map_or(0, |s| s.cards.len()),
                 channels,
                 warning: self.hist.last().and_then(crate::key_warning),
                 armed: self.telem.last_s.map(|_| self.telem.armed),

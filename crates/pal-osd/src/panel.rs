@@ -185,6 +185,9 @@ pub struct PanelIn<'a> {
     pub channels: &'a [u8],
     /// The latest channel scan, for the channel menu.
     pub scan: Option<&'a crate::channels::ScanView>,
+    /// Receiving cards in the latest stats line (0 before one): with one the
+    /// scan takes the link card itself off the video.
+    pub cards: usize,
     /// A standing warning for the Flight tab and whether it is an error
     /// (`widgets::key_warning`).
     pub warning: Option<(String, bool)>,
@@ -830,7 +833,7 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             }
         }
         Tab::Link if p.chan_menu && !i.channels.is_empty() => {
-            let m = channel_menu(ui, i.prefs, i.channels, i.scan, look);
+            let m = channel_menu(ui, i.prefs, i.channels, i.scan, i.cards, look);
             p.chan_menu = !m.back;
             if let Some(c) = m.choose {
                 out.prefs_changed = true;
@@ -844,7 +847,9 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             if !i.channels.is_empty() {
                 if let Some(set) = channels_button(ui, i.prefs, i.channels, h) {
                     p.chan_menu = true;
-                    cmd = Some(Cmd::ChannelScan(set));
+                    if scan_on_open(i.cards, i.scan.is_some_and(|s| s.running)) {
+                        cmd = Some(Cmd::ChannelScan(set));
+                    }
                 }
             }
             ui.horizontal(|ui| {
@@ -1005,6 +1010,17 @@ fn channels_button(ui: &mut Ui, prefs: &HudPrefs, set: &[u8], h: f32) -> Option<
     ui.add(b).clicked().then_some(offer)
 }
 
+/// Opening the channel menu scans only on a spare card, and never restarts
+/// a scan that is running. On one card a scan step takes the link card off
+/// the video for about 30 ms every 120 ms (two 10 ms dwells plus retunes and
+/// register reads): measured on the bench, 19-27 % of the drone's frames
+/// lost for the 6 s of the scan and the link down to its lowest rung. Menu
+/// visits in a row restarted it each time and the session dropped. There it
+/// waits for the operator's "scan".
+fn scan_on_open(cards: usize, running: bool) -> bool {
+    cards >= 2 && !running
+}
+
 #[derive(Default)]
 struct MenuOut {
     back: bool,
@@ -1033,6 +1049,7 @@ fn channel_menu(
     prefs: &mut HudPrefs,
     set: &[u8],
     scan: Option<&crate::channels::ScanView>,
+    cards: usize,
     look: Look,
 ) -> MenuOut {
     use crate::channels::{chosen, offered, toggle};
@@ -1051,7 +1068,7 @@ fn channel_menu(
             next = Some(Vec::new());
         }
         let running = scan.is_some_and(|s| s.running);
-        let b = btn("rescan", h);
+        let b = btn(if scan.is_some() { "rescan" } else { "scan" }, h);
         if ui.add_enabled(!running, b).clicked() {
             out.rescan = Some(offer.clone());
         }
@@ -1059,6 +1076,9 @@ fn channel_menu(
     let status = match scan {
         Some(s) if s.running => format!("scanning, pass {} of {}", s.pass + 1, s.passes),
         Some(_) => "scan done".to_string(),
+        None if cards < 2 => {
+            "no scan yet: \"scan\" takes this card off the video for 6 s".to_string()
+        }
         None => "no scan (no link core yet)".to_string(),
     };
     ui.label(RichText::new(status).small().color(Color32::GRAY));
@@ -1114,8 +1134,10 @@ fn channel_menu(
     ui.label(
         RichText::new(format!(
             "{mode} A change moves the link by a hop, without restarting it. The link \
-             channel's reading includes the link itself. With one card the scan leaves the \
-             link channel for 10 ms at a time: expect a few dropped frames while it runs."
+             channel's reading includes the link itself. With one card the scan takes the \
+             link card off the video about a quarter of the time for 6 s: about 20 % of the \
+             frames are lost and the link drops to its lowest rung, so scan on the ground. \
+             With two cards the spare card scans and the video is not touched."
         ))
         .small()
         .color(Color32::GRAY),
@@ -1130,6 +1152,14 @@ fn channel_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_menu_scans_on_open_only_on_a_spare_card_and_never_restarts_one() {
+        assert!(scan_on_open(2, false));
+        assert!(!scan_on_open(2, true), "a running scan is not restarted");
+        assert!(!scan_on_open(1, false), "one card: the operator starts it");
+        assert!(!scan_on_open(0, false), "no stats yet counts as one card");
+    }
 
     #[test]
     fn menu_from_waybeams_six_mode_driver() {
