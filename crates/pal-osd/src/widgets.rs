@@ -210,6 +210,7 @@ pub fn drone_state_name(s: i64) -> &'static str {
 const OK: Color32 = Color32::from_rgb(90, 200, 120);
 const WARN: Color32 = Color32::from_rgb(230, 180, 60);
 const BAD: Color32 = Color32::from_rgb(230, 80, 70);
+const STALE: Color32 = Color32::from_rgb(150, 150, 150);
 
 /// The UI stats lines (10 Hz from the core loop) of the last 60 s, for the
 /// monitor plots.
@@ -621,8 +622,14 @@ pub fn chips(
                     c = WARN;
                 }
             }
-            // "rendezvous  100 C"
-            chip("drone", 17, &t, c, None);
+            // Without a session the values are the last Telem the GS heard,
+            // not the drone now: a green "linked" there misleads.
+            if !s.session {
+                t += " stale";
+                c = STALE;
+            }
+            // "rendezvous  100 C stale"
+            chip("drone", 23, &t, c, None);
         }
         if let Some(ms) = s.drone_shed_ms {
             chip(

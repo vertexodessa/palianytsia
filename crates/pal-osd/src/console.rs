@@ -160,7 +160,7 @@ impl Console {
     /// the key banner. True when the operator moved a chip.
     pub fn overlay(&mut self, ui: &mut egui::Ui, now: f64, o: OverlayIn) -> bool {
         let r = o.hud;
-        crate::hud::hud(
+        let hud_band = crate::hud::hud(
             ui,
             r,
             o.video.center(),
@@ -175,7 +175,11 @@ impl Console {
         let mut moved = false;
         if self.prefs.stats || mismatch || o.status.is_some() {
             let base = if o.chips_in_hud { r } else { o.video };
-            let top = base.shrink(8.0).translate(egui::vec2(0.0, o.top_offset));
+            let mut top = base.shrink(8.0).translate(egui::vec2(0.0, o.top_offset));
+            // Below the HUD's top line, whatever its size: a TELEMETRY LOST
+            // under the arm state, or a headset's larger text, would otherwise
+            // sit under the first chip row or the banner.
+            top.min.y = top.min.y.max(hud_band + 6.0);
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top), |ui| {
                 if let Some(s) = o.status {
                     ui.label(s);

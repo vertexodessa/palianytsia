@@ -39,7 +39,18 @@ fn mmss(s: f64) -> String {
 /// Paints the HUD into `r` (the video rect, or the part of it left of an
 /// open settings panel, in points). `centre` is the video's centre: the dot
 /// marks the camera axis, so it must not follow `r` when the panel narrows it.
-pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f64, pf: &HudPrefs) {
+/// Returns the bottom of what it painted along the top edge (arm state, timer,
+/// TELEMETRY LOST, the link readout), so the stats chips and the key banner
+/// can start below it instead of covering it.
+pub fn hud(
+    ui: &Ui,
+    r: Rect,
+    centre: Pos2,
+    t: &Telemetry,
+    h: &History,
+    now_s: f64,
+    pf: &HudPrefs,
+) -> f32 {
     let base = (r.height() / 22.0).clamp(11.0, 22.0) * pf.scale;
     let pad = base * 0.8;
     let p = ui.painter();
@@ -57,11 +68,14 @@ pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f6
     let link = h.last();
     let session = link.is_some_and(|s| s.session);
 
+    let mut band = r.top();
+    let mut under = |x: Rect| band = band.max(x.bottom());
+
     // Top left: arm state and flight timer.
     let tl = r.left_top() + Vec2::new(pad, pad);
     if !pf.timer {
     } else if t.last_s.is_none() {
-        text(ui, tl, Align2::LEFT_TOP, "NO TELEMETRY", base, WARN);
+        under(text(ui, tl, Align2::LEFT_TOP, "NO TELEMETRY", base, WARN));
     } else {
         let (arm, col) = if t.armed {
             ("ARMED", BAD)
@@ -69,6 +83,7 @@ pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f6
             ("DISARMED", OK)
         };
         let a = text(ui, tl, Align2::LEFT_TOP, arm, base, col);
+        under(a);
         text(
             ui,
             a.right_top() + Vec2::new(base * 0.6, 0.0),
@@ -78,14 +93,14 @@ pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f6
             WHITE,
         );
         if !fresh {
-            text(
+            under(text(
                 ui,
                 a.left_bottom() + Vec2::new(0.0, base * 0.2),
                 Align2::LEFT_TOP,
                 "TELEMETRY LOST",
                 base * 0.8,
                 BAD,
-            );
+            ));
         }
     }
 
@@ -97,20 +112,27 @@ pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f6
         (true, Some((rssi, snr))) => {
             let mcs = link.map_or(-1, |s| s.mcs);
             let col = if snr > 15.0 { WHITE } else { WARN };
-            text(
+            under(text(
                 ui,
                 tr,
                 Align2::RIGHT_TOP,
                 &format!("{rssi:>4.0}dBm MCS{mcs}"),
                 base * 0.9,
                 col,
-            );
+            ));
         }
         (true, None) => {
-            text(ui, tr, Align2::RIGHT_TOP, "NO SIGNAL", base * 0.9, BAD);
+            under(text(
+                ui,
+                tr,
+                Align2::RIGHT_TOP,
+                "NO SIGNAL",
+                base * 0.9,
+                BAD,
+            ));
         }
         (false, _) => {
-            text(ui, tr, Align2::RIGHT_TOP, "NO LINK", base, BAD);
+            under(text(ui, tr, Align2::RIGHT_TOP, "NO LINK", base, BAD));
         }
     }
 
@@ -124,6 +146,7 @@ pub fn hud(ui: &Ui, r: Rect, centre: Pos2, t: &Telemetry, h: &History, now_s: f6
     if pf.messages {
         messages(ui, centre, r, t, base, now_s);
     }
+    band
 }
 
 fn battery(ui: &Ui, r: Rect, t: &Telemetry, base: f32, pad: f32) {
@@ -253,5 +276,41 @@ mod tests {
         assert_eq!(mmss(0.0), "00:00");
         assert_eq!(mmss(83.9), "01:23");
         assert_eq!(mmss(-5.0), "00:00");
+    }
+
+    /// The band the HUD reports covers what it painted along the top: one line with fresh
+    /// telemetry, and the TELEMETRY LOST line under the arm state once it goes stale, so the
+    /// chips placed below the band never cover it.
+    #[test]
+    fn the_top_band_grows_by_the_telemetry_lost_line() {
+        use super::*;
+        let r = Rect::from_min_size(Pos2::new(0.0, 100.0), Vec2::new(1280.0, 720.0));
+        let band_at = |now_s: f64| {
+            let t = Telemetry {
+                last_s: Some(1.0),
+                ..Default::default()
+            };
+            let mut band = 0.0;
+            let ctx = egui::Context::default();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    band = hud(
+                        ui,
+                        r,
+                        r.center(),
+                        &t,
+                        &History::default(),
+                        now_s,
+                        &HudPrefs::default(),
+                    );
+                });
+            });
+            band
+        };
+        let base = (r.height() / 22.0).clamp(11.0, 22.0);
+        let fresh = band_at(1.5);
+        let lost = band_at(60.0);
+        assert!(fresh >= r.top() + base, "one line: {fresh}");
+        assert!(lost >= fresh + base * 0.8, "fresh {fresh}, lost {lost}");
     }
 }
