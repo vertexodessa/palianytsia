@@ -6,8 +6,12 @@
 //! no such view); it measures, it never moves the link.
 use crate::json::J;
 
-/// Dwell length: long enough for a busy reading, short enough that a
-/// one-card link loses a frame or two per dwell at most.
+/// Dwell length: long enough for a busy reading. On one card it is not
+/// cheap: a step (PER_STEP dwells back to back, each 10 ms plus about 2.3 ms
+/// of retunes and register reads on an 8812AU) left 31 ms holes in the
+/// drone's frames every STEP_MS, about 17 frames at the lowest rung and 70
+/// at the top; the bench lost 19-27 % for the 6 s of a scan. So with one
+/// card the panel scans only when asked.
 pub const OBSERVE_MS: i32 = 10;
 /// Passes over the set; a channel's reading is their mean.
 pub const PASSES: u32 = 4;
