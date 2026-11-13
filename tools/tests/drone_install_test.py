@@ -120,6 +120,13 @@ CFG_WALLS_SPLIT = "[radio]\n  rate_walls_rel_20 = [63, 63, 63, 42, 20, 1, -2, -4
 CFG_WALLS_BOTH = "[radio]\nrate_walls_rel = [1, 2, 3, 4, 5, 6, 7, 8]\nrate_walls_rel_20 = [63, 63, 63, 63, 45, 23, 22, 21]\n[fec]\nwindow = 64\n"
 CFG_WALLS_BOTH_FIXED = "[radio]\nrate_walls_rel_20 = [63, 63, 63, 63, 45, 23, 22, 21]\n[fec]\nwindow = 64\n"
 
+# The camera tuning file: a name under /etc/sensors of another drone; the same key outside [venc] is not it.
+CFG_BIN = '[osd]\nsensor_bin = "/etc/sensors/other.bin"\n[venc]\n  sensor_bin = "/etc/sensors/gregspike5.bin"  # tuning\n[fec]\nwindow = 64\n'
+CFG_BIN_335 = CFG_BIN.replace("gregspike5.bin", "imx335_infinity6e.bin")
+CFG_BIN_415 = CFG_BIN.replace("gregspike5.bin", "imx415.bin")
+CFG_BIN_HOME = '[venc]\nsensor_bin = "/root/mine.bin"\n[fec]\nwindow = 64\n'
+STOCK_BINS = ("imx335_infinity6c.bin", "imx335_infinity6e.bin", "imx415.bin", "imx415_infinity6c.bin", "imx415_infinity6e.bin")
+
 LS = b"#!/bin/sh\ncase $SENSOR in\n\timx335)\n\t\tinsmod x\n\t\t;;\nesac\n"
 LS_PATCHED = (
     "#!/bin/sh\ncase $SENSOR in\n\t\timx415)\n"
@@ -171,7 +178,7 @@ def snapshot(root):
 
 
 def make_drone(root, bin_=BIN_OLD, cfg=CFG_KEY, wrapper="S96mabur", stock=(), ls=LS, ls_orig=None,
-               init_off=(), module=False, log=True):
+               init_off=(), module=False, log=True, sensors=()):
     for d in ("usr/bin", "etc/init.d", "tmp", "lib/modules/5.10/sigmastar", "lib/modules/5.10/extra", "overlay", "rom"):
         (root / d).mkdir(parents=True, exist_ok=True)
     (root / ".fake-drone").touch()
@@ -192,6 +199,10 @@ def make_drone(root, bin_=BIN_OLD, cfg=CFG_KEY, wrapper="S96mabur", stock=(), ls
         (root / "usr/bin/load_sigmastar.palianytsia").write_bytes(ls_orig)
     if module:
         (root / "lib/modules/5.10/sigmastar/sensor_imx415_star6e.ko").write_bytes(KO)
+    if sensors:
+        (root / "etc/sensors").mkdir()
+        for name in sensors:
+            (root / "etc/sensors" / name).write_bytes(b"t")
     (root / "lib/modules/5.10/extra/8812eu.ko").write_bytes(b"k")
     if log:
         (root / "tmp/mabur.log").write_text("maburd: build mabur abc\n")
@@ -297,6 +308,33 @@ SCENARIOS = [
           "usr/bin/maburd": "BIN_NEW",
       },
       backup=None, says=["(undo: install.py --remove D)", "== rebooting, waiting for the drone", "== done"]),
+    # The camera tuning file is fitted to what the drone has under /etc/sensors.
+    S("sensor_bin_missing_on_drone_set_to_the_image_file_for_its_sensor",
+      drone=dict(bin_=BIN_NEW, cfg=CFG_BIN, sensors=STOCK_BINS), pkg=dict(cfg=None),
+      rc=0, toml=CFG_BIN_335, changes={"etc/mabur.toml": CFG_BIN_335},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_BIN, "maburd": "BIN_NEW"},
+      says=["mabur.toml: venc.sensor_bin set to /etc/sensors/imx335_infinity6e.bin, this drone has no /etc/sensors/gregspike5.bin"]),
+    S("sensor_bin_falls_back_to_the_plain_sensor_file",
+      drone=dict(bin_=BIN_NEW, cfg=CFG_BIN, sensors=("imx415.bin", "imx335_infinity6e.bin")), pkg=dict(cfg=None),
+      env={"FAKE_SENSOR": "imx415", "FAKE_LSMOD": "sensor_imx415_mipi"},
+      rc=0, toml=CFG_BIN_415, changes={"etc/mabur.toml": CFG_BIN_415},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_BIN, "maburd": "BIN_NEW"}),
+    S("sensor_bin_present_on_drone_left_alone",
+      drone=dict(bin_=BIN_NEW, cfg=CFG_BIN, sensors=STOCK_BINS + ("gregspike5.bin",)), pkg=dict(cfg=None),
+      rc=0, toml=CFG_BIN, changes={}, backup=None, says=["== already installed, nothing to do"]),
+    S("sensor_bin_with_no_file_for_the_sensor_warns_and_keeps_the_path",
+      drone=dict(bin_=BIN_NEW, cfg=CFG_BIN, sensors=("imx415.bin",)), pkg=dict(cfg=None),
+      rc=0, toml=CFG_BIN, changes={}, backup=None,
+      says=["venc.sensor_bin: /etc/sensors/gregspike5.bin is not on this drone and it has no tuning file for sensor 'imx335'"]),
+    S("sensor_bin_outside_etc_sensors_left_alone",
+      drone=dict(bin_=BIN_NEW, cfg=CFG_BIN_HOME, sensors=STOCK_BINS), pkg=dict(cfg=None),
+      rc=0, toml=CFG_BIN_HOME, changes={}, backup=None),
+    S("first_install_fits_the_shipped_sensor_bin",
+      drone=dict(bin_=None, cfg=None, wrapper=None, sensors=STOCK_BINS), pkg=dict(cfg=CFG_BIN),
+      rc=0, toml=CFG_BIN_335,
+      changes={"etc/init.d.off": "dir", "etc/init.d/S96mabur": "INIT", "etc/mabur.toml": CFG_BIN_335, "etc/modprobe.d": "dir",
+               "etc/modprobe.d/palianytsia.conf": "blacklist 8812eu\n", "usr/bin/maburd": "BIN_NEW"},
+      backup=None),
     S("first_install_without_config_refuses", drone=dict(bin_=None, cfg=None, wrapper=None), pkg=dict(cfg=None),
       rc=2, toml=None, changes={}, backup=None, says=["a first install needs S96mabur and mabur.toml"]),
 

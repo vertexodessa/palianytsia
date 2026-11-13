@@ -93,6 +93,8 @@ On a stock OpenIPC FPV image (first install) it:
 2. blacklists the kernel Wi-Fi drivers in `/etc/modprobe.d/palianytsia.conf`, because maburd drives the card from user space;
 3. installs `maburd`, `mabur.toml` and the init script `/etc/init.d/S96mabur`, and reboots the drone.
 
+The camera tuning file (`venc.sensor_bin`) is fitted to the drone on the way, on an update too: when the configured file under `/etc/sensors` is not on the drone, the script sets the image's own file for the drone's sensor (`<sensor>_infinity6e.bin`, else `<sensor>.bin`) and says so. With no such file maburd still starts, and the picture runs untuned.
+
 On a drone that already runs maburd (update) it:
 
 1. shows the sha256 of what runs now and of what is about to go in, and stops if they already match;
@@ -127,6 +129,28 @@ To go back to the stock image (majestic + wifibroadcast, the original `load_sigm
 ```
 
 maburd refuses config keys it does not know, so `install.py` fits the config to the maburd it installs: it removes `fec.repairs_with_frame` when that maburd does not have the key (the original stays in the backup). A v0.8.x maburd takes that key as optional; a v0.7.1 or older one and v0.9 refuse a config that has it (v0.4 added `venc.binning`; a v0.3 binary refuses a config with it). Roll back with the backup folder (it restores the config it saved), not by copying an older maburd by hand.
+
+### What a first install gives
+
+A first install puts `drone/mabur.toml` on the drone as it is (an update keeps the drone's own file). With it and the ground station's defaults:
+
+| | Out of the box | Changed in |
+|---|---|---|
+| Picture | 1920x1080 at 90 fps, full view (binned) | settings, Picture tab |
+| Video bitrate | 1 to 14 Mbit/s, chosen by the link; at most 65 % of the capacity measured for the rate in use | Picture tab, Advanced: `ENC_BITRATE_MAX`, `ENC_AIRTIME` |
+| Width | 20 MHz (the ground station's default; the drone follows the ground station) | Link tab |
+| Channels | 40, 64, 112, 144, picked by the ground station | Link tab, Channels |
+| TX power | the card's own default power; the wall tables in the file are not used (`power_mode = "none"`) | Calibrate |
+| Capacity tables | the reference board's, in use from the first flight | Calibrate |
+| Error correction | +50 % repair data on the base layer, window 64; frame aggregation off | `mabur.toml` |
+| Keyframes | only when the ground station asks for one; quality floor `min_iqp` 42 | Picture tab |
+| Flight controller | MSP on `/dev/ttyS2` at 115200 for the OSD and the arm state; while disarmed the video drops to 1 Mbit/s at 30 fps | `mabur.toml`, `[msp]` and `[low_power]` |
+| Recording | on the drone's microSD when the ground station asks, 1920x1080 at 36 Mbit/s | Recording tab |
+| Pairing | the built-in default key | `/etc/mabur.key` on both ends |
+
+Calibrate (Link tab, drone at a distance and disarmed) measures this drone's card instead of the reference board: the highest clean TX power per rate (the walls) and the delivered capacity per rate, at 20 MHz and, against this maburd, at 40 MHz with the board's receive-gain floor. It writes them into the drone's `mabur.toml` and switches `power_mode` to `"offset"`. From then on each rate is sent `wall_margin_db` (6 dB) under its wall. On the bench drone a margin of 1 dB parked MCS 4 about 2 dB above the card's default power, where frames already drop; with 6 dB the top rung held 585 of 610 s, against 67 of 606 s uncalibrated.
+
+When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, or with a native (not binned) camera mode, the link carries more; if the OSD shows the bitrate at the ceiling on the top rung, raise `ENC_BITRATE_MAX` (the bench drone runs 18000 with `ENC_AIRTIME` 0.75 at 40 MHz). Values above the factory ones were run on one bench drone and not flown.
 
 ## Known limits in v0.13
 

@@ -35,7 +35,9 @@ BEFORE the copy, so the new one fits; the new files are checked by sha256 in
 the binary go together: maburd refuses config keys it does not know, so a new
 binary with an old config (or the reverse) would never start. migrate_config
 edits the config that lands on the drone to suit the new binary (the original
-stays in the backup).
+stays in the backup). The camera tuning file is fitted to the drone as well:
+a venc.sensor_bin under /etc/sensors that the drone does not have is set to
+the image's own file for its sensor.
 """
 import argparse
 import fnmatch
@@ -92,6 +94,7 @@ echo "bin_kb=$( [ -f /usr/bin/maburd ] && du -k /usr/bin/maburd | cut -f1 || ech
 echo "mod_sha=$(sha256sum /lib/modules/$(uname -r)/sigmastar/sensor_imx415_star6e.ko 2>/dev/null | cut -d' ' -f1)"
 echo "ls_patched=$(grep -c sensor_imx415_star6e /usr/bin/load_sigmastar 2>/dev/null)"
 echo "old_tail=$(grep -c 'frame_end_us/rep=' /usr/bin/maburd 2>/dev/null)"
+echo "sensor_bins=$(for f in /etc/sensors/*.bin; do [ -f "$f" ] && printf '%s ' "${f##*/}"; done)"
 '''
 
 # Run with NEW_BIN, HAVE_CFG, NEW_CFG, MOD_TODO, NEW_MOD, LS_TODO, NEW_LS and
@@ -329,6 +332,40 @@ def migrate_config(text, strip_key, raise_window, split_walls=False):
     return b"".join(out), changes
 
 
+def fit_sensor_bin(text, info):
+    """venc.sensor_bin names the camera tuning file, and images differ in what
+    they carry under /etc/sensors. maburd starts without the file (it falls
+    back to /etc/sensors/<sensor>.bin, and to no tuning when that is missing
+    too), so a wrong path shows only as a badly exposed picture. A path under
+    /etc/sensors that this drone does not have is set to the image's own file
+    for its sensor; a path elsewhere is the owner's business.
+    Returns (text, changes, warnings)."""
+    have = (info.get("sensor_bins") or "").split()
+    sensor = info.get("sensor") or ""
+    in_venc = False
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        bare = line.rstrip(b"\r\n")
+        if re.match(rb"[ \t]*\[", bare):
+            in_venc = re.fullmatch(rb"[ \t]*\[venc\][ \t]*(#.*)?", bare) is not None
+        m = re.match(rb'([ \t]*sensor_bin[ \t]*=[ \t]*")/etc/sensors/([^"/]+)(")', bare) if in_venc else None
+        if not m:
+            continue
+        name = m[2].decode(errors="replace")
+        if name in have:
+            return text, [], []
+        # Infinity6E is the only family maburd is built for (check_drone).
+        pick = next((c for c in (f"{sensor}_infinity6e.bin", f"{sensor}.bin") if sensor and c in have), None)
+        if not pick:
+            return text, [], [
+                f"venc.sensor_bin: /etc/sensors/{name} is not on this drone and it has no tuning file for "
+                f"sensor '{sensor or '?'}'; the picture runs untuned until the file is there"
+            ]
+        lines[i] = m[1] + b"/etc/sensors/" + pick.encode() + line[m.end(2):]
+        return b"".join(lines), [f"venc.sensor_bin set to /etc/sensors/{pick}, this drone has no /etc/sensors/{name}"], []
+    return text, [], []
+
+
 def patched_load_sigmastar(original):
     """load_sigmastar differs between images: an imx415 branch goes first in
     the drone's own sensor case (the first match wins)."""
@@ -395,7 +432,8 @@ def prepare_config(drone, cfg, old_cfg, binary_data, old_bin, info, workdir):
     migrated, changes = migrate_config(
         text, REMOVED_KEY not in binary_data, raise_window, b"rate_walls_rel_20" in binary_data
     )
-    for change in changes:
+    migrated, fitted, missing = fit_sensor_bin(migrated, info)
+    for change in changes + fitted + missing:
         warn(f"   mabur.toml: {change}")
     if migrated == text:
         return cfg
