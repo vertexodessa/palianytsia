@@ -501,6 +501,26 @@ pub fn pack_v2(msgid: u32, sysid: u8, compid: u8, seq: u8, payload: &[u8]) -> Ve
 }
 
 pub const MSG_HEARTBEAT: u32 = 0;
+/// The flight controller's system and component id.
+pub const FC_SYS: u8 = 1;
+pub const FC_COMP: u8 = 1;
+/// HEARTBEAT `base_mode` bit: the motors are armed.
+pub const MODE_FLAG_ARMED: u8 = 128;
+
+/// The flight controller's arm state when `pkt` (one whole MAVLink packet) is
+/// its HEARTBEAT; None for any other packet.
+pub fn fc_heartbeat_armed(pkt: &[u8]) -> Option<bool> {
+    let mut p = Parser::default();
+    if !pkt
+        .iter()
+        .fold(false, |ok, &b| ok | (p.feed(b) == Framing::Ok))
+    {
+        return None;
+    }
+    let m = p.message();
+    ((m.sysid, m.compid, m.msgid) == (FC_SYS, FC_COMP, MSG_HEARTBEAT))
+        .then(|| m.payload[6] & MODE_FLAG_ARMED != 0)
+}
 pub const MSG_STATUSTEXT: u32 = 253;
 pub const MSG_PARAM_EXT_REQUEST_READ: u32 = 320;
 pub const MSG_PARAM_EXT_REQUEST_LIST: u32 = 321;

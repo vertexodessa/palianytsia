@@ -321,7 +321,10 @@ fn wait_for(hub: &Hub, limit: Duration, ok: impl Fn(&Probe) -> bool) -> Result<P
             if ok(&p) {
                 return Ok(p);
             }
-            if matches!(p.state.as_str(), "rollback" | "restored" | "commit_failed") {
+            if matches!(
+                p.state.as_str(),
+                "rollback" | "restored" | "commit_failed" | "aborted_armed"
+            ) {
                 let log = exec(
                     hub,
                     "tail -n 25 /tmp/mabur-up/swap.log",
@@ -343,11 +346,14 @@ fn wait_for(hub: &Hub, limit: Duration, ok: impl Fn(&Probe) -> bool) -> Result<P
     ))
 }
 
-/// Runs the whole update; `link_ok` says whether video is coming in now.
+/// Runs the whole update; `link_ok` says whether video is coming in now,
+/// `may_go` whether the drone is known to be on the ground (`fc_disarmed`):
+/// asked before the upload, before the trial and before the commit.
 pub fn run(
     hub: &Hub,
     pl: &Payload,
     link_ok: &dyn Fn() -> bool,
+    may_go: &dyn Fn() -> Result<(), String>,
     prog: &mut dyn Progress,
 ) -> Result<Report, String> {
     let t0 = Instant::now();
@@ -369,8 +375,9 @@ pub fn run(
     if now.sha == new_sha && config == now.config {
         return Err("the drone already runs this maburd with this config".to_string());
     }
+    may_go()?;
     hub.set_video_off(true);
-    let r = upload_and_swap(hub, pl, &config, &new_sha, link_ok, prog);
+    let r = upload_and_swap(hub, pl, &config, &new_sha, link_ok, may_go, prog);
     hub.set_video_off(false);
     r?;
     Ok(Report {
@@ -387,6 +394,7 @@ fn upload_and_swap(
     config: &str,
     new_sha: &str,
     link_ok: &dyn Fn() -> bool,
+    may_go: &dyn Fn() -> Result<(), String>,
     prog: &mut dyn Progress,
 ) -> Result<(), String> {
     let files: [(&str, &[u8]); 4] = [
@@ -440,6 +448,7 @@ fn upload_and_swap(
             ));
         }
     }
+    may_go()?;
     prog.step("starting the new maburd (trial, flash untouched)");
     // The old maburd carries this shell and stops seconds after the script
     // starts, so the answer can be lost on the way; the probes below find
@@ -479,6 +488,9 @@ fn upload_and_swap(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    may_go().map_err(|e| {
+        format!("{e}: no commit; the drone goes back to its maburd once it is disarmed")
+    })?;
     prog.step("committing: the old maburd is deleted, the new one written to flash");
     exec(
         hub,
@@ -509,6 +521,17 @@ pub fn video_flows(sh: &Shared) -> impl Fn() -> bool + '_ {
     }
 }
 
+/// A `may_go` for `run`: the flight controller's last HEARTBEAT is fresh and
+/// says disarmed. A drone without an FC, or one whose FC is not heard, may
+/// be in the air: no update.
+pub fn fc_disarmed(sh: &Shared) -> impl Fn() -> Result<(), String> + '_ {
+    move || match sh.fc_armed() {
+        Some(false) => Ok(()),
+        Some(true) => Err("the drone is armed".to_string()),
+        None => Err("no heartbeat from the flight controller: the drone may be flying".to_string()),
+    }
+}
+
 /// What the automatic update does after a probe.
 #[derive(Debug, PartialEq)]
 enum Next {
@@ -523,7 +546,8 @@ enum Next {
     Update,
 }
 
-fn decide(p: &Result<Probe, ExecError>, want: &str, tried: bool) -> Next {
+/// `fc`: the flight controller's arm state, None when not heard.
+fn decide(p: &Result<Probe, ExecError>, want: &str, tried: bool, fc: Option<bool>) -> Next {
     match p {
         Err(ExecError::NoAnswer) => Next::Wait(Duration::from_secs(20), "no_lane"),
         Err(ExecError::Closed(st)) if *st == pal_wire::maint::STATUS_ARMED => {
@@ -535,6 +559,8 @@ fn decide(p: &Result<Probe, ExecError>, want: &str, tried: bool) -> Next {
         Ok(p) if p.exe != "/usr/bin/maburd" => Next::Wait(Duration::from_secs(10), "busy"),
         Ok(p) if p.sha == want => Next::Settled("current"),
         Ok(_) if tried => Next::Keep,
+        Ok(_) if fc == Some(true) => Next::Wait(Duration::from_secs(3), "armed"),
+        Ok(_) if fc.is_none() => Next::Wait(Duration::from_secs(3), "no_fc"),
         Ok(_) => Next::Update,
     }
 }
@@ -628,7 +654,7 @@ fn auto_loop(sh: &Shared, pl: &Payload) {
         if let Ok(p) = &p {
             v["drone"] = short(&p.sha).into();
         }
-        match decide(&p, &want, tried) {
+        match decide(&p, &want, tried, sh.fc_armed()) {
             Next::Wait(d, state) => {
                 v["state"] = state.into();
                 if let Err(e) = &p {
@@ -658,7 +684,7 @@ fn auto_loop(sh: &Shared, pl: &Payload) {
                     base: v.clone(),
                     step: String::new(),
                 };
-                match run(&sh.maint, pl, &video_flows(sh), &mut prog) {
+                match run(&sh.maint, pl, &video_flows(sh), &fc_disarmed(sh), &mut prog) {
                     Ok(r) => {
                         v["state"] = "updated".into();
                         v["secs"] = r.secs.into();
@@ -713,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn the_automatic_update_installs_any_other_maburd_once_and_never_on_an_armed_drone() {
+    fn the_automatic_update_installs_any_other_maburd_once_and_only_on_a_drone_known_disarmed() {
         let drone = |exe: &str, sha: &str| {
             Ok(Probe {
                 exe: exe.into(),
@@ -722,27 +748,37 @@ mod tests {
             })
         };
         let on_flash = "/usr/bin/maburd";
+        let down = Some(false);
         assert_eq!(
-            decide(&drone(on_flash, "aa"), "aa", false),
-            Next::Settled("current")
+            decide(&drone(on_flash, "aa"), "aa", false, None),
+            Next::Settled("current"),
+            "a current drone needs no FC"
         );
         assert_eq!(
-            decide(&drone(on_flash, "bb"), "aa", false),
+            decide(&drone(on_flash, "bb"), "aa", false, down),
             Next::Update,
             "older or newer"
         );
-        assert_eq!(decide(&drone(on_flash, "bb"), "aa", true), Next::Keep);
+        assert_eq!(decide(&drone(on_flash, "bb"), "aa", true, down), Next::Keep);
         assert!(matches!(
-            decide(&drone("/tmp/mabur-up/maburd", "bb"), "aa", false),
+            decide(&drone(on_flash, "bb"), "aa", false, Some(true)),
+            Next::Wait(_, "armed")
+        ));
+        assert!(matches!(
+            decide(&drone(on_flash, "bb"), "aa", false, None),
+            Next::Wait(_, "no_fc")
+        ));
+        assert!(matches!(
+            decide(&drone("/tmp/mabur-up/maburd", "bb"), "aa", false, down),
             Next::Wait(_, "busy")
         ));
         let armed = Err(ExecError::Closed(pal_wire::maint::STATUS_ARMED));
         assert!(matches!(
-            decide(&armed, "aa", false),
+            decide(&armed, "aa", false, down),
             Next::Wait(_, "armed")
         ));
         assert!(matches!(
-            decide(&Err(ExecError::NoAnswer), "aa", false),
+            decide(&Err(ExecError::NoAnswer), "aa", false, down),
             Next::Wait(_, "no_lane")
         ));
     }
@@ -772,7 +808,9 @@ mod tests {
     }
 
     /// The swap script on the host, its paths moved into a temp dir: a fake
-    /// init script and a fake maburd (a shell loop) stand in.
+    /// init script and a fake maburd stand in. The fake maburd writes the arm
+    /// file from `fc` (the FC's word as the test sets it), as maburd does
+    /// from the FC's reports; `fc` starts out disarmed.
     fn swap_world(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("pal-swap-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -793,7 +831,14 @@ mod tests {
             "init",
             &format!("#!/bin/sh\necho \"$1\" >> {}/init.calls\n", d.display()),
         );
-        w("up/maburd", "#!/bin/sh\nwhile true; do sleep 1; done\n");
+        w(
+            "up/maburd",
+            &format!(
+                "#!/bin/sh\nwhile true; do cp {0}/fc {0}/arm.tmp 2>/dev/null && mv {0}/arm.tmp {0}/arm; sleep 0.1; done\n",
+                d.display()
+            ),
+        );
+        std::fs::write(d.join("fc"), "disarmed\n").unwrap();
         w("up/mabur.toml", "new = 1\n");
         w("up/S96mabur", "#!/bin/sh\necho new init\n");
         d
@@ -814,6 +859,7 @@ mod tests {
             .env("STOP_WAIT", "2")
             .env("START_DELAY", "0")
             .env("NAME", "pal-swap-test-no-such-process")
+            .env("ARM", d.join("arm"))
             .spawn()
             .unwrap()
     }
@@ -823,6 +869,18 @@ mod tests {
             .unwrap_or_default()
             .trim()
             .to_string()
+    }
+
+    fn wait_state(d: &std::path::Path, want: &str) {
+        let t = Instant::now();
+        while state(d) != want && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(state(d), want);
+    }
+
+    fn init_calls(d: &std::path::Path) -> String {
+        std::fs::read_to_string(d.join("init.calls")).unwrap_or_default()
     }
 
     #[test]
@@ -879,5 +937,73 @@ mod tests {
         let log = std::fs::read_to_string(d.join("up/swap.log")).unwrap();
         assert!(log.contains("the new maburd exited (1)"), "{log}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn swap_script_does_not_start_a_trial_on_an_armed_drone() {
+        let d = swap_world("aborted");
+        std::fs::write(d.join("arm"), "armed\n").unwrap();
+        assert!(swap(&d, 30).wait().unwrap().success());
+        assert_eq!(state(&d), "aborted_armed");
+        assert_eq!(init_calls(&d), "", "the old maburd was never stopped");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn swap_script_restarts_maburd_only_on_a_disarmed_drone() {
+        // No commit in time while armed: the new maburd keeps flying.
+        let d = swap_world("held");
+        std::fs::write(d.join("fc"), "armed\n").unwrap();
+        let mut c = swap(&d, 1);
+        wait_state(&d, "trial_held");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(state(&d), "trial_held");
+        assert_eq!(init_calls(&d), "stop\n", "no restart while armed");
+        std::fs::write(d.join("fc"), "disarmed\n").unwrap();
+        assert!(c.wait().unwrap().success());
+        assert_eq!(state(&d), "restored");
+        assert_eq!(init_calls(&d), "stop\nstart\n");
+
+        // A commit while armed waits for the disarm; flash stays untouched.
+        let d2 = swap_world("commit_held");
+        std::fs::write(d2.join("fc"), "unknown\n").unwrap();
+        let mut c = swap(&d2, 30);
+        wait_state(&d2, "trial");
+        std::fs::write(d2.join("up/commit"), "").unwrap();
+        wait_state(&d2, "commit_held");
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(state(&d2), "commit_held");
+        assert_eq!(
+            std::fs::read_to_string(d2.join("bin")).unwrap(),
+            "old binary\n"
+        );
+        std::fs::write(d2.join("fc"), "disarmed\n").unwrap();
+        assert!(c.wait().unwrap().success());
+        assert_eq!(state(&d2), "committed");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn the_fc_heartbeat_alone_lets_an_update_go() {
+        let sh = Shared::default();
+        let go = fc_disarmed(&sh);
+        assert!(go().is_err(), "nothing heard: may be flying");
+        let hb = |base_mode: u8, sys: u8| {
+            let mut pl = [0u8; 9];
+            pl[6] = base_mode;
+            pal_wire::mavlink::pack_v2(pal_wire::mavlink::MSG_HEARTBEAT, sys, 1, 0, &pl)
+        };
+        sh.note_mav(&hb(128 | 1, 1));
+        assert_eq!(go(), Err("the drone is armed".to_string()));
+        sh.note_mav(&hb(1, 191));
+        assert!(
+            go().is_err(),
+            "maburd's own component says nothing of the FC"
+        );
+        sh.note_mav(&hb(1, 1));
+        assert_eq!(go(), Ok(()));
+        *sh.fc_arm.lock().unwrap() = Some((false, Instant::now() - crate::FC_ARM_STALE));
+        assert!(go().is_err(), "a stale heartbeat proves nothing");
     }
 }

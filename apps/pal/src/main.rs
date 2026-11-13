@@ -181,6 +181,8 @@ struct Sink {
     sends: u64,
     send_fail: u64,
     idr: Option<IdrDriver>,
+    /// Live: the FC's HEARTBEATs go here for `--update-drone`.
+    shared: Option<Arc<runtime::Shared>>,
 }
 
 impl Sink {
@@ -227,6 +229,7 @@ impl Sink {
             sends: 0,
             send_fail: 0,
             idr: None,
+            shared: None,
         }
     }
     fn finish(&mut self) {
@@ -280,6 +283,9 @@ impl Sink {
 impl CoreIo for Sink {
     fn on_mav(&mut self, pkt: &[u8]) {
         self.mav += 1;
+        if let Some(s) = &self.shared {
+            s.note_mav(pkt);
+        }
         if let Some(w) = self.mav_file.as_mut() {
             w.write_all(&(pkt.len() as u32).to_le_bytes()).unwrap();
             w.write_all(pkt).unwrap();
@@ -476,7 +482,14 @@ fn update_drone(
         }
         Ok(pl) => {
             let link_ok = du::video_flows(&shared);
-            match du::run(&shared.maint, &pl, &link_ok, &mut Steps(Instant::now(), 0)) {
+            let may_go = du::fc_disarmed(&shared);
+            match du::run(
+                &shared.maint,
+                &pl,
+                &link_ok,
+                &may_go,
+                &mut Steps(Instant::now(), 0),
+            ) {
                 Ok(r) => {
                     eprintln!(
                         "pal: update done in {:.1} s: maburd {} -> {}",
@@ -630,6 +643,7 @@ fn live(o: Opts) {
     let route = set
         .begin(o.ch, o.width, stamp, tx, &shared)
         .unwrap_or_else(|e| die(&e));
+    sink.shared = Some(shared.clone());
     if o.mode == Some(Mode::Gs) {
         sink.card = set.cards().first().cloned();
         if o.idr != Some(false) {

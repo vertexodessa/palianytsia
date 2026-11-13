@@ -77,7 +77,10 @@ impl UpdateView {
                 self.app
             ),
             "current" => format!("the drone runs this app's maburd {}", self.app),
-            "armed" => "not checked while the drone is armed".into(),
+            "armed" => "the drone is armed: it is checked and updated once disarmed".into(),
+            "no_fc" => "the drone's maburd differs from this app's, but no flight controller \
+                        heartbeat says it is disarmed: no update (it may be flying)"
+                .into(),
             "no_lane" => "the drone does not answer on the maintenance lane: a maburd without \
                           it is updated from a PC (drone/install.py)"
                 .into(),
@@ -114,7 +117,9 @@ mod tests {
             .unwrap()
             .0
             .contains("51 s"));
-        for s in ["waiting", "current", "armed", "no_lane", "busy", "error"] {
+        for s in [
+            "waiting", "current", "armed", "no_fc", "no_lane", "busy", "error",
+        ] {
             let v = view(&format!(r#"{{"state":"{s}","app":"abc"}}"#));
             assert_eq!(v.banner(), None, "{s}");
             assert!(!v.line().is_empty());

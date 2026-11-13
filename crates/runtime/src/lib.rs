@@ -80,7 +80,14 @@ pub struct Shared {
     /// The automatic drone update's state (`drone_update::spawn_auto`), for
     /// the UI stats line; None in a build that carries no maburd.
     pub update: Mutex<Option<serde_json::Value>>,
+    /// The flight controller's last HEARTBEAT: (armed, when). The drone
+    /// update goes ahead only on a fresh one that says disarmed.
+    pub fc_arm: Mutex<Option<(bool, Instant)>>,
 }
+
+/// How old the FC's last HEARTBEAT may be for the drone update to trust it
+/// (the FC sends one a second through maburd).
+pub const FC_ARM_STALE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A drone's Telem in another RC version (`rc::foreign_rc_version`), counted on the RX thread.
 #[derive(Default)]
@@ -178,6 +185,24 @@ impl Shared {
             return k;
         }
         last
+    }
+
+    /// Every MAVLink packet from the drone passes here; the FC's HEARTBEAT
+    /// sets `fc_arm`.
+    pub fn note_mav(&self, pkt: &[u8]) {
+        if let Some(armed) = pal_wire::mavlink::fc_heartbeat_armed(pkt) {
+            *self.fc_arm.lock().unwrap_or_else(|e| e.into_inner()) = Some((armed, Instant::now()));
+        }
+    }
+
+    /// The FC's arm state from a HEARTBEAT younger than `FC_ARM_STALE`; None
+    /// without one (no FC, or none heard lately).
+    pub fn fc_armed(&self) -> Option<bool> {
+        self.fc_arm
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .filter(|(_, at)| at.elapsed() < FC_ARM_STALE)
+            .map(|(armed, _)| armed)
     }
 
     pub fn set_update(&self, v: serde_json::Value) {
@@ -303,6 +328,7 @@ impl CoreIo for Sink {
         }
     }
     fn on_mav(&mut self, pkt: &[u8]) {
+        self.shared.note_mav(pkt);
         let _ = self.mav_tx.try_send(pkt.to_vec());
         if let Some((sock, peer)) = &self.udp {
             let _ = sock.send_to(pkt, peer);
