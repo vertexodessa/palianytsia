@@ -125,6 +125,18 @@ CFG_BIN = '[osd]\nsensor_bin = "/etc/sensors/other.bin"\n[venc]\n  sensor_bin = 
 CFG_BIN_335 = CFG_BIN.replace("gregspike5.bin", "imx335_infinity6e.bin")
 CFG_BIN_415 = CFG_BIN.replace("gregspike5.bin", "imx415.bin")
 CFG_BIN_HOME = '[venc]\nsensor_bin = "/root/mine.bin"\n[fec]\nwindow = 64\n'
+# venc.min_iqp is forced to the shipped value: replaced in place (comment kept), added under
+# [venc], or added with the section.
+SHIP_IQP = "[venc]\nfps = 60\nmin_iqp = 42  # shipped\n[fec]\nwindow = 64\n"
+CFG_IQP34 = "[venc]\r\n  min_iqp    = 34            # floor\r\nfps = 60\r\n[fec]\r\nwindow = 64\r\n"
+CFG_IQP42 = "[venc]\r\n  min_iqp    = 42            # floor\r\nfps = 60\r\n[fec]\r\nwindow = 64\r\n"
+CFG_NOIQP = "[venc]\nfps = 60\n[fec]\nwindow = 64\n"
+CFG_NOIQP_FIXED = "[venc]\nmin_iqp = 42\nfps = 60\n[fec]\nwindow = 64\n"
+CFG_NOVENC = "[fec]\nwindow = 64"
+CFG_NOVENC_FIXED = "[fec]\nwindow = 64\n[venc]\nmin_iqp = 42\n"
+# The check: a key this maburd lacks, a value of the wrong type, a key the file lacks and a tuned value.
+SHIP_CHECK = "[venc]\nmin_iqp = 42\nfps = 60\n[fec]\nwindow = 64\nsymbol_size = 332\n"
+CFG_CHECK = '[venc]\nmin_iqp = 42\nfps = "60"\nbogus_knob = 1\n[fec]\nwindow = 32\n'
 STOCK_BINS = ("imx335_infinity6c.bin", "imx335_infinity6e.bin", "imx415.bin", "imx415_infinity6c.bin", "imx415_infinity6e.bin")
 
 LS = b"#!/bin/sh\ncase $SENSOR in\n\timx335)\n\t\tinsmod x\n\t\t;;\nesac\n"
@@ -278,6 +290,32 @@ SCENARIOS = [
     S("hand_window_on_current_build_left_alone", drone=dict(bin_=BIN_NEW, cfg=CFG_HAND16), pkg=dict(bin_=BIN_NEW2),
       rc=0, toml=CFG_HAND16, changes={"usr/bin/maburd": "BIN_NEW2"},
       backup={**BACKUP_OLD, "mabur.toml": CFG_HAND16, "maburd": "BIN_NEW"}),
+    S("update_forces_min_iqp_to_the_shipped_value", drone=dict(bin_=BIN_NEW, cfg=CFG_IQP34),
+      pkg=dict(bin_=BIN_NEW2, cfg=SHIP_IQP),
+      rc=0, toml=CFG_IQP42, changes={"etc/mabur.toml": CFG_IQP42, "usr/bin/maburd": "BIN_NEW2"},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_IQP34, "maburd": "BIN_NEW"},
+      says=["mabur.toml: venc.min_iqp 34 set to 42, the value this release ships for every drone"]),
+    S("same_binary_still_forces_min_iqp", drone=dict(bin_=BIN_NEW, cfg=CFG_IQP34), pkg=dict(cfg=SHIP_IQP),
+      rc=0, toml=CFG_IQP42, changes={"etc/mabur.toml": CFG_IQP42},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_IQP34, "maburd": "BIN_NEW"}),
+    S("forced_min_iqp_added_under_venc", drone=dict(bin_=BIN_NEW, cfg=CFG_NOIQP), pkg=dict(cfg=SHIP_IQP),
+      rc=0, toml=CFG_NOIQP_FIXED, changes={"etc/mabur.toml": CFG_NOIQP_FIXED},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_NOIQP, "maburd": "BIN_NEW"},
+      says=["mabur.toml: venc.min_iqp added at 42"]),
+    S("forced_min_iqp_added_with_its_section", drone=dict(bin_=BIN_NEW, cfg=CFG_NOVENC), pkg=dict(cfg=SHIP_IQP),
+      rc=0, toml=CFG_NOVENC_FIXED, changes={"etc/mabur.toml": CFG_NOVENC_FIXED},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_NOVENC, "maburd": "BIN_NEW"}),
+    S("forced_min_iqp_already_shipped_value_changes_nothing", drone=dict(bin_=BIN_NEW, cfg=CFG_IQP42),
+      pkg=dict(cfg=SHIP_IQP),
+      rc=0, toml=CFG_IQP42, changes={}, backup=None, says=["== already installed, nothing to do"]),
+    S("update_reports_what_the_kept_config_gets_wrong", drone=dict(bin_=BIN_NEW, cfg=CFG_CHECK),
+      pkg=dict(bin_=BIN_NEW2, cfg=SHIP_CHECK),
+      rc=0, toml=CFG_CHECK, changes={"usr/bin/maburd": "BIN_NEW2"},
+      backup={**BACKUP_OLD, "mabur.toml": CFG_CHECK, "maburd": "BIN_NEW"},
+      says=["venc.bogus_knob: this maburd does not know the key and will not start on it",
+            'venc.fps = "60": should be a number (shipped 60)',
+            "fec.symbol_size: not set, maburd runs its built-in value (shipped 332)",
+            "fec.window = 32 (shipped 64)"]),
     S("config_flag_replaces_drone_config_and_fits_it", pkg=dict(cfg="[fec]\nwindow = 64\nrepairs_with_frame = true\n"),
       argv=("-y", "--config", "D", "PKG"),
       rc=0, toml=CFG_64, changes={"etc/mabur.toml": CFG_64, "usr/bin/maburd": "BIN_NEW"}, backup=BACKUP_OLD),

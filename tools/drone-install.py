@@ -38,6 +38,14 @@ edits the config that lands on the drone to suit the new binary (the original
 stays in the backup). The camera tuning file is fitted to the drone as well:
 a venc.sensor_bin under /etc/sensors that the drone does not have is set to
 the image's own file for its sensor.
+
+A kept config also gets the keys of FORCED at the value the mabur.toml next to
+maburd ships: a release that changes such a default means it for every drone,
+and a kept file would otherwise hold the old value for good. The kept config is
+then checked against the shipped one and the run reports what differs: keys
+this maburd does not know (it refuses to start on them), values of the wrong
+type, keys the file lacks (maburd runs its built-in value, not the shipped
+one) and values set apart from the shipped ones.
 """
 import argparse
 import fnmatch
@@ -49,6 +57,11 @@ import subprocess
 import sys
 import tempfile
 import time
+
+try:
+    import tomllib
+except ImportError:  # Python before 3.11: the config check is skipped
+    tomllib = None
 from datetime import datetime
 from pathlib import Path
 
@@ -56,6 +69,10 @@ FEC_WINDOW = 64  # the window the frame-tail repair rule is measured with
 REMOVED_KEY = b"repairs_with_frame"  # [fec], gone with the frame-tail rule
 FRAME_TAIL_MARK = b"frame_end_us/rep="  # a log format only that rule's builds print
 MODULE = "sensor_imx415_star6e.ko"
+# Keys an update sets to the shipped value whatever the drone's file holds.
+# venc.min_iqp: the keyframe QP floor; 34 and below make keyframes of 200 kB
+# and more at the fast rungs, a quarter of a second of air each.
+FORCED = (("venc", "min_iqp"),)
 
 # These three run on the drone, which has busybox sh and no Python.
 REMOVE_SH = r'''for s in S00mabur S96mabur; do [ -x /etc/init.d/$s ] && /etc/init.d/$s stop >/dev/null 2>&1; done
@@ -332,6 +349,136 @@ def migrate_config(text, strip_key, raise_window, split_walls=False):
     return b"".join(out), changes
 
 
+def _key_line(key):
+    return re.compile(rb"([ \t]*" + re.escape(key.encode()) + rb"[ \t]*=[ \t]*)([^#\r\n]*?)([ \t]*(?:#.*)?)$")
+
+
+def _is_header(bare, section=None):
+    if section is None:
+        return re.match(rb"[ \t]*\[", bare) is not None
+    return re.fullmatch(rb"[ \t]*\[" + re.escape(section.encode()) + rb"\][ \t]*(#.*)?", bare) is not None
+
+
+def shipped_value(text, section, key):
+    """The raw TOML value of section.key in text, or None."""
+    inside, pattern = False, _key_line(key)
+    for line in text.splitlines():
+        if _is_header(line):
+            inside = _is_header(line, section)
+        m = pattern.match(line) if inside else None
+        if m:
+            return m[2].strip()
+    return None
+
+
+def force_keys(text, bundle):
+    """Sets each FORCED key to the bundle's value: replaced in place (the
+    line's comment stays), added under its section, or added with a new
+    section at the end. Returns (text, changes, warnings)."""
+    changes, warnings = [], []
+    for section, key in FORCED:
+        value = shipped_value(bundle, section, key)
+        if value is None:
+            warnings.append(f"{section}.{key}: the shipped mabur.toml has no value to set it to")
+            continue
+        lines = text.splitlines(keepends=True)
+        inside, header, done, pattern = False, None, False, _key_line(key)
+        for i, line in enumerate(lines):
+            bare = line.rstrip(b"\r\n")
+            if _is_header(bare):
+                inside = _is_header(bare, section)
+                if inside and header is None:
+                    header = i
+            m = pattern.match(bare) if inside else None
+            if m:
+                done = True
+                old = m[2].strip()
+                if old != value:
+                    lines[i] = m[1] + value + m[3] + line[len(bare):]
+                    changes.append(f"{section}.{key} {old.decode(errors='replace')} set to "
+                                   f"{value.decode(errors='replace')}, the value this release ships for every drone")
+                break
+        if not done:
+            if header is not None:
+                end = lines[header][len(lines[header].rstrip(b"\r\n")):] or b"\n"
+                lines.insert(header + 1, key.encode() + b" = " + value + end)
+            else:
+                if lines and not lines[-1].endswith(b"\n"):
+                    lines[-1] += b"\n"
+                lines.append(b"[" + section.encode() + b"]\n" + key.encode() + b" = " + value + b"\n")
+            changes.append(f"{section}.{key} added at {value.decode(errors='replace')}, "
+                           "the value this release ships for every drone")
+        text = b"".join(lines)
+    return text, changes, warnings
+
+
+def _flat(table, prefix=""):
+    out = {}
+    for k, v in table.items():
+        name = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flat(v, name + "."))
+        else:
+            out[name] = v
+    return out
+
+
+def _kind(v):
+    if isinstance(v, bool):
+        return "true/false"
+    if isinstance(v, (int, float)):
+        return "a number"
+    if isinstance(v, str):
+        return "text"
+    if isinstance(v, list):
+        return "a list"
+    return type(v).__name__
+
+
+def _show(v):
+    if isinstance(v, bool):
+        s = "true" if v else "false"
+    elif isinstance(v, str):
+        s = f'"{v}"'
+    elif isinstance(v, list):
+        s = "[" + ", ".join(_show(x) for x in v) + "]"
+    else:
+        s = str(v)
+    return s if len(s) <= 60 else s[:57] + "..."
+
+
+def check_config(text, bundle, binary_data):
+    """The kept config against the shipped one. Returns (problems, notes):
+    problems stop maburd or make it run something else than the file seems
+    to say; notes are the values the drone's owner set apart from the
+    shipped ones."""
+    if tomllib is None:
+        return [], ["config not checked: this Python has no tomllib (3.11 or newer has it)"]
+    try:
+        have = _flat(tomllib.loads(text.decode()))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        return [f"the drone's mabur.toml does not parse ({e}); maburd will not start on it"], []
+    try:
+        ship = _flat(tomllib.loads(bundle.decode()))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
+        return [f"the shipped mabur.toml does not parse ({e}); config not checked"], []
+    problems, notes = [], []
+    for name, v in have.items():
+        if name not in ship:
+            if name.rsplit(".", 1)[-1].encode() not in binary_data:
+                problems.append(f"{name}: this maburd does not know the key and will not start on it")
+            else:
+                notes.append(f"{name} = {_show(v)}: not in the shipped config")
+        elif _kind(v) != _kind(ship[name]):
+            problems.append(f"{name} = {_show(v)}: should be {_kind(ship[name])} (shipped {_show(ship[name])})")
+        elif v != ship[name]:
+            notes.append(f"{name} = {_show(v)} (shipped {_show(ship[name])})")
+    for name, v in ship.items():
+        if name not in have:
+            problems.append(f"{name}: not set, maburd runs its built-in value (shipped {_show(v)})")
+    return problems, notes
+
+
 def fit_sensor_bin(text, info):
     """venc.sensor_bin names the camera tuning file, and images differ in what
     they carry under /etc/sensors. maburd starts without the file (it falls
@@ -410,9 +557,11 @@ def remove(args, drone):
     say(f"== done: {listing}")
 
 
-def prepare_config(drone, cfg, old_cfg, binary_data, old_bin, info, workdir):
+def prepare_config(drone, cfg, old_cfg, binary_data, old_bin, info, workdir, bundle=None):
     """The config that lands on the drone must suit the new binary, a kept one
     too: rerunning this script also repairs a drone stuck on a refused key.
+    bundle: the shipped mabur.toml when the drone's own is kept (FORCED keys
+    and the check come from it).
     Returns the path to upload, or None to leave the drone's file alone."""
     source = workdir / "mabur.toml.in"
     if cfg:
@@ -433,8 +582,21 @@ def prepare_config(drone, cfg, old_cfg, binary_data, old_bin, info, workdir):
         text, REMOVED_KEY not in binary_data, raise_window, b"rate_walls_rel_20" in binary_data
     )
     migrated, fitted, missing = fit_sensor_bin(migrated, info)
-    for change in changes + fitted + missing:
+    forced, forced_warn, problems, notes = [], [], [], []
+    if bundle and not cfg:
+        shipped = bundle.read_bytes()
+        migrated, forced, forced_warn = force_keys(migrated, shipped)
+        problems, notes = check_config(migrated, shipped, binary_data)
+    for change in changes + fitted + missing + forced + forced_warn:
         warn(f"   mabur.toml: {change}")
+    if problems:
+        warn("   mabur.toml check, needs a look:")
+        for p in problems:
+            warn(f"     {p}")
+    if notes:
+        say("   mabur.toml check, set apart from the shipped config:")
+        for n in notes:
+            say(f"     {n}")
     if migrated == text:
         return cfg
     target = workdir / "mabur.toml"
@@ -505,6 +667,7 @@ def install(args, drone, workdir, script):
     if not binary.is_file():
         raise Abort(f"no {binary}", 2)
     cfg = src / "mabur.toml" if (src / "mabur.toml").is_file() else None
+    bundle = None
     init = next((p for p in (src / "S96mabur", here / "S96mabur", here / "drone" / "S96mabur") if p.is_file()), None)
     module = src / MODULE if (src / MODULE).is_file() else None
 
@@ -525,8 +688,8 @@ def install(args, drone, workdir, script):
     # A backup dir restores its config; an update keeps the drone's own.
     if cfg and old_cfg and not args.config and not (src / ".drone-backup").is_file():
         say("   keeping the drone's mabur.toml (tuned settings live there; --config replaces it)")
-        cfg = None
-    cfg = prepare_config(drone, cfg, old_cfg, binary.read_bytes(), old_bin, info, workdir)
+        bundle, cfg = cfg, None
+    cfg = prepare_config(drone, cfg, old_cfg, binary.read_bytes(), old_bin, info, workdir, bundle)
 
     new_bin = sha256(binary)
     new_cfg = sha256(cfg) if cfg else ""

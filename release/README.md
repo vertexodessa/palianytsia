@@ -99,8 +99,9 @@ On a drone that already runs maburd (update) it:
 
 1. shows the sha256 of what runs now and of what is about to go in, and stops if they already match;
 2. saves the current `maburd` and `mabur.toml` to `./drone-backup-<date>/` on the PC;
-3. keeps the drone's `mabur.toml` (`--config` replaces it with the one in this folder);
-4. stops the service, swaps the binary and starts it again.
+3. keeps the drone's `mabur.toml` (`--config` replaces it with the one in this folder), except for the keys whose shipped value a release requires on every drone: `venc.min_iqp` (the keyframe size floor; 34 and below make keyframes of 200 kB and more) is set to the value in this folder's `drone/mabur.toml`, and the script says so;
+4. checks the kept file against this folder's `drone/mabur.toml` and lists what needs a look (keys this maburd does not know and would not start on, values of the wrong type, keys the file lacks, for which maburd runs its built-in value) and the values set apart from the shipped ones;
+5. stops the service, swaps the binary and starts it again.
 
 On an imx415 drone, both ways, it also installs the six-mode sensor driver:
 
