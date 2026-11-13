@@ -982,13 +982,13 @@ impl GsCore for RustCore {
             self.poll_nack(now_ms, io);
             if let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) {
                 n.win.drain(now_ms, &mut n.t);
-                let (rows, capped) = n.t.take_late_fills();
+                let (rows, capped) = n.t.take_resolved();
                 if !rows.is_empty() || capped > 0 {
                     let dq = self
                         .telem
                         .filter(|_| self.now_us.wrapping_sub(self.telem_rx_us) <= TELEM_STALE_US)
                         .map(|t| t.txq_wait_max_ms);
-                    self.diag.late_fills(&rows, capped, dq);
+                    self.diag.nack_rows(&rows, capped, dq);
                 }
             }
         }

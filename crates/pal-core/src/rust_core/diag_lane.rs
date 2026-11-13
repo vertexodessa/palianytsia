@@ -1,24 +1,25 @@
 //! Records for the flight log that WebGs has no home for, so neither the stats line nor the
 //! m1 parity lines carry them: the drone's congestion shed as episodes, the ground's arrival
-//! order, and the NACK requests their own copy answered. Three parts that never read each
+//! order, and how each requested NACK symbol resolved. Three parts that never read each
 //! other; the core feeds them and the loop takes the queue every tick.
 //!
 //! Cost bound: nothing here allocates per body. `RxOrder` is a bit test and a store per
 //! CRC-good video body. The log volume is bounded whatever the air does: at most
-//! `LATE_ROWS_PER_S` `nack_late` rows a second (the rest only counted), one `rx_reorder` row a
+//! `NACK_ROWS_PER_S` `nack_late` / `nack_waste` / `nack_fill` rows a second (the rest only
+//! counted), one `rx_reorder` row a
 //! second, and a `drone_shed` row per Telem edge; the queue holds at most `CAP` rows, the oldest
 //! dropped first.
 use std::collections::VecDeque;
 
 use crate::json::J;
-use crate::nack::LateFill;
+use crate::nack::{Outcome, Resolved};
 
 /// Rows kept between two takes. The loop takes every tick (about 1 ms), so this only bounds a
 /// loop that stopped taking.
 const CAP: usize = 256;
-/// `nack_late` rows a second; the rest go into the next `nack_late_capped` count. The bench jam
-/// gave 8-108 late fills per 27 s arm (2026-11-13), so 50 a second keeps every one there.
-const LATE_ROWS_PER_S: u32 = 50;
+/// NACK resolution rows a second; the rest go into the next `nack_rows_capped` count. The bench
+/// jam requested 65-285 symbols per 60 s arm, so 100 a second keeps every one there.
+const NACK_ROWS_PER_S: u32 = 100;
 
 #[derive(Default)]
 pub(super) struct DiagLane {
@@ -27,9 +28,9 @@ pub(super) struct DiagLane {
     pub shed: ShedWatch,
     pub order: RxOrder,
     order_t0_ms: u64,
-    late_t0_ms: u64,
-    late_rows: u32,
-    late_capped: u64,
+    nack_t0_ms: u64,
+    nack_rows: u32,
+    nack_capped: u64,
 }
 
 impl DiagLane {
@@ -51,20 +52,22 @@ impl DiagLane {
         self.q.drain(..).collect()
     }
 
-    /// One `nack_late` row per late fill, with the drone's queue as its last Telem told it.
-    pub fn late_fills(&mut self, rows: &[LateFill], capped: u64, dq_wait_ms: Option<u16>) {
-        self.late_capped += capped;
+    /// One row per requested symbol as it resolved (`nack_late`: its own copy came,
+    /// `nack_waste`: the frame's repairs solved it, `nack_fill`: the re-sent copy filled it),
+    /// with the drone's queue as its last Telem told it.
+    pub fn nack_rows(&mut self, rows: &[Resolved], capped: u64, dq_wait_ms: Option<u16>) {
+        self.nack_capped += capped;
         for r in rows {
-            if r.t_ms >= self.late_t0_ms + 1000 {
-                self.late_t0_ms = r.t_ms;
-                self.late_rows = 0;
-                self.flush_late_capped();
+            if r.t_ms >= self.nack_t0_ms + 1000 {
+                self.nack_t0_ms = r.t_ms;
+                self.nack_rows = 0;
+                self.flush_nack_capped();
             }
-            if self.late_rows >= LATE_ROWS_PER_S {
-                self.late_capped += 1;
+            if self.nack_rows >= NACK_ROWS_PER_S {
+                self.nack_capped += 1;
                 continue;
             }
-            self.late_rows += 1;
+            self.nack_rows += 1;
             let mut o = J::obj();
             o.set("t_ms", r.t_ms);
             o.set("seq", u64::from(r.seq));
@@ -74,15 +77,24 @@ impl DiagLane {
             o.set("after_req_ms", u64::from(r.after_req_ms));
             o.set("settle_ms", i64::from(r.settle_ms));
             o.set("dq_wait_ms", dq_wait_ms.map(u64::from));
-            self.push("nack_late", o);
+            o.set("open", r.open);
+            o.set("src_left", u64::from(r.src_left));
+            o.set("holes", u64::from(r.holes));
+            o.set("closed_after_req_ms", r.closed_after_req_ms.map(u64::from));
+            let ev = match r.outcome {
+                Outcome::Late => "nack_late",
+                Outcome::Wasted => "nack_waste",
+                Outcome::Filled => "nack_fill",
+            };
+            self.push(ev, o);
         }
     }
 
-    fn flush_late_capped(&mut self) {
-        if self.late_capped > 0 {
+    fn flush_nack_capped(&mut self) {
+        if self.nack_capped > 0 {
             let mut o = J::obj();
-            o.set("capped", core::mem::take(&mut self.late_capped));
-            self.push("nack_late_capped", o);
+            o.set("capped", core::mem::take(&mut self.nack_capped));
+            self.push("nack_rows_capped", o);
         }
     }
 
@@ -97,8 +109,8 @@ impl DiagLane {
             return;
         }
         self.order_t0_ms = now_ms;
-        if now_ms >= self.late_t0_ms + 1000 {
-            self.flush_late_capped();
+        if now_ms >= self.nack_t0_ms + 1000 {
+            self.flush_nack_capped();
         }
         let w = self.order.take_window();
         if w.late == 0 {
@@ -336,33 +348,41 @@ mod tests {
         assert_eq!(w.active_ms(3000), None);
     }
 
-    /// 120 late fills inside one second: 50 rows, and the other 70 as one count once the
-    /// second is over.
+    /// 150 resolutions inside one second: 100 rows named by outcome, and the other 50 as one
+    /// count once the second is over.
     #[test]
-    fn late_rows_have_a_budget_per_second() {
+    fn nack_rows_have_a_budget_per_second() {
         let mut d = DiagLane::default();
-        let r = |t_ms| LateFill {
-            t_ms,
+        let r = |i: u64| Resolved {
+            t_ms: 5000 + i,
             seq: 1,
+            outcome: if i.is_multiple_of(2) {
+                Outcome::Wasted
+            } else {
+                Outcome::Late
+            },
             from_tail: true,
             tries: 1,
             late_ms: 20,
             after_req_ms: 8,
             settle_ms: 12,
+            open: true,
+            src_left: 3,
+            holes: 1,
+            closed_after_req_ms: Some(4),
         };
-        let rows: Vec<LateFill> = (0..120).map(|i| r(5000 + i)).collect();
-        d.late_fills(&rows, 0, Some(30));
+        let rows: Vec<Resolved> = (0..150).map(r).collect();
+        d.nack_rows(&rows, 0, Some(30));
         d.order_window(5000);
         d.order_window(6200);
         let out = d.take();
-        assert_eq!(
-            out.iter().filter(|l| l.contains("\"nack_late\"")).count(),
-            50
-        );
+        let n = |ev: &str| out.iter().filter(|l| l.contains(ev)).count();
+        assert_eq!((n("\"nack_waste\""), n("\"nack_late\"")), (50, 50));
         assert_eq!(
             out.last().unwrap(),
-            r#"{"capped":70,"ev":"nack_late_capped"}"#
+            r#"{"capped":50,"ev":"nack_rows_capped"}"#
         );
+        assert!(out[0].contains(r#""closed_after_req_ms":4"#), "{}", out[0]);
         assert!(out[0].contains(r#""dq_wait_ms":30"#), "{}", out[0]);
     }
 

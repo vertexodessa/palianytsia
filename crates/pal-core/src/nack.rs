@@ -62,28 +62,54 @@ pub struct NackWindow {
 
 pub const MAX_FILL_SAMPLES: usize = 4096;
 
-/// A request answered by the symbol's own first copy (`late_fill`), kept for the flight log
-/// only: mabur's tracker counts them and WebGs has no home for the detail. The drone sends in
-/// order with no MAC retries (No-Ack broadcast), so a gap entry's copy arriving late means the
-/// ground reordered it (two cards' USB batches), and a tail entry's means the drone's queue or
-/// the air held it past the settle.
+/// How a requested seq ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LateFill {
+pub enum Outcome {
+    /// Its own first copy arrived (`late_fill`). The drone sends in order with no MAC retries
+    /// (No-Ack broadcast), so a gap entry's copy arriving late means the ground reordered it
+    /// (two cards' USB batches), and a tail entry's means the drone's queue or the air held it
+    /// past the settle.
+    Late,
+    /// The frame's repairs solved it before the re-sent copy came (`wasted`).
+    Wasted,
+    /// The re-sent copy filled it (`filled`).
+    Filled,
+}
+
+/// A requested seq as it resolved, kept for the flight log only: mabur's tracker counts the
+/// outcomes and WebGs has no home for the detail. The frame fields say whether waiting for the
+/// frame's own repairs would have spared the request: the drone sends a frame's repairs after
+/// its last source fragment, so while that fragment has not arrived the repairs are still to
+/// come.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolved {
     pub t_ms: u64,
     pub seq: u32,
+    pub outcome: Outcome,
     pub from_tail: bool,
     pub tries: i32,
     /// From first missing (gap: the decoder saw it missing; tail: the frame's last progress)
-    /// to the copy.
+    /// to the resolution.
     pub late_ms: u32,
-    /// From the first request to the copy.
+    /// From the first request to the resolution.
     pub after_req_ms: u32,
     pub settle_ms: i32,
+    /// At the first request the seq was in the newest frame and that frame's last source
+    /// fragment had not arrived.
+    pub open: bool,
+    /// At the first request, for a seq in the newest frame: its source fragments not heard yet
+    /// past the highest one heard, and the seqs of that frame the tracker held as missing, so
+    /// together the holes the frame's repairs had to cover so far.
+    pub src_left: u16,
+    pub holes: u16,
+    /// From the first request to the first poll that saw the frame's last source fragment or a
+    /// newer frame; `None` when the request found the frame closed or it resolved first.
+    pub closed_after_req_ms: Option<u32>,
 }
 
-/// Late fills kept between two takes. The loop takes them every tick; the cap only bounds a
-/// loop that stopped taking (8-108 per 27 s arm under the bench jam, 2026-11-13).
-pub const LATE_FILL_CAP: usize = 64;
+/// Resolved rows kept between two takes. The loop takes them every tick; the cap only bounds a
+/// loop that stopped taking.
+pub const RESOLVED_CAP: usize = 256;
 
 #[derive(Clone, Copy, Default)]
 struct Entry {
@@ -94,6 +120,26 @@ struct Entry {
     from_tail: bool,
     dead: bool,
     deadline_counted: bool,
+    /// Flight-log detail of the first request (`Resolved`); no decision reads it.
+    at_req: FrameAtReq,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FrameAtReq {
+    open: bool,
+    frame_first: u32,
+    src_left: u16,
+    holes: u16,
+    closed_ms: Option<u64>,
+}
+
+/// The first seq of the newest frame and its fragment count.
+fn frame_of(tv: &NackTailView) -> (u32, u16) {
+    (tv.seq_at_max.wrapping_sub(u32::from(tv.max_idx)), tv.count)
+}
+
+fn in_frame(s: u32, (first, count): (u32, u16)) -> bool {
+    s.wrapping_sub(first) < u32::from(count)
 }
 
 pub struct NackTracker {
@@ -104,8 +150,8 @@ pub struct NackTracker {
     counter: u32,
     stats: NackStats,
     win: NackWindow,
-    late_fills: Vec<LateFill>,
-    late_fills_dropped: u64,
+    resolved: Vec<Resolved>,
+    resolved_dropped: u64,
 }
 
 impl NackTracker {
@@ -119,8 +165,8 @@ impl NackTracker {
             counter: 0,
             stats: NackStats::default(),
             win: NackWindow::default(),
-            late_fills: Vec::new(),
-            late_fills_dropped: 0,
+            resolved: Vec::new(),
+            resolved_dropped: 0,
         }
     }
 
@@ -147,10 +193,80 @@ impl NackTracker {
     pub fn take_window(&mut self) -> NackWindow {
         core::mem::take(&mut self.win)
     }
-    /// The late fills since the last take, and how many the cap dropped.
-    pub fn take_late_fills(&mut self) -> (Vec<LateFill>, u64) {
-        let d = core::mem::take(&mut self.late_fills_dropped);
-        (core::mem::take(&mut self.late_fills), d)
+    /// The requested seqs resolved since the last take, and how many the cap dropped.
+    pub fn take_resolved(&mut self) -> (Vec<Resolved>, u64) {
+        let d = core::mem::take(&mut self.resolved_dropped);
+        (core::mem::take(&mut self.resolved), d)
+    }
+
+    fn note_resolved(&mut self, now: u64, s: u32, e: &Entry, outcome: Outcome) {
+        if self.resolved.len() >= RESOLVED_CAP {
+            self.resolved_dropped += 1;
+            return;
+        }
+        let a = e.at_req;
+        self.resolved.push(Resolved {
+            t_ms: now,
+            seq: s,
+            outcome,
+            from_tail: e.from_tail,
+            tries: e.tries,
+            late_ms: now.wrapping_sub(e.first_missing_ms) as u32,
+            after_req_ms: now.wrapping_sub(e.first_sent_ms) as u32,
+            settle_ms: self.settle_ms,
+            open: a.open,
+            src_left: a.src_left,
+            holes: a.holes,
+            closed_after_req_ms: a.closed_ms.map(|c| c.wrapping_sub(e.first_sent_ms) as u32),
+        });
+    }
+
+    /// Flight-log detail only: marks the requested entries whose frame has closed since their
+    /// first request (its last source fragment heard, or a newer frame begun).
+    fn note_frame_close(&mut self, now: u64, tv: Option<NackTailView>) {
+        let cur = tv.map(|tv| {
+            (
+                frame_of(&tv),
+                u32::from(tv.max_idx) + 1 >= u32::from(tv.count),
+            )
+        });
+        for e in self.entries.values_mut() {
+            let a = &mut e.at_req;
+            if e.tries == 0 || !a.open || a.closed_ms.is_some() {
+                continue;
+            }
+            let closed = match cur {
+                Some((f, done)) => f.0 != a.frame_first || done,
+                None => true,
+            };
+            if closed {
+                a.closed_ms = Some(now);
+            }
+        }
+    }
+
+    /// Flight-log detail only: the newest frame's state for a seq requested for the first time.
+    fn frame_at_req(&self, s: u32, tv: Option<NackTailView>) -> FrameAtReq {
+        let Some(tv) = tv else {
+            return FrameAtReq::default();
+        };
+        let f = frame_of(&tv);
+        if !in_frame(s, f) {
+            return FrameAtReq::default();
+        }
+        let src_left = tv.count.saturating_sub(tv.max_idx + 1);
+        let holes = self
+            .entries
+            .keys()
+            .filter(|&&k| in_frame(k, f) && k.wrapping_sub(f.0) <= u32::from(tv.max_idx))
+            .count() as u16;
+        FrameAtReq {
+            open: src_left > 0,
+            frame_first: f.0,
+            src_left,
+            holes,
+            closed_ms: None,
+        }
     }
 
     fn note_late(&mut self, now: u64, late_ms: u32) {
@@ -202,24 +318,13 @@ impl NackTracker {
                                 .fill_ms
                                 .push(now.wrapping_sub(e.first_sent_ms) as u32);
                         }
+                        self.note_resolved(now, s, &e, Outcome::Filled);
                     }
                 }
                 SourceState::Direct => {
                     if e.tries > 0 {
                         self.stats.late_fill += 1;
-                        if self.late_fills.len() < LATE_FILL_CAP {
-                            self.late_fills.push(LateFill {
-                                t_ms: now,
-                                seq: s,
-                                from_tail: e.from_tail,
-                                tries: e.tries,
-                                late_ms: now.wrapping_sub(e.first_missing_ms) as u32,
-                                after_req_ms: now.wrapping_sub(e.first_sent_ms) as u32,
-                                settle_ms: self.settle_ms,
-                            });
-                        } else {
-                            self.late_fills_dropped += 1;
-                        }
+                        self.note_resolved(now, s, &e, Outcome::Late);
                     } else {
                         self.note_late(now, now.wrapping_sub(e.first_missing_ms) as u32);
                     }
@@ -227,6 +332,7 @@ impl NackTracker {
                 SourceState::Recovered => {
                     if e.tries > 0 {
                         self.stats.wasted += 1;
+                        self.note_resolved(now, s, &e, Outcome::Wasted);
                     }
                 }
                 SourceState::BelowFloor => {
@@ -278,6 +384,8 @@ impl NackTracker {
         }
         self.resolve(now, inp);
         self.admit(now, inp);
+        let tv = (inp.tail)();
+        self.note_frame_close(now, tv);
         let mut due = Vec::new();
         for (&s, e) in self.entries.iter_mut() {
             if e.dead || e.tries >= self.cfg.max_tries {
@@ -326,9 +434,15 @@ impl NackTracker {
             };
             while i < due.len() && due[i].wrapping_sub(en.first_seq) < 32 {
                 en.bitmap |= 1u32 << due[i].wrapping_sub(en.first_seq);
+                let at_req = if self.entries[&due[i]].tries == 0 {
+                    self.frame_at_req(due[i], tv)
+                } else {
+                    FrameAtReq::default()
+                };
                 let e = self.entries.get_mut(&due[i]).expect("due entry");
                 if e.tries == 0 {
                     e.first_sent_ms = now;
+                    e.at_req = at_req;
                 } else {
                     any_repeat = true;
                 }
@@ -523,15 +637,98 @@ mod tests {
         st.borrow_mut().insert(21, SourceState::Direct);
         t.poll(1030, &inp);
         assert_eq!(t.stats().late_fill, 2, "7 and 21");
-        let (rows, dropped) = t.take_late_fills();
+        let (rows, dropped) = t.take_resolved();
         assert_eq!(dropped, 0);
         let gap = rows.iter().find(|r| r.seq == 7).expect("gap row");
         assert_eq!(
-            (gap.from_tail, gap.tries, gap.late_ms, gap.after_req_ms),
-            (false, 1, 30, 18)
+            (
+                gap.outcome,
+                gap.from_tail,
+                gap.tries,
+                gap.late_ms,
+                gap.after_req_ms
+            ),
+            (Outcome::Late, false, 1, 30, 18)
         );
         let tl = rows.iter().find(|r| r.seq == 21).expect("tail row");
         assert_eq!((tl.from_tail, tl.late_ms, tl.settle_ms), (true, 35, 12));
-        assert!(t.take_late_fills().0.is_empty());
+        assert!(t.take_resolved().0.is_empty());
+    }
+
+    /// The frame detail of a request: a hole asked while its frame's last source had not
+    /// arrived is `open`, with the holes and the sources still to come; the poll that sees the
+    /// last source closes it, and the repair that then solves it books `Wasted` with the time
+    /// from the request to the close. A hole asked after its frame closed is not `open`.
+    #[test]
+    fn resolved_rows_say_whether_the_frame_was_still_open() {
+        let mut t = NackTracker::new(NackCfg {
+            enable: true,
+            ..NackCfg::default()
+        });
+        // Frame of 10 fragments at seqs 100..=109; 102 and 104 lost.
+        let st = RefCell::new(BTreeMap::from([
+            (102u32, SourceState::Unknown),
+            (104, SourceState::Unknown),
+        ]));
+        let max_idx = RefCell::new(5u16);
+        let missing = || {
+            st.borrow()
+                .iter()
+                .filter(|(_, v)| **v == SourceState::Unknown)
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        let state = |s: u32| st.borrow().get(&s).copied().unwrap_or(SourceState::Direct);
+        let tail = || {
+            let m = *max_idx.borrow();
+            Some(NackTailView {
+                count: 10,
+                max_idx: m,
+                seq_at_max: 100 + u32::from(m),
+                last_progress_ms: 1000,
+            })
+        };
+        let util = || 0.0;
+        let inp = NackInputs {
+            missing: &missing,
+            state: &state,
+            tail: &tail,
+            util: &util,
+            down_util: 0.35,
+            gap_timeout_ms: 80,
+        };
+        t.poll(1000, &inp);
+        assert!(t.poll(1012, &inp).is_some(), "both asked at the settle");
+        *max_idx.borrow_mut() = 9;
+        t.poll(1015, &inp);
+        st.borrow_mut().insert(102, SourceState::Recovered);
+        st.borrow_mut().insert(104, SourceState::Retx);
+        t.poll(1020, &inp);
+        let (rows, _) = t.take_resolved();
+        let w = rows.iter().find(|r| r.seq == 102).expect("102");
+        assert_eq!(
+            (
+                w.outcome,
+                w.open,
+                w.src_left,
+                w.holes,
+                w.closed_after_req_ms
+            ),
+            (Outcome::Wasted, true, 4, 2, Some(3))
+        );
+        let f = rows.iter().find(|r| r.seq == 104).expect("104");
+        assert_eq!((f.outcome, f.after_req_ms), (Outcome::Filled, 8));
+
+        // A hole in the same frame, now closed: asked, not open, no close time.
+        st.borrow_mut().insert(107, SourceState::Unknown);
+        t.poll(1030, &inp);
+        t.poll(1042, &inp).expect("107 asked");
+        st.borrow_mut().insert(107, SourceState::Retx);
+        t.poll(1050, &inp);
+        let (rows, _) = t.take_resolved();
+        assert_eq!(
+            (rows[0].seq, rows[0].open, rows[0].closed_after_req_ms),
+            (107, false, None)
+        );
     }
 }
