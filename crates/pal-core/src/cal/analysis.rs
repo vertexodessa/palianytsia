@@ -50,9 +50,14 @@ pub struct CalThresholds {
     pub sat_rssi_dbm: f64,
     pub narrow_span: i32,
     /// A single failing cell does not end the run when this many cells right
-    /// above it deliver: more power delivered again, so the cell lost its
-    /// frames to the channel, not to the PA. 0 = every failing cell ends it.
+    /// above it deliver at least `bridge_pct`: more power delivered again, so
+    /// the cell lost its frames to the channel, not to the PA. 0 = every
+    /// failing cell ends it.
     pub bridge_clean: usize,
+    /// Near-clean (19 of 20), not merely over the wall threshold: right at
+    /// the edge a dip followed by 18 20 19 (a 20 MHz mcs4 sweep) is the slope
+    /// starting, and passing it put the wall 4 indices (1 dB) high.
+    pub bridge_pct: f64,
     pub card_disagree: i32,
     pub tx_bound_blocked_pct: i32,
     pub lossy_ratio: f64,
@@ -68,6 +73,7 @@ impl Default for CalThresholds {
             sat_rssi_dbm: -45.0,
             narrow_span: 4,
             bridge_clean: 3,
+            bridge_pct: 95.0,
             card_disagree: 2,
             tx_bound_blocked_pct: 50,
             lossy_ratio: 0.9,
@@ -106,9 +112,16 @@ fn delivery_pct(c: &CalCell, card: usize) -> f64 {
 
 /// (floor_idx, wall, bridged) of the first contiguous run at or above `pct`;
 /// `bridged` counts the single failing cells it passed over because the
-/// `bridge_clean` cells right above each delivered.
-fn first_run(cells: &[CalCell], card: usize, pct: f64, bridge_clean: usize) -> (i32, i32, u32) {
+/// `bridge_clean` cells right above each reached `bridge_pct`.
+fn first_run(
+    cells: &[CalCell],
+    card: usize,
+    pct: f64,
+    bridge_clean: usize,
+    bridge_pct: f64,
+) -> (i32, i32, u32) {
     let ok = |c: &CalCell| delivery_pct(c, card) >= pct;
+    let clean = |c: &CalCell| delivery_pct(c, card) >= bridge_pct;
     let Some(mut i) = cells.iter().position(ok) else {
         return (NO_WALL, NO_WALL, 0);
     };
@@ -119,7 +132,7 @@ fn first_run(cells: &[CalCell], card: usize, pct: f64, bridge_clean: usize) -> (
             wall = cells[i].idx;
         } else if bridge_clean > 0
             && i + bridge_clean < cells.len()
-            && cells[i + 1..=i + bridge_clean].iter().all(ok)
+            && cells[i + 1..=i + bridge_clean].iter().all(clean)
         {
             bridged += 1;
         } else {
@@ -133,10 +146,10 @@ fn first_run(cells: &[CalCell], card: usize, pct: f64, bridge_clean: usize) -> (
 /// `cells` sorted ascending by idx. The wall is the END OF THE FIRST
 /// CONTIGUOUS run at or above `deliver_pct`: past the first dip delivery
 /// is a comb, and an island there is not headroom. One exception: a single
-/// failing cell with `bridge_clean` delivering cells right above it does not
-/// end the run (`FLAG_BRIDGED`); with 20 frames a cell three frames lost to
-/// the channel fail it, and the comb never shows three clean cells in a row
-/// straight after its first dip. Scored on the best single card, never the
+/// failing cell with `bridge_clean` cells right above it that each reach
+/// `bridge_pct` does not end the run (`FLAG_BRIDGED`); with 20 frames a cell
+/// three frames lost to the channel fail it, and the comb never shows three
+/// near-clean cells in a row straight after its first dip. Scored on the best single card, never the
 /// union (diversity does not protect against PA compression).
 pub fn analyze_rate(cells: &[CalCell], th: &CalThresholds) -> RateWall {
     let mut out = RateWall::default();
@@ -163,7 +176,8 @@ pub fn analyze_rate(cells: &[CalCell], th: &CalThresholds) -> RateWall {
     if peak != RSSI_NONE && f64::from(peak) > th.sat_rssi_dbm {
         out.flags |= FLAG_SATURATED;
     }
-    let (floor, wall, bridged) = first_run(cells, best, th.deliver_pct, th.bridge_clean);
+    let (floor, wall, bridged) =
+        first_run(cells, best, th.deliver_pct, th.bridge_clean, th.bridge_pct);
     out.floor_idx = floor;
     if bridged > 0 {
         out.flags |= FLAG_BRIDGED;
@@ -184,7 +198,8 @@ pub fn analyze_rate(cells: &[CalCell], th: &CalThresholds) -> RateWall {
     }
     let other = 1 - best;
     if cells.iter().any(|c| c.received[other] > 0) {
-        let (ofloor, owall, _) = first_run(cells, other, th.deliver_pct, th.bridge_clean);
+        let (ofloor, owall, _) =
+            first_run(cells, other, th.deliver_pct, th.bridge_clean, th.bridge_pct);
         // Compared against the raw run end, as the C++ does.
         if ofloor != NO_WALL && (owall - wall).abs() > th.card_disagree {
             out.flags |= FLAG_CARD_DISAGREE;
@@ -452,6 +467,26 @@ mod tests {
         let w = analyze_rate(&row20(&got), &th());
         assert_eq!(w.wall, 25);
         assert_eq!(w.flags & FLAG_BRIDGED, 0);
+    }
+
+    #[test]
+    fn a_dip_followed_by_cells_just_over_the_threshold_ends_the_run() {
+        // 20 MHz mcs4 of a bench sweep: 16 at idx 18, then 18 20 19, then 14
+        // 13 5. The three cells above the dip clear 90 % but not all 95 %.
+        let mut got = vec![20; 59];
+        got.extend([16, 18, 20, 19, 14, 13, 5, 2, 0]);
+        got.resize(105, 0);
+        let w = analyze_rate(&row20(&got), &th());
+        assert_eq!(w.wall, 17);
+        assert_eq!(w.flags & FLAG_BRIDGED, 0);
+        // With the clean bar at the wall threshold it was passed.
+        let loose = CalThresholds {
+            bridge_pct: 90.0,
+            ..th()
+        };
+        let w = analyze_rate(&row20(&got), &loose);
+        assert_eq!(w.wall, 21);
+        assert_ne!(w.flags & FLAG_BRIDGED, 0);
     }
 
     #[test]

@@ -115,14 +115,16 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   (625 to 708 ms). Checked: both rows set and read back over the link, `pal-desktop --panel picture
   --params` snapshots against that build. Not yet seen: the switch in the headset.
 - mabur pin, 2026-11-13 (pal-ajcs): the calibration wall rule passes one failing cell when the three
-  cells right above it deliver (`bridge_clean`, flag `bridged` = 1024), and a wall that sits under a
+  cells right above it each deliver 95 %, 19 of 20 (`bridge_clean`, `bridge_pct`, flag `bridged` = 1024;
+  a bar at the 90 % wall threshold reached into the slope at the edge: a 20 MHz mcs4 sweep, 16 then
+  18 20 19 then 14, moved its wall 17 -> 21, 1 dB high), and a wall that sits under a
   faster rate's wall is flagged (`under_faster` = 2048, the wall stays as measured). Both in mabur's
   GS (`cal_analysis`) and the Rust port (`pal-core` `cal/analysis.rs`, unit tests mirror the C++
   ones; calibration is outside the ref==rust replay gates); the panel names the flags "dip passed"
   and "under a faster rate". The case: a 40 MHz mcs5 row of a field run that delivered 19-20 of 20
   up to index 31 except one cell at -12 (15 of 20) got its wall at -13, and the table went to the
   drone 44 indices low unflagged; both implementations now give 31. Replayed over the 10
-  calibration logs on disk (158 rows of 20 sweeps): 23 walls change, all upward. Not done: a
+  calibration logs on disk (158 rows of 20 sweeps): 14 walls change, all upward. Not done: a
   calibration on the air with the new rule, and the ticket's lesser item (the -45 dBm "saturated"
   threshold). The drone side is unchanged (the rule runs on the GS), so no maburd rebuild.
 - mabur pin, 2026-11-13 (pal-444x): `palianytsia/base-v2` rebased onto upstream master with
