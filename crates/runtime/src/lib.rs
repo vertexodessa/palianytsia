@@ -81,9 +81,11 @@ impl PeerRc {
     }
 }
 
-/// The loop's view of `PeerRc`: the UI shows the other version while its Telems keep coming
-/// (one a second; the view lasts `PEER_RC_HOLD_US` past the last), the flight log gets one
-/// event per version heard.
+/// The loop's view of `PeerRc`: the UI shows the other version from the first of its Telems
+/// until a session forms or none has been heard for `PEER_RC_HOLD_US`; the flight log gets one
+/// event per version heard. The hold is long because the drone sends one Telem a second and a
+/// GS on an auto config is on the drone's channel only now and then: on the bench it heard two
+/// in 40 s.
 #[derive(Default)]
 struct PeerRcWatch {
     seen: u64,
@@ -91,7 +93,7 @@ struct PeerRcWatch {
     logged: Option<u8>,
 }
 
-const PEER_RC_HOLD_US: u64 = 5_000_000;
+const PEER_RC_HOLD_US: u64 = 60_000_000;
 
 impl PeerRcWatch {
     /// (the UI view, an event for the flight log) for this stats pass.
@@ -100,6 +102,7 @@ impl PeerRcWatch {
         now: u64,
         ver: u8,
         frames: u64,
+        session: bool,
     ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
         let view = |v: u8| serde_json::json!({"ver": v, "app": pal_wire::rc::RC_VERSION});
         let mut event = None;
@@ -112,6 +115,9 @@ impl PeerRcWatch {
                 e["frames"] = frames.into();
                 event = Some(e);
             }
+        }
+        if session {
+            self.heard_us = None;
         }
         let ui = self
             .heard_us
@@ -645,10 +651,12 @@ impl CoreLoop {
         let cal = self.cal_line();
         let log_err = self.log_err();
         let pr = &self.sink.shared.peer_rc;
+        let session = stats.as_ref().is_some_and(|s| s["session"] == true);
         let (peer_rc, ev) = self.peer_rc.pass(
             now,
             pr.ver.load(Ordering::Relaxed),
             pr.frames.load(Ordering::Acquire),
+            session,
         );
         if let Some(e) = ev {
             self.sink.shared.event("peer_rc", e);
@@ -1449,26 +1457,40 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Nothing until a foreign Telem is counted; then the UI view while they keep coming and
-    /// for 5 s after the last, and one event per version, not per Telem.
+    /// Nothing until a foreign Telem is counted; then the UI view until 60 s after the last
+    /// or a session, and one event per version, not per Telem.
     #[test]
-    fn a_drone_on_another_rc_version_shows_while_heard_and_logs_once() {
+    fn a_drone_on_another_rc_version_shows_until_a_session_and_logs_once() {
         let app = u64::from(pal_wire::rc::RC_VERSION);
         let mut w = PeerRcWatch::default();
-        assert_eq!(w.pass(1_000_000, 0, 0), (None, None));
-        let (ui, ev) = w.pass(2_000_000, 19, 1);
+        assert_eq!(w.pass(1_000_000, 0, 0, false), (None, None));
+        let (ui, ev) = w.pass(2_000_000, 19, 1, false);
         assert_eq!(ui, Some(serde_json::json!({"ver": 19, "app": app})));
         assert_eq!(ev.expect("first Telem logs")["frames"], 1);
-        assert_eq!(
-            w.pass(3_000_000, 19, 2).1,
-            None,
-            "same version: no new event"
+        let same = w.pass(3_000_000, 19, 2, false).1;
+        assert_eq!(same, None, "same version: no new event");
+        assert!(
+            w.pass(62_900_000, 19, 2, false).0.is_some(),
+            "59.9 s after the last"
         );
-        assert!(w.pass(7_900_000, 19, 2).0.is_some(), "4.9 s after the last");
-        assert_eq!(w.pass(8_000_000, 19, 2).0, None, "5 s after the last");
-        let (ui, ev) = w.pass(9_000_000, 17, 3);
+        assert_eq!(
+            w.pass(63_000_000, 19, 2, false).0,
+            None,
+            "60 s after the last"
+        );
+        let (ui, ev) = w.pass(64_000_000, 17, 3, false);
         assert_eq!(ui.expect("heard again")["ver"], 17);
         assert_eq!(ev.expect("another version logs")["ver"], 17);
+        assert_eq!(
+            w.pass(65_000_000, 17, 3, true).0,
+            None,
+            "a session clears it"
+        );
+        assert_eq!(
+            w.pass(66_000_000, 17, 3, false).0,
+            None,
+            "and it stays clear"
+        );
     }
 
     fn table(list: &str, min_iqp: Option<&str>) -> String {
