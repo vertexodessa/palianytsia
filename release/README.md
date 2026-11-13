@@ -1,11 +1,11 @@
-# Palianytsia v0.13.1
+# Palianytsia v0.14
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.13.1.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.13.1.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.14.0.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.14.0.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -14,30 +14,20 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
 
-## What changed in v0.13.1
-- **The desktop app has the channel menu.** Gear, Link, Channels, as in the Quest and phone apps: it scans the 5 GHz channels, shows foreign frames per second and a DFS mark for each, and the ticked ones are where the link may sit. One ticked channel holds the link there; a change moves a live link by a hop. The choice is saved and applied at the next start. Before, the desktop had no way to choose a channel but `--ch`, although this README said it had the menu. `--ch N` still holds one channel with no search and no menu.
-- **The desktop applies "Step down on enhance-layer loss".** The switch was shown and saved but only the apps used it.
-- **README:** the desktop writes a flight log only when started with `--log-dir DIR`.
+## What changed in v0.14
+- **The ground station updates the drone by itself.** The Quest, phone and desktop apps carry the maburd of their release. When one meets a disarmed drone that runs a different maburd (older or newer, or one on another RC version), it uploads its own over the radio link, runs it from RAM, waits for video from it, then writes it to flash and deletes the old one. It takes about 50 s with the video off; the banner says UPDATING DRONE with the step and a percentage, then DRONE UPDATED or DRONE UPDATE FAILED. Settings, System shows what the drone runs. If the new maburd does not run, or the link is lost before the flash write, the drone starts its old maburd again within 2 minutes by itself. The drone keeps its own `mabur.toml`; the keys a release sets on every drone are set as `install.py` does. Never while the drone is armed, and one try per app start.
+- **This one install is still from a PC.** A drone learns the update lane with v0.14's maburd: install it once with `drone/install.py`, later releases arrive from the ground station. A v0.13 drone flies with a v0.14 ground station (same RC version and parameter table), and Settings, System says it cannot be updated over the air.
+- **A picture that cannot heal is named.** When four keyframe requests in a row bring no whole keyframe, the ground station asks every 2 s, then 4 s, instead of every second, and the banner says PICTURE CANNOT HEAL until a keyframe comes in whole.
+- **A drone on another RC version is named on screen** (DRONE SPEAKS RC N, THIS APP RC M) instead of an endless search.
+- **The drone gives way to a neighbour more gently.** While another transmitter keeps filling the drone's queue, the drone lowers its video bitrate a step (at most three, each 25 %) instead of dropping every other frame again and again; the OSD shows a "half fps" chip while it does drop frames.
+- **Channels.** With one card the channel scan takes one 12 ms look every 250 ms (5 % of the frames lost during a scan on the bench, against 19 % before), and the menu scans on open only with a spare card. At boot the link moves to the chosen channel only once video flows.
+- **Calibration.** One failing cell with three clean cells above it no longer ends a power wall low; replayed over ten calibration logs, 14 of 158 walls move up.
+- **install.py.** An update also sets A-MPDU off, the 6 dB wall margin, `venc.min_iqp` 42 and, on an uncalibrated drone, the single-frame capacity tables. The camera tuning file is fitted to the drone's sensor. The shipped config has a wall margin of 6 dB.
+- **OSD.** The video chip turns amber while the decoder throws video away; the stats chips sit below the HUD's top line; the drone chip says stale without a session.
 
-maburd, the drone config and the Quest and phone apps are the same as in v0.13 (the APKs only carry the new version number). A v0.13 ground station and drone work with v0.13.1.
+On one bench (RTL8822E drone, ch 144): the released Quest app met the drone on an older maburd and had it on this release's maburd, written to flash, 48.5 s later; the desktop app did the same in 49 s and, started again, left the drone alone. A build that exits at once was refused by the trial and the drone stayed on its maburd. The phone app carries the same code and was not run against a drone. A power cut during the flash write (a few seconds) can leave the drone without maburd; `install.py` from a PC recovers it.
 
-## What changed since v0.12
-Update both ends together. The drone parameter table has two new rows, so a v0.13 ground station with an older drone (or the other way round) shows "table mismatch" and the new settings without a value. The video itself still flies between v0.12 and v0.13.
-
-- **The picture no longer stalls when the stream runs near the drone's limit.** Above about 18 Mbit/s the drone's video thread waited for the thread that builds the repair packets, up to 167 ms at a time, and stayed in that state: frames were skipped at the camera, the ones that followed were large and arrived late. It now waits only when it must, and that did not happen in any run. When the drone's CPU cannot build every repair packet it sends fewer of them instead of holding frames back.
-- **Periodic refresh is a setting.** Picture, Advanced: "Periodic refresh every, s" and "Refresh picture instead of a keyframe". Off by default (the ground station asks for a keyframe when its picture is damaged). With the second one on, the drone sends one all-intra picture per period instead of a keyframe. Each change restarts the video for about 0.7 s.
-- **Calibration covers both widths.** One start calibrates TX power and capacity at 20 MHz, then measures the board's own 40 MHz receive-gain floor and writes it (never under the default 53), then calibrates 40 MHz. If the 40 MHz part fails, what 20 MHz applied stays. The floor measurement needs a quiet channel; on a busy one the drone says so and nothing is written.
-- **Flight log.** `pal log` says how many frames its latency percentiles leave out (truncated, never emitted). Channel-search events carry the time they happened.
-
-On one bench (RTL8822E drone, 2944x1656 at 60 fps, 40 MHz):
-- Bitrate ceiling raised to 20000 kbps, 60 s runs alternating, two each: before, 30 % and 27 % of the camera's frames were missing, 95 % of the frames were complete within 161 and 159 ms, and the ground station asked for a keyframe 64 and 44 times; after, 2 frames of about 3400 were missing, 95 % within 33 ms, 1 request.
-- At the shipped ceiling of 18000 kbps, one run of 15 minutes each: before, 26 waits, the longest 105 ms, and a worst frame of 168 ms; after, no wait and a worst frame of 84 ms. The typical frame is the same (median 24 and 25 ms, 95 % within 31 ms), and neither run fell into the stalled state. After the change 0.2 % of the camera's frames were missing, most of them in two stretches of 2 s that are not explained yet (before: 0.04 %).
-- Refresh every second, 30 pictures removed from a recording: with a keyframe or with the refresh picture the image is whole again at the next refresh; with the refresh off it stays damaged until a keyframe is asked for.
-- Under loss, with the Quest 3 as the ground station, 40 s runs at 20000 kbps: with 200 foreign frames a second on the channel, 8 and 5 damaged base pictures and 10 and 7 keyframe requests before, none and 2 and 2 after; with 8 % of the packets dropped at each receiving card, 6 damaged base pictures and 95 % of the frames within 141 ms before, none and 48 ms after. The missing repair packets cost nothing there. A weak signal at range is not measured.
-
-From the Quest and phone apps, a calibration against a v0.13 drone runs the 40 MHz steps too; those have host tests only.
-
-v0.12 notes: the link stays on its top rung (NACK residual rule), `VENC_MIN_IQP` 42, A-MPDU off by default, the 40 MHz receive-gain floor, the Quest menu panel.
+v0.13.1 notes: the channel menu in the desktop app. v0.13 notes: the picture no longer stalls near the drone's limit (FEC), periodic refresh as a setting, calibration of both widths.
 
 ## Ground station
 
@@ -46,7 +36,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.13.1.apk    # or the phone APK
+   adb install palianytsia-quest-0.14.0.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -117,6 +107,8 @@ Both ways it asks for confirmation (`-y` skips it), uploads to `/tmp` and checks
    maburd: build mabur @MABUR_SHA@ devourer @DEVOURER_SHA@ RC_VERSION @RC_VERSION@
    ```
 
+Once the drone runs this release's maburd, later releases need no PC: a ground station that carries another maburd installs it over the radio link while the drone is disarmed (see "What changed in v0.14"). It keeps the drone's own `mabur.toml` and sets the same release keys as an update by `install.py`.
+
 To roll back, run the same script with the backup folder it printed:
 
 ```
@@ -153,11 +145,12 @@ Calibrate (Link tab, drone at a distance and disarmed) measures this drone's car
 
 When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, or with a native (not binned) camera mode, the link carries more; if the OSD shows the bitrate at the ceiling on the top rung, raise `ENC_BITRATE_MAX` (the bench drone runs 18000 with `ENC_AIRTIME` 0.75 at 40 MHz). Values above the factory ones were run on one bench drone and not flown.
 
-## Known limits in v0.13
+## Known limits in v0.14
 
+- The automatic drone update has been run from the Quest and desktop apps on one bench, not in the field. The phone app carries it and was not run against a drone. A power cut during the few seconds of the flash write can leave the drone without maburd; `install.py` from a PC recovers it. Two ground stations of different releases each install their own maburd, once per app start.
 - Pairing uses the default link key on both ends.
-- The changes of v0.13 have been run on one bench and not flown. The released Quest app has run there (video under interference and simulated loss); its menu was not opened, so the two new settings have not been used in the headset. The phone app was built but not run.
-- Calibration: against a v0.13 drone the Calibrate button of the Quest and phone apps, and of a desktop started with the shipped `gs.toml` and no `--ch`, runs five steps: power and capacity at 20 MHz, the receive-gain floor, power and capacity at 40 MHz. The apps have no button for the 20 MHz part alone. A desktop pinned to a channel with `--ch` on a 20 MHz link runs the 20 MHz part only (run once on the bench against this maburd). The floor measurement has been run on one board. The 40 MHz power and capacity steps have host tests only.
+- The changes of v0.13 and v0.14 have been run on one bench and not flown. The released Quest app has run there (video under interference and simulated loss); its menu was not opened, so the two new settings have not been used in the headset. The phone app was built but not run.
+- Calibration: against a v0.13 or v0.14 drone the Calibrate button of the Quest and phone apps, and of a desktop started with the shipped `gs.toml` and no `--ch`, runs five steps: power and capacity at 20 MHz, the receive-gain floor, power and capacity at 40 MHz. The apps have no button for the 20 MHz part alone. A desktop pinned to a channel with `--ch` on a 20 MHz link runs the 20 MHz part only (run once on the bench against this maburd). The floor measurement has been run on one board. The 40 MHz power and capacity steps have host tests only.
 - Periodic refresh: with the shipped frame layering only "off" (a keyframe) and "on" (one refresh picture) restore the whole image. A longer refresh stripe (`venc.intra_refresh_frames` above 1 in `mabur.toml`) restores the top of the picture only.
 - 40 MHz video is experimental. The gain floor default clears every board measured so far, but its cost for the control link at long range is not measured; a board's own lowest working value is lower (36 on the bench board), and calibration now measures it on a quiet channel. Without a calibration the 40 MHz power table stays the reference board's. Keep `encoder.bitrate_max_kbps` at what your drone can send: above that, frames arrive late and are cut.
 - The link does not notice frames that arrive late, only frames that are lost. A bitrate cap set too high for the drone shows as cut frames on the top rung.
@@ -176,7 +169,7 @@ When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, 
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.12` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.11` plus the receiver gain floor key, the new drone defaults and the ground-station fixes from `palianytsia/base-v2`.
+- mabur: fork branch `release/v0.14` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `palianytsia/base-v2` (upstream master with PR #120-#123 and our commits) without the bench-only `/sim` endpoint.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
