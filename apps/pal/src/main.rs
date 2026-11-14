@@ -277,14 +277,6 @@ impl Sink {
         }
     }
 
-    /// The core's closed loss episodes into fec.log, every tick.
-    fn log_fec(&mut self, core: &mut dyn GsCore) {
-        let rows = core.take_fec_rows();
-        if let Some(l) = self.log.as_mut() {
-            l.fec_rows(&rows).unwrap();
-        }
-    }
-
     /// Once a second of core clock: the stats line into the flight log.
     fn log_stats(&mut self, now_us: u64, last: &mut u64, core: &dyn GsCore) {
         if self.log.is_some() && now_us >= *last + 1_000_000 {
@@ -462,12 +454,11 @@ impl runtime::BodyLoop for Live {
             c.tick(now).unwrap();
         }
         self.sink.now_us = now;
-        if let Some(l) = self.sink.log.as_mut() {
-            l.tick(now).unwrap();
-        }
+        runtime::log_shared_events(&self.shared, self.sink.log.as_mut(), now);
         let el = self.t0.elapsed().as_secs_f64();
         self.sets.fire(&mut *self.core, |ts| el >= ts);
         self.core.tick(now, &mut self.sink);
+        runtime::log_core_output(&mut *self.core, self.sink.log.as_mut(), now);
         if self.print_params {
             // Live: print each change of a row's state as it happens.
             let p = self.core.params_json(now);
@@ -869,7 +860,7 @@ fn replay(o: Opts) {
                     l.tick(t).unwrap();
                 }
                 core.tick(t, &mut sink);
-                sink.log_fec(&mut *core);
+                runtime::log_core_output(&mut *core, sink.log.as_mut(), t);
                 sink.idr_step(t, &mut *core);
                 sink.log_stats(t, &mut last_stats, &*core);
             }
