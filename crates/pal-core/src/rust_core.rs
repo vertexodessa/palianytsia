@@ -185,16 +185,23 @@ impl Gs {
         if self.cal.session.radio_silent(now_us / 1000) {
             return;
         }
-        let card = self.sel.selected();
+        self.air(self.sel.selected(), body, io);
+    }
+
+    /// The one way onto the air, past the scout gate: None = the scout has
+    /// `card` off the link (nothing sent), else the card's send result
+    /// (always true without a card roster, where `io` carries the frame).
+    fn air(&self, card: usize, body: &[u8], io: &mut dyn CoreIo) -> Option<bool> {
         if self.chan.as_ref().is_some_and(|c| !c.may_send(card)) {
-            return;
+            return None;
         }
-        match self.cards.get(card) {
-            Some(c) => {
-                c.send_control(body);
+        Some(match self.cards.get(card) {
+            Some(c) => c.send_control(body),
+            None => {
+                io.send(body);
+                true
             }
-            None => io.send(body),
-        }
+        })
     }
 
     /// The card this RCF step transmits on (maburgs main.cpp at vrx.step).
@@ -228,19 +235,8 @@ impl Gs {
     /// Past the calibration gate: the cal lane's own frames, which the
     /// session offers only while the air is the GS's.
     fn send_now(&mut self, f: &SlotFrame, now_us: u64, io: &mut dyn CoreIo) -> bool {
-        if self
-            .chan
-            .as_ref()
-            .is_some_and(|c| !c.may_send(f.card as usize))
-        {
+        let Some(ok) = self.air(f.card as usize, &f.frame, io) else {
             return false;
-        }
-        let ok = match self.cards.get(f.card as usize) {
-            Some(c) => c.send_control(&f.frame),
-            None => {
-                io.send(&f.frame);
-                true
-            }
         };
         self.sends += 1;
         if f.stamp_rtt {
@@ -1777,6 +1773,7 @@ mod tests {
             clk.advance(5);
             core.tick(us(&clk), &mut io);
         }
+        core.send_raw(b"MT\x01raw", us(&clk), &mut io);
         assert_eq!(card.s().sent.len(), n1, "a send broke the radio silence");
 
         // Sweep frames reach the session, not the video path.
