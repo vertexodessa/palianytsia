@@ -320,8 +320,6 @@ pub struct RustCore {
 /// Rows kept for a loop that never takes them (no flight log): about a
 /// minute of a bad link, oldest dropped.
 const FEC_ROWS_CAP: usize = 4096;
-/// Telem flags bit4 (mabur rc_proto): the drone sheds the enh layer for TxQueue pressure.
-const TELEM_CONGESTION_SHED: u8 = 0x10;
 /// Telem older than this says nothing about the drone now (WebGs's drone_lp staleness).
 const TELEM_STALE_US: u64 = 3_000_000;
 
@@ -496,6 +494,16 @@ macro_rules! au_out {
 impl RustCore {
     pub fn new(cfg: &Config, opts: CoreOpts) -> Result<Self, String> {
         Self::build(cfg, opts, None)
+    }
+
+    /// A Telem arrived within TELEM_STALE_US of the last tick's clock.
+    fn telem_recent(&self) -> bool {
+        self.now_us.wrapping_sub(self.telem_rx_us) <= TELEM_STALE_US
+    }
+
+    /// The last Telem while it still says something about the drone now.
+    fn fresh_telem(&self) -> Option<&rc::Telem> {
+        self.telem.as_ref().filter(|_| self.telem_recent())
     }
 
     /// mabur's GS drains the episodes every tick and stamps each with the op
@@ -728,7 +736,7 @@ impl RustCore {
                 let (seq, state, flags) = (t.tlm_seq, t.state, t.flags);
                 self.telem_rx_us = us;
                 self.note_shed(
-                    flags & TELEM_CONGESTION_SHED != 0,
+                    flags & rc::TELEM_FLAG_CONGESTION_SHED != 0,
                     t.txq_wait_max_ms,
                     us / 1000,
                 );
@@ -743,7 +751,7 @@ impl RustCore {
                     // RTT pairs telem echoes with our own sends.
                     g.rtt.on_telem(
                         t.rcf_seq_echo,
-                        flags & 0x08 != 0,
+                        flags & rc::TELEM_FLAG_ECHO_VALID != 0,
                         t.rcf_age_ms,
                         t.pts_at_build,
                         us,
@@ -1012,16 +1020,13 @@ impl GsCore for RustCore {
                 n.win.drain(now_ms, &mut n.t);
                 let (rows, capped) = n.t.take_resolved();
                 if !rows.is_empty() || capped > 0 {
-                    let dq = self
-                        .telem
-                        .filter(|_| self.now_us.wrapping_sub(self.telem_rx_us) <= TELEM_STALE_US)
-                        .map(|t| t.txq_wait_max_ms);
+                    let dq = self.fresh_telem().map(|t| t.txq_wait_max_ms);
                     self.diag.nack_rows(&rows, capped, dq);
                 }
             }
         }
         self.diag.order_window(now_ms);
-        if self.now_us.wrapping_sub(self.telem_rx_us) > TELEM_STALE_US {
+        if !self.telem_recent() {
             if let Some(dur) = self.diag.shed.active_ms(now_ms) {
                 self.diag.shed.forget();
                 let mut o = J::obj();
@@ -1225,9 +1230,7 @@ impl GsCore for RustCore {
     }
 
     fn drone_json(&self) -> Option<String> {
-        if self.telem.is_none() || self.now_us.wrapping_sub(self.telem_rx_us) > TELEM_STALE_US {
-            return None;
-        }
+        self.fresh_telem()?;
         let mut o = J::obj();
         o.set("shed_ms", self.diag.shed.active_ms(self.now_us / 1000));
         Some(o.dump())
@@ -1364,13 +1367,11 @@ impl GsCore for RustCore {
                 .map(|t| i64::from(t.soc_temp_c)),
         );
         // Gs only: a spotter has no RCF for the low_power readout to drive.
-        const DRONE_LP_STALE_US: u64 = 3_000_000;
         j.set(
             "drone_lp",
-            t.filter(|_| {
-                g.is_some() && self.now_us.wrapping_sub(self.telem_rx_us) <= DRONE_LP_STALE_US
-            })
-            .map(|t| t.flags & 0x80 != 0),
+            self.fresh_telem()
+                .filter(|_| g.is_some())
+                .map(|t| t.flags & rc::TELEM_FLAG_LOW_POWER != 0),
         );
         j.set("rec_state", t.map(|t| t.rec_status & 0x03));
         j.set("rec_err", t.map(|t| t.rec_status >> 2));

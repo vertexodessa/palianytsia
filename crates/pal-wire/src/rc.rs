@@ -140,12 +140,19 @@ impl Default for DiscAck {
     }
 }
 
+/// Telem `flags` bit3 (mabur rc_proto): `rcf_seq_echo` is valid.
+pub const TELEM_FLAG_ECHO_VALID: u8 = 0x08;
+/// Telem `flags` bit4: the drone sheds the enh layer for TxQueue pressure.
+pub const TELEM_FLAG_CONGESTION_SHED: u8 = 0x10;
+/// Telem `flags` bit7: the drone runs its low-power mode.
+pub const TELEM_FLAG_LOW_POWER: u8 = 0x80;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Telem {
     pub tlm_seq: u16,
     pub state: u8,
     /// bit0 failsafe_shed, bit1 auth_reject, bit3 rcf_seq_echo valid,
-    /// bit4 congestion_shed, bit7 low_power.
+    /// bit4 congestion_shed, bit7 low_power (the `TELEM_FLAG_*` constants).
     pub flags: u8,
     pub rcf_age_ms: u16,
     pub rcf_seq_echo: u16,
