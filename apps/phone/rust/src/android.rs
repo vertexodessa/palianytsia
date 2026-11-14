@@ -63,7 +63,7 @@ impl Phone {
                 },
                 toml: a.toml.clone(),
                 log_dir: a.log_dir.clone(),
-                pick: pal_android::link_pick(&a.prefs_path),
+                pick: runtime::link_pick(&a.prefs_path),
             },
             a.win.clone(),
         )?;

@@ -309,21 +309,16 @@ fn resolve_config(o: &mut Opts) {
         std::fs::read_to_string(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
     let mut menu = false;
     if o.live() {
-        let prefs = pal_osd::prefs::HudPrefs::load(&prefs_path());
-        let bw = match o.link_bw {
-            0 => prefs.link_bw,
-            b => b,
-        };
+        let mut pick = runtime::link_pick(&prefs_path());
+        if o.link_bw != 0 {
+            pick.bw = o.link_bw;
+        }
+        let bw = pick.bw;
         menu = o.rust
             && o.mode == Mode::Gs
             && o.ch == 0
             && pal_core::config::parse_config_str(&text).is_ok_and(|c| c.radio.pin.is_none());
         if menu {
-            let pick = pal_core::config::LinkPick {
-                bw,
-                channels: prefs.link_channels,
-                s3_demote: Some(prefs.s3_demote),
-            };
             let (t, skipped) = pal_core::config::with_link_pick(&text, pick);
             for s in skipped {
                 eprintln!("pal-desktop: {s}");

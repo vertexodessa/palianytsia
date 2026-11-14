@@ -176,7 +176,7 @@ pub fn run(hub: Arc<Hub>, act: usize, vm: usize, toml: String, log_dir: PathBuf,
         let fds: Vec<i32> = opens.iter().map(|o| o.fd).collect();
         // The bring-up (seconds per card) runs once per attach: a restart
         // for new settings runs on the cards still open.
-        let set = match pal_android::open_cards(&fds, &toml, pal_android::link_pick(&prefs)) {
+        let set = match pal_android::open_cards(&fds, &toml, runtime::link_pick(&prefs)) {
             Ok(s) => s,
             Err(e) => {
                 for o in opens {
@@ -198,7 +198,7 @@ pub fn run(hub: Arc<Hub>, act: usize, vm: usize, toml: String, log_dir: PathBuf,
                 cards: Cards::Open(set.clone()),
                 toml: toml.clone(),
                 log_dir: log_dir.clone(),
-                pick: pal_android::link_pick(&prefs),
+                pick: runtime::link_pick(&prefs),
             };
             let (link, ports) = match Link::start(cfg, win.clone()) {
                 Ok(x) => x,

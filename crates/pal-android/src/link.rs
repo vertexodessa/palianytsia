@@ -32,17 +32,6 @@ pub fn clear_err() {
     LAST_ERR.lock().unwrap_or_else(|p| p.into_inner()).clear();
 }
 
-/// The start-time choices in the saved prefs: the one place that knows
-/// which HudPrefs fields a link applies when it starts.
-pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
-    let p = pal_osd::prefs::HudPrefs::load(prefs);
-    pal_core::config::LinkPick {
-        bw: p.link_bw,
-        channels: p.link_channels,
-        s3_demote: Some(p.s3_demote),
-    }
-}
-
 /// The cards a link runs on.
 pub enum Cards {
     /// Cards the caller opened (`open_cards`) and keeps across links: a
@@ -139,7 +128,7 @@ pub struct LinkCfg {
     pub toml: String,
     /// Flight log root; one `fl-NNNN_*` directory per start.
     pub log_dir: PathBuf,
-    /// The operator's start-time choices (`link_pick`).
+    /// The operator's start-time choices (`runtime::link_pick`).
     pub pick: pal_core::config::LinkPick,
 }
 

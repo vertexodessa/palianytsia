@@ -25,6 +25,18 @@ pub mod stats_line;
 
 pub use panic_hook::install_panic_hook;
 
+/// The start-time choices in the saved prefs: the one place that knows
+/// which HudPrefs fields a link applies when it starts (the APKs and
+/// pal-desktop live).
+pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
+    let p = pal_osd::prefs::HudPrefs::load(prefs);
+    pal_core::config::LinkPick {
+        bw: p.link_bw,
+        channels: p.link_channels,
+        s3_demote: Some(p.s3_demote),
+    }
+}
+
 /// Core tick period.
 pub const TICK_US: u64 = 2000;
 
