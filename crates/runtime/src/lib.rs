@@ -18,6 +18,7 @@ pub mod drone_fetch;
 pub mod drone_update;
 pub mod maint;
 pub mod panic_hook;
+pub mod param_order;
 pub mod rf_sim;
 pub mod stats_line;
 
@@ -374,6 +375,8 @@ pub struct CoreLoop {
     log_err_told: bool,
     /// The drone's parameter table as last read, for the flight log.
     params: ParamLog,
+    /// A VENC_MODE set waiting for its REC_FPS to be accepted (`param_order`).
+    held: Option<param_order::Held>,
     /// The cards the core drives, in card order (`watch_cards`).
     taps: Vec<Arc<dyn RxTap>>,
     peer_rc: PeerRcWatch,
@@ -418,6 +421,7 @@ impl CoreLoop {
             rung_seen_ms: None,
             log_err_told: false,
             params: ParamLog::default(),
+            held: None,
             taps: Vec::new(),
             peer_rc: PeerRcWatch::default(),
         }
@@ -583,16 +587,25 @@ impl CoreLoop {
     fn apply_cmd(&mut self, c: pal_osd::params::Cmd) {
         match c {
             pal_osd::params::Cmd::Set(row, text) => {
-                let r = self.core.param_set(row, &text);
-                eprintln!("pal: param set {row} {text:?}: {r:?}");
-                // Android has no stderr: the flight log keeps it. Row
-                // numbers move between releases; the id does not.
-                let (id, prev) = self.params.row(row);
-                self.sink.shared.event(
-                    "param_set",
-                    serde_json::json!({"row": row, "id": id, "prev": prev, "value": text,
-                        "result": result_text(&r, "sent")}),
-                );
+                let t = pal_osd::params::Table::parse(&self.core.params_json(self.sink.now_us));
+                let first = t.and_then(|t| param_order::rec_fps_first(&t, row, &text));
+                let r = match first {
+                    Some((rec_row, rec_text)) => {
+                        self.held = None;
+                        let r = self.send_set(rec_row, &rec_text);
+                        if r.is_ok() {
+                            self.held = Some(param_order::Held {
+                                row,
+                                text,
+                                rec_row,
+                                rec_text,
+                                since_us: self.sink.now_us,
+                            });
+                        }
+                        r
+                    }
+                    None => self.send_set(row, &text),
+                };
                 let _ = self.ports.set_res_tx.try_send((row, r));
             }
             pal_osd::params::Cmd::Refresh => self.core.param_refresh(),
@@ -618,6 +631,47 @@ impl CoreLoop {
                     "channels",
                     serde_json::json!({"channels": chs, "result": result_text(&r, "ok")}),
                 );
+            }
+        }
+    }
+
+    fn send_set(&mut self, row: usize, text: &str) -> Result<(), String> {
+        let r = self.core.param_set(row, text);
+        eprintln!("pal: param set {row} {text:?}: {r:?}");
+        // Android has no stderr: the flight log keeps it. Row
+        // numbers move between releases; the id does not.
+        let (id, prev) = self.params.row(row);
+        self.sink.shared.event(
+            "param_set",
+            serde_json::json!({"row": row, "id": id, "prev": prev, "value": text,
+                "result": result_text(&r, "sent")}),
+        );
+        r
+    }
+
+    /// The held VENC_MODE set: sent once its REC_FPS is accepted, dropped
+    /// (and reported against its row) when that fails.
+    fn step_held(&mut self, json: &str, now: u64) {
+        let Some(h) = self.held.as_ref() else { return };
+        let Some(t) = pal_osd::params::Table::parse(json) else {
+            return;
+        };
+        match param_order::step(h, &t, now) {
+            param_order::Step::Wait => {}
+            param_order::Step::Send => {
+                let h = self.held.take().expect("held");
+                let r = self.send_set(h.row, &h.text);
+                let _ = self.ports.set_res_tx.try_send((h.row, r));
+            }
+            param_order::Step::Drop(why) => {
+                let h = self.held.take().expect("held");
+                eprintln!("pal: param set {} {:?} dropped: {why}", h.row, h.text);
+                self.sink.shared.event(
+                    "param_set",
+                    serde_json::json!({"row": h.row, "value": h.text,
+                        "result": format!("dropped: {why}")}),
+                );
+                let _ = self.ports.set_res_tx.try_send((h.row, Err(why)));
             }
         }
     }
@@ -681,6 +735,7 @@ impl CoreLoop {
             if let Some(values) = self.params.note(&j) {
                 self.sink.shared.event("params", values);
             }
+            self.step_held(&j, now);
             let _ = self.ports.params_tx.try_send(j);
         }
     }
@@ -1807,6 +1862,85 @@ mod tests {
         // and 3.3 s; the odd tenth carries the wobble's 1 ms. Every later
         // line reads the same move 1 ms earlier or not, and stays quiet.
         assert_eq!(ages, [70, 31], "{told:?}");
+    }
+
+    /// A drone's parameter table: (id, value, state) rows, the pending row
+    /// and every set the loop sent, shared with the test.
+    #[derive(Default)]
+    struct ParamDrone {
+        rows: Vec<(&'static str, String, &'static str)>,
+        pending: Option<usize>,
+        sets: Vec<(usize, String)>,
+    }
+
+    struct ParamCore(Arc<Mutex<ParamDrone>>);
+
+    impl GsCore for ParamCore {
+        fn on_rx(&mut self, _: &RxBody, _: &mut dyn CoreIo) {}
+        fn tick(&mut self, _: u64, _: &mut dyn CoreIo) {}
+        fn stats_json(&self) -> String {
+            r#"{"session":true,"rung":0}"#.into()
+        }
+        fn link_op(&self) -> (i32, i32) {
+            (0, 20)
+        }
+        fn params_json(&self, _: u64) -> String {
+            let d = self.0.lock().unwrap();
+            let rows: Vec<_> = d
+                .rows
+                .iter()
+                .map(|(id, v, st)| serde_json::json!({"id": id, "value": v, "state": st, "status": ""}))
+                .collect();
+            serde_json::json!({"linked": true, "list": "complete",
+                "pending": d.pending.map_or(-1, |p| p as i64), "rows": rows})
+            .to_string()
+        }
+        fn param_set(&mut self, row: usize, text: &str) -> Result<(), String> {
+            let mut d = self.0.lock().unwrap();
+            d.sets.push((row, text.to_string()));
+            d.rows[row].2 = "sending";
+            d.pending = Some(row);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_camera_mode_under_the_recording_rate_waits_for_rec_fps() {
+        let drone = Arc::new(Mutex::new(ParamDrone {
+            rows: vec![
+                ("VENC_MODE", "90@1920x1080/binned".into(), "idle"),
+                ("REC_ENABLE", "1".into(), "idle"),
+                ("REC_FPS", "90".into(), "idle"),
+            ],
+            ..ParamDrone::default()
+        }));
+        let Rig { mut cl, .. } = rig(Box::new(ParamCore(drone.clone())), None);
+        cl.tick(1_000_000);
+        cl.apply_cmd(pal_osd::params::Cmd::Set(0, "60@2944x1656/native".into()));
+        assert_eq!(drone.lock().unwrap().sets, [(2, "60".to_string())]);
+        // REC_FPS still applying: the mode waits.
+        cl.tick(2_000_000);
+        assert_eq!(drone.lock().unwrap().sets.len(), 1);
+        {
+            let mut d = drone.lock().unwrap();
+            d.rows[2] = ("REC_FPS", "60".into(), "accepted");
+            d.pending = None;
+        }
+        cl.tick(3_000_000);
+        assert_eq!(
+            drone.lock().unwrap().sets,
+            [
+                (2, "60".to_string()),
+                (0, "60@2944x1656/native".to_string())
+            ]
+        );
+        // A faster mode goes straight out.
+        drone.lock().unwrap().pending = None;
+        cl.apply_cmd(pal_osd::params::Cmd::Set(0, "90@2272x1278/native".into()));
+        assert_eq!(
+            drone.lock().unwrap().sets.last().unwrap().1,
+            "90@2272x1278/native"
+        );
     }
 
     #[test]
