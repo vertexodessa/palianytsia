@@ -1573,18 +1573,7 @@ impl ChannelCore {
         if self.pinned {
             return Err("a pinned config keeps its channel".into());
         }
-        if chosen.is_empty() {
-            return Err("choose at least one channel".into());
-        }
-        let set = &self.cfg.radio.channels;
-        if let Some(c) = chosen.iter().find(|c| !set.contains(c)) {
-            return Err(format!("{c} is not a member of radio.channels"));
-        }
-        let use_: Vec<u8> = if set.iter().all(|c| chosen.contains(c)) {
-            Vec::new()
-        } else {
-            chosen.to_vec()
-        };
+        let use_ = self.cfg.radio.narrow(chosen)?;
         self.cfg.radio.use_ = use_.clone();
         let usable = self.cfg.radio.usable().to_vec();
         if let Some(s) = &self.scout {
@@ -1741,8 +1730,7 @@ impl ChannelCore {
             want: self.plan.want(),
             // Only radio.use (Rust only) narrows it: a link the grid search
             // found outside the set relocates as in mabur (relocate_due).
-            op_usable: self.cfg.radio.use_.is_empty()
-                || self.cfg.radio.use_.contains(&self.plan.op()),
+            op_usable: self.cfg.radio.allows(self.plan.op()),
             relocate_due: self.plan.relocate_due(),
             plan_hopping: self.plan.hopping(),
             hop_active: hop_active(inp.in_session, inp.cal_running),

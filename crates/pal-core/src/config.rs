@@ -166,6 +166,28 @@ impl RadioCfg {
             &self.use_
         }
     }
+
+    /// The link may sit on `ch` as far as `radio.use` goes (no use = any).
+    pub fn allows(&self, ch: u8) -> bool {
+        self.use_.is_empty() || self.use_.contains(&ch)
+    }
+
+    /// The operator's choice over the set as a `radio.use` value: every
+    /// chosen channel a member, at least one; all of them = empty (plain
+    /// auto). The one rule for the config edit and the live link.
+    pub fn narrow(&self, chosen: &[u8]) -> Result<Vec<u8>, String> {
+        if chosen.is_empty() {
+            return Err("choose at least one channel".into());
+        }
+        if let Some(c) = chosen.iter().find(|c| !self.channels.contains(c)) {
+            return Err(format!("{c} is not a member of radio.channels"));
+        }
+        Ok(if self.channels.iter().all(|c| chosen.contains(c)) {
+            Vec::new()
+        } else {
+            chosen.to_vec()
+        })
+    }
 }
 
 impl Default for RadioCfg {
@@ -962,15 +984,10 @@ pub fn with_search_grid(text: &str) -> R<String> {
 /// member is still auto, so the choice can change on a live link
 /// (`ChannelCore::set_usable`); a pin could not.
 pub fn with_channels(text: &str, chosen: &[u8]) -> R<String> {
-    let set = parse_config_str(text)?.radio.channels;
-    if let Some(ch) = chosen.iter().find(|c| !set.contains(c)) {
-        return Err(ConfigError(format!(
-            "{ch} is not a member of radio.channels"
-        )));
-    }
-    if chosen.is_empty() {
-        return Err(ConfigError("choose at least one channel".into()));
-    }
+    let use_ = parse_config_str(text)?
+        .radio
+        .narrow(chosen)
+        .map_err(ConfigError)?;
     let mut j = parse_table(text)?;
     let radio = j
         .entry("radio")
@@ -978,12 +995,12 @@ pub fn with_channels(text: &str, chosen: &[u8]) -> R<String> {
         .as_table_mut()
         .ok_or_else(|| ConfigError("config: radio is not a table".into()))?;
     radio.insert("channel".into(), Value::String("auto".into()));
-    if set.iter().all(|c| chosen.contains(c)) {
+    if use_.is_empty() {
         radio.remove("use");
     } else {
         radio.insert(
             "use".into(),
-            Value::Array(chosen.iter().map(|&c| Value::Integer(c.into())).collect()),
+            Value::Array(use_.iter().map(|&c| Value::Integer(c.into())).collect()),
         );
     }
     finish_edit(&j)
