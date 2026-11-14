@@ -16,6 +16,7 @@ pub mod cam_fps;
 pub mod dev_card;
 pub mod drone_fetch;
 pub mod drone_update;
+pub mod dvr;
 pub mod maint;
 pub mod panic_hook;
 pub mod param_order;
@@ -300,6 +301,42 @@ pub struct Sink {
     /// GS mode only: AU damage and decoder errors into IDR requests.
     pub idr: Option<IdrDriver>,
     pub cam_fps: cam_fps::CamFps,
+    /// GS DVR (F12); None = no recording.
+    pub dvr: Option<dvr::Dvr>,
+}
+
+impl Sink {
+    /// The DVR's share of an AU: its start asks the drone for an IDR, and
+    /// starts, sealed files and errors go to the flight log.
+    fn dvr_au(&mut self, a: &Au) {
+        let Some(d) = self.dvr.as_mut() else { return };
+        let step = d.on_au(a, self.shared.fc_armed(), self.now_us);
+        if let Some(p) = &step.started {
+            if let Some(i) = self.idr.as_mut() {
+                i.r.request(pal_core::refresh::Reason::Dvr, self.now_us / 1000);
+            }
+            self.shared.event(
+                "dvr_start",
+                serde_json::json!({ "file": p.display().to_string() }),
+            );
+        }
+        for s in &step.sealed {
+            self.shared.event(
+                "dvr_stop",
+                serde_json::json!({
+                    "file": s.path.display().to_string(),
+                    "bytes": s.bytes,
+                    "samples": s.samples,
+                    "ok": s.ok,
+                }),
+            );
+        }
+        if let Some(e) = step.error {
+            log::warn!("dvr: {e}");
+            self.shared
+                .event("dvr_error", serde_json::json!({ "error": e }));
+        }
+    }
 }
 
 impl CoreIo for Sink {
@@ -312,6 +349,7 @@ impl CoreIo for Sink {
             // A failed write stops the session; `CoreLoop::log_err` tells.
             let _ = l.au(self.now_us, &a);
         }
+        self.dvr_au(&a);
         if let Some(off) = self.pts_off_us {
             let d = pal_core::uplink::cap_to_complete_us(a.pts_us, self.now_us, off).max(0) as u64;
             let lat = &self.shared.lat;
@@ -825,6 +863,7 @@ impl CoreLoop {
                     ("rf_sim", rf_sim::active().map(|s| s.snapshot())),
                     ("peer_rc", peer_rc),
                     ("idr_stuck", idr_stuck),
+                    ("dvr", self.sink.dvr.as_ref().and_then(dvr::Dvr::status)),
                     ("update", update),
                     ("fetch", fetch),
                     (
@@ -1034,7 +1073,7 @@ fn warn_low_log_space(sink: &Sink) {
 }
 
 /// Bytes an unprivileged writer may still use on the volume holding `p`.
-fn free_bytes(p: &std::path::Path) -> Option<u64> {
+pub(crate) fn free_bytes(p: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
     // SAFETY: statvfs is plain old data that the call fills in; zeroed is a
@@ -1789,6 +1828,7 @@ mod tests {
             shared: shared.clone(),
             idr: None,
             cam_fps: Default::default(),
+            dvr: None,
         };
         let (stats_tx, stats_rx) = mpsc::sync_channel(1 << 12);
         let (params_tx, params_rx) = mpsc::sync_channel(1 << 12);

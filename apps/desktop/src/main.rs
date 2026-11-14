@@ -12,7 +12,7 @@
 //!     no --ch on an auto config (Rust core, GS): the channel core runs as in the apps and the
 //!     Link tab has their channel menu (scan, tick the channels the link may use; saved);
 //!     --ch N holds that one channel: no search, no menu
-//!   common: [--core rust|ref] [--log-dir DIR] [--snapshot out.ppm --secs N]
+//!   common: [--core rust|ref] [--log-dir DIR] [--dvr-dir DIR (live gs: record from arm)] [--snapshot out.ppm --secs N]
 //!           [--mav-udp HOST:PORT]   drone MAVLink to a GCS (QGroundControl) and back
 //!           [--idr | --no-idr]      GS IDR requests (default: on live, off replay)
 //!           [--hwdec auto|vdpau|vaapi|cuda|sw]  decoder (default auto: first hwaccel
@@ -94,6 +94,9 @@ struct Opts {
     rust: bool,
     looping: bool,
     log_dir: Option<PathBuf>,
+    /// `--dvr-dir DIR`: live gs mode records from the FC's arm to 3 s after
+    /// disarm into DIR (F12), as the apps do.
+    dvr_dir: Option<PathBuf>,
     /// `--payload-dir DIR`: the payload directory of `drone_update::spawn_auto`.
     payload_dir: Option<PathBuf>,
     snapshot: Option<PathBuf>,
@@ -196,6 +199,7 @@ fn parse() -> Opts {
             }
             "--loop" => o.looping = true,
             "--log-dir" => o.log_dir = Some(val().into()),
+            "--dvr-dir" => o.dvr_dir = Some(val().into()),
             "--snapshot" => o.snapshot = Some(val().into()),
             "--secs" => o.secs = val().parse().unwrap_or_else(|_| die("--secs")),
             "--mav-udp" => o.mav_udp = Some(val()),
@@ -858,6 +862,25 @@ fn main() {
         Some(d) => format!("flight log in {}", d.display()),
         None => "flight log off (start with --log-dir DIR)".into(),
     };
+    // Named after the flight log when there is one, so the two pair up.
+    let dvr = o
+        .dvr_dir
+        .clone()
+        .filter(|_| o.live() && o.mode == Mode::Gs)
+        .map(|dir| {
+            let stem = log
+                .as_ref()
+                .and_then(|l| l.dir().file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    let t = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    format!("pal-desktop-{t}")
+                });
+            eprintln!("pal-desktop: recording from arm into {}", dir.display());
+            runtime::dvr::Dvr::new(runtime::dvr::When::OnArm { dir, stem })
+        });
     let sink = Sink {
         au_tx,
         mav_tx,
@@ -869,6 +892,7 @@ fn main() {
         shared: shared.clone(),
         idr: (o.mode == Mode::Gs && o.idr.unwrap_or(o.live())).then(IdrDriver::default),
         cam_fps: Default::default(),
+        dvr,
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

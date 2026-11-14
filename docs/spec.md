@@ -286,8 +286,11 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
 - M4, done: the channel core (Rust port of ChannelCore/scout/hop, checked against mabur's record by
   record in `pal-ref/tests/chan_trace.rs`), the channel menu and scan, TxSelector, per-card OSD
   (frames/s, CRC, DEAF) and `card_deaf` flight-log events, MAVLink telemetry widgets, TX-power
-  calibration with the channel pick. Not done: GS-side DVR, VTX recording control beyond the
-  REC_* parameters, preflight.
+  calibration with the channel pick, the GS-side DVR (F12, 2026-11-14: crate `dvr`, a port of mabur's
+  `DvrMux`/`RawDvr`/`HevcParams`; the phone and the Quest record from the FC's arm to 3 s after its
+  disarm into `<files>/Movies/<flight log>-N.mp4`, an IDR asked for at arm, a new file per camera mode,
+  a REC chip; pal-desktop does the same with `--dvr-dir DIR` (live gs mode); `pal live`/`pal replay
+  --dvr out.mp4` record the whole run; not yet run on a headset). Not done: VTX recording control beyond the REC_* parameters, preflight.
 - M5: the parameter client is done; MSP OSD and Quest hand tracking are not.
 - 2026-11-07: mabur `palianytsia/base-v2` rebased onto upstream master with #114 (hop verdict
   reads NHM airtime only: occupied route = blocked streak of `hop.verdict.occupied_windows`, detect
@@ -454,7 +457,7 @@ devourer is the driver with hardware proof on 8812EU, 8812AU and 8822C in this r
 
 The plan as drafted. As built (see `README.md` for the current layout): the channel core lives in
 `pal-core::chan`, not in a `pal-chan` crate; there is no `radio` crate (cards are `devourer-sys` plus
-`runtime::dev_card`) and no `dvr` crate yet (GS-side DVR is not done); `pal-android` holds the Android
+`runtime::dev_card`); the `dvr` crate muxes, `runtime::dvr` decides when; `pal-android` holds the Android
 link shared by the phone and the Quest; the phone shell is Java, not Kotlin.
 
 ```

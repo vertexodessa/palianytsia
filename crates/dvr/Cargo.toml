@@ -1,0 +1,10 @@
+[package]
+name = "dvr"
+description = "GS DVR: fragmented MP4 of the received HEVC AUs (port of mabur's DvrMux / RawDvr / HevcParams)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hevc.workspace = true

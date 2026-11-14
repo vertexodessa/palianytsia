@@ -56,12 +56,49 @@ pub struct Snapshot {
     pub chscan: Option<channels::ScanView>,
     /// The write error that stopped the flight log (UI stats line only).
     pub log_err: Option<String>,
+    /// The GS DVR (`runtime::dvr::Dvr::status`, UI stats line only); None
+    /// before the first recording.
+    pub dvr: Option<DvrView>,
     /// The automatic drone update; None in a build that carries no maburd
     /// (UI stats line only).
     pub update: Option<crate::update::UpdateView>,
     pub fetch: Option<crate::update::FetchView>,
     /// The extra tools show (a signed tools file in the payload directory).
     pub tools_on: bool,
+}
+
+/// The GS DVR's state for the REC chip.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DvrView {
+    /// "rec", "wait" (armed, the file opens on the next keyframe), "off", "error".
+    pub state: String,
+    pub file: Option<String>,
+    pub mb: f64,
+    pub error: Option<String>,
+}
+
+impl DvrView {
+    fn parse(v: &Value) -> Option<Self> {
+        Some(Self {
+            state: v.get("state")?.as_str()?.to_string(),
+            file: v.get("file").and_then(Value::as_str).map(str::to_string),
+            mb: v.get("mb").and_then(Value::as_f64).unwrap_or(0.0),
+            error: v.get("error").and_then(Value::as_str).map(str::to_string),
+        })
+    }
+
+    /// The chip's text and whether it is a failure; None = no chip.
+    pub fn chip(&self) -> Option<(String, bool)> {
+        match self.state.as_str() {
+            "rec" => Some((format!("REC {:.0} MB", self.mb), false)),
+            "wait" => Some(("REC waiting for a keyframe".into(), false)),
+            "error" => Some((
+                format!("REC FAILED: {}", self.error.as_deref().unwrap_or("?")),
+                true,
+            )),
+            _ => None,
+        }
+    }
 }
 
 /// What the next rung promote waits on (`GsCore::ladder_json`).
@@ -224,6 +261,7 @@ impl Snapshot {
             cal: v.get("cal").and_then(cal::CalView::parse),
             chscan: v.get("chscan").and_then(channels::ScanView::parse),
             log_err: v.get("log_err").and_then(Value::as_str).map(str::to_string),
+            dvr: v.get("dvr").and_then(DvrView::parse),
             update: v.get("update").and_then(crate::update::UpdateView::parse),
             fetch: v.get("fetch").and_then(crate::update::FetchView::parse),
             tools_on: v.get("tools").and_then(Value::as_bool).unwrap_or(false),
@@ -245,6 +283,8 @@ pub fn drone_state_name(s: i64) -> &'static str {
 const OK: Color32 = Color32::from_rgb(90, 200, 120);
 const WARN: Color32 = Color32::from_rgb(230, 180, 60);
 const BAD: Color32 = Color32::from_rgb(230, 80, 70);
+/// A recording in progress: the red of a camera's REC lamp, not an alarm.
+const REC: Color32 = Color32::from_rgb(255, 60, 60);
 const STALE: Color32 = Color32::from_rgb(150, 150, 150);
 
 /// The UI stats lines (10 Hz from the core loop) of the last 60 s, for the
@@ -736,6 +776,10 @@ pub fn chips(
                 Some(hover),
             );
         }
+        if let Some((t, failed)) = s.dvr.as_ref().and_then(DvrView::chip) {
+            let hover = s.dvr.as_ref().and_then(|d| d.file.clone());
+            chip("rec", 0, &t, if failed { BAD } else { REC }, hover);
+        }
         if let Some(e) = &s.log_err {
             // Last in the row: it appears mid-flight and must not push the
             // other chips around.
@@ -967,6 +1011,7 @@ mod tests {
             .unwrap();
         assert_eq!((two.cards[0].frames, two.cards[1].crc_fail), (10, 1));
         assert_eq!(two.log_err, None);
+        assert_eq!(two.dvr, None);
         assert_eq!(two.drone_shed_ms, None);
         let shed = |l: &str| Snapshot::parse(l).unwrap().drone_shed_ms;
         assert_eq!(shed(r#"{"drone":{"shed_ms":12500}}"#), Some(12500));
@@ -977,6 +1022,24 @@ mod tests {
             stopped.log_err.as_deref(),
             Some("No space left on device (os error 28)")
         );
+        let rec = |l: &str| Snapshot::parse(l).unwrap().dvr.and_then(|d| d.chip());
+        assert_eq!(
+            rec(
+                r#"{"dvr":{"state":"rec","file":"fl-1_x-1.mp4","mb":12.4,"files":1,"error":null}}"#
+            ),
+            Some(("REC 12 MB".into(), false))
+        );
+        assert_eq!(
+            rec(r#"{"dvr":{"state":"wait","file":null,"mb":0.0,"files":1,"error":null}}"#),
+            Some(("REC waiting for a keyframe".into(), false))
+        );
+        assert_eq!(
+            rec(
+                r#"{"dvr":{"state":"error","file":null,"mb":0.0,"files":1,"error":"500 MB free, 1024 MB needed"}}"#
+            ),
+            Some(("REC FAILED: 500 MB free, 1024 MB needed".into(), true))
+        );
+        assert_eq!(rec(r#"{"dvr":{"state":"off","files":2}}"#), None);
         let s = Snapshot::parse(r#"{"mode":"gs","key_fp":"default","key_mismatch":false,"rtt_ms":6.1,"uplink":"ok","uplink_pct":92,"pre_fec_loss":0.085,"residual":0.0106,"drone_temp_c":46,"nack":{"fill":48,"fill_pps":0.0}}"#)
             .expect("parse");
         assert_eq!(

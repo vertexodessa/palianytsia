@@ -4,7 +4,7 @@
 //! two are diffed on.
 //!
 //!   pal live   -c gs.toml --ch 144 --width 40 [--mode gs|spotter] [--secs 30]
-//!              [--card N] [--capture bodies.bin] [--dump out.h265] [--aus out.aus]
+//!              [--card N] [--capture bodies.bin] [--dump out.h265] [--dvr out.mp4] [--aus out.aus]
 //!              [--log-dir DIR [--capture-mb N]] [--core ref|rust] [--param-set T_S,ROW,TEXT ...]
 //!              [--rf-sim SPEC]   bench RF loss simulator (`runtime::rf_sim`), e.g. atten=50,fade=8/300
 //!              [--exec CMD | --shell] [--video-off]   the drone's shell over the maintenance
@@ -13,7 +13,7 @@
 //!              to CMD's stdin
 //!              [--update-drone DIR]   install DIR/{maburd,mabur.toml,S96mabur} on the drone over
 //!              the lane: trial from RAM, commit to flash once video comes from the new maburd
-//!   pal replay <bodies.bin>...|<fl-NNNN_...> -c gs.toml [--mode gs|spotter] [--dump out.h265]
+//!   pal replay <bodies.bin>...|<fl-NNNN_...> -c gs.toml [--mode gs|spotter] [--dump out.h265] [--dvr out.mp4]
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
 //!              [--param-set T_S,ROW,TEXT ...]   F18 sets; prints `param` results and `params`
@@ -49,6 +49,8 @@ struct Opts {
     card: i32,
     capture: Option<PathBuf>,
     dump: Option<PathBuf>,
+    /// `--dvr out.mp4`: the whole run's AUs as a fragmented MP4 (F12).
+    dvr: Option<PathBuf>,
     aus: Option<PathBuf>,
     sends: Option<PathBuf>,
     mav: Option<PathBuf>,
@@ -103,6 +105,7 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--card" => o.card = val().parse().unwrap_or_else(|_| die("--card")),
             "--capture" => o.capture = Some(val().into()),
             "--dump" => o.dump = Some(val().into()),
+            "--dvr" => o.dvr = Some(val().into()),
             "--aus" => o.aus = Some(val().into()),
             "--sends" => o.sends = Some(val().into()),
             "--mav" => o.mav = Some(val().into()),
@@ -169,6 +172,9 @@ fn die(msg: &str) -> ! {
 /// (u32 len | sid | flags|0x04 complete | u32 pts_us | data, as webgs replay).
 struct Sink {
     dump: Option<BufWriter<std::fs::File>>,
+    /// `--dvr`: recorded from the first IRAP to the end; asks for no IDR, so
+    /// a replay's sent RC bytes stay those of the live run.
+    dvr: Option<runtime::dvr::Dvr>,
     aus_file: Option<BufWriter<std::fs::File>>,
     /// Every RC body handed to `send`, LP (u32 len | bytes), for `cmp`.
     sends_file: Option<BufWriter<std::fs::File>>,
@@ -203,6 +209,10 @@ impl Sink {
         };
         Sink {
             dump: mk(&o.dump),
+            dvr: o
+                .dvr
+                .clone()
+                .map(|p| runtime::dvr::Dvr::new(runtime::dvr::When::Always(p))),
             aus_file: mk(&o.aus),
             sends_file: mk(&o.sends),
             mav_file: mk(&o.mav),
@@ -239,6 +249,9 @@ impl Sink {
         }
     }
     fn finish(&mut self) {
+        if let Some(d) = self.dvr.as_mut() {
+            dvr_sealed(&d.stop());
+        }
         for w in [
             self.dump.as_mut(),
             self.aus_file.as_mut(),
@@ -286,6 +299,19 @@ impl Sink {
     }
 }
 
+/// One line per file the DVR closed (a camera mode change opens the next).
+fn dvr_sealed(files: &[dvr::Sealed]) {
+    for f in files {
+        eprintln!(
+            "pal: dvr {} {} samples {} bytes{}",
+            f.path.display(),
+            f.samples,
+            f.bytes,
+            if f.ok { "" } else { " (write failed)" }
+        );
+    }
+}
+
 impl CoreIo for Sink {
     fn on_mav(&mut self, pkt: &[u8]) {
         self.mav += 1;
@@ -319,6 +345,13 @@ impl CoreIo for Sink {
         }
         if let Some(w) = self.dump.as_mut() {
             w.write_all(&a.data).unwrap();
+        }
+        if let Some(d) = self.dvr.as_mut() {
+            let step = d.on_au(&a, None, self.now_us);
+            dvr_sealed(&step.sealed);
+            if let Some(e) = step.error {
+                eprintln!("pal: dvr: {e}");
+            }
         }
         if let Some(w) = self.aus_file.as_mut() {
             let flags = a.flags | if a.complete { 0x04 } else { 0 };

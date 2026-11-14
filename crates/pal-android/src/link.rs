@@ -252,6 +252,19 @@ impl Link {
             ),
         };
         log::info!("{log_info}");
+        // F12: video from arm to a tail after disarm, into the app's own
+        // Movies directory (no permission; `adb pull` or a file manager),
+        // named after the flight log so the two pair up.
+        let dvr = runtime::dvr::Dvr::new(runtime::dvr::When::OnArm {
+            dir: c
+                .log_dir
+                .parent()
+                .map_or_else(|| c.log_dir.join("Movies"), |d| d.join("Movies")),
+            stem: log
+                .as_ref()
+                .and_then(|l| l.dir().file_name())
+                .map_or_else(|| "pal".into(), |n| n.to_string_lossy().into_owned()),
+        });
         let sink = Sink {
             au_tx,
             mav_tx,
@@ -263,6 +276,7 @@ impl Link {
             shared: shared.clone(),
             idr: Some(IdrDriver::default()),
             cam_fps: Default::default(),
+            dvr: Some(dvr),
         };
         // RustCore is built on the core thread (GsCore is not Send); a
         // config it refuses still shows up in last_error().

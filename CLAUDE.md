@@ -12,6 +12,7 @@ status: `docs/spec.md`; read its "Status (2026-11-07)" section first; the dated 
 | `crates/pal-ref` | mabur's C++ WebGs behind `GsCore` (C shim): the test oracle (desktop/host only); `RefCard` (`cpp/pal_card.cpp`) lends the devourer-sys card to it as a `maburgs::LinkCard`, so it runs mabur's ChannelCore live; `tests/chan_trace.rs` checks the Rust ChannelCore against it record by record |
 | `crates/devourer-sys` | devourer through a C shim (USB cards) |
 | `crates/flightlog`, `decode`, `pal-osd`, `hevc` | flight log + `palcap 1` captures, libavcodec decode, OSD widgets, NAL/skip-slice |
+| `crates/dvr` | GS DVR: fragmented MP4 of the AUs (port of mabur's DvrMux/RawDvr/HevcParams, same boxes); `runtime::dvr` starts it on the FC's arm (APKs, pal-desktop `--dvr-dir DIR`) or for the whole run (`pal ... --dvr out.mp4`) |
 | `crates/pal-build` | which build this is (`release/VERSION`, commit + dirty flag, mabur/devourer pins) for `--version`, the flight log's `build` event and the panel |
 | `crates/runtime` | shared by the apps: devourer RX thread, core loop (`CoreLoop`: GsCore + IdrDriver + log + stats/params), `run_live` |
 | `apps/pal` | CLI: `pal live`, `pal replay`, `pal log` |

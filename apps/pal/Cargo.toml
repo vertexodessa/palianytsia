@@ -14,6 +14,7 @@ pal-ref.workspace = true
 devourer-sys.workspace = true
 runtime.workspace = true
 flightlog.workspace = true
+dvr.workspace = true
 decode.workspace = true
 pal-build.workspace = true
 toml = "0.8"
