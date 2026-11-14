@@ -558,11 +558,9 @@ pub struct ChannelCore {
     now_ms: MsClock,
     n_cards: usize,
     pinned: bool,
-    /// Auto mode: the in-flight hop, its scout and burst run only here.
-    reactive: bool,
     snr_ok: Vec<bool>,
+    /// Set with `scout`, never apart: the card the scout owns.
     scout_card: Option<usize>,
-    one_card: bool,
     /// The last value handed to `store`.
     saved_op: u8,
     gs_start_ms: u64,
@@ -856,10 +854,8 @@ impl ChannelCore {
             now_ms,
             n_cards: n,
             pinned,
-            reactive,
             snr_ok,
             scout_card,
-            one_card,
             saved_op: cfg.start_ch,
             gs_start_ms,
             cur_ch: vec![cfg.start_ch; n],
@@ -934,6 +930,15 @@ impl ChannelCore {
                 || (!self.pinned && s.pick_open())
                 || s.round_open()
         })
+    }
+
+    /// Auto mode: the in-flight hop, its scout and burst run only here.
+    fn reactive(&self) -> bool {
+        !self.pinned
+    }
+
+    fn one_card(&self) -> bool {
+        self.n_cards == 1
     }
 
     fn is_scout_card(&self, i: usize) -> bool {
@@ -1426,7 +1431,7 @@ impl ChannelCore {
     fn pick_min_rounds(&self) -> i32 {
         let min_rounds = self.cfg.radio.scan.min_rounds;
         match &self.scout {
-            Some(s) if self.one_card && s.prelude_done() && s.rounds() < min_rounds as u64 => 1,
+            Some(s) if self.one_card() && s.prelude_done() && s.rounds() < min_rounds as u64 => 1,
             _ => min_rounds,
         }
     }
@@ -1542,11 +1547,10 @@ impl ChannelCore {
     }
 
     fn step_scout_inputs(&mut self) {
-        let Some(s) = self.scout.clone() else {
+        let (Some(s), Some(sci)) = (self.scout.clone(), self.scout_card) else {
             self.live.scout_working.store(false, Relaxed);
             return;
         };
-        let sci = self.scout_card.expect("a scout has a card");
         s.set_op(self.plan.op());
         self.scout_search_req =
             self.plan.release_scout() && !self.scout_card_down && !self.live.dwelling(sci);
@@ -1731,7 +1735,7 @@ impl ChannelCore {
             in_session: inp.in_session,
             video: vrx.video_flowing(now_ms),
             cal_running: inp.cal_running,
-            one_card: self.one_card,
+            one_card: self.one_card(),
             scout_owns: self.scout_owns(),
             op: self.plan.op(),
             want: self.plan.want(),
@@ -2031,7 +2035,7 @@ impl ChannelCore {
         }
         self.last_verdict = vo.v;
         self.last_verdict_out = vo;
-        if let Some(b) = hop_store_blank_until(&vo, self.reactive, self.cfg.hop.confirm_ms) {
+        if let Some(b) = hop_store_blank_until(&vo, self.reactive(), self.cfg.hop.confirm_ms) {
             vrx.blank_store(b);
         }
     }
@@ -2083,7 +2087,7 @@ impl ChannelCore {
     /// burst belongs on this thread.
     fn start_inflight_if_due(&mut self) {
         if self.inflight_started
-            || !self.reactive
+            || !self.reactive()
             || self.scout_owns()
             || self.boot_pick.open()
             || self.n_cards < 2
@@ -2141,7 +2145,7 @@ impl ChannelCore {
             hop_burst_period_ms(self.hopc.state(), false, ranking_complete, &self.cfg.hop);
         let spare_usb_burst = burst_card.is_some_and(|c| c != inp.tx_card);
         self.start_inflight_if_due();
-        if self.reactive
+        if self.reactive()
             && !self.scout_owns()
             && !relocation_owns
             && !self.burst_inflight
@@ -2193,7 +2197,7 @@ impl ChannelCore {
         // Pinned: the verdict is still measured (OSD/sideport read it) but
         // the controller never sees a reactive trigger. Relocation re-arms it
         // on its own tick.
-        if !self.reactive {
+        if !self.reactive() {
             ht.verdict.trigger = false;
         }
         if self.scout_owns() {
@@ -2205,12 +2209,12 @@ impl ChannelCore {
             // Onto the pin, or where a calibration run is about to
             // calibrate: the confirm lands it, no verify (the run's
             // cal_running would cut the verify window short anyway).
-            ht.no_verify = !self.reactive || r.cal;
+            ht.no_verify = !self.reactive() || r.cal;
             ht.best = Some(r.ch);
             ht.best_score = 0;
             ht.escape = None;
             ht.escape_score = 0;
-        } else if relocation_owns || !self.reactive {
+        } else if relocation_owns || !self.reactive() {
             ht.best = None;
             ht.escape = None;
         }
@@ -2248,7 +2252,7 @@ impl ChannelCore {
 
     /// Auto mode with a spare card that can measure (two or more cards).
     pub fn cal_can_measure(&self) -> bool {
-        self.scout.is_some() && !self.pinned && !self.one_card && self.n_cards >= 2
+        self.scout.is_some() && !self.pinned && !self.one_card() && self.n_cards >= 2
     }
 
     /// Arms one measure round (restarts nothing while one is pending or
@@ -2395,10 +2399,9 @@ impl ChannelCore {
                 "maburgs channel: calibration measure round dropped: a run is calibrating".into(),
             );
         }
-        let Some(scout) = self.scout.clone() else {
+        let (Some(scout), Some(sci)) = (self.scout.clone(), self.scout_card) else {
             return;
         };
-        let sci = self.scout_card.expect("a scout has a card");
         // Only with the scout thread up and its card alive: a round on a
         // scout that never steps would hold the card for good.
         if self.cal_meas.s == CalMeasureState::Waiting
@@ -2593,7 +2596,7 @@ impl ChannelCore {
 
     /// `relocate_due`: the boot pick handed the controller a relocate this tick.
     fn step_lease(&mut self, inp: &ChannelTickIn, relocate_due: bool) {
-        let Some(scout) = self.scout.clone() else {
+        let (Some(scout), Some(sci)) = (self.scout.clone(), self.scout_card) else {
             return;
         };
         // Unconditional, so it also turns off the tick the lease lapses or
@@ -2650,7 +2653,6 @@ impl ChannelCore {
         }
         {
             // As step_cal: inflight then the card's device-use lock.
-            let sci = self.scout_card.expect("a scout has a card");
             let live = self.live.clone();
             let _ilk = live.inflight.lock().unwrap();
             let _hold = live.sampler.hold_card(sci);
@@ -2676,7 +2678,7 @@ impl ChannelCore {
         if self.live.inflight.lock().unwrap().is_none()
             || !hop_active(inp.in_session, inp.cal_running)
             || self.plan.hopping()
-            || (self.reactive && (lv.trigger || lv.ref_frozen))
+            || (self.reactive() && (lv.trigger || lv.ref_frozen))
             || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
             || relocate_due
             || self.boot_pick.relocation_pending(&self.last_bi)
