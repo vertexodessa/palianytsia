@@ -909,6 +909,50 @@ fn auto_boot_hop_relocates_to_the_pick() {
     assert!(d.has("(relocated)"));
 }
 
+/// The same with the scout card's busy from CLM (a card without the NHM
+/// window, the RTL8812AU): the pick still sees 64's pair blocked, and the
+/// two cores agree record by record.
+#[test]
+fn auto_boot_hop_relocates_to_the_pick_on_clm_busy() {
+    let mut d = Duo::new(2, None, 40);
+    d.card(1, |s| {
+        s.clm_busy_pct_on[64] = 100;
+        for ch in [40u8, 112, 144] {
+            s.clm_busy_pct_on[ch as usize] = 0;
+        }
+    });
+    let visits = |d: &Duo, ch: u8| {
+        let p = format!(" ch={ch} ");
+        d.tr.iter()
+            .filter(|l| l.starts_with("D ") && l.contains(&p))
+            .count()
+    };
+    for _ in 0..3000 {
+        if visits(&d, 64) >= d.cfg.radio.scan.min_rounds as usize {
+            break;
+        }
+        d.tick(false);
+    }
+    assert!(
+        d.tr.iter().any(|l| l.starts_with("D ")
+            && l.contains(" ch=64 ")
+            && l.contains(" bv=1 bp=100.000")),
+        "64 read busy from CLM"
+    );
+    d.session_opened_on(64, 64);
+    d.link_up();
+    d.until(6000, true, "boot pick wants");
+    d.until(200, true, "relocate 64 -> ");
+    let target = d.core.hop_target();
+    assert_ne!(target, 64);
+    assert_eq!(d.pump_rcf().unwrap().hop_ch, target);
+    d.note_video(target);
+    d.tick(true);
+    d.verify_window();
+    d.snapshot(0);
+    assert!(d.has("(relocated)"));
+}
+
 /// A drone another GS left on 100, outside the set: past two passes the
 /// scout bursts on the grid, the link forms on 100 and the boot pick's
 /// relocation brings it back to a member.

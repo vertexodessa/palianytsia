@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use super::gate::verdict_card_usable;
-use super::radio::{nhm_busy_pct, LinkCard, NhmWindowTracker, ScoutEnergy, ScoutFrames};
+use super::radio::{
+    nhm_busy_pct, ClmBusyRead, LinkCard, NhmBusyRead, NhmWindowTracker, ScoutEnergy, ScoutFrames,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CardSample {
@@ -160,10 +162,26 @@ impl WindowSampler {
                 trackers[i].invalidate();
                 continue;
             }
-            let nb = fe.read_nhm_busy();
+            // A CLM window is read only when one is armed (an unarmed CLM
+            // read samples NHM and drains the FA/CCA delta read just below).
+            let clm = trackers[i].clm();
+            let nb = if clm {
+                NhmBusyRead::default()
+            } else {
+                fe.read_nhm_busy()
+            };
+            let cb = if clm {
+                fe.read_clm_busy()
+            } else {
+                ClmBusyRead::default()
+            };
             let dgen = g.dwell_gen[i].load(Acquire);
             let tgen = g.tune_gen[i].load(Acquire);
-            if trackers[i].usable(&nb, fe.channel(), dgen, tgen) {
+            if clm {
+                if trackers[i].usable_clm(&cb, fe.channel(), dgen, tgen) {
+                    s.nhm_busy_pct = Some(f64::from(cb.pct));
+                }
+            } else if trackers[i].usable(&nb, fe.channel(), dgen, tgen) {
                 s.nhm_busy_pct = nhm_busy_pct(&nb, self.cfg.busy_dbm);
             }
             s.energy = fe.read_energy_scout();
@@ -172,7 +190,10 @@ impl WindowSampler {
             if fe.arm_nhm_busy(self.cfg.nhm_period_4us) {
                 trackers[i].armed(s.channel, self.cfg.nhm_period_4us, dgen, tgen);
             } else {
-                trackers[i].invalidate();
+                match fe.arm_clm_busy(u32::from(self.cfg.nhm_period_4us) * 4) {
+                    0 => trackers[i].invalidate(),
+                    us => trackers[i].armed_clm(s.channel, us, dgen, tgen),
+                }
             }
             s.valid = true;
         }
@@ -352,8 +373,38 @@ mod tests {
         assert!(r.cards[0].energy.fa_ofdm == 7 && r.cards[1].energy.fa_ofdm == 9);
         assert!(r.cards[0].frames.own == 100 && r.cards[1].frames.own == 200);
         assert_eq!(r.cards[0].channel, 40);
+        // nhm read, (energy, frames), nhm arm, and on its refusal the CLM
+        // arm over the same span
         let c = g.cards[0].calls();
-        assert!(c.len() >= 2 && c[0] == "read_nhm" && c.last().unwrap() == "arm_nhm 35000");
+        assert!(c.len() >= 3 && c[0] == "read_nhm");
+        assert!(c[c.len() - 2] == "arm_nhm 35000" && c[c.len() - 1] == "arm_clm 140000");
+    }
+
+    /// A card without the NHM window arms CLM over the same span; its read
+    /// is taken only while our own arm stands, under the same dwell/tune/
+    /// channel pins. Revert (no CLM arm): no busy reading on this card.
+    #[test]
+    fn a_card_without_nhm_reads_clm_busy_under_the_same_pins() {
+        let g = Rig::new(1);
+        {
+            let mut s = g.cards[0].s();
+            s.clm_ok = true;
+            s.clm_read.valid = true;
+            s.clm_read.pct = 42;
+        }
+        assert!(g.s.sample_once(1000).cards[0].nhm_busy_pct.is_none());
+        assert_eq!(g.s.sample_once(1150).cards[0].nhm_busy_pct, Some(42.0));
+        g.gates.dwell_gen[0].fetch_add(1, SeqCst);
+        assert!(g.s.sample_once(1300).cards[0].nhm_busy_pct.is_none());
+        assert!(g.s.sample_once(1450).cards[0].nhm_busy_pct.is_some());
+        let c = g.cards[0].calls();
+        assert!(c.iter().any(|x| x == "arm_clm 140000"));
+        assert!(!c.iter().any(|x| x == "read_clm unarmed"));
+        g.cards[0].s().clm_ok = false;
+        g.s.sample_once(1600);
+        let n = g.cards[0].calls().len();
+        assert!(g.s.sample_once(1750).cards[0].nhm_busy_pct.is_none());
+        assert!(!g.cards[0].calls()[n..].iter().any(|x| x == "read_clm"));
     }
 
     #[test]

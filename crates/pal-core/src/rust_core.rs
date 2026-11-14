@@ -404,6 +404,12 @@ impl ChannelSink for LogSink {
                 J::Null
             },
         );
+        // Which sensor: CLM airtime on a card with no NHM window; a CLM
+        // window the card sent inside reads low.
+        if d.busy_clm {
+            j.set("busy_src", "clm");
+            j.set("busy_own_tx", d.busy_own_tx);
+        }
         j.set("frames", d.frames);
         j.set("in_session", d.in_session);
         // Where a dwell's time away from the link channel goes: the retune

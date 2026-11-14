@@ -29,6 +29,11 @@ struct pal_tenergy {
   int8_t floor_dbm;
 };
 
+struct pal_tclm {
+  uint8_t valid, pct, own_tx;
+  uint32_t window_us;
+};
+
 struct pal_tnhm {
   uint8_t valid;
   uint8_t buckets[12];
@@ -45,6 +50,8 @@ struct pal_tcard_vt {
   void (*frames)(void*, uint64_t*);   // own, foreign, own_air_us
   int (*arm_nhm_busy)(void*, uint16_t);
   void (*read_nhm_busy)(void*, pal_tnhm*);
+  uint32_t (*arm_clm_busy)(void*, uint32_t);
+  void (*read_clm_busy)(void*, pal_tclm*);
   int (*ready)(void*);
   int (*alive)(void*);
   int (*snr_ok)(void*);
@@ -118,6 +125,17 @@ class TraceCard final : public LinkCard {
     return ScoutFrames{f[0], f[1], f[2]};
   }
   bool arm_nhm_busy(uint16_t p) override { return v_.arm_nhm_busy(v_.user, p) != 0; }
+  uint32_t arm_clm_busy(uint32_t us) override { return v_.arm_clm_busy(v_.user, us); }
+  ClmBusyRead read_clm_busy() override {
+    pal_tclm r{};
+    v_.read_clm_busy(v_.user, &r);
+    ClmBusyRead o;
+    o.valid = r.valid;
+    o.pct = r.pct;
+    o.own_tx = r.own_tx;
+    o.window_us = r.window_us;
+    return o;
+  }
   NhmBusyRead read_nhm_busy() override {
     pal_tnhm r{};
     v_.read_nhm_busy(v_.user, &r);

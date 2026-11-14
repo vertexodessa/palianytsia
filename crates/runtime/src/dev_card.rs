@@ -6,13 +6,13 @@
 //! reads). Every device call holds the card's control lock (`Card::ctl`);
 //! the channel atomics change under it, so two retunes from two threads
 //! cannot leave `channel` naming the wrong one.
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use pal_core::chan::core::{MsClock, Sleeper, UsClock};
 use pal_core::chan::own_air::{ht_mcs_of_rate, OwnAirAcc};
 use pal_core::chan::radio::{
-    CardCaps, LinkCard, NhmBusyRead, ScoutEnergy, ScoutFrames, ScoutRadio,
+    CardCaps, ClmBusyRead, LinkCard, NhmBusyRead, ScoutEnergy, ScoutFrames, ScoutRadio,
 };
 use pal_core::config::{ht40_offset, Config};
 use pal_core::rust_core::{ChanEnv, RustCore};
@@ -127,6 +127,11 @@ pub struct DevCard {
     rx_channel: AtomicU8,
     /// Shared by the core's cards: where each one is tuned, over time.
     book: Arc<ChannelBook>,
+    /// A CLM window armed and not yet read: devourer answers an unarmed
+    /// read with a fresh NHM sample that drains the FA/CCA delta, so a read
+    /// whose window someone else consumed (a scout dwell between the
+    /// sampler's arm and read) must not reach it.
+    clm_armed: AtomicBool,
 }
 
 impl DevCard {
@@ -183,6 +188,7 @@ impl DevCard {
             tuned_w: AtomicU8::new(if width == 40 { 40 } else { 20 }),
             rx_channel: AtomicU8::new(ch),
             book,
+            clm_armed: AtomicBool::new(false),
         }
     }
 
@@ -322,6 +328,34 @@ impl ScoutRadio for DevCard {
     fn arm_nhm_busy(&self, period_4us: u16) -> bool {
         self.with_ctl(|c| c.arm_nhm_busy(period_4us))
             .unwrap_or(false)
+    }
+    fn arm_clm_busy(&self, window_us: u32) -> u32 {
+        // devourer has the NHM window on Jaguar3: a refused NHM arm there is
+        // a failed register batch, not a missing sensor, and a CLM figure in
+        // its place would rank one metric against another.
+        if self.caps.gen == "jaguar3" {
+            return 0;
+        }
+        let us = self
+            .with_ctl(|c| c.arm_channel_busy(window_us))
+            .unwrap_or(0);
+        self.clm_armed.store(us != 0, Ordering::Release);
+        us
+    }
+    fn read_clm_busy(&self) -> ClmBusyRead {
+        if !self.clm_armed.swap(false, Ordering::AcqRel) {
+            return ClmBusyRead::default();
+        }
+        self.with_ctl(|c| {
+            let b = c.read_channel_busy();
+            ClmBusyRead {
+                valid: b.valid,
+                pct: b.pct,
+                window_us: b.window_us,
+                own_tx: b.own_tx,
+            }
+        })
+        .unwrap_or_default()
     }
     fn read_nhm_busy(&self) -> NhmBusyRead {
         self.with_ctl(|c| {

@@ -66,7 +66,10 @@ class PalCard final : public maburgs::LinkCard {
     ready_.store(true, std::memory_order_release);
   }
 
-  void mark_down() { ready_.store(false, std::memory_order_release); }
+  void mark_down() {
+    ready_.store(false, std::memory_order_release);
+    clm_armed_.store(false, std::memory_order_release);
+  }
 
   // RadioFrontend::on_packet's counters. Returns -1 for a frame that is not
   // a body, else its rx_channel (0 while a retune blinds the stamp).
@@ -168,6 +171,26 @@ class PalCard final : public maburgs::LinkCard {
     std::lock_guard<std::mutex> g(ctl_);
     return dev_.ArmNhmBusy(period_4us);
   }
+  // As mabur's RadioFrontend: CLM only on a card without the NHM window,
+  // read only while our own arm stands.
+  uint32_t arm_clm_busy(uint32_t window_us) override {
+    if (!ready() || caps_.gen == "jaguar3") return 0;
+    std::lock_guard<std::mutex> g(ctl_);
+    const uint32_t us = dev_.ArmChannelBusy(window_us);
+    clm_armed_.store(us != 0, std::memory_order_release);
+    return us;
+  }
+  maburgs::ClmBusyRead read_clm_busy() override {
+    maburgs::ClmBusyRead out;
+    if (!clm_armed_.exchange(false, std::memory_order_acq_rel) || !ready()) return out;
+    std::lock_guard<std::mutex> g(ctl_);
+    const devourer::ChannelBusy b = dev_.GetChannelBusy();
+    out.valid = b.valid && b.valid_busy;
+    out.pct = b.busy_pct;
+    out.window_us = b.window_us;
+    out.own_tx = b.own_tx_in_window;
+    return out;
+  }
   maburgs::NhmBusyRead read_nhm_busy() override {
     maburgs::NhmBusyRead out;
     if (!ready()) return out;
@@ -187,6 +210,7 @@ class PalCard final : public maburgs::LinkCard {
   maburgs::CardCaps caps_;
   std::mutex ctl_;
   std::atomic<bool> ready_{false};
+  std::atomic<bool> clm_armed_{false};
   std::atomic<uint64_t> rx_frames_{0}, foreign_{0}, own_{0}, own_air_us_{0};
   std::atomic<uint64_t> tx_frames_{0}, tx_fail_{0};
   maburgs::OwnAirAcc own_air_;   // RX thread only

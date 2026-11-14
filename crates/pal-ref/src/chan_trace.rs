@@ -23,6 +23,14 @@ struct TEnergy {
 }
 
 #[repr(C)]
+struct TClm {
+    valid: u8,
+    pct: u8,
+    own_tx: u8,
+    window_us: u32,
+}
+
+#[repr(C)]
 struct TNhm {
     valid: u8,
     buckets: [u8; 12],
@@ -41,6 +49,8 @@ struct TCardVt {
     frames: extern "C" fn(U, *mut u64),
     arm_nhm_busy: extern "C" fn(U, u16) -> c_int,
     read_nhm_busy: extern "C" fn(U, *mut TNhm),
+    arm_clm_busy: extern "C" fn(U, u32) -> u32,
+    read_clm_busy: extern "C" fn(U, *mut TClm),
     ready: extern "C" fn(U) -> c_int,
     alive: extern "C" fn(U) -> c_int,
     snr_ok: extern "C" fn(U) -> c_int,
@@ -196,6 +206,23 @@ extern "C" fn c_read_nhm(u: U, o: *mut TNhm) {
         }
     })
 }
+extern "C" fn c_arm_clm(u: U, us: u32) -> u32 {
+    guard(|| card(u).arm_clm_busy(us))
+}
+extern "C" fn c_read_clm(u: U, o: *mut TClm) {
+    guard(|| {
+        let r = card(u).read_clm_busy();
+        // SAFETY: valid out pointer.
+        unsafe {
+            *o = TClm {
+                valid: r.valid as u8,
+                pct: r.pct,
+                own_tx: r.own_tx as u8,
+                window_us: r.window_us,
+            }
+        }
+    })
+}
 extern "C" fn c_ready(u: U) -> c_int {
     guard(|| card(u).ready() as c_int)
 }
@@ -307,6 +334,8 @@ impl CppTrace {
                 frames: c_frames,
                 arm_nhm_busy: c_arm_nhm,
                 read_nhm_busy: c_read_nhm,
+                arm_clm_busy: c_arm_clm,
+                read_clm_busy: c_read_clm,
                 ready: c_ready,
                 alive: c_alive,
                 snr_ok: c_snr_ok,

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
 use std::sync::Mutex;
 
 use super::pair::{all_pairs_ranked, any_pair_ranked, pair_proposal, pair_ranking};
-use super::radio::{nhm_busy_pct, nhm_period_4us, NhmBusyRead, ScoutRadio};
+use super::radio::{arm_busy, nhm_period_4us, read_busy_tx, BusySensor, ScoutRadio};
 use super::ranker::{ChannelRanker, RankEntry, RankSample};
 use crate::config::ht40_offset;
 use pal_wire::ht40::grid_5g;
@@ -123,6 +123,10 @@ pub struct ScoutDwell {
     pub back_us: i64,
     pub busy_valid: bool,
     pub busy_pct: f64,
+    /// Rust only (flight log): the busy figure is CLM airtime (a card with
+    /// no NHM window), and the card sent inside that window.
+    pub busy_clm: bool,
+    pub busy_own_tx: bool,
 }
 
 /// devourer `chanmig::ScanScheduler` with the scout's flat cadence (every
@@ -721,21 +725,15 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
         // Discard barrier: zero the delta counters, let the USB pipe drain.
         let _ = self.radio.read_energy(false);
         let period = nhm_period_4us(self.cfg.dwell_ms);
-        let armed = self.radio.arm_nhm_busy(period);
+        let busy_arm = arm_busy(&*self.radio, period);
         let f0 = self.radio.frames();
         let tx0 = self.tx_frames.load(Acquire);
         let t0 = (self.now)();
         (self.sleep)(self.cfg.dwell_ms);
-        let nb = if armed {
-            self.radio.read_nhm_busy()
-        } else {
-            NhmBusyRead::default()
-        };
-        let busy = if nb.valid && nb.period == period {
-            nhm_busy_pct(&nb, self.cfg.busy_dbm)
-        } else {
-            None
-        };
+        // Before read_energy(true): its NHM read would spoil a CLM window.
+        let (busy, own_tx) = read_busy_tx(&*self.radio, &busy_arm, self.cfg.busy_dbm);
+        d.busy_clm = busy_arm.sensor == BusySensor::Clm;
+        d.busy_own_tx = own_tx;
         d.busy_valid = busy.is_some();
         d.busy_pct = busy.unwrap_or(0.0);
         let e = self.radio.read_energy(true);
@@ -891,7 +889,7 @@ impl<R: ScoutRadio + ?Sized> ChannelScout<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::radio::{NhmBusyRead, ScoutEnergy, ScoutFrames};
+    use super::super::radio::{ClmBusyRead, NhmBusyRead, ScoutEnergy, ScoutFrames};
     use super::*;
     use std::sync::{Arc, OnceLock, Weak};
 
@@ -904,6 +902,9 @@ mod tests {
         /// NHM busy % per channel; -1: no NHM window.
         busy_pct_on: Vec<i32>,
         armed: u16,
+        /// CLM busy % per channel; -1: no CLM window.
+        clm_pct_on: Vec<i32>,
+        clm_armed_us: u32,
         last_read: i64,
     }
 
@@ -917,6 +918,7 @@ mod tests {
             Arc::new(Self(Mutex::new(FakeState {
                 cca_per_ms_on: vec![0; 256],
                 busy_pct_on: vec![-1; 256],
+                clm_pct_on: vec![-1; 256],
                 ..Default::default()
             })))
         }
@@ -935,6 +937,9 @@ mod tests {
         fn nhm(&self, ch: u8, pct: i32) {
             self.st().busy_pct_on[ch as usize] = pct;
         }
+        fn clm(&self, ch: u8, pct: i32) {
+            self.st().clm_pct_on[ch as usize] = pct;
+        }
     }
 
     impl ScoutRadio for FakeRadio {
@@ -948,6 +953,32 @@ mod tests {
             let mut s = self.st();
             s.armed = p;
             s.busy_pct_on[s.ch as usize] >= 0
+        }
+        fn arm_clm_busy(&self, us: u32) -> u32 {
+            let mut s = self.st();
+            s.calls.push(format!("arm_clm {us}"));
+            s.clm_armed_us = if s.clm_pct_on[s.ch as usize] >= 0 {
+                us
+            } else {
+                0
+            };
+            s.clm_armed_us
+        }
+        fn read_clm_busy(&self) -> ClmBusyRead {
+            let mut s = self.st();
+            if s.clm_armed_us == 0 {
+                s.calls.push("read_clm unarmed".into());
+                return ClmBusyRead::default();
+            }
+            s.calls.push("read_clm".into());
+            let r = ClmBusyRead {
+                valid: true,
+                window_us: s.clm_armed_us,
+                pct: s.clm_pct_on[s.ch as usize] as u8,
+                own_tx: false,
+            };
+            s.clm_armed_us = 0;
+            r
         }
         fn read_nhm_busy(&self) -> NhmBusyRead {
             let s = self.st();
@@ -1280,6 +1311,53 @@ mod tests {
         assert_eq!(h.s.pick_ranking(), vec![144, 136]);
         h.s.set_op(144);
         assert_eq!(h.s.proposal(), 144);
+    }
+
+    /// A card without the NHM window (the RTL8812AU) measures busy with CLM
+    /// over the same dwell, read before the dwell's NHM energy read (which
+    /// would spoil it). Revert (no CLM fallback): neither pair reads busy
+    /// and op 136 holds.
+    #[test]
+    fn a_card_without_the_nhm_window_ranks_by_clm_busy() {
+        let g = Rig::new(two(true));
+        g.s.set_op(136);
+        g.s.set_search(true);
+        g.r.clm(136, 30);
+        g.r.clm(144, 0);
+        g.steps(4);
+        assert_eq!(g.s.proposal(), 144);
+        let c = g.r.calls();
+        let arm = c
+            .iter()
+            .position(|x| x == "arm_clm 250000")
+            .expect("CLM armed");
+        let rd = arm
+            + c[arm..]
+                .iter()
+                .position(|x| x == "read_clm")
+                .expect("CLM read");
+        assert!(
+            !c[arm..rd].iter().any(|x| x == "read+nhm"),
+            "CLM read first"
+        );
+        assert!(!c.iter().any(|x| x == "read_clm unarmed"));
+        let d = g.s.take_dwells();
+        assert!(d.iter().any(|d| d.busy_valid && d.busy_clm));
+    }
+
+    /// Both windows on a card: NHM is the measure, CLM never armed.
+    #[test]
+    fn nhm_stays_the_busy_measure_where_the_card_has_it() {
+        let g = Rig::new(two(true));
+        g.s.set_op(136);
+        g.s.set_search(true);
+        g.r.nhm(136, 0);
+        g.r.nhm(144, 0);
+        g.r.clm(136, 90);
+        g.r.clm(144, 0);
+        g.steps(4);
+        assert_eq!(g.s.proposal(), 136);
+        assert!(!g.r.calls().iter().any(|x| x.starts_with("arm_clm")));
     }
 
     /// Width 40 ranks NHM busy first, and op keeps the pick until a

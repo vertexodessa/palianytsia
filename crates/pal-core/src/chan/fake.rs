@@ -5,7 +5,9 @@
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use super::radio::{CardCaps, LinkCard, NhmBusyRead, ScoutEnergy, ScoutFrames, ScoutRadio};
+use super::radio::{
+    CardCaps, ClmBusyRead, LinkCard, NhmBusyRead, ScoutEnergy, ScoutFrames, ScoutRadio,
+};
 
 #[derive(Clone, Default)]
 pub struct FakeClock(pub Arc<AtomicU64>);
@@ -43,6 +45,15 @@ pub struct FakeState {
     pub last_read: u64,
     /// Returned once by read_energy_scout's fa_ofdm.
     pub fa_next: u32,
+    /// CLM busy window (the fallback when arm_nhm_busy refuses): clm_ok
+    /// arms it for the window asked; a read returns clm_read with that
+    /// window, and an unarmed read is logged apart (devourer would sample
+    /// NHM for it).
+    pub clm_ok: bool,
+    pub clm_armed_us: u32,
+    pub clm_read: ClmBusyRead,
+    /// Per-channel CLM busy % (-1 = fall back to clm_ok/clm_read).
+    pub clm_busy_pct_on: Vec<i32>,
     pub nhm_arm_ok: bool,
     pub nhm_read: NhmBusyRead,
     /// Air that reads nhm_read's buckets under whatever period was last
@@ -89,11 +100,15 @@ impl FakeCard {
                 txf: 0,
                 last_read: 0,
                 fa_next: 0,
+                clm_ok: false,
+                clm_armed_us: 0,
+                clm_read: ClmBusyRead::default(),
                 nhm_arm_ok: false,
                 nhm_read: NhmBusyRead::default(),
                 nhm_any_period: false,
                 nhm_armed_period: 0,
                 nhm_busy_pct_on: vec![-1; 256],
+                clm_busy_pct_on: vec![-1; 256],
                 block_next_read: false,
                 in_read: false,
                 release: false,
@@ -158,6 +173,40 @@ impl ScoutRadio for FakeCard {
         s.calls.push(format!("arm_nhm {period_4us}"));
         s.nhm_armed_period = period_4us;
         s.nhm_busy_pct_on[s.ch as usize] >= 0 || s.nhm_arm_ok
+    }
+    fn arm_clm_busy(&self, us: u32) -> u32 {
+        let mut s = self.s();
+        s.calls.push(format!("arm_clm {us}"));
+        s.clm_armed_us = if s.clm_ok || s.clm_busy_pct_on[s.ch as usize] >= 0 {
+            us
+        } else {
+            0
+        };
+        s.clm_armed_us
+    }
+    fn read_clm_busy(&self) -> ClmBusyRead {
+        let mut s = self.s();
+        if s.clm_armed_us == 0 {
+            s.calls.push("read_clm unarmed".into());
+            return ClmBusyRead::default();
+        }
+        s.calls.push("read_clm".into());
+        let pct = s.clm_busy_pct_on[s.ch as usize];
+        let r = if pct >= 0 {
+            ClmBusyRead {
+                valid: true,
+                pct: pct as u8,
+                window_us: s.clm_armed_us,
+                own_tx: false,
+            }
+        } else {
+            ClmBusyRead {
+                window_us: s.clm_armed_us,
+                ..s.clm_read
+            }
+        };
+        s.clm_armed_us = 0;
+        r
     }
     fn read_nhm_busy(&self) -> NhmBusyRead {
         let mut s = self.s();

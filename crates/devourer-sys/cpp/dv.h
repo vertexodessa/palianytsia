@@ -60,6 +60,13 @@ typedef struct {
   uint16_t duration, period;
 } dv_nhm;
 
+/* One armed CLM busy-airtime window (devourer ChannelBusy, the fields the
+ * scout uses). */
+typedef struct {
+  uint8_t valid, pct, own_tx;
+  uint32_t window_us;
+} dv_busy;
+
 typedef struct {
   uint8_t supported;
   char chip[32];
@@ -81,6 +88,11 @@ int dv_set_monitor(dv_card *c, uint8_t ch, uint8_t width_mhz, uint8_t ht40_offse
 int dv_tuned_central(dv_card *c);
 int dv_arm_nhm_busy(dv_card *c, uint16_t period_4us);
 int dv_read_nhm_busy(dv_card *c, dv_nhm *out);
+/* IRadio::ArmChannelBusy: the window armed in us, 0 = not ported. */
+uint32_t dv_arm_channel_busy(dv_card *c, uint32_t window_us);
+/* IRadio::GetChannelBusy. Call only after an arm that returned nonzero: an
+ * unarmed read takes a 2 ms NHM sample and drains the FA/CCA delta. */
+int dv_read_channel_busy(dv_card *c, dv_busy *out);
 
 /* The card's IRtlRadio (devourer), for C++ in the same binary that drives
  * the control plane itself (pal-ref's LinkCard). Valid until dv_close. */

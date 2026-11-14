@@ -36,6 +36,19 @@ pub struct NhmBusyRead {
     pub period: u16,
 }
 
+/// mabur `ClmBusyRead`: one armed busy-airtime CLM window (devourer
+/// `GetChannelBusy` after `ArmChannelBusy`), the share of 4 us ticks the
+/// baseband held CCA busy, receive-side only. The fallback for a card whose
+/// NHM window is not ported (Jaguar1: the RTL8812AU). `own_tx` = the card
+/// transmitted inside it, which reads low.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClmBusyRead {
+    pub valid: bool,
+    pub pct: u8,
+    pub window_us: u32,
+    pub own_tx: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardCaps {
     pub valid: bool,
@@ -90,6 +103,16 @@ pub trait ScoutRadio: Send + Sync {
     fn read_nhm_busy(&self) -> NhmBusyRead {
         NhmBusyRead::default()
     }
+    /// Busy-airtime CLM window, for a card that refuses `arm_nhm_busy`: the
+    /// window actually armed in us (0 = unsupported). Read only after an arm
+    /// that returned nonzero: an unarmed read on devourer takes a 2 ms NHM
+    /// sample and drains the FA/CCA delta the dwell is measuring.
+    fn arm_clm_busy(&self, _window_us: u32) -> u32 {
+        0
+    }
+    fn read_clm_busy(&self) -> ClmBusyRead {
+        ClmBusyRead::default()
+    }
 }
 
 /// A USB link card (mabur `LinkCard` minus the relay calls, which
@@ -134,13 +157,88 @@ pub fn nhm_period_4us(ms: i32) -> u16 {
     (ms as i64 * 250).clamp(1, 65535) as u16
 }
 
+/// mabur `BusySensor`: which sensor one observation's busy window was armed
+/// on, the NHM share above busy_dbm where the card has it (Jaguar3), else
+/// CLM busy airtime over the same span (Jaguar1). Without the fallback an
+/// RTL8812AU GS read no busy at all: every pick kept the channel it started
+/// on and no hop fired.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BusySensor {
+    #[default]
+    None,
+    Nhm,
+    Clm,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BusyArm {
+    pub sensor: BusySensor,
+    /// The NHM period asked for.
+    pub period_4us: u16,
+    /// The CLM window devourer armed.
+    pub clm_us: u32,
+}
+
+pub fn arm_busy<R: ScoutRadio + ?Sized>(r: &R, period_4us: u16) -> BusyArm {
+    let mut a = BusyArm {
+        period_4us,
+        ..Default::default()
+    };
+    if r.arm_nhm_busy(period_4us) {
+        a.sensor = BusySensor::Nhm;
+    } else {
+        a.clm_us = r.arm_clm_busy(u32::from(period_4us) * 4);
+        if a.clm_us != 0 {
+            a.sensor = BusySensor::Clm;
+        }
+    }
+    a
+}
+
+/// A CLM read is this window's only if it spans the window armed.
+pub fn clm_busy_pct(c: &ClmBusyRead, a: &BusyArm) -> Option<f64> {
+    (c.valid && c.window_us == a.clm_us).then_some(f64::from(c.pct))
+}
+
+/// The busy % of the window `a` armed, read at the observation's end, and
+/// whether the card sent inside a CLM window (which reads low; the flight
+/// log carries it, mabur has no field for it).
+pub fn read_busy_tx<R: ScoutRadio + ?Sized>(
+    r: &R,
+    a: &BusyArm,
+    busy_dbm: i32,
+) -> (Option<f64>, bool) {
+    match a.sensor {
+        BusySensor::Nhm => {
+            let nb = r.read_nhm_busy();
+            if !nb.valid || nb.period != a.period_4us {
+                return (None, false);
+            }
+            (nhm_busy_pct(&nb, busy_dbm), false)
+        }
+        BusySensor::Clm => {
+            let c = r.read_clm_busy();
+            (clm_busy_pct(&c, a), c.own_tx)
+        }
+        BusySensor::None => (None, false),
+    }
+}
+
+/// mabur `read_busy`.
+pub fn read_busy<R: ScoutRadio + ?Sized>(r: &R, a: &BusyArm, busy_dbm: i32) -> Option<f64> {
+    read_busy_tx(r, a, busy_dbm).0
+}
+
 /// Whether an NHM read is the window this scout armed: same channel, same
-/// period, no dwell or retune since.
+/// period, no dwell or retune since. A card without the NHM window arms CLM
+/// instead (`armed_clm`): the same pins hold, and its read must span the
+/// window devourer armed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NhmWindowTracker {
     armed: bool,
     ch: u8,
     period: u16,
+    clm_us: u32,
     dwell_gen: u32,
     tune_gen: u32,
 }
@@ -151,12 +249,32 @@ impl NhmWindowTracker {
             armed: true,
             ch,
             period,
+            clm_us: 0,
+            dwell_gen,
+            tune_gen,
+        };
+    }
+    pub fn armed_clm(&mut self, ch: u8, clm_us: u32, dwell_gen: u32, tune_gen: u32) {
+        *self = Self {
+            armed: true,
+            ch,
+            period: 0,
+            clm_us,
             dwell_gen,
             tune_gen,
         };
     }
     pub fn invalidate(&mut self) {
         self.armed = false;
+        self.clm_us = 0;
+    }
+    /// The window in flight is a CLM one: read it with `read_clm_busy`, and
+    /// only then.
+    pub fn clm(&self) -> bool {
+        self.armed && self.clm_us != 0
+    }
+    fn pinned(&self, ch_now: u8, dwell_gen_now: u32, tune_gen_now: u32) -> bool {
+        ch_now == self.ch && dwell_gen_now == self.dwell_gen && tune_gen_now == self.tune_gen
     }
     pub fn usable(
         &self,
@@ -166,11 +284,22 @@ impl NhmWindowTracker {
         tune_gen_now: u32,
     ) -> bool {
         self.armed
+            && self.clm_us == 0
             && r.valid
             && r.period == self.period
-            && ch_now == self.ch
-            && dwell_gen_now == self.dwell_gen
-            && tune_gen_now == self.tune_gen
+            && self.pinned(ch_now, dwell_gen_now, tune_gen_now)
+    }
+    pub fn usable_clm(
+        &self,
+        r: &ClmBusyRead,
+        ch_now: u8,
+        dwell_gen_now: u32,
+        tune_gen_now: u32,
+    ) -> bool {
+        self.clm()
+            && r.valid
+            && r.window_us == self.clm_us
+            && self.pinned(ch_now, dwell_gen_now, tune_gen_now)
     }
 }
 

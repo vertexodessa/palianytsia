@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use super::hop_ranker::HopVisit;
-use super::radio::{nhm_busy_pct, nhm_period_4us, NhmBusyRead, ScoutRadio};
+use super::radio::{arm_busy, nhm_period_4us, read_busy_tx, BusySensor, ScoutRadio};
 use super::scout::{ScoutDwell, FLAG_NHM_MISSING, FLAG_READ_FAILED, FLAG_RETUNE_FAILED};
 use crate::config::ht40_offset;
 
@@ -106,21 +106,14 @@ impl InflightScout {
         let t1 = (self.now_us)();
         let _ = r.read_energy_scout();
         let period = nhm_period_4us(self.cfg.observe_ms);
-        let armed = r.arm_nhm_busy(period);
+        let busy_arm = arm_busy(&**r, period);
         let f0 = r.frames();
         let t2 = (self.now_us)();
         (self.sleep_ms)(self.cfg.observe_ms);
         let t3 = (self.now_us)();
-        let nb = if armed {
-            r.read_nhm_busy()
-        } else {
-            NhmBusyRead::default()
-        };
-        let busy = if nb.valid && nb.period == period {
-            nhm_busy_pct(&nb, self.cfg.busy_dbm)
-        } else {
-            None
-        };
+        let (busy, own_tx) = read_busy_tx(&**r, &busy_arm, self.cfg.busy_dbm);
+        d.busy_clm = busy_arm.sensor == BusySensor::Clm;
+        d.busy_own_tx = own_tx;
         d.busy_valid = busy.is_some();
         d.busy_pct = busy.unwrap_or(0.0);
         let e = r.read_energy_scout();
@@ -210,7 +203,7 @@ impl InflightScout {
 #[cfg(test)]
 mod tests {
     use super::super::hop_ranker::HopRanker;
-    use super::super::radio::{ScoutEnergy, ScoutFrames};
+    use super::super::radio::{NhmBusyRead, ScoutEnergy, ScoutFrames};
     use super::*;
     use crate::config::{BusyCfg, HopCfg};
     use std::sync::atomic::{AtomicI64, Ordering::SeqCst};

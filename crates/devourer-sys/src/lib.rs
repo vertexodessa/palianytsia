@@ -52,6 +52,15 @@ struct DvEnergy {
 
 #[repr(C)]
 #[derive(Default)]
+struct DvBusy {
+    valid: u8,
+    pct: u8,
+    own_tx: u8,
+    window_us: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
 struct DvNhm {
     valid: u8,
     buckets: [u8; 12],
@@ -90,6 +99,8 @@ extern "C" {
     fn dv_tuned_central(c: *mut DvCard) -> c_int;
     fn dv_arm_nhm_busy(c: *mut DvCard, period_4us: u16) -> c_int;
     fn dv_read_nhm_busy(c: *mut DvCard, out: *mut DvNhm) -> c_int;
+    fn dv_arm_channel_busy(c: *mut DvCard, window_us: u32) -> u32;
+    fn dv_read_channel_busy(c: *mut DvCard, out: *mut DvBusy) -> c_int;
 }
 
 /// devourer `RxEnergy`: the counters a channel search reads.
@@ -127,6 +138,15 @@ pub struct NhmBusy {
     pub buckets: [u8; 12],
     pub duration: u16,
     pub period: u16,
+}
+
+/// devourer `ChannelBusy` from an armed CLM window, the part the scout uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelBusy {
+    pub valid: bool,
+    pub pct: u8,
+    pub window_us: u32,
+    pub own_tx: bool,
 }
 
 /// devourer `AdapterCaps`, the part a channel search uses.
@@ -230,6 +250,26 @@ impl Ctl<'_> {
             buckets: o.buckets,
             duration: o.duration,
             period: o.period,
+        }
+    }
+
+    /// devourer `ArmChannelBusy`: the window armed in us, 0 = not ported.
+    pub fn arm_channel_busy(&self, window_us: u32) -> u32 {
+        unsafe { dv_arm_channel_busy(self.raw, window_us) }
+    }
+
+    /// devourer `GetChannelBusy`. Only after an arm that returned nonzero:
+    /// an unarmed read takes a 2 ms NHM sample and drains the FA/CCA delta.
+    pub fn read_channel_busy(&self) -> ChannelBusy {
+        let mut o = DvBusy::default();
+        if unsafe { dv_read_channel_busy(self.raw, &mut o) } != 0 {
+            return ChannelBusy::default();
+        }
+        ChannelBusy {
+            valid: o.valid != 0,
+            pct: o.pct,
+            window_us: o.window_us,
+            own_tx: o.own_tx != 0,
         }
     }
 

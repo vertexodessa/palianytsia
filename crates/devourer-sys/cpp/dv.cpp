@@ -249,6 +249,26 @@ extern "C" int dv_read_nhm_busy(dv_card *c, dv_nhm *o) try {
   return -1;
 }
 
+extern "C" uint32_t dv_arm_channel_busy(dv_card *c, uint32_t window_us) try {
+  if (!c || !c->dev) return 0;
+  return c->dev->ArmChannelBusy(window_us);
+} catch (...) {
+  return 0;
+}
+
+extern "C" int dv_read_channel_busy(dv_card *c, dv_busy *o) try {
+  if (!c || !c->dev || !o) return -1;
+  *o = dv_busy{};
+  const devourer::ChannelBusy b = c->dev->GetChannelBusy();
+  o->valid = b.valid && b.valid_busy;
+  o->pct = b.busy_pct;
+  o->own_tx = b.own_tx_in_window;
+  o->window_us = b.window_us;
+  return 0;
+} catch (...) {
+  return -1;
+}
+
 extern "C" void *dv_radio(dv_card *c) { return c ? c->dev.get() : nullptr; }
 
 extern "C" const char *dv_chip(const dv_card *c) {
