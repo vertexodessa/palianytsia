@@ -268,11 +268,16 @@ fn parse() -> Opts {
         // Channel from the config unless given: radio.channel's pin, else
         // the first of radio.channels.
         let c = &o.cfg;
-        if o.ch == 0 && c.radio.pin.is_none() {
-            // A GS runs the channel core on the card (either core); a Rust
-            // spotter, which has none, sweeps for the drone instead.
-            o.channel_core = o.mode == Mode::Gs;
-            if o.rust && !o.channel_core {
+        if o.ch == 0 {
+            // A GS runs the channel core on the card: on an auto config
+            // either core, on a pinned one the Rust core, as the APKs do, so
+            // a drone parked on another member is found and moved onto the
+            // pin (a fixed drive would wait on the pin forever). A Rust
+            // spotter on an auto config, which has no channel core, sweeps
+            // for the drone instead.
+            let auto = c.radio.pin.is_none();
+            o.channel_core = o.mode == Mode::Gs && (auto || o.rust);
+            if o.rust && auto && !o.channel_core {
                 o.search = o.cfg.radio.channels.clone();
             }
         }
@@ -358,8 +363,8 @@ fn resolve_config(o: &mut Opts) {
     o.config_text = text;
 }
 
-/// Who tunes the card(s) on a live run: on an auto config a GS hands the
-/// cards to its channel core (either core); otherwise the runtime holds
+/// Who tunes the card(s) on a live run: without --ch a GS hands the cards
+/// to its channel core (see `channel_core`); otherwise the runtime holds
 /// the channel, sweeping for the drone when `o.search` is set.
 fn drive(o: &Opts) -> Drive {
     if o.channel_core {
