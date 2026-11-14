@@ -156,13 +156,10 @@ impl UepDecoder {
         }
         let mut out = Vec::new();
         for env in &r.survivors {
-            let pkts = l.sw.add_symbol(env, now_ms, hint, crc_ok, r.retx);
-            let seqs = l.sw.last_out_seqs();
-            for (k, pkt) in pkts.into_iter().enumerate() {
+            for (seq, pkt) in l.sw.add_symbol(env, now_ms, hint, crc_ok, r.retx) {
                 if pkt.len() < FRAG_HDR_LEN {
                     continue;
                 }
-                let seq = seqs.get(k).copied().unwrap_or(0);
                 out.push(DecodedFrag {
                     stream_id: sid,
                     frag: pkt,

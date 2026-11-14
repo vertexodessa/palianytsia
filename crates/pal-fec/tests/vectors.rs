@@ -47,7 +47,7 @@ fn sw_decode_scenarios() {
                 if drop.contains(&i) {
                     continue;
                 }
-                for p in dec.add_symbol(e, 1000, Boundary::None, true, false) {
+                for (_, p) in dec.add_symbol(e, 1000, Boundary::None, true, false) {
                     got.push(hex(&p));
                 }
             }

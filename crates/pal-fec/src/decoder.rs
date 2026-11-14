@@ -115,7 +115,6 @@ pub struct SwDecoder {
     rows: BTreeMap<u64, Row>,
     recovered_await_src: BTreeSet<u64>,
     retx_await_src: BTreeSet<u64>,
-    last_out_seqs: Vec<u32>,
     st: DecoderStats,
     repair_window_hwm: usize,
     repair_window_recent: RecentWindow,
@@ -193,7 +192,6 @@ impl SwDecoder {
             rows: BTreeMap::new(),
             recovered_await_src: BTreeSet::new(),
             retx_await_src: BTreeSet::new(),
-            last_out_seqs: Vec::new(),
             st: DecoderStats::default(),
             repair_window_hwm: 0,
             repair_window_recent: RecentWindow::default(),
@@ -221,10 +219,6 @@ impl SwDecoder {
     }
     pub fn arrival_guard(&self) -> u32 {
         self.arr_guard
-    }
-    /// Wire seq of the symbol each packet of the last `add_symbol` came from.
-    pub fn last_out_seqs(&self) -> &[u32] {
-        &self.last_out_seqs
     }
     pub fn newest_seq(&self) -> u64 {
         if self.have_seq {
@@ -394,7 +388,7 @@ impl SwDecoder {
         self.base = nb;
     }
 
-    fn unpack_symbol(&mut self, sym: &[u8], out: &mut Vec<Vec<u8>>) {
+    fn unpack_symbol(&mut self, seq: u32, sym: &[u8], out: &mut Vec<(u32, Vec<u8>)>) {
         let ss = self.cfg.symbol_size;
         let mut pos = 0;
         while pos + 2 <= ss {
@@ -406,7 +400,7 @@ impl SwDecoder {
             if end > ss {
                 break;
             }
-            out.push(sym[pos + 2..end].to_vec());
+            out.push((seq, sym[pos + 2..end].to_vec()));
             self.st.packets_out += 1;
             pos = end;
         }
@@ -449,7 +443,7 @@ impl SwDecoder {
         }
     }
 
-    fn ingest(&mut self, v: u64, sym: Vec<u8>, origin: Origin, out: &mut Vec<Vec<u8>>) {
+    fn ingest(&mut self, v: u64, sym: Vec<u8>, origin: Origin, out: &mut Vec<(u32, Vec<u8>)>) {
         let mut queue: Vec<(u64, Vec<u8>)> = vec![(v, sym)];
         let mut first = true;
         while let Some((s, payload)) = queue.pop() {
@@ -464,10 +458,7 @@ impl SwDecoder {
             if s < self.live_floor() || self.known.contains_key(&s) {
                 continue;
             }
-            self.unpack_symbol(&payload, out);
-            while self.last_out_seqs.len() < out.len() {
-                self.last_out_seqs.push(s as u32);
-            }
+            self.unpack_symbol(s as u32, &payload, out);
             match o {
                 Origin::Source => self.st.syms_delivered += 1,
                 Origin::Retx => {
@@ -499,8 +490,9 @@ impl SwDecoder {
     }
 
     /// Feeds one envelope; returns the app packets of every symbol that became
-    /// known (source first, cascades after). `clean`: the carrying body's FCS
-    /// verdict. `retx`: the body is a NACK retransmit.
+    /// known (source first, cascades after), each with the wire seq of the
+    /// symbol it came from. `clean`: the carrying body's FCS verdict. `retx`:
+    /// the body is a NACK retransmit.
     pub fn add_symbol(
         &mut self,
         env: &[u8],
@@ -508,8 +500,7 @@ impl SwDecoder {
         mut b: Boundary,
         clean: bool,
         retx: bool,
-    ) -> Vec<Vec<u8>> {
-        self.last_out_seqs.clear();
+    ) -> Vec<(u32, Vec<u8>)> {
         let mut out = Vec::new();
         let Some(h) = sw::Header::parse(env) else {
             return out;

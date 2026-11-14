@@ -239,10 +239,8 @@ proptest! {
         let mut packets = 0u64;
         for (t, env) in sent.iter().enumerate() {
             let pkts = dec.add_symbol(env, t as u64, Boundary::None, true, false);
-            let seqs = dec.last_out_seqs().to_vec();
-            prop_assert_eq!(seqs.len(), pkts.len());
             let mut prev = None;
-            for (pkt, &s) in pkts.iter().zip(&seqs) {
+            for &(s, ref pkt) in &pkts {
                 let src = by_seq[&s];
                 prop_assert!(d.pkts[src].contains(pkt), "seq {} packet differs from its source", s);
                 if prev != Some(s) {
@@ -339,8 +337,7 @@ proptest! {
                     let mut env = header(&h);
                     env.extend((0..ss).map(|i| fill.wrapping_mul(i as u8 | 1)));
                     let pkts = dec.add_symbol(&env, now, b, clean, retx);
-                    prop_assert_eq!(dec.last_out_seqs().len(), pkts.len());
-                    prop_assert!(pkts.iter().all(|p| !p.is_empty() && p.len() + 2 <= ss));
+                    prop_assert!(pkts.iter().all(|(_, p)| !p.is_empty() && p.len() + 2 <= ss));
                 }
                 Op::Raw(r) => {
                     let _ = dec.add_symbol(&r, now, b, clean, retx);
