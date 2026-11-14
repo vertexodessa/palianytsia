@@ -391,6 +391,46 @@ impl CoreIo for Sink {
     }
 }
 
+/// After each core tick, for every loop that drives a core (the apps'
+/// CoreLoop, `pal live` and `pal replay`): the core's flight-log output.
+/// The channel core's records and the core's own (`take_log_records`),
+/// each under the event name in its `ev` (chan when it has none), then
+/// the closed loss episodes into fec.log. Taken every tick with or without
+/// a log, so the core's queues stay short.
+pub fn log_core_output(core: &mut dyn GsCore, mut log: Option<&mut Session>, now: u64) {
+    for recs in [core.take_chan_records(), core.take_log_records()] {
+        let Some(l) = log.as_deref_mut() else {
+            continue;
+        };
+        for r in recs {
+            if let Ok(serde_json::Value::Object(mut m)) = serde_json::from_str(&r) {
+                let ev = m.remove("ev");
+                let ev = ev
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("chan");
+                let _ = l.event(now, ev, m.into());
+            }
+        }
+    }
+    let rows = core.take_fec_rows();
+    if let Some(l) = log {
+        let _ = l.fec_rows(&rows);
+    }
+}
+
+/// Before each core tick: the log's clock moves to `now`, then the events
+/// other threads raised (`Shared::event`), each at its own time.
+pub fn log_shared_events(shared: &Shared, log: Option<&mut Session>, now: u64) {
+    let evs = std::mem::take(&mut *shared.events.lock().unwrap_or_else(|p| p.into_inner()));
+    if let Some(l) = log {
+        let _ = l.tick(now);
+        for (ev, d, at) in evs {
+            let _ = l.event(at.unwrap_or(now), ev, d);
+        }
+    }
+}
+
 pub struct CoreLoop {
     pub core: Box<dyn GsCore>,
     pub sink: Sink,
@@ -585,9 +625,7 @@ impl CoreLoop {
         self.hand_cal_log_dir();
         self.core.tick(now, &mut self.sink);
         self.pump_maint(now);
-        self.log_chan_records(now);
-        self.log_core_records(now);
-        self.log_fec_rows();
+        log_core_output(&mut *self.core, self.sink.log.as_mut(), now);
         self.publish_params(now);
         self.step_idr(now);
         self.publish_stats(now);
@@ -611,20 +649,7 @@ impl CoreLoop {
     }
 
     fn drain_events(&mut self, now: u64) {
-        let evs = std::mem::take(
-            &mut *self
-                .sink
-                .shared
-                .events
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()),
-        );
-        if let Some(l) = self.sink.log.as_mut() {
-            let _ = l.tick(now);
-            for (ev, d, at) in evs {
-                let _ = l.event(at.unwrap_or(now), ev, d);
-            }
-        }
+        log_shared_events(&self.sink.shared, self.sink.log.as_mut(), now);
     }
 
     fn feed_decoder_errors(&mut self, now: u64) {
@@ -734,49 +759,6 @@ impl CoreLoop {
             self.cal.log_dir_set = true;
             if let Some(l) = self.sink.log.as_ref() {
                 self.core.set_cal_log_dir(l.dir());
-            }
-        }
-    }
-
-    /// The channel core's records into the flight log, each under its own
-    /// event name; dropped unread when there is no log.
-    /// Taken every tick with or without a log, like the channel records,
-    /// so the core's queue stays short.
-    fn log_fec_rows(&mut self) {
-        let rows = self.core.take_fec_rows();
-        if let Some(l) = self.sink.log.as_mut() {
-            let _ = l.fec_rows(&rows);
-        }
-    }
-
-    fn log_chan_records(&mut self, now: u64) {
-        let recs = self.core.take_chan_records();
-        self.log_records(now, recs);
-    }
-
-    /// The core's own flight-log records (`GsCore::take_log_records`), taken every tick with or
-    /// without a log so the core's queue stays short.
-    fn log_core_records(&mut self, now: u64) {
-        let recs = self.core.take_log_records();
-        self.log_records(now, recs);
-    }
-
-    /// Each record under the event name in its `ev` (chan when it has none).
-    fn log_records(&mut self, now: u64, recs: Vec<String>) {
-        if recs.is_empty() {
-            return;
-        }
-        let Some(l) = self.sink.log.as_mut() else {
-            return;
-        };
-        for r in recs {
-            if let Ok(serde_json::Value::Object(mut m)) = serde_json::from_str(&r) {
-                let ev = m.remove("ev");
-                let ev = ev
-                    .as_ref()
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("chan");
-                let _ = l.event(now, ev, m.into());
             }
         }
     }
