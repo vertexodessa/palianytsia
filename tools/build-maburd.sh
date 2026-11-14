@@ -52,6 +52,6 @@ RC=$(sed -n 's/.*constexpr uint8_t RC_VERSION = \([0-9]*\);.*/\1/p' "$MABUR/comm
   echo "RC_VERSION $RC"
   echo "chips 8822E"
   echo
-  (cd "$DIST" && sha256sum -- * | grep -v ' PAIR.txt$')
+  (cd "$DIST" && sha256sum -- "$BIN" mabur.default.toml S96mabur)
 } > "$DIST/PAIR.txt"
 cat "$DIST/PAIR.txt"
