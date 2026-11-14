@@ -2324,6 +2324,7 @@ impl ChannelCore {
             self.cal_reloc.s,
             CalRelocState::Waiting | CalRelocState::InFlight
         ) || !self.plan.member(ch)
+            || !self.cfg.radio.usable().contains(&ch)
             || ch == self.plan.op()
             || !hop_active(self.in_session_cur, self.cal_running_cur)
             || self.plan.hopping()
@@ -2476,7 +2477,7 @@ impl ChannelCore {
             &members,
             if have_op { self.op_live } else { None },
             op,
-            &self.cfg.radio.channels,
+            self.cfg.radio.usable(),
             f64::from(scan.pick_margin_pct),
             scan.busy.blocked_pct,
         );

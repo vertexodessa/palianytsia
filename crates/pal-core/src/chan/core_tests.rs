@@ -1483,6 +1483,38 @@ fn cal_measure_round_ranks_the_set_once() {
     assert_eq!(g.core.cal_measure_best(), Some(112));
 }
 
+/// The round still dwells on every member, but its pick names only one
+/// the operator chose (`radio.use`). As in cal_measure_round_ranks_the_set_once
+/// op is blocked by its foreign frames and 112 reads quietest (5 %); with 112
+/// left out the pick is the first unblocked chosen member, 64 (144 reads
+/// the same 25 %, and a tie keeps config order).
+#[test]
+fn cal_measure_round_picks_only_inside_radio_use() {
+    let mut g = Rig::with_use(2, false, 0, &[40, 64, 144]);
+    g.linked_auto(30, 200);
+    g.cal_air();
+    assert!(g.core.cal_can_measure());
+    assert_eq!(g.core.op(), 40);
+    let now = g.ms();
+    g.core.begin_cal_measure(now);
+    for _ in 0..50 {
+        if g.core.cal_measure_best().is_some() {
+            break;
+        }
+        g.live_tick(200);
+    }
+    assert_eq!(g.core.cal_measure_best(), Some(64));
+}
+
+/// A calibration relocate never lands outside `radio.use`.
+#[test]
+fn cal_relocate_refuses_a_channel_outside_radio_use() {
+    let mut g = Rig::with_use(2, false, 0, &[40, 64, 144]);
+    g.linked_auto(5, 0);
+    assert!(!g.core.order_cal_relocate(112)); // a member, not chosen
+    assert!(g.core.order_cal_relocate(64));
+}
+
 /// Over a quiet op a candidate must beat op by pick_margin: op stays.
 #[test]
 fn cal_measure_round_keeps_a_clean_op() {
