@@ -149,3 +149,8 @@ pairing key.
 - Keep the beads board current without being asked: `bd update <id> --status in_progress` before the first
   edit or measurement, `--append-notes` with the numbers as each step lands, `bd close` only when proven,
   back to open with a note when stopped or blocked.
+- Tickets are written for a human reader (description, design, acceptance, notes): short paragraphs with blank
+  lines between them; labels (Where, Value, Effort, Hypotheses, Test, ...) on their own line, not inline; hypotheses
+  and steps as lists, measurement series as tables; notes as a dated log, one entry per date, blank line between
+  entries. Titles stay under ~110 characters; detail that does not fit opens the description. Keep every number,
+  path, sha and id when reshaping an existing ticket. Pass long text with `--body-file`/`--design-file`, not inline.
