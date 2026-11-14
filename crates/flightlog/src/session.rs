@@ -434,24 +434,27 @@ impl Session {
     }
 
     fn write_refresh_events(&mut self, evs: &[pal_core::refresh::Event]) -> io::Result<()> {
+        use pal_core::refresh::EventKind;
         for e in evs {
             // fec.log's `I` / `H` lines (FecLog::request / heal) beside the
             // episodes they answer; mabur's fec.log has no stuck line.
             match e.kind {
-                'H' => writeln!(self.fec, "H {} {} {}", e.t_ms, e.heal_ms, e.retries)?,
-                'I' => writeln!(self.fec, "I {} {} {}", e.t_ms, e.reason.as_str(), e.epoch)?,
-                _ => {}
+                EventKind::Heal => writeln!(self.fec, "H {} {} {}", e.t_ms, e.heal_ms, e.retries)?,
+                EventKind::Request => {
+                    writeln!(self.fec, "I {} {} {}", e.t_ms, e.reason.as_str(), e.epoch)?
+                }
+                EventKind::Stuck => {}
             }
             let (ev, d) = match e.kind {
-                'H' => (
+                EventKind::Heal => (
                     "idr_heal",
                     json!({"reason": e.reason.as_str(), "epoch": e.epoch, "heal_ms": e.heal_ms, "retries": e.retries}),
                 ),
-                'S' => (
+                EventKind::Stuck => (
                     "idr_stuck",
                     json!({"reason": e.reason.as_str(), "epoch": e.epoch, "retries": e.retries}),
                 ),
-                _ => (
+                EventKind::Request => (
                     "idr_req",
                     json!({"reason": e.reason.as_str(), "epoch": e.epoch, "retry": e.retries}),
                 ),
@@ -1058,7 +1061,7 @@ mod tests {
     /// core thread; the stats row after such a call says how long.
     #[test]
     fn loss_episodes_and_refresh_rows_go_to_fec_log_in_mabur_text() {
-        use pal_core::refresh::{Event, Reason};
+        use pal_core::refresh::{Event, EventKind, Reason};
         let root = std::env::temp_dir().join(format!("pal-fl-fec-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut s = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
@@ -1099,8 +1102,12 @@ mod tests {
             heal_ms: 350,
             retries: 1,
         };
-        s.refresh_events(&[ev('I', 1250), ev('S', 1250), ev('H', 1600)])
-            .expect("refresh");
+        s.refresh_events(&[
+            ev(EventKind::Request, 1250),
+            ev(EventKind::Stuck, 1250),
+            ev(EventKind::Heal, 1600),
+        ])
+        .expect("refresh");
         let dir = s.dir().to_path_buf();
         drop(s);
         let text = fs::read_to_string(dir.join(FEC_FILE)).expect("fec.log");

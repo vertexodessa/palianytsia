@@ -59,12 +59,20 @@ pub struct Counters {
     pub by_reason: [u64; REASONS],
 }
 
-/// 'I' per bump (a retry repeats the arming reason, `retries` = its
-/// ordinal), 'S' once per request when it turns stuck (after that retry's
-/// 'I'), 'H' per clearing IRAP (`retries` = how many it took).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    /// Per bump; a retry repeats the arming reason, `retries` = its ordinal
+    /// (fec.log `I`).
+    Request,
+    /// Once per request when it turns stuck, after that retry's Request.
+    Stuck,
+    /// Per clearing IRAP, `retries` = how many it took (fec.log `H`).
+    Heal,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
-    pub kind: char,
+    pub kind: EventKind,
     pub reason: Reason,
     pub epoch: u8,
     pub t_ms: u64,
@@ -216,7 +224,7 @@ impl RefreshRequester {
         self.retries_this += 1;
         self.bump(now_ms);
         if self.retries_this == STUCK_AFTER {
-            self.push(now_ms, 'S', 0);
+            self.push(now_ms, EventKind::Stuck, 0);
         }
     }
 
@@ -260,9 +268,9 @@ impl RefreshRequester {
     fn bump(&mut self, now_ms: u64) {
         self.epoch = self.epoch.wrapping_add(1);
         self.last_bump_ms = now_ms;
-        self.push(now_ms, 'I', 0);
+        self.push(now_ms, EventKind::Request, 0);
     }
-    fn push(&mut self, t_ms: u64, kind: char, heal_ms: u64) {
+    fn push(&mut self, t_ms: u64, kind: EventKind, heal_ms: u64) {
         self.events.push(Event {
             kind,
             reason: self.reason,
@@ -283,7 +291,7 @@ impl RefreshRequester {
         let heal = now_ms.saturating_sub(self.armed_since_ms);
         self.c.heals += 1;
         self.c.heal_ms_last = heal;
-        self.push(now_ms, 'H', heal);
+        self.push(now_ms, EventKind::Heal, heal);
     }
 }
 
@@ -503,8 +511,11 @@ mod tests {
         assert_eq!(c.by_reason[Reason::Hole as usize], 2);
         let ev = r.take_events();
         assert_eq!(ev.len(), 3);
-        assert_eq!((ev[1].kind, ev[1].retries), ('I', 1));
-        assert_eq!((ev[2].kind, ev[2].heal_ms, ev[2].retries), ('H', 350, 1));
+        assert_eq!((ev[1].kind, ev[1].retries), (EventKind::Request, 1));
+        assert_eq!(
+            (ev[2].kind, ev[2].heal_ms, ev[2].retries),
+            (EventKind::Heal, 350, 1)
+        );
         r.note_au(1, false, false, 1, 0, 500);
         assert!(!r.armed());
     }
@@ -553,7 +564,7 @@ mod tests {
         );
         assert_eq!(r.stuck(), Some(11));
         let ev = r.take_events();
-        let stuck: Vec<_> = ev.iter().filter(|e| e.kind == 'S').collect();
+        let stuck: Vec<_> = ev.iter().filter(|e| e.kind == EventKind::Stuck).collect();
         assert_eq!(stuck.len(), 1);
         assert_eq!((stuck[0].t_ms, stuck[0].retries), (2100, STUCK_AFTER));
         // The heal ends it; the next request starts with the short waits again.
