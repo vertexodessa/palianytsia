@@ -23,8 +23,7 @@ use crate::config::Config;
 use crate::frame_stream::{AuLat, FragArrival, FrameOut, FrameStream, FrameStreamCfg};
 use crate::gap::{DroneRestartDetector, GapTimeoutPolicy};
 use crate::json::J;
-use crate::ladder::LinkHealth;
-use crate::link_health::{LinkHealthAssembler, LinkHealthInputs, OpPoint};
+use crate::link_health::{LhTick, LinkHealthAssembler, LinkHealthInputs, OpPoint};
 use crate::mav::MavTunnel;
 use crate::nack::{NackInputs, NackTailView};
 use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelectorCfg};
@@ -301,7 +300,8 @@ pub struct RustCore {
     c: Counters,
     gs: Option<Gs>,
     lha: LinkHealthAssembler,
-    last_health: LinkHealth,
+    /// The assembler's last tick: the stats line reads link state only here.
+    last_lh: LhTick,
     /// A spotter drives no ladder: its link setting is the configured width.
     spotter_op: OpPoint,
     telem_rx_us: u64,
@@ -656,7 +656,7 @@ impl RustCore {
                 sw::HEADER_LEN + layers[1].symbol_size,
                 cfg.link.nack_residual,
             ),
-            last_health: LinkHealth::empty(),
+            last_lh: LhTick::empty(),
             spotter_op: OpPoint {
                 bw: i32::from(cfg.rx_width()),
                 ..OpPoint::default()
@@ -1102,7 +1102,7 @@ impl GsCore for RustCore {
                 g.send(&f, now_us, io);
             }
         }
-        self.last_health = lh.health;
+        self.last_lh = lh;
     }
 
     fn set_idr_requests(&mut self, n: u32) {
@@ -1316,9 +1316,9 @@ impl GsCore for RustCore {
         for k in ["follow_state", "follows"] {
             j.set(k, J::Null);
         }
-        let pre = self.lha.pre_all;
+        let pre = self.last_lh.pre_all;
         j.set("pre_fec_loss", pre.valid.then_some(pre.loss));
-        j.set("residual", self.lha.residual);
+        j.set("residual", self.last_lh.residual);
         // Per-card receive counters, only with two or more cards: a one-card
         // line stays byte-equal to WebGs's (the m1 parity gate).
         if self.agg.cards().len() > 1 {
@@ -1374,8 +1374,8 @@ impl GsCore for RustCore {
         );
         j.set("rec_state", t.map(|t| t.rec_status & 0x03));
         j.set("rec_err", t.map(|t| t.rec_status >> 2));
-        j.set("snr_db", self.last_health.rf_snr_db);
-        j.set("rssi_dbm", self.last_health.rf_rssi_dbm);
+        j.set("snr_db", self.last_lh.health.rf_snr_db);
+        j.set("rssi_dbm", self.last_lh.health.rf_rssi_dbm);
         j.set("bodies", self.c.bodies);
         j.set("aus", self.c.aus_complete);
         j.set("trunc", self.c.aus_truncated);

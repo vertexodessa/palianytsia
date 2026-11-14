@@ -377,6 +377,25 @@ pub struct LhTick {
     pub health: LinkHealth,
     /// Set only on a commanded-probe edge.
     pub probe_tail_ms: Option<i32>,
+    /// Pooled residual loss over the window (stats `residual`).
+    pub residual: Option<f64>,
+    /// Pre-FEC loss of both layers, stale symbols excluded (stats `pre_fec_loss`).
+    pub pre_all: LossSample,
+}
+
+impl LhTick {
+    /// Before the first tick.
+    pub fn empty() -> Self {
+        Self {
+            health: LinkHealth::empty(),
+            probe_tail_ms: None,
+            residual: None,
+            pre_all: LossSample {
+                valid: false,
+                loss: 0.0,
+            },
+        }
+    }
 }
 
 const PROBE_SWITCH_BLANK_MS: f64 = 150.0;
@@ -398,17 +417,10 @@ pub struct LinkHealthAssembler {
     s3_loss_cur: S1LossWindow,
     s3_resid_cur: S1LossWindow,
     pool_resid: S1LossWindow,
-    pool_resid_cur: S1LossWindow,
-    layer_resid: [S1LossWindow; 2],
     prev_pool_frames: Vec<u64>,
     prev_pkts_out: u64,
     pkts_now: u64,
     edge: TransitionEdge,
-    pub residual: Option<f64>,
-    pub residual_cur: Option<f64>,
-    pub pre_all: LossSample,
-    pub layer_delivery_pct: [u8; 2],
-    pub last_health: LinkHealth,
 }
 
 impl LinkHealthAssembler {
@@ -435,8 +447,6 @@ impl LinkHealthAssembler {
             s3_loss_cur: S1LossWindow::default(),
             s3_resid_cur: S1LossWindow::default(),
             pool_resid: S1LossWindow::default(),
-            pool_resid_cur: S1LossWindow::default(),
-            layer_resid: [S1LossWindow::default(), S1LossWindow::default()],
             prev_pool_frames: vec![0; n_cards],
             prev_pkts_out: 0,
             pkts_now: 0,
@@ -447,14 +457,6 @@ impl LinkHealthAssembler {
                 last_enh_mcs: -1,
                 last_enh_bw: -1,
             },
-            residual: None,
-            residual_cur: None,
-            pre_all: LossSample {
-                valid: false,
-                loss: 0.0,
-            },
-            layer_delivery_pct: [0; 2],
-            last_health: LinkHealth::empty(),
         }
     }
 
@@ -500,26 +502,9 @@ impl LinkHealthAssembler {
         let mut out_tail = None;
         self.edge_tick(&inp.op, agg.decoder_mut(), now);
         let dec = agg.decoder();
-        let mut ld = [0u8; 2];
-        for (s, slot) in ld.iter_mut().enumerate() {
-            let lc = residual_counts(dec, s, false);
-            let w = &mut self.layer_resid[s];
-            w.add(lc.expected, lc.arrived, now);
-            let ls = w.sample(now);
-            let pct = if ls.valid {
-                (100.0 * (1.0 - ls.loss)) as i32
-            } else {
-                100
-            };
-            *slot = pct.clamp(0, 100) as u8;
-        }
         let rc_tot = residual_counts_pooled(dec, false);
-        let rc_cur = residual_counts_pooled(dec, true);
         self.pool_resid.add(rc_tot.expected, rc_tot.arrived, now);
-        self.pool_resid_cur
-            .add(rc_cur.expected, rc_cur.arrived, now);
         let pr = self.pool_resid.sample(now);
-        let prc = self.pool_resid_cur.sample(now);
         let s1 = dec.stats(0);
         let s2 = dec.stats(1);
         let pkts_now = s1.dec.packets_out + s2.dec.packets_out;
@@ -630,15 +615,12 @@ impl LinkHealthAssembler {
             probe_bodies_total: pu.expected_blocks / self.probe_bpb as u64,
             probe_rung: inp.probe_rung,
         };
-        self.residual = pr.valid.then_some(pr.loss);
-        self.residual_cur = prc.valid.then_some(prc.loss);
-        self.layer_delivery_pct = ld;
-        self.pre_all = pre_all;
         self.pkts_now = pkts_now;
-        self.last_health = health;
         LhTick {
             health,
             probe_tail_ms: out_tail,
+            residual: pr.valid.then_some(pr.loss),
+            pre_all,
         }
     }
 
