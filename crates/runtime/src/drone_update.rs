@@ -1528,6 +1528,64 @@ mod tests {
         std::fs::read_to_string(d.join("init.calls")).unwrap_or_default()
     }
 
+    /// maburd's shell inherits its descriptors (devourer's flock on the card
+    /// among them); the new maburd and the init loop must not.
+    #[test]
+    fn swap_script_does_not_pass_inherited_descriptors_on() {
+        let d = swap_world("fds");
+        let lock = d.join("devourer-usb-1-1.lock");
+        let dump = |who: &str| format!("ls -l /proc/$$/fd > {}/{who}.fds", d.display());
+        std::fs::write(
+            d.join("up/maburd"),
+            format!(
+                "#!/bin/sh\n{}\nwhile true; do cp {1}/fc {1}/arm.tmp 2>/dev/null && mv {1}/arm.tmp {1}/arm; sleep 0.1; done\n",
+                dump("maburd"),
+                d.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("init"),
+            format!(
+                "#!/bin/sh\n{}\necho \"$1\" >> {}/init.calls\n",
+                dump("init"),
+                d.display()
+            ),
+        )
+        .unwrap();
+        let base = swap_cmd(&d, "trial");
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c")
+            .arg(format!(
+                "exec 7<>{}; exec sh {SWAP_PATH} trial",
+                lock.display()
+            ))
+            .env("COMMIT_WAIT", "30");
+        for (k, v) in base.get_envs() {
+            if let Some(v) = v {
+                c.env(k, v);
+            }
+        }
+        let mut c = c.spawn().unwrap();
+        wait_state(&d, "trial");
+        let t = Instant::now();
+        while read(&d, "maburd.fds").is_empty() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::write(d.join("up/commit"), "").unwrap();
+        assert!(c.wait().unwrap().success());
+        assert_eq!(state(&d), "committed");
+        for who in ["maburd", "init"] {
+            let fds = read(&d, &format!("{who}.fds"));
+            assert!(!fds.is_empty(), "{who} listed no descriptors");
+            assert!(
+                !fds.contains("devourer-usb"),
+                "{who} inherited the card lock:\n{fds}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn swap_script_commits_on_the_commit_file() {
         let d = swap_world("commit");

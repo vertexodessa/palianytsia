@@ -291,6 +291,17 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   (`chan_trace.rs` random scripts now jam op through NHM and decode frames;
   `pal-ref/tests/verdict_diff.rs` checks the verdict against mabur's on both routes). Not ported:
   mabur's live ChannelCore `set_width` (a Palianytsia width change restarts the link).
+- devourer pin, 2026-11-14: a jaguar1 RTL8812A sends one frame per URB unless
+  `tx.usb_agg_8812a` (env `DEVOURER_TX_USB_AGG_8812A=1`) opts in; the 8821A and 8814A keep the
+  packing maburd asks for (`usb_agg_max = 3`, compiled into maburd). The wing's 8812AU (0bda:881a)
+  with packed URBs: GS pre-FEC loss 0.87 at 20 and 40 MHz; one frame per URB: 0.00-0.01 and
+  30 AU/s. One unit measured; other 8812AU units may take packing, which is why it is an opt-in
+  and not a removal. The wing runs a maburd with this pin, installed by the Quest over the air.
+- Drone update, 2026-11-14: `mabur-swap.sh trial` closes the descriptors it inherited before it
+  stops maburd. Started from maburd's maintenance-lane shell, it held maburd's flock on the card
+  (devourer opens it without close-on-exec), so the trial maburd and then the rollback were refused
+  ("adapter in use") and the wing went dark until the S96 loop was restarted by hand. Test
+  `swap_script_does_not_pass_inherited_descriptors_on`. Owed: close-on-exec on devourer's lock.
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).

@@ -75,6 +75,27 @@ reap() {
 
 start_init() { setsid "$INIT" start </dev/null >/dev/null 2>&1; }
 
+# maburd starts its shell with every descriptor it holds: devourer's flock on
+# the card (/tmp/devourer-usb-*.lock), /dev/mi_*, the FC's tty. Inherited
+# here they outlive the old maburd, in this script and in the init loop it
+# starts, and the new maburd and every restart after it are refused the card
+# ("adapter ... already in use": the wing's first OTA, 2026-11-14, stayed dark
+# until the init loop was restarted by hand). Keeps stdio and the descriptor
+# the shell reads this script from.
+drop_inherited() {
+  self=$(readlink -f "$0")
+  wide=
+  (eval 'exec 19>&-') 2>/dev/null && wide=1   # dash parses fds 0-9 only
+  for f in /proc/$$/fd/*; do
+    n=${f##*/}
+    case $n in '' | *[!0-9]*) continue ;; esac
+    [ "$n" -gt 2 ] || continue
+    [ "${#n}" -eq 1 ] || [ -n "$wide" ] || continue
+    [ "$(readlink -f "$f")" = "$self" ] && continue
+    eval "exec $n>&-"
+  done
+}
+
 arm() { w=$(cat "$ARM" 2>/dev/null); echo "${w:-unknown}"; }
 
 # Returns 0 once maburd (pid $2) reports the drone disarmed, 1 when that
@@ -261,7 +282,7 @@ restore_lkg() {
 }
 
 case "$1" in
-  trial) trial ;;
+  trial) drop_inherited; trial ;;
   # The init system's call at boot: must return at once.
   start) setsid "$0" guard </dev/null >/dev/null 2>&1 & ;;
   guard) guard ;;
