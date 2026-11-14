@@ -710,7 +710,7 @@ impl RustCore {
         self.agg.decoder_mut().reset_continuity();
         self.fs.reset(&mut au_out!(self, io));
         if let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) {
-            n.t.clear();
+            n.on_video_reset();
         }
         self.cur = Au::default();
         self.c.resets += 1;
@@ -758,7 +758,7 @@ impl RustCore {
                     );
                     g.uplink.on_telem(seq, t.rcf_rx, state, us / 1000);
                     if let Some(n) = g.nack.as_mut() {
-                        n.drone.on_telem(&t);
+                        n.on_telem(&t);
                     }
                 }
                 self.telem = Some(t);
@@ -797,13 +797,7 @@ impl RustCore {
         let Some(g) = gs.as_mut() else { return };
         let Some(n) = g.nack.as_mut() else { return };
         let sctx = g.vrx.session_ctx();
-        // != 0: session_ctx() keeps reporting the held nonce in BEACONING.
-        if sctx.vtx_nonce != 0 && sctx.vtx_nonce != n.vtx_seen {
-            n.vtx_seen = sctx.vtx_nonce;
-            n.t.restart_counter();
-        }
-        if sctx.vtx_nonce == 0 || !*frame_wire {
-            n.t.clear();
+        if !n.on_session(sctx.vtx_nonce, *frame_wire) {
             return;
         }
         let dec = agg.decoder();
@@ -828,7 +822,7 @@ impl RustCore {
             down_util: n.down_util,
             gap_timeout_ms: fs.gap_ms(0),
         };
-        if let Some(nk) = n.t.poll(now_ms, &inp) {
+        if let Some(nk) = n.poll(now_ms, &inp) {
             let mut ctx = sctx;
             ctx.seq32 = nk.counter;
             let sf = SlotFrame {
@@ -839,7 +833,7 @@ impl RustCore {
             };
             if g.send(&sf, *now_us, io) {
                 if let Some(n) = g.nack.as_mut() {
-                    n.sent += 1;
+                    n.on_sent();
                 }
             }
         }
@@ -1017,8 +1011,7 @@ impl GsCore for RustCore {
         if self.gs.as_ref().is_some_and(|g| g.nack.is_some()) {
             self.poll_nack(now_ms, io);
             if let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) {
-                n.win.drain(now_ms, &mut n.t);
-                let (rows, capped) = n.t.take_resolved();
+                let (rows, capped) = n.take_rows(now_ms);
                 if !rows.is_empty() || capped > 0 {
                     let dq = self.fresh_telem().map(|t| t.txq_wait_max_ms);
                     self.diag.nack_rows(&rows, capped, dq);
@@ -1070,7 +1063,7 @@ impl GsCore for RustCore {
                 probe_profile: g.vrx.probe_profile(),
                 probe_rung: g.vrx.ctl().probe_rung(),
                 // poll_nack ran above, after this tick's drain.
-                nack_late_fills: g.nack.as_ref().map_or(0, |n| n.t.stats().filled_late),
+                nack_late_fills: g.nack.as_ref().map_or(0, |n| n.late_fills()),
             },
             None => LinkHealthInputs {
                 op: self.spotter_op,

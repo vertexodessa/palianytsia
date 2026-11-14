@@ -4,18 +4,20 @@
 //! window the stats line shows.
 use crate::config::Config;
 use crate::json::J;
-use crate::nack::{NackTracker, NackWindow};
+use crate::nack::{NackInputs, NackTracker, NackWindow, Resolved};
 use pal_wire::rc;
 
 pub(super) struct NackLane {
-    pub t: NackTracker,
+    t: NackTracker,
+    /// Config: how far back the tracker looks for holes (`link.nack.lookback`).
     pub lookback: u32,
+    /// Config: the ladder's down_util, the tracker's air-budget line.
     pub down_util: f64,
     /// The vtx_nonce the tracker's counter belongs to.
-    pub vtx_seen: u32,
-    pub sent: u64,
-    pub drone: DroneNack,
-    pub win: WindowView,
+    vtx_seen: u32,
+    sent: u64,
+    drone: DroneNack,
+    win: WindowView,
 }
 
 impl NackLane {
@@ -30,6 +32,52 @@ impl NackLane {
             drone: DroneNack::default(),
             win: WindowView::default(),
         })
+    }
+
+    /// The session edge, before each poll: a new non-zero vtx_nonce restarts
+    /// the request counter (session_ctx() keeps reporting the held nonce in
+    /// BEACONING, which is no new session); nonce 0 or no frame wire clears
+    /// the tracker. True = the tracker may poll.
+    pub fn on_session(&mut self, vtx_nonce: u32, frame_wire: bool) -> bool {
+        if vtx_nonce != 0 && vtx_nonce != self.vtx_seen {
+            self.vtx_seen = vtx_nonce;
+            self.t.restart_counter();
+        }
+        if vtx_nonce == 0 || !frame_wire {
+            self.t.clear();
+            return false;
+        }
+        true
+    }
+
+    pub fn poll(&mut self, now_ms: u64, inp: &NackInputs) -> Option<rc::Nack> {
+        self.t.poll(now_ms, inp)
+    }
+
+    /// A NACK left on air.
+    pub fn on_sent(&mut self) {
+        self.sent += 1;
+    }
+
+    /// The video restarted: every tracked hole is gone.
+    pub fn on_video_reset(&mut self) {
+        self.t.clear();
+    }
+
+    pub fn on_telem(&mut self, t: &rc::Telem) {
+        self.drone.on_telem(t);
+    }
+
+    /// After this tick's poll: closes the stats window, then hands over the
+    /// resolved requests for the flight log (rows, rows dropped at the cap).
+    pub fn take_rows(&mut self, now_ms: u64) -> (Vec<Resolved>, u64) {
+        self.win.drain(now_ms, &mut self.t);
+        self.t.take_resolved()
+    }
+
+    /// `NackStats::filled_late`, cumulative (the LHA's residual input).
+    pub fn late_fills(&self) -> u64 {
+        self.t.stats().filled_late
     }
 
     /// The stats line's `nack` object.
@@ -63,16 +111,16 @@ impl NackLane {
 
 /// The drone's NACK counters: each T_TELEM carries its period's counts.
 #[derive(Default)]
-pub(super) struct DroneNack {
+struct DroneNack {
     tlm_seen: Option<u16>,
-    pub nack_rx: u64,
-    pub retx_syms: u64,
-    pub retx_refused: u64,
+    nack_rx: u64,
+    retx_syms: u64,
+    retx_refused: u64,
 }
 
 impl DroneNack {
     /// Sums a Telem period once, however often it is heard.
-    pub fn on_telem(&mut self, t: &rc::Telem) {
+    fn on_telem(&mut self, t: &rc::Telem) {
         if self.tlm_seen == Some(t.tlm_seq) {
             return;
         }
@@ -85,19 +133,19 @@ impl DroneNack {
 
 /// The tracker's last full second, as the stats line reads it.
 #[derive(Default)]
-pub(super) struct WindowView {
+struct WindowView {
     t0_ms: u64,
-    pub fill_pps: Option<f64>,
-    pub late_max: u32,
-    pub fill_p50: Option<u32>,
-    pub fill_p90: Option<u32>,
-    pub fill_max: Option<u32>,
+    fill_pps: Option<f64>,
+    late_max: u32,
+    fill_p50: Option<u32>,
+    fill_p90: Option<u32>,
+    fill_max: Option<u32>,
 }
 
 impl WindowView {
     /// Once a second: takes the tracker's window. The first call only
     /// starts the clock.
-    pub fn drain(&mut self, now_ms: u64, t: &mut NackTracker) {
+    fn drain(&mut self, now_ms: u64, t: &mut NackTracker) {
         if self.t0_ms == 0 {
             self.t0_ms = now_ms;
             return;
