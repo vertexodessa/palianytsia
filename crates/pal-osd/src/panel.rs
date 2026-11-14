@@ -197,7 +197,7 @@ pub struct PanelIn<'a> {
     pub update: Option<&'a crate::update::UpdateView>,
     /// The last fetch of the drone's logs.
     pub fetch: Option<&'a crate::update::FetchView>,
-    /// The tools show (the GS has a payload directory).
+    /// The extra tools show (`runtime::drone_update::PayloadDir::tools`).
     pub tools_on: bool,
 }
 

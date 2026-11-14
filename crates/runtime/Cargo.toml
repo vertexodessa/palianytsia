@@ -17,3 +17,4 @@ pal-build.workspace = true
 log = "0.4"
 libc.workspace = true
 sha2 = "0.10"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }

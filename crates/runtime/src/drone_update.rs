@@ -77,6 +77,58 @@ const LINK_KEYS: [(&str, &str); 2] = [("link", "key_file"), ("radio", "channels"
 /// In the payload directory: install a custom mabur.toml that changes `LINK_KEYS`.
 pub const ALLOW_LINK_CHANGE: &str = "allow-link-change";
 
+/// The ed25519 key a payload directory's contents must be signed with; the
+/// private half stays with whoever builds them.
+const PAYLOAD_KEY: [u8; 32] = [
+    0xc8, 0x71, 0xff, 0x3d, 0xc9, 0xce, 0x15, 0x8e, 0x9c, 0xec, 0x19, 0x90, 0xe4, 0xdd, 0x28, 0x87,
+    0x5d, 0x59, 0xa3, 0x5e, 0xcb, 0x8c, 0x03, 0xd7, 0xa6, 0x6a, 0xb4, 0x72, 0xa3, 0x4f, 0x35, 0x96,
+];
+
+/// In the payload directory: the hex signature of `payload_message`.
+pub const PAYLOAD_SIG: &str = "payload.sig";
+/// In the payload directory: the hex signature of `TOOLS_MSG`, which shows
+/// the extra tools in the UI.
+pub const TOOLS_SIG: &str = "tools.sig";
+pub const TOOLS_MSG: &[u8] = b"palianytsia tools v1\n";
+
+/// What a payload signature covers: every file that goes to the drone and
+/// the link-change marker, by sha256 ("-" for a file that is not there).
+pub fn payload_message(
+    maburd: &[u8],
+    toml: Option<&[u8]>,
+    s96: Option<&[u8]>,
+    allow: bool,
+) -> String {
+    let h = |b: Option<&[u8]>| b.map_or_else(|| "-".to_string(), sha256_hex);
+    format!(
+        "palianytsia payload v1\nmaburd {}\nmabur.toml {}\nS96mabur {}\nallow-link-change {}\n",
+        sha256_hex(maburd),
+        h(toml),
+        h(s96),
+        u8::from(allow)
+    )
+}
+
+/// `sig_hex`, the file's text, is `key`'s ed25519 signature of `msg`.
+fn signed(key: &[u8; 32], msg: &[u8], sig_hex: &[u8]) -> bool {
+    let t = String::from_utf8_lossy(sig_hex);
+    let t = t.trim();
+    if t.len() != 128 || !t.is_ascii() {
+        return false;
+    }
+    let mut sig = [0u8; 64];
+    for (i, b) in sig.iter_mut().enumerate() {
+        match u8::from_str_radix(&t[2 * i..2 * i + 2], 16) {
+            Ok(v) => *b = v,
+            Err(_) => return false,
+        }
+    }
+    ed25519_dalek::VerifyingKey::from_bytes(key).is_ok_and(|k| {
+        k.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&sig))
+            .is_ok()
+    })
+}
+
 /// The `LINK_KEYS` whose values differ between two configs, spaces aside.
 fn link_changes(from: &str, to: &str) -> Vec<String> {
     let v = |t: &str, s: &str, k: &str| shipped_value(t, s, k).map(|v| v.replace(' ', ""));
@@ -106,9 +158,13 @@ impl Payload {
     }
 
     /// A custom build in `dir`: maburd, and optionally mabur.toml
-    /// (installed as it is) and S96mabur (else the release's). None when the
-    /// directory has no maburd.
+    /// (installed as it is) and S96mabur (else the release's), signed with
+    /// `PAYLOAD_KEY` in `PAYLOAD_SIG`. None when the directory has no maburd.
     pub fn custom_from_dir(dir: &Path) -> Result<Option<Self>, String> {
+        Self::custom_from_dir_with(dir, &PAYLOAD_KEY)
+    }
+
+    fn custom_from_dir_with(dir: &Path, key: &[u8; 32]) -> Result<Option<Self>, String> {
         let rd = |n: &str| match std::fs::read(dir.join(n)) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -125,12 +181,23 @@ impl Payload {
                 dir.join("maburd").display()
             ));
         }
+        let toml = rd("mabur.toml")?;
+        let s96 = rd("S96mabur")?;
+        let allow = dir.join(ALLOW_LINK_CHANGE).exists();
+        let msg = payload_message(&maburd, toml.as_deref(), s96.as_deref(), allow);
+        let sig = rd(PAYLOAD_SIG)?.unwrap_or_default();
+        if !signed(key, msg.as_bytes(), &sig) {
+            return Err(format!(
+                "the build in {} carries no valid signature",
+                dir.display()
+            ));
+        }
         Ok(Some(Self {
             maburd,
-            toml: rd("mabur.toml")?.unwrap_or_default(),
-            s96: rd("S96mabur")?.unwrap_or_else(|| RELEASE_S96.to_vec()),
+            toml: toml.unwrap_or_default(),
+            s96: s96.unwrap_or_else(|| RELEASE_S96.to_vec()),
             custom: true,
-            allow_link_change: dir.join(ALLOW_LINK_CHANGE).exists(),
+            allow_link_change: allow,
         }))
     }
 
@@ -217,14 +284,15 @@ pub struct PayloadDir {
     /// The build of `stamp`; None until loaded.
     loaded: Option<Result<Option<CustomBuild>, String>>,
     loads: u64,
+    key: [u8; 32],
 }
 
 impl PayloadDir {
     pub fn new(dir: PathBuf) -> Self {
-        Self::with_still(dir, STILL)
+        Self::with(dir, STILL, PAYLOAD_KEY)
     }
 
-    fn with_still(dir: PathBuf, still: Duration) -> Self {
+    fn with(dir: PathBuf, still: Duration, key: [u8; 32]) -> Self {
         Self {
             dir,
             still,
@@ -232,7 +300,13 @@ impl PayloadDir {
             since: Instant::now(),
             loaded: None,
             loads: 0,
+            key,
         }
+    }
+
+    /// The extra tools show: the directory holds a valid `TOOLS_SIG`.
+    pub fn tools(&self) -> bool {
+        std::fs::read(self.dir.join(TOOLS_SIG)).is_ok_and(|s| signed(&self.key, TOOLS_MSG, &s))
     }
 
     pub fn dir(&self) -> &Path {
@@ -240,14 +314,20 @@ impl PayloadDir {
     }
 
     fn stamp_now(&self) -> Stamp {
-        ["maburd", "mabur.toml", "S96mabur", ALLOW_LINK_CHANGE]
-            .iter()
-            .map(|n| {
-                std::fs::metadata(self.dir.join(n))
-                    .ok()
-                    .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
-            })
-            .collect()
+        [
+            "maburd",
+            "mabur.toml",
+            "S96mabur",
+            ALLOW_LINK_CHANGE,
+            PAYLOAD_SIG,
+        ]
+        .iter()
+        .map(|n| {
+            std::fs::metadata(self.dir.join(n))
+                .ok()
+                .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+        })
+        .collect()
     }
 
     /// Ok(None): no maburd in the directory (custom payload off). Err: the files
@@ -271,10 +351,12 @@ impl PayloadDir {
         if self.loaded.is_none() {
             self.loads += 1;
             let n = self.loads;
-            self.loaded = Some(Payload::custom_from_dir(&self.dir).map(|p| {
-                p.map(|p| (sha256_hex(&p.maburd), p))
-                    .map(|(s, p)| (p, s, n))
-            }));
+            self.loaded = Some(
+                Payload::custom_from_dir_with(&self.dir, &self.key).map(|p| {
+                    p.map(|p| (sha256_hex(&p.maburd), p))
+                        .map(|(s, p)| (p, s, n))
+                }),
+            );
         }
         match self.loaded.as_ref().expect("loaded above") {
             Ok(Some((p, sha, n))) => Ok(Some((p, sha.as_str(), *n))),
@@ -861,7 +943,7 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
     let mut updated_at: Option<Instant> = None;
     while !sh.quit.load(Ordering::Relaxed) && !sh.core_done.load(Ordering::Acquire) {
         sh.tools_on.store(
-            custom.as_ref().is_some_and(|d| d.dir().is_dir()),
+            custom.as_ref().is_some_and(PayloadDir::tools),
             Ordering::Relaxed,
         );
         let picked = match custom.as_mut().map(PayloadDir::poll) {
@@ -1093,18 +1175,114 @@ mod tests {
         d
     }
 
+    const TEST_SEED: [u8; 32] = [7; 32];
+
+    fn test_key() -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&TEST_SEED)
+            .verifying_key()
+            .to_bytes()
+    }
+
+    fn sign_hex(seed: &[u8; 32], msg: &[u8]) -> String {
+        use ed25519_dalek::Signer;
+        ed25519_dalek::SigningKey::from_bytes(seed)
+            .sign(msg)
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            + "\n"
+    }
+
+    /// Signs the set in `d` with the test key, as the private script does.
+    fn sign_dir(d: &Path) {
+        let rd = |n: &str| std::fs::read(d.join(n)).ok();
+        let Some(m) = rd("maburd") else { return };
+        let msg = payload_message(
+            &m,
+            rd("mabur.toml").as_deref(),
+            rd("S96mabur").as_deref(),
+            d.join(ALLOW_LINK_CHANGE).exists(),
+        );
+        std::fs::write(d.join(PAYLOAD_SIG), sign_hex(&TEST_SEED, msg.as_bytes())).unwrap();
+    }
+
+    /// The set in `d`, signed first.
+    fn load(d: &Path) -> Result<Option<Payload>, String> {
+        sign_dir(d);
+        Payload::custom_from_dir_with(d, &test_key())
+    }
+
+    #[test]
+    fn a_payload_is_taken_only_signed_and_the_signature_covers_every_file() {
+        let d = payload_dir("sig");
+        let k = test_key();
+        std::fs::write(d.join("maburd"), b"\x7fELF build").unwrap();
+        let e = Payload::custom_from_dir_with(&d, &k).err().unwrap();
+        assert!(e.contains("no valid signature"), "{e}");
+        sign_dir(&d);
+        assert!(Payload::custom_from_dir_with(&d, &k).unwrap().is_some());
+        assert!(
+            Payload::custom_from_dir(&d).is_err(),
+            "the test key is not the build's key"
+        );
+        // Each file the signature names, changed or added after signing.
+        for (f, body) in [
+            ("maburd", &b"\x7fELF other"[..]),
+            ("mabur.toml", b"a = 1\n"),
+            ("S96mabur", b"#!/bin/sh\n"),
+            (ALLOW_LINK_CHANGE, b""),
+        ] {
+            sign_dir(&d);
+            std::fs::write(d.join(f), body).unwrap();
+            assert!(
+                Payload::custom_from_dir_with(&d, &k).is_err(),
+                "{f} changed"
+            );
+            sign_dir(&d);
+            assert!(Payload::custom_from_dir_with(&d, &k).is_ok(), "{f} signed");
+        }
+        let other = sign_hex(&[9; 32], b"x");
+        std::fs::write(d.join(PAYLOAD_SIG), other).unwrap();
+        assert!(
+            Payload::custom_from_dir_with(&d, &k).is_err(),
+            "another key"
+        );
+        std::fs::write(d.join(PAYLOAD_SIG), "zz".repeat(64)).unwrap();
+        assert!(Payload::custom_from_dir_with(&d, &k).is_err(), "not hex");
+
+        // The tools: a signature of their own message, by the same key.
+        let w = PayloadDir::with(d.clone(), STILL, k);
+        assert!(!w.tools());
+        std::fs::write(d.join(TOOLS_SIG), sign_hex(&[9; 32], TOOLS_MSG)).unwrap();
+        assert!(!w.tools(), "another key");
+        std::fs::write(d.join(TOOLS_SIG), sign_hex(&TEST_SEED, b"tools")).unwrap();
+        assert!(!w.tools(), "another message");
+        std::fs::write(d.join(TOOLS_SIG), sign_hex(&TEST_SEED, TOOLS_MSG)).unwrap();
+        assert!(w.tools());
+        assert!(!PayloadDir::new(d.clone()).tools(), "not the build's key");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directory the private script filled (PAL_PAYLOAD_DIR): its build and
+    /// tools pass with the key this build carries.
+    #[test]
+    #[ignore]
+    fn a_directory_signed_by_the_script_passes() {
+        let d = PathBuf::from(std::env::var("PAL_PAYLOAD_DIR").unwrap());
+        assert!(Payload::custom_from_dir(&d).unwrap().is_some());
+        assert!(PayloadDir::new(d).tools());
+    }
+
     #[test]
     fn a_payload_directory_gives_its_maburd_its_config_if_any_and_the_release_init_script() {
         let d = payload_dir("payload");
-        assert!(
-            Payload::custom_from_dir(&d).unwrap().is_none(),
-            "no maburd: off"
-        );
+        assert!(load(&d).unwrap().is_none(), "no maburd: off");
         std::fs::write(d.join("maburd"), "#!/bin/sh\n").unwrap();
-        let e = Payload::custom_from_dir(&d).err().unwrap();
+        let e = load(&d).err().unwrap();
         assert!(e.contains("not an ELF"), "{e}");
         std::fs::write(d.join("maburd"), b"\x7fELF custom build").unwrap();
-        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        let p = load(&d).unwrap().unwrap();
         assert!(p.custom && p.toml.is_empty());
         assert_eq!(p.s96, RELEASE_S96);
         assert_eq!(p.exact_config(), None);
@@ -1118,7 +1296,7 @@ mod tests {
 
         std::fs::write(d.join("mabur.toml"), "[venc]\nfps = 90\n").unwrap();
         std::fs::write(d.join("S96mabur"), "#!/bin/sh\n# custom\n").unwrap();
-        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        let p = load(&d).unwrap().unwrap();
         let (t, ch) = p.config_for(drone).unwrap();
         assert_eq!((t.as_str(), ch.len()), ("[venc]\nfps = 90\n", 1));
         assert_eq!(p.exact_config().as_deref(), Some("[venc]\nfps = 90\n"));
@@ -1132,7 +1310,7 @@ mod tests {
             "[radio]\nchannels = [40,64]   # same set\n[link]\nkey_file = \"/etc/mabur.key\"\nx = 1\n",
         )
         .unwrap();
-        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        let p = load(&d).unwrap().unwrap();
         assert!(
             p.config_for(linked).is_ok(),
             "spaces and comments aside, the same"
@@ -1142,7 +1320,7 @@ mod tests {
             "[radio]\nchannels = [149]\n[link]\nkey_file = \"/etc/other.key\"\n",
         )
         .unwrap();
-        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        let p = load(&d).unwrap().unwrap();
         let e = p.config_for(linked).unwrap_err();
         assert!(
             e.contains("link.key_file \"/etc/mabur.key\" to \"/etc/other.key\"")
@@ -1155,7 +1333,7 @@ mod tests {
             "a drone with no config has nothing to lose"
         );
         std::fs::write(d.join(ALLOW_LINK_CHANGE), "").unwrap();
-        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        let p = load(&d).unwrap().unwrap();
         assert!(p.allow_link_change && p.config_for(linked).is_ok());
 
         // A release payload still forces its keys.
@@ -1172,9 +1350,10 @@ mod tests {
     #[test]
     fn the_payload_directory_is_taken_only_once_its_files_stay_unchanged() {
         let d = payload_dir("watch");
-        let mut w = PayloadDir::with_still(d.clone(), Duration::from_millis(300));
+        let mut w = PayloadDir::with(d.clone(), Duration::from_millis(300), test_key());
         assert!(matches!(w.poll(), Ok(None)), "empty: custom payload off");
         std::fs::write(d.join("maburd"), b"\x7fELF one").unwrap();
+        sign_dir(&d);
         assert!(w.poll().is_err(), "just written");
         std::thread::sleep(Duration::from_millis(350));
         let (sha1, n1) = {
@@ -1184,6 +1363,7 @@ mod tests {
         };
         assert_eq!(w.poll().unwrap().unwrap().2, n1, "loaded once");
         std::fs::write(d.join("maburd"), b"\x7fELF two, longer").unwrap();
+        sign_dir(&d);
         assert!(w.poll().is_err(), "a new build waits again");
         std::thread::sleep(Duration::from_millis(350));
         let (p, sha2, n2) = w.poll().unwrap().unwrap();

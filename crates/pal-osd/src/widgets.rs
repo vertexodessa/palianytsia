@@ -60,7 +60,7 @@ pub struct Snapshot {
     /// (UI stats line only).
     pub update: Option<crate::update::UpdateView>,
     pub fetch: Option<crate::update::FetchView>,
-    /// The GS has a payload directory: the tools show.
+    /// The extra tools show (a signed tools file in the payload directory).
     pub tools_on: bool,
 }
 

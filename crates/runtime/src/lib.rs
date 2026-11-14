@@ -84,8 +84,8 @@ pub struct Shared {
     /// The last fetch of the drone's logs (`drone_fetch::spawn_fetch`), for
     /// the UI stats line.
     pub fetch: Mutex<Option<serde_json::Value>>,
-    /// The tools show in the UI: the GS has a payload directory
-    /// (`drone_update::PayloadDir`), even an empty one.
+    /// The extra tools show in the UI: the payload directory holds a signed
+    /// tools file (`drone_update::PayloadDir::tools`).
     pub tools_on: AtomicBool,
     /// The flight controller's last HEARTBEAT: (armed, when). The drone
     /// update goes ahead only on a fresh one that says disarmed.
