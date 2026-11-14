@@ -953,6 +953,44 @@ fn auto_boot_hop_relocates_to_the_pick_on_clm_busy() {
     assert!(d.has("(relocated)"));
 }
 
+/// One card, the drone found on 144 after the prelude: with no busy
+/// reading the start channel 40 does not out-rank 144 and the link stays
+/// (bench 2026-11-14); with 144 blocked the prelude's 64 earns the move.
+fn one_card_found_on_144(d: &mut Duo) {
+    d.until(800, false, "one-card prelude ranking picks");
+    d.session_opened_on(144, 144);
+    d.link_up();
+    d.move_edge();
+    for _ in 0..200 {
+        if d.has("relocate 144 -> ") {
+            break;
+        }
+        d.tick(true);
+    }
+    d.snapshot(0);
+}
+
+#[test]
+fn one_card_link_found_on_a_channel_the_ranking_does_not_beat_stays() {
+    let mut d = Duo::new(1, None, 40);
+    one_card_found_on_144(&mut d);
+    assert!(d.has("40 does not out-rank 144 where the link formed: staying"));
+    assert!(!d.has("relocate 144 -> "));
+}
+
+#[test]
+fn one_card_link_found_on_a_blocked_channel_moves_to_the_pick() {
+    let mut d = Duo::new(1, None, 40);
+    d.cards(|_, s| {
+        for (ch, pct) in [(40usize, 100), (64, 0), (112, 100), (144, 100)] {
+            s.nhm_busy_pct_on[ch] = pct;
+        }
+    });
+    one_card_found_on_144(&mut d);
+    assert!(!d.has("where the link formed: staying"));
+    assert!(d.has("relocate 144 -> 64 placed"));
+}
+
 /// A drone another GS left on 100, outside the set: past two passes the
 /// scout bursts on the grid, the link forms on 100 and the boot pick's
 /// relocation brings it back to a member.

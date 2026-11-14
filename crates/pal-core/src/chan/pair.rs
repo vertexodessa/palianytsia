@@ -71,6 +71,33 @@ pub fn pair_proposal(
     current
 }
 
+/// Whether a link that formed on `found` should still move to `want`: only
+/// when `pair_proposal` with `found` as current picks `want`. Found's row
+/// must be ranked (a one-sided comparison never moves a working link);
+/// want's must out-order it by tier, by a busy reading found lacks, or by
+/// `margin_pct`. The want it would leave was chosen against another
+/// channel (the start channel, or the op of a pick made before the link).
+pub fn relocation_earned(
+    all: &[RankEntry],
+    found: u8,
+    want: u8,
+    min_rounds: i32,
+    margin_pct: f64,
+    blocked_pct: f64,
+) -> bool {
+    if want == found || row_for(all, found, min_rounds).is_none() {
+        return false;
+    }
+    pair_proposal(
+        all,
+        found,
+        &[found, want],
+        min_rounds,
+        margin_pct,
+        blocked_pct,
+    ) == want
+}
+
 /// Any pair in `set` ranked (its primary's row at `min_rounds`).
 pub fn any_pair_ranked(all: &[RankEntry], set: &[u8], min_rounds: i32) -> bool {
     set.iter().any(|&c| row_for(all, c, min_rounds).is_some())
@@ -114,6 +141,30 @@ mod tests {
             worst_busy_pct: busy,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn relocation_earned_only_when_the_pick_rule_moves_off_the_found_channel() {
+        let clear = [e(40, 0, 3, true, 40.0), e(144, 0, 3, true, 5.0)];
+        assert!(relocation_earned(&clear, 40, 144, 3, 10.0, 1e9));
+        assert!(!relocation_earned(&clear, 144, 40, 3, 10.0, 1e9));
+        assert!(!relocation_earned(&clear, 144, 144, 3, 10.0, 1e9));
+        let close = [e(40, 0, 3, true, 5.0), e(144, 0, 3, true, 0.0)];
+        assert!(!relocation_earned(&close, 144, 40, 3, 10.0, 1e9));
+        assert!(!relocation_earned(&close, 40, 144, 3, 10.0, 1e9));
+        // No busy reading on either side: the frame score alone moves nothing.
+        let blind = [e(40, 0, 3, false, 0.0), e(144, 500, 3, false, 0.0)];
+        assert!(!relocation_earned(&blind, 144, 40, 3, 10.0, 1e9));
+        // The found channel unmeasured: a one-sided comparison stays.
+        let unmeasured = [e(40, 0, 3, true, 0.0), e(144, 0, 1, true, 90.0)];
+        assert!(!relocation_earned(&unmeasured, 144, 40, 3, 10.0, 1e9));
+        assert!(relocation_earned(&unmeasured, 144, 40, 1, 10.0, 1e9));
+        let want_unread = [e(40, 0, 1, true, 0.0), e(144, 0, 3, true, 90.0)];
+        assert!(!relocation_earned(&want_unread, 144, 40, 3, 10.0, 1e9));
+        // A blocked found channel loses to an unblocked want under the margin.
+        let blocked = [e(40, 0, 3, true, 45.0), e(144, 0, 3, true, 52.0)];
+        assert!(relocation_earned(&blocked, 144, 40, 3, 10.0, 50.0));
+        assert!(!relocation_earned(&blocked, 144, 40, 3, 10.0, 1e9));
     }
 
     #[test]

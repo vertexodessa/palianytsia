@@ -253,8 +253,16 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   airtime, receive-side), read before the dwell's NHM energy read and only while our own arm
   stands; a Jaguar3 never arms it. The Rust core follows it (`radio::arm_busy`), `scout_dwell`
   carries `busy_src` and `busy_own_tx`, and `chan_trace` checks a relocation on CLM busy against
-  the C++ core. Open on the bench: CLM readings of 36/40 against 144 with the thresholds tuned on
-  NHM (`blocked_pct`, `pick_margin_pct`), and how far the card's own uplink pulls a window down.
+  the C++ core. Bench 2026-11-14 (desktop, one 881a, drone v0.14): CLM read 36 at 39 %, 40 at 34 %,
+  44-64 at 1-8 %, 100-161 at 0-3 %; the prelude picked 104 and relocated the link there (rung 3,
+  no pre-FEC loss), where the build without it stayed on 36 at rung 0 with 18 % pre-FEC loss.
+  Still open: how far the card's own uplink pulls a window down.
+  Second part, same day: a link found on a channel is relocated to `want` only when the scout's
+  ranking, with the found channel as current, earns it (`relocation_earned`: the pair rule over the
+  two rows, the found row ranked). `want` had been chosen against the start channel or a pre-link
+  op, so a pick with no reading, or one under `pick_margin_pct`, moved a working link. Pins, a
+  calibration's relocation, a drone found outside the set and a link outside `radio.use` keep their
+  move. `chan_trace` checks both outcomes on one card against the C++ core.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.14, signed APKs; v0.14, 2026-11-13: the apps carry their maburd and update a disarmed drone over the maintenance lane (the first v0.14 install is from a PC), the shed bitrate step, the stuck keyframe backoff, the RC version banner, one-card scan pace, the release Quest APK updated the bench quad in 48.5 s, the phone APK not run; v0.13.1, 2026-11-13: the channel menu in the desktop app (the apps' link pick at start, `Cmd::Channels` on the live link), maburd and apps as v0.13, bench only; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):

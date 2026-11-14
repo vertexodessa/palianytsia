@@ -40,7 +40,7 @@ use super::hop::{
 use super::hop_ranker::{HopRanker, HopVisit};
 use super::inflight::{InflightScout, InflightScoutCfg};
 use super::op_scan::{self, OpScan, Reading};
-use super::pair::any_pair_ranked;
+use super::pair::{any_pair_ranked, relocation_earned};
 use super::plan::{ChannelPlan, ChannelPlanCfg, MoveEvent};
 use super::radio::{
     needs_width_fix, nhm_period_4us, width_resync_open, LinkCard, ScoutFrames, ScoutRadio,
@@ -1144,7 +1144,8 @@ impl ChannelCore {
     /// The DISC_ACK that opened the session: the link forms where it was
     /// heard. Only our nonce, not key-mismatch flagged (a stranger's drone
     /// cannot drag the cards), only on this body's rx channel; the
-    /// relocation to want, if any, is an ordinary hop order (BootPick).
+    /// relocation to want, if the ranking still earns it there
+    /// (keep_found_link), is an ordinary hop order (BootPick).
     pub fn on_session_opened(&mut self, ack: &DiscAck, now_ms: f64, vrx: &mut VrxController) {
         let x = self.rc_body_rx_ch;
         if ack.vrx_nonce == vrx.rz_nonce()
@@ -1164,6 +1165,7 @@ impl ChannelCore {
                 "maburgs channel: drone found on {x} (op {op}): the link forms there{off}"
             ));
             self.plan.link_found(now_ms, x);
+            self.keep_found_link(now_ms, x);
             // A DISC proposes the channel it is sent on: stay.
             vrx.set_proposal(self.plan.op());
         }
@@ -1378,15 +1380,58 @@ impl ChannelCore {
         }
     }
 
+    /// The link formed on x != want: want follows x unless the scout's
+    /// ranking earns the move (`relocation_earned`). A pin, a calibration's
+    /// relocation, a drone found outside the set and a link outside
+    /// `radio.use` (steer_into_use's) keep their move.
+    fn keep_found_link(&mut self, now_ms: f64, x: u8) {
+        let want = self.plan.want();
+        // link_found() refuses while a hop is in flight: op stayed, so want does.
+        if self.plan.op() != x
+            || want == x
+            || self.pinned
+            || !self.plan.member(x)
+            || !self.cfg.radio.usable().contains(&x)
+            || matches!(
+                self.cal_reloc.s,
+                CalRelocState::Waiting | CalRelocState::InFlight
+            )
+        {
+            return;
+        }
+        let scan = &self.cfg.radio.scan;
+        if let Some(s) = &self.scout {
+            if relocation_earned(
+                &s.ranking(),
+                x,
+                want,
+                self.pick_min_rounds(),
+                f64::from(scan.pick_margin_pct),
+                scan.busy.blocked_pct,
+            ) {
+                return;
+            }
+        }
+        self.log(format!(
+            "maburgs channel: {want} does not out-rank {x} where the link formed: staying"
+        ));
+        self.plan.set_want(now_ms, x);
+    }
+
+    /// The min_rounds the boot pick ranks with: one card, a prelude cut
+    /// short ranks on one round.
+    fn pick_min_rounds(&self) -> i32 {
+        let min_rounds = self.cfg.radio.scan.min_rounds;
+        match &self.scout {
+            Some(s) if self.one_card && s.prelude_done() && s.rounds() < min_rounds as u64 => 1,
+            _ => min_rounds,
+        }
+    }
+
     fn freeze_pick(&mut self, t: f64, why: &str) {
         let Some(s) = self.scout.clone() else { return };
         s.freeze();
-        let min_rounds = self.cfg.radio.scan.min_rounds;
-        let mr = if self.one_card && s.prelude_done() && s.rounds() < min_rounds as u64 {
-            1
-        } else {
-            min_rounds
-        };
+        let mr = self.pick_min_rounds();
         let all = s.ranking();
         // The ranking's width is the scout's: its dwells ran at its card's width.
         let any = if s.link_width_mhz() == 40 {

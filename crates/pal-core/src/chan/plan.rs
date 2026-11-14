@@ -168,7 +168,8 @@ impl ChannelPlan {
     /// The ack that opened the session was heard on `x`: the link forms there.
     /// `x` may be a 5 GHz grid channel outside the set (the scout's grid
     /// search found the drone there; relocate_due() then brings the link
-    /// back to want).
+    /// back to want). On a member the core sets want to `x` unless the
+    /// ranking earns the move (`ChannelCore::keep_found_link`).
     pub fn link_found(&mut self, now_ms: f64, x: u8) {
         self.now_ms = now_ms;
         if self.hopping || x == self.op || !(self.member(x) || GRID_5G.contains(&x)) {

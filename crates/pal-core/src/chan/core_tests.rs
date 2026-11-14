@@ -1152,6 +1152,54 @@ fn one_card_link_edge_freezes_one_card_linked() {
     assert_eq!(s.scan_pick, Some(g.core.op()));
 }
 
+/// One card, the prelude done, then the drone found on 144 (bench
+/// 2026-11-14, fl-0001: a working link relocated 144 -> 36 on a pick with
+/// no busy reading). want was chosen against the start channel, not 144:
+/// it moves the link only when the ranking, with 144 as current, earns it.
+fn one_card_found_on_144(g: &mut Rig) {
+    g.until(800, false, "one-card prelude ranking picks");
+    assert!(g.has_line("one-card prelude ranking picks"));
+    g.session_opened_on(144, 144);
+    assert_eq!(g.core.op(), 144);
+    g.link_up();
+    g.vrx.test_set_move_edge();
+    g.until(200, true, "relocate 144 -> ");
+}
+
+#[test]
+fn a_link_found_on_a_channel_the_ranking_does_not_beat_stays_there() {
+    let mut g = Rig::auto(1); // no busy reading anywhere: want stays the start channel 40
+    one_card_found_on_144(&mut g);
+    assert!(g.has_line("maburgs channel: 40 does not out-rank 144 where the link formed: staying"));
+    assert!(!g.has_line("relocate 144 -> "));
+    assert_eq!(g.core.op(), 144);
+    assert!(g.has_line("pick frozen on 144 (one-card linked)"));
+    // Read, but under the margin: the prelude committed 64, 144 as quiet.
+    let mut h = Rig::auto(1);
+    for (ch, pct) in [(40, 100), (64, 0), (112, 100), (144, 4)] {
+        h.cards[0].s().nhm_busy_pct_on[ch] = pct;
+    }
+    one_card_found_on_144(&mut h);
+    assert!(h.has_line("maburgs channel: 64 does not out-rank 144 where the link formed: staying"));
+    assert!(!h.has_line("relocate 144 -> "));
+    assert_eq!(h.core.op(), 144);
+}
+
+#[test]
+fn a_link_found_on_a_channel_the_ranking_beats_moves_to_the_pick() {
+    let mut g = Rig::auto(1);
+    for (ch, pct) in [(40, 100), (64, 0), (112, 100), (144, 100)] {
+        g.cards[0].s().nhm_busy_pct_on[ch] = pct;
+    }
+    one_card_found_on_144(&mut g);
+    assert!(!g.has_line("where the link formed: staying"));
+    assert!(
+        g.has_line("maburgs channel: relocate 144 -> 64 placed"),
+        "{:?}",
+        g.rec().lines
+    );
+}
+
 #[test]
 fn inflight_dwell_feeds_ranker_and_dwell_stats() {
     let mut g = Rig::auto(2);
