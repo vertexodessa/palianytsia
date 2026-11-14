@@ -14,6 +14,7 @@ use pal_wire::dot11;
 
 pub mod cam_fps;
 pub mod dev_card;
+pub mod drone_fetch;
 pub mod drone_update;
 pub mod maint;
 pub mod panic_hook;
@@ -80,6 +81,12 @@ pub struct Shared {
     /// The automatic drone update's state (`drone_update::spawn_auto`), for
     /// the UI stats line; None in a build that carries no maburd.
     pub update: Mutex<Option<serde_json::Value>>,
+    /// The last fetch of the drone's logs (`drone_fetch::spawn_fetch`), for
+    /// the UI stats line.
+    pub fetch: Mutex<Option<serde_json::Value>>,
+    /// The tools show in the UI: the GS has a payload directory
+    /// (`drone_update::PayloadDir`), even an empty one.
+    pub tools_on: AtomicBool,
     /// The flight controller's last HEARTBEAT: (armed, when). The drone
     /// update goes ahead only on a fresh one that says disarmed.
     pub fc_arm: Mutex<Option<(bool, Instant)>>,
@@ -596,6 +603,14 @@ impl CoreLoop {
                 let r = self.core.chan_scan(&chs);
                 eprintln!("pal: channel scan {chs:?}: {r:?}");
             }
+            pal_osd::params::Cmd::DroneFetch => {
+                if self.sink.shared.tools_on.load(Ordering::Relaxed) {
+                    drone_fetch::spawn_fetch(
+                        self.sink.shared.clone(),
+                        self.sink.log.as_ref().map(|l| l.dir().to_path_buf()),
+                    )
+                }
+            }
             pal_osd::params::Cmd::Channels(chs) => {
                 let r = self.core.set_channels(&chs);
                 eprintln!("pal: channels {chs:?}: {r:?}");
@@ -729,6 +744,13 @@ impl CoreLoop {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let fetch = self
+            .sink
+            .shared
+            .fetch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let off = (!off.is_empty()).then(|| off.into());
         let idr_stuck = self
             .sink
@@ -749,6 +771,15 @@ impl CoreLoop {
                     ("peer_rc", peer_rc),
                     ("idr_stuck", idr_stuck),
                     ("update", update),
+                    ("fetch", fetch),
+                    (
+                        "tools",
+                        self.sink
+                            .shared
+                            .tools_on
+                            .load(Ordering::Relaxed)
+                            .then_some(true.into()),
+                    ),
                 ],
                 cal,
             ),

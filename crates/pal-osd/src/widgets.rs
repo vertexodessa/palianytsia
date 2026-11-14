@@ -59,6 +59,9 @@ pub struct Snapshot {
     /// The automatic drone update; None in a build that carries no maburd
     /// (UI stats line only).
     pub update: Option<crate::update::UpdateView>,
+    pub fetch: Option<crate::update::FetchView>,
+    /// The GS has a payload directory: the tools show.
+    pub tools_on: bool,
 }
 
 /// What the next rung promote waits on (`GsCore::ladder_json`).
@@ -222,6 +225,8 @@ impl Snapshot {
             chscan: v.get("chscan").and_then(channels::ScanView::parse),
             log_err: v.get("log_err").and_then(Value::as_str).map(str::to_string),
             update: v.get("update").and_then(crate::update::UpdateView::parse),
+            fetch: v.get("fetch").and_then(crate::update::FetchView::parse),
+            tools_on: v.get("tools").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }

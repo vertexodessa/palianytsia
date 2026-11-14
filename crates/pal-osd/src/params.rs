@@ -75,6 +75,9 @@ pub enum Cmd {
     Channels(Vec<u8>),
     /// Scan these channels (empty = the drone's set) for the channel menu.
     ChannelScan(Vec<u8>),
+    /// The drone's logs and state into the flight log directory, over the
+    /// maintenance lane (`runtime::drone_fetch`).
+    DroneFetch,
 }
 
 /// Per-row edit buffers (empty: the current value shows as a hint) and the

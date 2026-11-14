@@ -132,6 +132,48 @@ impl UpdateView {
     }
 }
 
+/// The last fetch of the drone's logs (`fetch` in the UI stats line, from
+/// `runtime::drone_fetch`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FetchView {
+    /// fetching | done | failed
+    pub state: String,
+    pub step: String,
+    pub dir: String,
+    pub bytes: u64,
+    pub error: String,
+}
+
+impl FetchView {
+    pub fn parse(v: &Value) -> Option<Self> {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        Some(Self {
+            state: v.get("state")?.as_str()?.to_string(),
+            step: s("step"),
+            dir: s("dir"),
+            bytes: u64_or(v, "bytes", 0),
+            error: s("error"),
+        })
+    }
+
+    pub fn busy(&self) -> bool {
+        self.state == "fetching"
+    }
+
+    pub fn line(&self) -> String {
+        match self.state.as_str() {
+            "fetching" => format!("fetching the drone's {}", self.step),
+            "done" => format!(
+                "drone logs ({} kB) in {}",
+                self.bytes.div_ceil(1024),
+                self.dir
+            ),
+            "failed" => format!("drone logs not fetched: {}", self.error),
+            s => s.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +230,12 @@ mod tests {
         );
         assert!(!view(r#"{"state":"current","app":"abc"}"#).custom);
         assert!(UpdateView::parse(&serde_json::json!({})).is_none());
+        let f =
+            FetchView::parse(&serde_json::json!({"state":"done","dir":"/l/drone-1","bytes":2049}))
+                .unwrap();
+        assert_eq!(f.line(), "drone logs (3 kB) in /l/drone-1");
+        let f =
+            FetchView::parse(&serde_json::json!({"state":"fetching","step":"swap.log"})).unwrap();
+        assert!(f.busy() && f.line() == "fetching the drone's swap.log");
     }
 }

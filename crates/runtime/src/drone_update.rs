@@ -860,6 +860,10 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
     let mut next = Instant::now();
     let mut updated_at: Option<Instant> = None;
     while !sh.quit.load(Ordering::Relaxed) && !sh.core_done.load(Ordering::Acquire) {
+        sh.tools_on.store(
+            custom.as_ref().is_some_and(|d| d.dir().is_dir()),
+            Ordering::Relaxed,
+        );
         let picked = match custom.as_mut().map(PayloadDir::poll) {
             Some(Ok(Some(x))) => Ok(Some(x)),
             Some(Err(e)) => Err(e),

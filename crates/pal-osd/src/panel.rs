@@ -195,6 +195,10 @@ pub struct PanelIn<'a> {
     pub armed: Option<bool>,
     /// The automatic drone update; None in a build that carries no maburd.
     pub update: Option<&'a crate::update::UpdateView>,
+    /// The last fetch of the drone's logs.
+    pub fetch: Option<&'a crate::update::FetchView>,
+    /// The tools show (the GS has a payload directory).
+    pub tools_on: bool,
 }
 
 #[derive(Default)]
@@ -926,6 +930,22 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
                 |u| u.line(),
             );
             ui.label(format!("Drone software: {sw}"));
+            if i.tools_on {
+                ui.horizontal_wrapped(|ui| {
+                    let busy = i.fetch.is_some_and(|f| f.busy());
+                    if ui.add_enabled(!busy, btn("fetch drone logs", h)).clicked() {
+                        cmd = Some(Cmd::DroneFetch);
+                    }
+                    if let Some(f) = i.fetch {
+                        let c = if f.state == "failed" {
+                            BAD
+                        } else {
+                            Color32::GRAY
+                        };
+                        ui.label(RichText::new(f.line()).small().color(c));
+                    }
+                });
+            }
             ui.separator();
             if let Some(t) = i.table {
                 ui.horizontal_wrapped(|ui| {
