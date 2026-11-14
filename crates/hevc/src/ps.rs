@@ -181,6 +181,44 @@ pub fn parse_st_rps(
     (!r.bad()).then_some(out)
 }
 
+/// The SPS's displayed size (conformance window applied); nal from the
+/// 2-byte NAL header, escaped. Unlike `parse_sps` it refuses no stream it
+/// can read: the DVR names any picture it records.
+pub fn sps_display_size(nal: &[u8]) -> Option<(u32, u32)> {
+    if nal.len() < 3 {
+        return None;
+    }
+    let rb = unescape(&nal[2..]);
+    let mut r = BitReader::new(&rb);
+    r.u(4);
+    let max_sub = r.u(3);
+    r.u(1);
+    skip_ptl(&mut r, max_sub);
+    r.ue();
+    let chroma = r.ue();
+    if chroma == 3 {
+        r.u(1);
+    }
+    let mut pw = i64::from(r.ue());
+    let mut ph = i64::from(r.ue());
+    if r.flag() {
+        let (l, rt, t, bt) = (
+            i64::from(r.ue()),
+            i64::from(r.ue()),
+            i64::from(r.ue()),
+            i64::from(r.ue()),
+        );
+        let sw = if chroma == 1 || chroma == 2 { 2 } else { 1 };
+        let sh = if chroma == 1 { 2 } else { 1 };
+        pw -= sw * (l + rt);
+        ph -= sh * (t + bt);
+    }
+    if r.bad() || pw <= 0 || ph <= 0 || pw > 16384 || ph > 16384 {
+        return None;
+    }
+    Some((pw as u32, ph as u32))
+}
+
 /// nal: from the 2-byte NAL header, escaped.
 pub fn parse_sps(nal: &[u8]) -> Result<Sps, PsStatus> {
     if nal.len() < 3 {

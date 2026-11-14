@@ -1,6 +1,8 @@
 //! VPS/SPS/PPS bookkeeping and the hvcC they make (mabur `hevc_params.cpp`).
 
+use hevc::bits::unescape;
 use hevc::nal::split_nals;
+use hevc::ps::sps_display_size;
 
 /// True when the AU carries VPS, SPS and PPS: every IDR and also the GDR
 /// encoder's refresh start, which is a P slice and so not a sync point.
@@ -37,58 +39,6 @@ pub struct HevcParams {
     pps: Vec<u8>,
 }
 
-/// RBSP of an escaped NAL payload (emulation-prevention bytes dropped),
-/// from `from` on, at most `max` bytes.
-fn rbsp(nal: &[u8], from: usize, max: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len().min(max));
-    let mut zeros = 0;
-    for &b in nal.iter().skip(from) {
-        if out.len() >= max {
-            break;
-        }
-        if zeros >= 2 && b == 0x03 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    out
-}
-
-struct Bits<'a> {
-    b: &'a [u8],
-    pos: usize,
-    bad: bool,
-}
-
-impl Bits<'_> {
-    fn u(&mut self, n: u32) -> u32 {
-        let mut v = 0u32;
-        for _ in 0..n {
-            let byte = self.pos >> 3;
-            let Some(&x) = self.b.get(byte) else {
-                self.bad = true;
-                return 0;
-            };
-            v = (v << 1) | ((x >> (7 - (self.pos & 7))) & 1) as u32;
-            self.pos += 1;
-        }
-        v
-    }
-    fn ue(&mut self) -> u32 {
-        let mut lz = 0;
-        while self.u(1) == 0 {
-            lz += 1;
-            if self.bad || lz > 31 {
-                self.bad = true;
-                return 0;
-            }
-        }
-        ((1u64 << lz) - 1) as u32 + self.u(lz)
-    }
-}
-
 impl HevcParams {
     /// Takes the AU's parameter sets; true when all three are known.
     pub fn feed(&mut self, au: &[u8]) -> bool {
@@ -118,7 +68,7 @@ impl HevcParams {
         // layers / nesting byte, then the 12-byte general profile_tier_level.
         // Copying the escaped bytes would shift every field after the first
         // emulation-prevention byte, and a Main-profile SPS has two there.
-        let r = rbsp(&self.sps, 2, 13);
+        let r = unescape(&self.sps[2.min(self.sps.len())..]);
         if r.len() < 13 {
             return None;
         }
@@ -146,61 +96,6 @@ impl HevcParams {
 
     /// The SPS's displayed size (conformance window applied).
     pub fn sps_dimensions(&self) -> Option<(u32, u32)> {
-        if self.sps.len() < 3 {
-            return None;
-        }
-        let rb = rbsp(&self.sps, 2, usize::MAX);
-        let mut r = Bits {
-            b: &rb,
-            pos: 0,
-            bad: false,
-        };
-        r.u(4);
-        let max_sub = r.u(3).min(7) as usize;
-        r.u(1);
-        r.u(8);
-        r.u(32);
-        r.u(24);
-        r.u(24);
-        r.u(8);
-        let mut prof = [false; 8];
-        let mut lvl = [false; 8];
-        for i in 0..max_sub {
-            prof[i] = r.u(1) == 1;
-            lvl[i] = r.u(1) == 1;
-        }
-        if max_sub > 0 {
-            for _ in max_sub..8 {
-                r.u(2);
-            }
-        }
-        for i in 0..max_sub {
-            if prof[i] {
-                r.u(32);
-                r.u(32);
-                r.u(24);
-            }
-            if lvl[i] {
-                r.u(8);
-            }
-        }
-        r.ue();
-        let chroma = r.ue();
-        if chroma == 3 {
-            r.u(1);
-        }
-        let mut pw = r.ue() as i64;
-        let mut ph = r.ue() as i64;
-        if r.u(1) == 1 {
-            let (l, rt, t, bt) = (r.ue() as i64, r.ue() as i64, r.ue() as i64, r.ue() as i64);
-            let sw = if chroma == 1 || chroma == 2 { 2 } else { 1 };
-            let sh = if chroma == 1 { 2 } else { 1 };
-            pw -= sw * (l + rt);
-            ph -= sh * (t + bt);
-        }
-        if r.bad || pw <= 0 || ph <= 0 || pw > 16384 || ph > 16384 {
-            return None;
-        }
-        Some((pw as u32, ph as u32))
+        sps_display_size(&self.sps)
     }
 }
