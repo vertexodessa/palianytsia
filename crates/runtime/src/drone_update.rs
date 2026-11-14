@@ -1614,6 +1614,12 @@ mod tests {
         std::fs::write(d2.join("fc"), "unknown\n").unwrap();
         let mut c = swap(&d2, 30);
         wait_state(&d2, "trial");
+        // The commit comes once the new maburd has spoken, as the GS's does
+        // after seconds of its video: a file not yet written is no word.
+        let t = Instant::now();
+        while !d2.join("arm").exists() && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         std::fs::write(d2.join("up/commit"), "").unwrap();
         wait_state(&d2, "commit_held");
         std::thread::sleep(Duration::from_millis(1500));
@@ -1627,6 +1633,43 @@ mod tests {
         assert_eq!(state(&d2), "committed");
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn a_commit_to_a_maburd_without_the_arm_word_goes_ahead() {
+        // The release maburd before the word (v0.14) writes no arm file; the
+        // old one's file says disarmed until the trial removes it.
+        let d = swap_world("no_word");
+        std::fs::write(
+            d.join("up/maburd"),
+            "#!/bin/sh\nwhile true; do sleep 1; done\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("arm"), "disarmed\n").unwrap();
+        let mut c = swap(&d, 30);
+        wait_state(&d, "trial");
+        std::fs::write(d.join("up/commit"), "").unwrap();
+        // The bench hang sat in commit_held for good; the commit itself may
+        // take long here (its sync waits on whatever the host is writing).
+        let t = Instant::now();
+        while matches!(state(&d).as_str(), "trial" | "commit_held")
+            && t.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let held = state(&d);
+        if held == "commit_held" {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        assert_ne!(
+            held, "commit_held",
+            "the commit waits for a word that never comes"
+        );
+        assert!(c.wait().unwrap().success());
+        assert_eq!(state(&d), "committed");
+        assert_eq!(read(&d, "bin"), read(&d, "up/maburd"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

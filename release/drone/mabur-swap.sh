@@ -78,10 +78,13 @@ start_init() { setsid "$INIT" start </dev/null >/dev/null 2>&1; }
 arm() { w=$(cat "$ARM" 2>/dev/null); echo "${w:-unknown}"; }
 
 # Returns 0 once maburd (pid $2) reports the drone disarmed, 1 when that
-# maburd exits first; says once that it waits.
+# maburd exits first; says once that it waits. A maburd without the word
+# never writes the file (removed before it started): the GS's check of the
+# FC's heartbeat, made just before it asked for the commit, stands.
 wait_disarmed() {
   held=
   while [ "$(arm)" != disarmed ]; do
+    [ -f "$ARM" ] || return 0
     kill -0 "$2" 2>/dev/null || return 1
     if [ -z "$held" ]; then state "$1" "drone $(arm)"; held=1; fi
     sleep 1
