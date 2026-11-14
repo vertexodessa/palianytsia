@@ -64,6 +64,30 @@ pub struct Payload {
     pub toml: Vec<u8>,
     pub s96: Vec<u8>,
     pub custom: bool,
+    /// Custom: a config was asked for that changes what the GS finds
+    /// the drone by (`LINK_KEYS`), with the file `ALLOW_LINK_CHANGE`.
+    pub allow_link_change: bool,
+}
+
+/// The keys a GS finds and reaches the drone by. A custom mabur.toml that
+/// changes one is refused unless asked for: a GS that does not follow loses
+/// the drone until its trial or its boot guard brings the old set back.
+const LINK_KEYS: [(&str, &str); 2] = [("link", "key_file"), ("radio", "channels")];
+
+/// In the payload directory: install a custom mabur.toml that changes `LINK_KEYS`.
+pub const ALLOW_LINK_CHANGE: &str = "allow-link-change";
+
+/// The `LINK_KEYS` whose values differ between two configs, spaces aside.
+fn link_changes(from: &str, to: &str) -> Vec<String> {
+    let v = |t: &str, s: &str, k: &str| shipped_value(t, s, k).map(|v| v.replace(' ', ""));
+    LINK_KEYS
+        .iter()
+        .filter(|(s, k)| v(from, s, k) != v(to, s, k))
+        .map(|(s, k)| {
+            let show = |t: &str| shipped_value(t, s, k).unwrap_or_else(|| "unset".into());
+            format!("{s}.{k} {} to {}", show(from), show(to))
+        })
+        .collect()
 }
 
 impl Payload {
@@ -77,6 +101,7 @@ impl Payload {
             toml: rd("mabur.toml")?,
             s96: rd("S96mabur")?,
             custom: false,
+            allow_link_change: false,
         })
     }
 
@@ -105,6 +130,7 @@ impl Payload {
             toml: rd("mabur.toml")?.unwrap_or_default(),
             s96: rd("S96mabur")?.unwrap_or_else(|| RELEASE_S96.to_vec()),
             custom: true,
+            allow_link_change: dir.join(ALLOW_LINK_CHANGE).exists(),
         }))
     }
 
@@ -114,6 +140,20 @@ impl Payload {
         if self.custom {
             if !self.toml.is_empty() {
                 let t = String::from_utf8_lossy(&self.toml).into_owned();
+                let link = if drone.trim().is_empty() {
+                    vec![]
+                } else {
+                    link_changes(drone, &t)
+                };
+                if !link.is_empty() && !self.allow_link_change {
+                    return Err(format!(
+                        "the custom mabur.toml changes {}: a GS that does not follow loses the drone. \
+                         To install it anyway, put a file named {ALLOW_LINK_CHANGE} beside it; \
+                         without a GS reaching it, \
+                         the drone's trial or boot guard brings the old set back",
+                        link.join(", ")
+                    ));
+                }
                 let ch = if t == drone {
                     vec![]
                 } else {
@@ -155,6 +195,7 @@ pub fn embedded() -> Option<Payload> {
         toml: RELEASE_TOML.to_vec(),
         s96: RELEASE_S96.to_vec(),
         custom: false,
+        allow_link_change: false,
     })
 }
 
@@ -199,7 +240,7 @@ impl PayloadDir {
     }
 
     fn stamp_now(&self) -> Stamp {
-        ["maburd", "mabur.toml", "S96mabur"]
+        ["maburd", "mabur.toml", "S96mabur", ALLOW_LINK_CHANGE]
             .iter()
             .map(|n| {
                 std::fs::metadata(self.dir.join(n))
@@ -879,10 +920,10 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
         }
         let config = pl.exact_config();
         let p = probe(&sh.maint, Duration::from_secs(3));
-        let key = p
-            .as_ref()
-            .ok()
-            .map(|p| tried_key(p, want, config.as_deref()));
+        // Asking for a link change is a new try of the same build.
+        let key = p.as_ref().ok().map(|p| {
+            tried_key(p, want, config.as_deref()) + if pl.allow_link_change { " +link" } else { "" }
+        });
         let tried = key
             .as_ref()
             .is_some_and(|k| TRIED.lock().unwrap_or_else(|e| e.into_inner()).contains(k));
@@ -1078,6 +1119,40 @@ mod tests {
         assert_eq!((t.as_str(), ch.len()), ("[venc]\nfps = 90\n", 1));
         assert_eq!(p.exact_config().as_deref(), Some("[venc]\nfps = 90\n"));
         assert_eq!(p.s96, b"#!/bin/sh\n# custom\n");
+
+        // A custom config that moves the key or the channel set is refused
+        // unless asked for.
+        let linked = "[radio]\nchannels = [40, 64]\n[link]\nkey_file = \"/etc/mabur.key\"\n";
+        std::fs::write(
+            d.join("mabur.toml"),
+            "[radio]\nchannels = [40,64]   # same set\n[link]\nkey_file = \"/etc/mabur.key\"\nx = 1\n",
+        )
+        .unwrap();
+        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        assert!(
+            p.config_for(linked).is_ok(),
+            "spaces and comments aside, the same"
+        );
+        std::fs::write(
+            d.join("mabur.toml"),
+            "[radio]\nchannels = [149]\n[link]\nkey_file = \"/etc/other.key\"\n",
+        )
+        .unwrap();
+        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        let e = p.config_for(linked).unwrap_err();
+        assert!(
+            e.contains("link.key_file \"/etc/mabur.key\" to \"/etc/other.key\"")
+                && e.contains("radio.channels [40, 64] to [149]")
+                && e.contains(ALLOW_LINK_CHANGE),
+            "{e}"
+        );
+        assert!(
+            p.config_for("").is_ok(),
+            "a drone with no config has nothing to lose"
+        );
+        std::fs::write(d.join(ALLOW_LINK_CHANGE), "").unwrap();
+        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        assert!(p.allow_link_change && p.config_for(linked).is_ok());
 
         // A release payload still forces its keys.
         let rel = Payload {
