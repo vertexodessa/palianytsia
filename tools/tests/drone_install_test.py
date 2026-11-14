@@ -202,7 +202,7 @@ def snapshot(root):
 
 
 def make_drone(root, bin_=BIN_OLD, cfg=CFG_KEY, wrapper="S96mabur", stock=(), ls=LS, ls_orig=None,
-               init_off=(), module=False, log=True, sensors=()):
+               init_off=(), module=False, log=True, sensors=(), ota=False):
     for d in ("usr/bin", "etc/init.d", "tmp", "lib/modules/5.10/sigmastar", "lib/modules/5.10/extra", "overlay", "rom"):
         (root / d).mkdir(parents=True, exist_ok=True)
     (root / ".fake-drone").touch()
@@ -228,6 +228,13 @@ def make_drone(root, bin_=BIN_OLD, cfg=CFG_KEY, wrapper="S96mabur", stock=(), ls
         for name in sensors:
             (root / "etc/sensors" / name).write_bytes(b"t")
     (root / "lib/modules/5.10/extra/8812eu.ko").write_bytes(b"k")
+    if ota:
+        # Left by an over-the-air update (release/drone/mabur-swap.sh): its
+        # boot guard, the fallback set and the flag on the unproven build.
+        (root / "etc/init.d/S97mabur-guard").write_bytes(INIT)
+        (root / "etc/mabur-lkg").mkdir()
+        (root / "etc/mabur-lkg/sha").write_text("ab\n")
+        (root / "etc/mabur.unproven").write_text("boot-1\n")
     if log:
         (root / "tmp/mabur.log").write_text("maburd: build mabur abc\n")
 
@@ -265,6 +272,11 @@ SCENARIOS = [
     S("update_to_new_maburd_strips_removed_key",
       rc=0, toml=CFG_KEY_STRIPPED, changes=UPDATED, backup=BACKUP_OLD,
       says=[STRIPPED, "== done"]),
+    # A cable install is proven: the guard of an earlier air update must not
+    # put its fallback over it; guard and fallback stay for the next one.
+    S("update_clears_the_unproven_flag_of_an_air_update", drone=dict(ota=True),
+      rc=0, toml=CFG_KEY_STRIPPED, changes={**UPDATED, "etc/mabur.unproven": "deleted"}, backup=BACKUP_OLD,
+      says=["== done"]),
     S("update_to_maburd_that_knows_key_keeps_it", pkg=dict(bin_=BIN_OLD + b"e"),
       rc=0, toml=CFG_KEY, changes={"usr/bin/maburd": "BIN_OLD+e"}, backup=BACKUP_OLD),
     S("update_to_v07_maburd_strips_key", pkg=dict(bin_=BIN_V07),
@@ -439,6 +451,17 @@ SCENARIOS = [
     S("remove_takes_maburd_out_and_keeps_config", argv=("-y", "--remove", "D"),
       rc=0, toml=CFG_KEY, changes={"etc/init.d/S96mabur": "deleted", "usr/bin/maburd": "deleted"}, backup=None,
       says=["removed; /etc/mabur.toml kept"]),
+    S("remove_takes_out_the_air_update_guard_and_fallback", drone=dict(ota=True), argv=("-y", "--remove", "D"),
+      rc=0, toml=CFG_KEY,
+      changes={
+          "etc/init.d/S96mabur": "deleted",
+          "etc/init.d/S97mabur-guard": "deleted",
+          "etc/mabur-lkg": "deleted",
+          "etc/mabur-lkg/sha": "deleted",
+          "etc/mabur.unproven": "deleted",
+          "usr/bin/maburd": "deleted",
+      },
+      backup=None, says=["removed; /etc/mabur.toml kept"]),
     S("remove_restores_load_sigmastar_module_and_stock_services",
       drone=dict(cfg=CFG_64, module=True, ls=LS_PATCHED, ls_orig=LS, init_off=("S95majestic", "S98wifibroadcast")),
       argv=("-y", "--remove", "D"),

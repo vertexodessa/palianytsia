@@ -19,6 +19,12 @@
 //! and keeps the drone on it (`spawn_auto`): whenever a drone is heard, it
 //! reads the drone's maburd and installs its own when they differ, older or
 //! newer.
+//!
+//! A drone with no cable must come back from a build that passes the trial
+//! and fails after a reboot: the commit keeps the last proven set on flash and
+//! marks the new one unproven, `PROBE` is the proof that clears the mark, and
+//! the swap script's boot guard restores the kept set when no GS comes
+//! (release/drone/mabur-swap.sh).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -442,7 +448,13 @@ struct Probe {
     config: String,
 }
 
-const PROBE: &str = "echo \"exe=$(readlink /proc/$PPID/exe)\"; \
+/// Also the proof the swap script's boot guard waits for: this shell runs
+/// under the installed maburd in a boot later than its commit, so the flag
+/// that marks it unproven goes (release/drone/mabur-swap.sh).
+const PROBE: &str = "e=$(readlink /proc/$PPID/exe); f=/etc/mabur.unproven; \
+    [ \"$e\" = /usr/bin/maburd ] && [ -f $f ] && \
+    [ \"$(cat $f)\" != \"$(cat /proc/sys/kernel/random/boot_id)\" ] && rm -f $f; \
+    echo \"exe=$e\"; \
     echo \"sha=$(sha256sum /usr/bin/maburd 2>/dev/null | cut -d' ' -f1)\"; \
     echo \"state=$(cat /tmp/mabur-up/state 2>/dev/null)\"; echo ---; cat /etc/mabur.toml";
 
@@ -877,6 +889,9 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
         let mut v = base("");
         if let Ok(p) = &p {
             v["drone"] = short(&p.sha).into();
+            if p.state == "guard_restored" {
+                v["fallback"] = true.into();
+            }
         }
         match decide(&p, (want, config.as_deref()), tried, sh.fc_armed()) {
             Next::Wait(d, state) => {
@@ -1175,27 +1190,64 @@ mod tests {
         std::fs::write(d.join("fc"), "disarmed\n").unwrap();
         w("up/mabur.toml", "new = 1\n");
         w("up/S96mabur", "#!/bin/sh\necho new init\n");
+        std::fs::write(d.join("boot_id"), "boot-1\n").unwrap();
         d
     }
 
-    fn swap(d: &std::path::Path, wait: u32) -> std::process::Child {
-        std::process::Command::new("sh")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../release/drone/mabur-swap.sh"
-            ))
-            .arg("trial")
+    const SWAP_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../release/drone/mabur-swap.sh"
+    );
+
+    /// The swap script with `arg`, every path in the world `d`.
+    fn swap_cmd(d: &std::path::Path, arg: &str) -> std::process::Command {
+        let mut c = std::process::Command::new("sh");
+        c.arg(SWAP_PATH)
+            .arg(arg)
             .env("UP", d.join("up"))
             .env("BIN", d.join("bin"))
             .env("CONF", d.join("conf"))
             .env("INIT", d.join("init"))
-            .env("COMMIT_WAIT", wait.to_string())
             .env("STOP_WAIT", "2")
             .env("START_DELAY", "0")
             .env("NAME", "pal-swap-test-no-such-process")
             .env("ARM", d.join("arm"))
+            .env("LKG", d.join("lkg"))
+            .env("FLAG", d.join("unproven"))
+            .env("GUARD", d.join("guard"))
+            .env("BOOT_ID", d.join("boot_id"))
+            .env("LKG_WAIT", "30")
+            .env("GUARD_POLL", "1");
+        c
+    }
+
+    fn swap(d: &std::path::Path, wait: u32) -> std::process::Child {
+        swap_cmd(d, "trial")
+            .env("COMMIT_WAIT", wait.to_string())
             .spawn()
             .unwrap()
+    }
+
+    /// A trial of what is in `up/`, committed.
+    fn commit(d: &std::path::Path) {
+        let mut c = swap(d, 30);
+        wait_state(d, "trial");
+        std::fs::write(d.join("up/commit"), "").unwrap();
+        assert!(c.wait().unwrap().success());
+        assert_eq!(state(d), "committed");
+    }
+
+    fn read(d: &std::path::Path, p: &str) -> String {
+        std::fs::read_to_string(d.join(p)).unwrap_or_default()
+    }
+
+    fn gunzip(p: &std::path::Path) -> Vec<u8> {
+        std::process::Command::new("gunzip")
+            .arg("-c")
+            .arg(p)
+            .output()
+            .unwrap()
+            .stdout
     }
 
     fn state(d: &std::path::Path) -> String {
@@ -1316,6 +1368,186 @@ mod tests {
         assert_eq!(state(&d2), "committed");
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn a_commit_keeps_the_proven_set_and_marks_the_new_one_unproven() {
+        let d = swap_world("lkg");
+        let old_init = read(&d, "init");
+        commit(&d);
+        assert_eq!(gunzip(&d.join("lkg/maburd.gz")), b"old binary\n");
+        assert_eq!(read(&d, "lkg/mabur.toml"), "old = 1\n");
+        assert_eq!(read(&d, "lkg/S96mabur"), old_init);
+        assert_eq!(read(&d, "lkg/sha").trim(), sha256_hex(b"old binary\n"));
+        assert_eq!(
+            read(&d, "unproven"),
+            "boot-1\n",
+            "the new set waits for a GS after a reboot"
+        );
+        assert_eq!(
+            std::fs::read(d.join("guard")).unwrap(),
+            std::fs::read(SWAP_PATH).unwrap(),
+            "the script itself is the boot guard"
+        );
+        // A second build in the same boot: the outgoing one was never proven,
+        // so the fallback stays the cable-installed set.
+        let build2 = read(&d, "up/maburd") + "# build 2\n";
+        std::fs::write(d.join("up/maburd"), build2).unwrap();
+        commit(&d);
+        assert_eq!(gunzip(&d.join("lkg/maburd.gz")), b"old binary\n");
+        assert!(read(&d, "up/swap.log").contains("the outgoing maburd is unproven"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_set_that_does_not_fit_beside_the_fallback_wins_the_room() {
+        let d = swap_world("full");
+        // An overlay with room for the new maburd only once the fallback is
+        // gone: a cp onto `bin` comes out short while `lkg` exists.
+        std::fs::create_dir_all(d.join("path")).unwrap();
+        let cp = d.join("path/cp");
+        std::fs::write(
+            &cp,
+            format!(
+                "#!/bin/sh\nif [ \"$2\" = {0}/bin ] && [ -d {0}/lkg ]; then head -c 4 \"$1\" > \"$2\"; exit 1; fi\nexec /bin/cp \"$@\"\n",
+                d.display()
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("755")
+            .arg(&cp)
+            .status()
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            d.join("path").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let mut c = swap_cmd(&d, "trial")
+            .env("COMMIT_WAIT", "30")
+            .env("PATH", path)
+            .spawn()
+            .unwrap();
+        wait_state(&d, "trial");
+        std::fs::write(d.join("up/commit"), "").unwrap();
+        assert!(c.wait().unwrap().success());
+        assert_eq!(state(&d), "committed");
+        assert_eq!(read(&d, "bin"), read(&d, "up/maburd"));
+        assert!(!d.join("lkg").exists());
+        assert!(read(&d, "up/swap.log").contains("the fallback goes"));
+        // No fallback: the guard has nothing to put back and leaves the build.
+        std::fs::write(d.join("boot_id"), "boot-2\n").unwrap();
+        assert!(swap_cmd(&d, "guard")
+            .env("LKG_WAIT", "0")
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(read(&d, "bin"), read(&d, "up/maburd"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_boot_guard_puts_the_fallback_back_when_no_gs_comes_after_a_reboot() {
+        let d = swap_world("guard");
+        let old_init = read(&d, "init");
+        commit(&d);
+        // In the boot that committed, the trial is the proof: nothing to do.
+        assert!(swap_cmd(&d, "guard")
+            .env("LKG_WAIT", "0")
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(read(&d, "bin"), read(&d, "up/maburd"));
+        std::fs::write(d.join("boot_id"), "boot-2\n").unwrap();
+        // The FC armed: it holds past LKG_WAIT.
+        std::fs::write(d.join("arm"), "armed\n").unwrap();
+        let mut g = swap_cmd(&d, "guard").env("LKG_WAIT", "1").spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(g.try_wait().unwrap().is_none(), "no restart while armed");
+        assert_eq!(read(&d, "bin"), read(&d, "up/maburd"));
+        std::fs::write(d.join("arm"), "disarmed\n").unwrap();
+        assert!(g.wait().unwrap().success());
+        assert_eq!(state(&d), "guard_restored");
+        assert_eq!(read(&d, "bin"), "old binary\n");
+        assert_eq!(read(&d, "conf"), "old = 1\n");
+        assert_eq!(read(&d, "init"), old_init);
+        assert!(!d.join("unproven").exists(), "the fallback is proven");
+        assert!(init_calls(&d).ends_with("start\n"), "{}", init_calls(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_boot_guard_stands_aside_for_a_gs_or_a_new_install() {
+        let d = swap_world("guard_aside");
+        commit(&d);
+        std::fs::write(d.join("boot_id"), "boot-2\n").unwrap();
+        // A GS's probe deletes the flag.
+        let mut g = swap_cmd(&d, "guard").spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::remove_file(d.join("unproven")).unwrap();
+        assert!(g.wait().unwrap().success());
+        assert!(read(&d, "up/swap.log").contains("a GS reached the drone"));
+        assert_eq!(read(&d, "bin"), read(&d, "up/maburd"));
+        // Someone replaces maburd (a GS whose probe knows no flag, a cable).
+        std::fs::write(d.join("unproven"), "boot-1\n").unwrap();
+        let mut g = swap_cmd(&d, "guard").env("LKG_WAIT", "3").spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::remove_file(d.join("bin")).unwrap();
+        std::fs::write(d.join("bin"), "other install\n").unwrap();
+        assert!(g.wait().unwrap().success());
+        assert!(read(&d, "up/swap.log").contains("maburd replaced meanwhile"));
+        assert_eq!(read(&d, "bin"), "other install\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The probe's own text, run by sh as the drone would: this test is the
+    /// maburd the shell's parent is, the flag and boot id live in a temp dir.
+    #[test]
+    fn the_probe_proves_the_installed_maburd_only_in_a_later_boot() {
+        let d = swap_world("probe");
+        let me = std::env::current_exe().unwrap();
+        let flag = d.join("unproven");
+        let at = |p: &str| d.join(p).to_str().unwrap().to_string();
+        let moved = PROBE
+            .replace("/etc/mabur.unproven", &at("unproven"))
+            .replace("/proc/sys/kernel/random/boot_id", &at("boot_id"))
+            .replace("/etc/mabur.toml", &at("conf"));
+        let mine = moved.replace(
+            "[ \"$e\" = /usr/bin/maburd ]",
+            &format!("[ \"$e\" = {} ]", me.display()),
+        );
+        assert_ne!(mine, moved);
+        let run = |cmd: &str| {
+            let o = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{o:?}");
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        std::fs::write(&flag, "boot-1\n").unwrap();
+        let out = run(&mine);
+        assert!(out.contains(&format!("exe={}", me.display())), "{out}");
+        assert!(out.ends_with("---\nold = 1\n"), "{out}");
+        assert!(
+            flag.exists(),
+            "same boot as the commit: the trial was the proof"
+        );
+        std::fs::write(d.join("boot_id"), "boot-2\n").unwrap();
+        run(&moved);
+        assert!(
+            flag.exists(),
+            "a shell under another program (a trial from /tmp) proves nothing"
+        );
+        run(&mine);
+        assert!(
+            !flag.exists(),
+            "a later boot, reached under the installed maburd"
+        );
+        run(&mine);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

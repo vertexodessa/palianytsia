@@ -124,6 +124,9 @@ pairing key.
   `PAL_MABURD=<maburd>` carries it, and pal-desktop live (gs mode) and both APKs then install it on
   any drone whose maburd differs (`runtime::drone_update::spawn_auto`, banner `UPDATING DRONE`);
   release APKs and the release desktop need `PAL_MABURD`.
+  A committed build is unproven until a GS reaches it after a reboot; without one in 300 s the
+  drone's boot guard (`S97mabur-guard`, the swap script) restores the last proven set from
+  `/etc/mabur-lkg` (epic pal-448t: no cable after the first install).
 - `tools/lpdiff.py a b`: first differing records of two `--aus`/`--sends` dumps.
 - `tools/retxmark.py in.bin out.bin [every]`: a capture copy with base bodies re-marked as NACK retransmits (the m1 retx case; a capture's own retransmits change no rung in replay).
 - Capture analysis (`tools/palcap.py` reads `palcap 1` + SBI/FEC envelopes): `tools/losstrace.py bodies.bin [--json f]`

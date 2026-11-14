@@ -22,6 +22,9 @@ pub struct UpdateView {
     pub drone: String,
     /// Custom payload: `app` is the payload directory's maburd.
     pub custom: bool,
+    /// The drone's boot guard put its fallback set back: no GS reached the
+    /// build committed before the drone's last reboot.
+    pub fallback: bool,
 }
 
 impl UpdateView {
@@ -37,6 +40,7 @@ impl UpdateView {
             app: s("app"),
             drone: s("drone"),
             custom: v.get("custom").and_then(Value::as_bool).unwrap_or(false),
+            fallback: v.get("fallback").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
@@ -80,6 +84,18 @@ impl UpdateView {
         if let Some((b, _)) = self.banner() {
             return b;
         }
+        let l = self.state_line();
+        if self.fallback {
+            return format!(
+                "the drone went back to its fallback maburd {}: no GS reached the build it \
+                 had after a reboot. {l}",
+                self.drone
+            );
+        }
+        l
+    }
+
+    fn state_line(&self) -> String {
         if self.custom {
             match self.state.as_str() {
                 "waiting" => {
@@ -162,6 +178,14 @@ mod tests {
             assert_eq!(v.banner(), None, "{s}");
             assert!(v.line().starts_with("custom payload: "), "{}", v.line());
         }
+        let fb = view(r#"{"state":"armed","app":"abc","drone":"0123","fallback":true}"#);
+        assert!(
+            fb.line()
+                .starts_with("the drone went back to its fallback maburd 0123")
+                && fb.line().ends_with("once disarmed"),
+            "{}",
+            fb.line()
+        );
         assert!(!view(r#"{"state":"current","app":"abc"}"#).custom);
         assert!(UpdateView::parse(&serde_json::json!({})).is_none());
     }

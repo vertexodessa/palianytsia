@@ -92,6 +92,7 @@ FORCED = (
 REMOVE_SH = r'''for s in S00mabur S96mabur; do [ -x /etc/init.d/$s ] && /etc/init.d/$s stop >/dev/null 2>&1; done
 killall maburd 2>/dev/null
 rm -f /usr/bin/maburd /etc/init.d/S00mabur /etc/init.d/S96mabur /etc/modprobe.d/palianytsia.conf
+rm -rf /etc/init.d/S97mabur-guard /etc/mabur-lkg /etc/mabur.unproven
 [ -f /usr/bin/load_sigmastar.palianytsia ] && mv /usr/bin/load_sigmastar.palianytsia /usr/bin/load_sigmastar
 # Only our copy of the sensor module goes: an image that ships it (and loads
 # it with no fallback) gets its own back, never a deletion mark over it.
@@ -209,6 +210,9 @@ if [ -n "$HAVE_CFG" ]; then
   [ "$(sha256sum /etc/mabur.toml | cut -d' ' -f1)" = "$NEW_CFG" ] || { echo "   mabur.toml on flash differs (overlay full?)"; exit 1; }
 fi
 rm -f /tmp/maburd.new /tmp/mabur.toml.new /tmp/S96mabur.new
+# A cable install is proven: the boot guard of an earlier over-the-air
+# update (release/drone/mabur-swap.sh) must not put its fallback over it.
+rm -f /etc/mabur.unproven
 if [ "$FRESH" = 1 ]; then
   reboot
 else

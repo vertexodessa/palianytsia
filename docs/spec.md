@@ -226,6 +226,19 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   trial start is left alone (`aborted_armed`). Host tests: the swap script against a fake maburd
   that writes the arm file (hold, commit hold, abort), the FC gate on HEARTBEATs. Open: a bench run
   with the arm file (needs a drone on the new maburd).
+- Recovery with no cable, 2026-11-14 (pal-448t.1, under pal-448t: the drone installed once by
+  cable, everything after over the air): the trial proves a build in the boot that installs it,
+  not after a reboot. The commit keeps the outgoing set, when proven, in `/etc/mabur-lkg` (maburd
+  gzipped, mabur.toml, S96mabur), marks the new one unproven (`/etc/mabur.unproven`, this boot's
+  id) and installs the swap script as `/etc/init.d/S97mabur-guard`. A GS whose probe reaches the
+  installed maburd in a later boot deletes the mark; without one within 300 s of a boot, and the
+  FC not armed, the guard puts the kept set back. It stands aside while a trial runs and when
+  maburd is replaced meanwhile. A cable install (`drone-install.py`) counts as proven; `--remove`
+  takes the guard and the kept set out. The System line says when the drone came back on its
+  fallback. Host tests: the kept set, an unproven outgoing build, the guard's restore, its armed
+  hold, standing aside, the probe's rule run as sh; installer scenarios. Open: the overlay's room
+  for the gzipped copy and busybox gzip on the bench drone, a bench run with a build that is
+  unreachable after a reboot.
 - M3: phone and Quest 3 apps fly the quad (releases v0.1-v0.14, signed APKs; v0.14, 2026-11-13: the apps carry their maburd and update a disarmed drone over the maintenance lane (the first v0.14 install is from a PC), the shed bitrate step, the stuck keyframe backoff, the RC version banner, one-card scan pace, the release Quest APK updated the bench quad in 48.5 s, the phone APK not run; v0.13.1, 2026-11-13: the channel menu in the desktop app (the apps' link pick at start, `Cmd::Channels` on the live link), maburd and apps as v0.13, bench only; v0.13, 2026-11-12: the FEC ring-row backstop, the periodic refresh as two drone parameters (GS and drone update together), calibration of both widths with the floor sweep; v0.12.1, 2026-11-12: `install.py` renames a kept config's one-table `radio.rate_walls_rel` to `_20`, maburd and apps as v0.12; v0.12, 2026-11-11: the NACK residual rule, A-MPDU off with single-frame efficiency tables, `min_iqp` 42, the receive-gain floor key, the panel tabs and the Quest menu quad, bench only, the phone not run, not flown yet; v0.11, 2026-11-09: air clock bound, rung change hold, `VENC_MIN_IQP` in the menu, not flown yet; v0.10, 2026-11-08: per-frame FEC repair window, not flown yet; v0.9, 2026-11-08: the frame-tail FEC rule, not flown yet; v0.8.1, 2026-11-07: a drone config without `fec.repairs_with_frame` gets the mode with its window raised to 64; v0.8, 2026-11-04: maburd from mabur `release/v0.8` = `release/v0.7` + `fec.repairs_with_frame`, bundle `fec.window = 64`, built and packed locally, not published). The G2G and RCF-heard
   comparisons against PixelPilot and the 10 min Quest frame check are not measured yet.
   Planned (Ihor, 2026-11-03): Quest latency per stage with kernel tracing (the headset has root):
