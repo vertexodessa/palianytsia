@@ -13,10 +13,12 @@
 #           has no room for two), the new files go to flash, the init loop
 #           starts on them.
 #
-# Neither a rollback nor the commit restarts maburd unless the drone is known
-# to be disarmed: $ARM is maburd's word for the FC's arm state (armed,
-# disarmed, unknown). A drone armed during the trial keeps flying the new
-# maburd from RAM; a power cut boots the old one from flash.
+# Neither a rollback nor the commit restarts maburd while the drone says it
+# is armed: $ARM is maburd's word for the FC's arm state (armed, disarmed,
+# unknown). "unknown" (no FC, MSP off, an FC not heard) does not hold an
+# update: the GS and the drone meet on the ground before a flight, and a
+# camera with no FC says nothing else. A drone armed during the trial keeps
+# flying the new maburd from RAM; a power cut boots the old one from flash.
 #
 # The trial proves a build in the boot that installs it, not in the next one
 # (a cold start, a config that only bites after a reboot). A drone with no
@@ -98,13 +100,13 @@ drop_inherited() {
 
 arm() { w=$(cat "$ARM" 2>/dev/null); echo "${w:-unknown}"; }
 
-# Returns 0 once maburd (pid $2) reports the drone disarmed, 1 when that
+# Returns 0 once maburd (pid $2) no longer reports the drone armed, 1 when that
 # maburd exits first; says once that it waits. A maburd without the word
 # never writes the file (removed before it started): the GS's check of the
 # FC's heartbeat, made just before it asked for the commit, stands.
-wait_disarmed() {
+wait_not_armed() {
   held=
-  while [ "$(arm)" != disarmed ]; do
+  while [ "$(arm)" = armed ]; do
     [ -f "$ARM" ] || return 0
     kill -0 "$2" 2>/dev/null || return 1
     if [ -z "$held" ]; then state "$1" "drone $(arm)"; held=1; fi
@@ -141,20 +143,20 @@ trial() {
       rollback "the new maburd exited ($?)"
       return
     fi
-    if [ "$waited" -ge "$COMMIT_WAIT" ] && [ "$(arm)" = disarmed ]; then
+    if [ "$waited" -ge "$COMMIT_WAIT" ] && [ "$(arm)" != armed ]; then
       kill "$pid" 2>/dev/null
       reap "$pid"
       rollback "no commit in ${COMMIT_WAIT} s"
       return
     fi
     if [ "$waited" -ge "$COMMIT_WAIT" ] && [ -z "$held" ]; then
-      state trial_held "no commit, drone $(arm): the new maburd stays until it is disarmed"
+      state trial_held "no commit, drone armed: the new maburd stays until it is disarmed"
       held=1
     fi
     sleep 1
     waited=$((waited + 1))
   done
-  if ! wait_disarmed commit_held "$pid"; then
+  if ! wait_not_armed commit_held "$pid"; then
     wait "$pid"
     rollback "the new maburd exited ($?)"
     return

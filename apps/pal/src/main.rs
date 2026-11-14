@@ -495,7 +495,7 @@ fn update_drone(
         }
         Ok(pl) => {
             let link_ok = du::video_flows(&shared);
-            let may_go = du::fc_disarmed(&shared);
+            let may_go = du::fc_not_armed(&shared);
             match du::run(
                 &shared.maint,
                 &pl,

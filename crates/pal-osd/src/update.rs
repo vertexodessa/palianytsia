@@ -8,7 +8,7 @@ use crate::json::u64_or;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UpdateView {
-    /// waiting | current | armed | no_fc | no_lane | busy | error |
+    /// waiting | current | armed | other_platform | no_lane | busy | error |
     /// updating | updated | failed | custom_wait
     pub state: String,
     pub step: String,
@@ -119,9 +119,7 @@ impl UpdateView {
             ),
             "current" => format!("the drone runs this app's maburd {}", self.app),
             "armed" => "the drone is armed: it is checked and updated once disarmed".into(),
-            "no_fc" => "the drone's maburd differs from this app's, but no flight controller \
-                        heartbeat says it is disarmed: no update (it may be flying)"
-                .into(),
+            "other_platform" => format!("no update: {}", self.error),
             "no_lane" => "the drone does not answer on the maintenance lane: a maburd without \
                           it is updated from a PC (drone/install.py)"
                 .into(),
@@ -201,7 +199,13 @@ mod tests {
             .0
             .contains("51 s"));
         for s in [
-            "waiting", "current", "armed", "no_fc", "no_lane", "busy", "error",
+            "waiting",
+            "current",
+            "armed",
+            "other_platform",
+            "no_lane",
+            "busy",
+            "error",
         ] {
             let v = view(&format!(r#"{{"state":"{s}","app":"abc"}}"#));
             assert_eq!(v.banner(), None, "{s}");

@@ -1,4 +1,8 @@
 #!/bin/sh
+# The Hi3516CV610 maburd links the HiSi MPP libraries kept in /usr/lib/mabur;
+# the SigmaStar drones have no such directory. One wrapper for both, so an
+# update that ships this file leaves the camera able to start its maburd.
+[ -d /usr/lib/mabur ] && export LD_LIBRARY_PATH=/usr/lib/mabur
 DAEMON=/usr/bin/maburd
 CONF=/etc/mabur.toml
 PIDFILE=/var/run/mabur-loop.pid

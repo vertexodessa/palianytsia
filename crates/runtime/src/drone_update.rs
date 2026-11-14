@@ -569,6 +569,70 @@ struct Probe {
     sha: String,
     state: String,
     config: String,
+    /// The U-Boot `soc` variable (what tools/drone-install.py checks too):
+    /// "ssc338q" on the SigmaStar drones, "hi3516cv610" on the HiSi camera.
+    soc: String,
+}
+
+/// The SoC families maburd is built for. A build runs on one only: the
+/// SigmaStar maburd is glibc and opens libmi_*, the Hi3516CV610 one is musl
+/// and links the HiSi MPP (libss_mpi*); the wrong one does not even start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Star6e,
+    Cv610,
+}
+
+impl Platform {
+    fn of_soc(soc: &str) -> Option<Self> {
+        let s = soc.trim();
+        if s.starts_with("ssc33") || s.starts_with("ssc30k") {
+            Some(Self::Star6e)
+        } else if s.starts_with("hi3516cv61") {
+            Some(Self::Cv610)
+        } else {
+            None
+        }
+    }
+
+    /// From the libraries the binary names.
+    pub fn of_maburd(bin: &[u8]) -> Option<Self> {
+        let has = |n: &[u8]| bin.windows(n.len()).any(|w| w == n);
+        match (has(b"libmi_sys.so"), has(b"libss_mpi")) {
+            (true, false) => Some(Self::Star6e),
+            (false, true) => Some(Self::Cv610),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Star6e => "SigmaStar",
+            Self::Cv610 => "Hi3516CV610",
+        }
+    }
+}
+
+/// Whether a maburd built for `build` runs on the drone of `p`; the reason
+/// when not. A drone or a build of no known family gets nothing: a wrong
+/// binary would only fail its trial, but it cuts the video for a minute.
+fn fits(p: &Probe, build: Option<Platform>) -> Result<(), String> {
+    match (Platform::of_soc(&p.soc), build) {
+        (Some(d), Some(b)) if d == b => Ok(()),
+        (Some(d), Some(b)) => Err(format!(
+            "this maburd is built for {}, the drone is {} ({})",
+            b.name(),
+            d.name(),
+            p.soc
+        )),
+        (None, _) => Err(format!(
+            "the drone's SoC ({:?}) is none maburd is built for",
+            p.soc
+        )),
+        (_, None) => {
+            Err("this maburd names neither libmi_sys nor libss_mpi: its platform is unknown".into())
+        }
+    }
 }
 
 /// Also the proof the swap script's boot guard waits for: this shell runs
@@ -579,7 +643,8 @@ const PROBE: &str = "e=$(readlink /proc/$PPID/exe); f=/etc/mabur.unproven; \
     [ \"$(cat $f)\" != \"$(cat /proc/sys/kernel/random/boot_id)\" ] && rm -f $f; \
     echo \"exe=$e\"; \
     echo \"sha=$(sha256sum /usr/bin/maburd 2>/dev/null | cut -d' ' -f1)\"; \
-    echo \"state=$(cat /tmp/mabur-up/state 2>/dev/null)\"; echo ---; cat /etc/mabur.toml";
+    echo \"state=$(cat /tmp/mabur-up/state 2>/dev/null)\"; \
+    echo \"soc=$(fw_printenv -n soc 2>/dev/null)\"; echo ---; cat /etc/mabur.toml";
 
 fn probe(hub: &Hub, answer: Duration) -> Result<Probe, ExecError> {
     let (st, out) = exec(hub, PROBE, &[], answer, Duration::from_secs(10), |_| {})?;
@@ -598,6 +663,7 @@ fn probe(hub: &Hub, answer: Duration) -> Result<Probe, ExecError> {
                 "exe" => p.exe = v.to_string(),
                 "sha" => p.sha = v.to_string(),
                 "state" => p.state = v.to_string(),
+                "soc" => p.soc = v.to_string(),
                 _ => {}
             }
         }
@@ -639,8 +705,8 @@ fn wait_for(hub: &Hub, limit: Duration, ok: impl Fn(&Probe) -> bool) -> Result<P
 }
 
 /// Runs the whole update; `link_ok` says whether video is coming in now,
-/// `may_go` whether the drone is known to be on the ground (`fc_disarmed`):
-/// asked before the upload, before the trial and before the commit.
+/// `may_go` whether the drone may restart maburd (`fc_not_armed`): asked
+/// before the upload, before the trial and before the commit.
 pub fn run(
     hub: &Hub,
     pl: &Payload,
@@ -658,6 +724,7 @@ pub fn run(
             now.exe
         ));
     }
+    fits(&now, Platform::of_maburd(&pl.maburd))?;
     let (config, config_changes) = pl.config_for(&now.config)?;
     if now.sha == new_sha && config == now.config {
         return Err("the drone already runs this maburd with this config".to_string());
@@ -808,14 +875,15 @@ pub fn video_flows(sh: &Shared) -> impl Fn() -> bool + '_ {
     }
 }
 
-/// A `may_go` for `run`: the flight controller's last HEARTBEAT is fresh and
-/// says disarmed. A drone without an FC, or one whose FC is not heard, may
-/// be in the air: no update.
-pub fn fc_disarmed(sh: &Shared) -> impl Fn() -> Result<(), String> + '_ {
+/// A `may_go` for `run`: no update while the flight controller's last
+/// HEARTBEAT says armed. No heartbeat (no FC, as on the camera, or MSP
+/// telemetry off) does not hold it: the GS meets the drone on the ground
+/// before a flight and updates it then (Ihor, 2026-11-14). The drone's own
+/// swap script holds the restart on its "armed" word the same way.
+pub fn fc_not_armed(sh: &Shared) -> impl Fn() -> Result<(), String> + '_ {
     move || match sh.fc_armed() {
-        Some(false) => Ok(()),
         Some(true) => Err("the drone is armed".to_string()),
-        None => Err("no heartbeat from the flight controller: the drone may be flying".to_string()),
+        _ => Ok(()),
     }
 }
 
@@ -834,11 +902,12 @@ enum Next {
 }
 
 /// `want`: the maburd's sha256, and the config the drone must hold too (a custom
-/// payload's own; None keeps the drone's). `fc`: the flight controller's arm
-/// state, None when not heard.
+/// payload's own; None keeps the drone's). `build`: the platform that maburd
+/// is for. `fc`: the flight controller's arm state, None when not heard.
 fn decide(
     p: &Result<Probe, ExecError>,
     want: (&str, Option<&str>),
+    build: Option<Platform>,
     tried: bool,
     fc: Option<bool>,
 ) -> Next {
@@ -853,9 +922,9 @@ fn decide(
         // ends it by itself within the swap script's commit wait.
         Ok(p) if p.exe != "/usr/bin/maburd" => Next::Wait(Duration::from_secs(10), "busy"),
         Ok(p) if p.sha == want && config.is_none_or(|c| c == p.config) => Next::Settled("current"),
+        Ok(p) if fits(p, build).is_err() => Next::Settled("other_platform"),
         Ok(_) if tried => Next::Keep,
         Ok(_) if fc == Some(true) => Next::Wait(Duration::from_secs(3), "armed"),
-        Ok(_) if fc.is_none() => Next::Wait(Duration::from_secs(3), "no_fc"),
         Ok(_) => Next::Update,
     }
 }
@@ -1020,7 +1089,8 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
                 v["fallback"] = true.into();
             }
         }
-        match decide(&p, (want, config.as_deref()), tried, sh.fc_armed()) {
+        let build = Platform::of_maburd(&pl.maburd);
+        match decide(&p, (want, config.as_deref()), build, tried, sh.fc_armed()) {
             Next::Wait(d, state) => {
                 v["state"] = state.into();
                 if let Err(e) = &p {
@@ -1031,6 +1101,9 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
             }
             Next::Settled(state) => {
                 v["state"] = state.into();
+                if let Some(Err(e)) = p.as_ref().ok().map(|p| fits(p, build)) {
+                    v["error"] = e.into();
+                }
                 sh.set_update(v);
                 settled = true;
             }
@@ -1047,7 +1120,13 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
                     base: v.clone(),
                     step: String::new(),
                 };
-                match run(&sh.maint, pl, &video_flows(sh), &fc_disarmed(sh), &mut prog) {
+                match run(
+                    &sh.maint,
+                    pl,
+                    &video_flows(sh),
+                    &fc_not_armed(sh),
+                    &mut prog,
+                ) {
                     Ok(r) => {
                         v["state"] = "updated".into();
                         v["secs"] = r.secs.into();
@@ -1102,42 +1181,67 @@ mod tests {
     }
 
     #[test]
-    fn the_automatic_update_installs_any_other_maburd_once_and_only_on_a_drone_known_disarmed() {
+    fn the_automatic_update_installs_any_other_maburd_of_the_drones_platform_once_unless_armed() {
         let drone = |exe: &str, sha: &str| {
             Ok(Probe {
                 exe: exe.into(),
                 sha: sha.into(),
+                soc: "ssc338q".into(),
                 ..Probe::default()
             })
         };
         let on_flash = "/usr/bin/maburd";
+        let star = Some(Platform::Star6e);
         let down = Some(false);
         assert_eq!(
-            decide(&drone(on_flash, "aa"), ("aa", None), false, None),
-            Next::Settled("current"),
-            "a current drone needs no FC"
+            decide(&drone(on_flash, "aa"), ("aa", None), star, false, None),
+            Next::Settled("current")
         );
         assert_eq!(
-            decide(&drone(on_flash, "bb"), ("aa", None), false, down),
+            decide(&drone(on_flash, "bb"), ("aa", None), star, false, down),
             Next::Update,
             "older or newer"
         );
         assert_eq!(
-            decide(&drone(on_flash, "bb"), ("aa", None), true, down),
+            decide(&drone(on_flash, "bb"), ("aa", None), star, false, None),
+            Next::Update,
+            "no FC heard (none, or MSP telemetry off) does not hold it"
+        );
+        assert_eq!(
+            decide(&drone(on_flash, "bb"), ("aa", None), star, true, down),
             Next::Keep
         );
         assert!(matches!(
-            decide(&drone(on_flash, "bb"), ("aa", None), false, Some(true)),
+            decide(
+                &drone(on_flash, "bb"),
+                ("aa", None),
+                star,
+                false,
+                Some(true)
+            ),
             Next::Wait(_, "armed")
         ));
-        assert!(matches!(
-            decide(&drone(on_flash, "bb"), ("aa", None), false, None),
-            Next::Wait(_, "no_fc")
-        ));
+        assert_eq!(
+            decide(
+                &drone(on_flash, "bb"),
+                ("aa", None),
+                Some(Platform::Cv610),
+                false,
+                down
+            ),
+            Next::Settled("other_platform"),
+            "a camera build never goes on a SigmaStar drone"
+        );
+        assert_eq!(
+            decide(&drone(on_flash, "bb"), ("aa", None), None, false, down),
+            Next::Settled("other_platform"),
+            "nor a build of no known platform"
+        );
         assert!(matches!(
             decide(
                 &drone("/tmp/mabur-up/maburd", "bb"),
                 ("aa", None),
+                star,
                 false,
                 down
             ),
@@ -1145,11 +1249,11 @@ mod tests {
         ));
         let armed = Err(ExecError::Closed(pal_wire::maint::STATUS_ARMED));
         assert!(matches!(
-            decide(&armed, ("aa", None), false, down),
+            decide(&armed, ("aa", None), star, false, down),
             Next::Wait(_, "armed")
         ));
         assert!(matches!(
-            decide(&Err(ExecError::NoAnswer), ("aa", None), false, down),
+            decide(&Err(ExecError::NoAnswer), ("aa", None), star, false, down),
             Next::Wait(_, "no_lane")
         ));
         // A custom payload with its own config: a drone with the right maburd
@@ -1159,13 +1263,35 @@ mod tests {
             p.config = "x = 1\n".into();
         }
         assert_eq!(
-            decide(&p, ("aa", Some("x = 1\n")), false, None),
+            decide(&p, ("aa", Some("x = 1\n")), star, false, None),
             Next::Settled("current")
         );
         assert_eq!(
-            decide(&p, ("aa", Some("x = 2\n")), false, down),
+            decide(&p, ("aa", Some("x = 2\n")), star, false, down),
             Next::Update
         );
+    }
+
+    #[test]
+    fn a_maburd_goes_only_to_a_drone_of_its_platform() {
+        let star: &[u8] = b"\x7fELF..libstdc++.so.6\0libmi_sys.so\0libmi_venc.so\0";
+        let cam: &[u8] = b"\x7fELF..libss_mpi.so\0libss_mpi_isp.so\0libot_osal.so\0";
+        assert_eq!(Platform::of_maburd(star), Some(Platform::Star6e));
+        assert_eq!(Platform::of_maburd(cam), Some(Platform::Cv610));
+        assert_eq!(Platform::of_maburd(b"\x7fELF test binary"), None);
+        let on = |soc: &str| Probe {
+            soc: soc.into(),
+            ..Probe::default()
+        };
+        assert_eq!(fits(&on("ssc338q"), Some(Platform::Star6e)), Ok(()));
+        assert_eq!(fits(&on("hi3516cv610\n"), Some(Platform::Cv610)), Ok(()));
+        let e = fits(&on("hi3516cv610"), Some(Platform::Star6e)).unwrap_err();
+        assert!(
+            e.contains("built for SigmaStar") && e.contains("Hi3516CV610"),
+            "{e}"
+        );
+        assert!(fits(&on(""), Some(Platform::Star6e)).is_err(), "SoC unread");
+        assert!(fits(&on("ssc338q"), None).is_err());
     }
 
     fn payload_dir(name: &str) -> PathBuf {
@@ -1653,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn swap_script_restarts_maburd_only_on_a_disarmed_drone() {
+    fn swap_script_restarts_maburd_only_on_a_drone_not_armed() {
         // No commit in time while armed: the new maburd keeps flying.
         let d = swap_world("held");
         std::fs::write(d.join("fc"), "armed\n").unwrap();
@@ -1669,7 +1795,7 @@ mod tests {
 
         // A commit while armed waits for the disarm; flash stays untouched.
         let d2 = swap_world("commit_held");
-        std::fs::write(d2.join("fc"), "unknown\n").unwrap();
+        std::fs::write(d2.join("fc"), "armed\n").unwrap();
         let mut c = swap(&d2, 30);
         wait_state(&d2, "trial");
         // The commit comes once the new maburd has spoken, as the GS's does
@@ -1691,6 +1817,36 @@ mod tests {
         assert_eq!(state(&d2), "committed");
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn swap_script_commits_on_a_drone_with_no_arm_report() {
+        // A camera with no FC says "unknown" for good: that held the commit
+        // forever before (Hi3516CV610, 2026-11-14).
+        let d = swap_world("unknown");
+        std::fs::write(d.join("fc"), "unknown\n").unwrap();
+        let mut c = swap(&d, 30);
+        wait_state(&d, "trial");
+        let t = Instant::now();
+        while !d.join("arm").exists() && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::write(d.join("up/commit"), "").unwrap();
+        // Bounded: a script that waits for "disarmed" never ends here.
+        let t = Instant::now();
+        let st = loop {
+            if let Some(st) = c.try_wait().unwrap() {
+                break st;
+            }
+            if t.elapsed() > Duration::from_secs(60) {
+                let _ = c.kill();
+                panic!("no commit in 60 s, state {}", state(&d));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(st.success());
+        assert_eq!(state(&d), "committed");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1911,10 +2067,10 @@ mod tests {
     }
 
     #[test]
-    fn the_fc_heartbeat_alone_lets_an_update_go() {
+    fn only_an_fc_heartbeat_saying_armed_holds_an_update() {
         let sh = Shared::default();
-        let go = fc_disarmed(&sh);
-        assert!(go().is_err(), "nothing heard: may be flying");
+        let go = fc_not_armed(&sh);
+        assert_eq!(go(), Ok(()), "nothing heard: no FC, or MSP telemetry off");
         let hb = |base_mode: u8, sys: u8| {
             let mut pl = [0u8; 9];
             pl[6] = base_mode;
@@ -1923,13 +2079,14 @@ mod tests {
         sh.note_mav(&hb(128 | 1, 1));
         assert_eq!(go(), Err("the drone is armed".to_string()));
         sh.note_mav(&hb(1, 191));
-        assert!(
-            go().is_err(),
+        assert_eq!(
+            go(),
+            Err("the drone is armed".to_string()),
             "maburd's own component says nothing of the FC"
         );
         sh.note_mav(&hb(1, 1));
         assert_eq!(go(), Ok(()));
-        *sh.fc_arm.lock().unwrap() = Some((false, Instant::now() - crate::FC_ARM_STALE));
-        assert!(go().is_err(), "a stale heartbeat proves nothing");
+        *sh.fc_arm.lock().unwrap() = Some((true, Instant::now() - crate::FC_ARM_STALE));
+        assert_eq!(go(), Ok(()), "a stale armed heartbeat holds nothing either");
     }
 }

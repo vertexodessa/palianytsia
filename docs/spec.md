@@ -225,7 +225,16 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   trial keeps the new maburd running from RAM until the drone is disarmed, and an armed drone at
   trial start is left alone (`aborted_armed`). Host tests: the swap script against a fake maburd
   that writes the arm file (hold, commit hold, abort), the FC gate on HEARTBEATs. Open: a bench run
-  with the arm file (needs a drone on the new maburd).
+  with the arm file (needs a drone on the new maburd). Changed 2026-11-14 (pal-54st, Ihor: the GS
+  and the drone meet on the ground before a flight): no heartbeat (no FC, or MSP telemetry off)
+  and the drone's `unknown` no longer hold an update; only a HEARTBEAT or an arm file saying
+  armed does. The Hi3516CV610 camera has no FC and its commit waited in `commit_held` for good.
+  The same change matches the build to the drone: the probe reads the U-Boot `soc` variable, and
+  a maburd goes only to a drone of its platform (SigmaStar `ssc33*`/`ssc30k*` for a build that
+  opens `libmi_sys.so`, Hi3516CV61x for one that links `libss_mpi*`); any other pair, or a SoC or
+  build of no known family, gets System `other_platform` with the reason, and the manual
+  `--update-drone` refuses it. Host tests: the platform pairs, the decision table, a commit on a
+  drone that reports `unknown`.
 - Recovery with no cable, 2026-11-14 (pal-448t.1, under pal-448t: the drone installed once by
   cable, everything after over the air): the trial proves a build in the boot that installs it,
   not after a reboot. The commit keeps the outgoing set, when proven, in `/etc/mabur-lkg` (maburd
