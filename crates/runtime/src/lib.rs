@@ -45,7 +45,8 @@ pub struct Shared {
     pub ended: AtomicBool,
     /// The window closed: the core loop returns, so the flight log flushes.
     pub quit: AtomicBool,
-    /// The core loop has returned and dropped its Session.
+    /// The core loop has returned and dropped its Session (set by the
+    /// CoreLoop's own drop, after its Sink).
     pub core_done: AtomicBool,
     pub lat: Lat,
     /// Events from other threads (decoder stalls) for the flight log; the
@@ -418,6 +419,18 @@ pub struct CoreLoop {
     /// The cards the core drives, in card order (`watch_cards`).
     taps: Vec<Arc<dyn RxTap>>,
     peer_rc: PeerRcWatch,
+    /// Declared last, so it drops after `sink` and its Session.
+    _done: DoneMark,
+}
+
+/// Publishes `Shared::core_done` when the CoreLoop is gone, however it ends
+/// (return, panic): the one owner of that fact.
+struct DoneMark(Arc<Shared>);
+
+impl Drop for DoneMark {
+    fn drop(&mut self) {
+        self.0.core_done.store(true, Ordering::Release);
+    }
 }
 
 /// The loop's channels to the UI.
@@ -443,6 +456,7 @@ impl CoreLoop {
     /// `lat`: the --lat latency report on stderr.
     pub fn new(core: Box<dyn GsCore>, sink: Sink, ports: LoopPorts, lat: bool) -> Self {
         warn_low_log_space(&sink);
+        let done = DoneMark(sink.shared.clone());
         Self {
             core,
             sink,
@@ -462,6 +476,7 @@ impl CoreLoop {
             held: None,
             taps: Vec::new(),
             peer_rc: PeerRcWatch::default(),
+            _done: done,
         }
     }
 
@@ -2024,6 +2039,14 @@ mod tests {
         // No time of its own: the draining tick's.
         assert_eq!(at("cards"), 4_000_000);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_core_loop_says_it_is_done_when_dropped() {
+        let Rig { cl, shared, .. } = rig(Box::new(AuCore), None);
+        assert!(!shared.core_done.load(Ordering::Acquire));
+        drop(cl);
+        assert!(shared.core_done.load(Ordering::Acquire));
     }
 
     #[test]

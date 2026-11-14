@@ -964,8 +964,6 @@ fn main() {
                                 }
                             }
                         }
-                        // `cl` (and its Session) is dropped by now.
-                        shared.core_done.store(true, Ordering::Release);
                     })
                     .expect("core thread");
             }
