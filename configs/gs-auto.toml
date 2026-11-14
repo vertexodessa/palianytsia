@@ -96,7 +96,10 @@ starved_confirm_ms     = 300    # no video this long = fall to the most robust r
 # trouble earlier than the base layer.
 s3_demote              = true   # step down on enhance-layer loss too
 s3_down_util           = 0.15   # enhance-layer loss level that triggers a step down
-s3_min_syms            = 50     # below this much traffic, a window tells us nothing
+s3_min_syms            = 300    # below this much traffic, a window tells us nothing: at low_power
+                                # (30 fps, ~1 Mbps) a 500 ms window holds ~100 enhance symbols, so
+                                # 4 lost ones (the 0.3-0.6 % on-air loss) passed 0.15 and the rung
+                                # saw-toothed (fl-1955: 16 s3 demotes in one flight, 2026-11-14)
 s3_settle_ms           = 300    # ignore this check just after a rung change
 
 # What a piece the software NACK (see [link.nack]) got re-sent counts as
