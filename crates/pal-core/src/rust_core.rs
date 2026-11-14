@@ -30,7 +30,7 @@ use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelector
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
 use crate::vrx::{RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState};
 use crate::CoreOpts;
-use crate::{Au, CoreIo, GsCore, Mode, RxBody};
+use crate::{Au, CoreIo, FecRow, GsCore, Mode, RxBody};
 use pal_wire::cal::{self, SweepSpec};
 use pal_wire::frame_wire::FrameHdr;
 use pal_wire::{rc, sbi, sw};
@@ -312,7 +312,7 @@ pub struct RustCore {
     /// The channel core's records for the flight log.
     chan_recs: Arc<std::sync::Mutex<ChanRecords>>,
     /// Closed loss episodes as fec.log rows, until the loop takes them.
-    fec_rows: std::collections::VecDeque<String>,
+    fec_rows: std::collections::VecDeque<FecRow>,
     /// Flight-log records outside the webgs line (`GsCore::take_log_records`).
     diag: DiagLane,
 }
@@ -507,8 +507,7 @@ impl RustCore {
     }
 
     /// mabur's GS drains the episodes every tick and stamps each with the op
-    /// and that layer's commanded overhead as of the tick (gs/src/main.cpp);
-    /// the row text is FecLog::row's, so flightreport.py reads the file.
+    /// and that layer's commanded overhead as of the tick (gs/src/main.cpp).
     fn queue_fec_rows(&mut self, now_ms: u64, op: &OpPoint) {
         for sid in 0..2 {
             let ov = if sid == 0 {
@@ -520,20 +519,14 @@ impl RustCore {
                 if self.fec_rows.len() >= FEC_ROWS_CAP {
                     self.fec_rows.pop_front();
                 }
-                self.fec_rows.push_back(format!(
-                    "{now_ms} {sid} {} {} {ov:.2} {} {} {} {} {} {} {} {} {}",
-                    op.mcs,
-                    op.bw,
-                    e.first_seq as u32,
-                    e.span,
-                    e.missing,
-                    e.recovered,
-                    e.retx,
-                    e.abandoned,
-                    e.stale,
-                    e.repairs,
-                    e.window
-                ));
+                self.fec_rows.push_back(FecRow {
+                    t_ms: now_ms,
+                    sid: sid as u8,
+                    mcs: op.mcs,
+                    bw: op.bw,
+                    ov,
+                    ep: e,
+                });
             }
         }
     }
@@ -1214,7 +1207,7 @@ impl GsCore for RustCore {
         r.q.drain(..).collect()
     }
 
-    fn take_fec_rows(&mut self) -> Vec<String> {
+    fn take_fec_rows(&mut self) -> Vec<FecRow> {
         self.fec_rows.drain(..).collect()
     }
 

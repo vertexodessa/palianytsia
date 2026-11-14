@@ -71,6 +71,21 @@ pub struct Au {
     pub vcl_nal: u8,
 }
 
+/// One closed loss episode with the link setting it closed under: a
+/// fec.log row (mabur FecLog::row; the text is flightlog's).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FecRow {
+    /// Core time of the tick that drained it.
+    pub t_ms: u64,
+    /// 0 base, 1 enh.
+    pub sid: u8,
+    pub mcs: i32,
+    pub bw: i32,
+    /// That layer's commanded overhead as of the tick.
+    pub ov: f64,
+    pub ep: pal_fec::LossEpisode,
+}
+
 /// What a core is started with; the same for the Rust core and mabur's.
 #[derive(Clone, Copy, Debug)]
 pub struct CoreOpts {
@@ -185,11 +200,9 @@ pub trait GsCore {
     fn take_chan_records(&mut self) -> Vec<String> {
         Vec::new()
     }
-    /// Loss episodes closed since the last call, one fec.log row each in
-    /// mabur's `feclog 4` text: `t_ms sid mcs bw ov first_seq span missing
-    /// recovered retx abandoned stale repairs window`. The oracle's shim
-    /// does not expose its episodes: empty.
-    fn take_fec_rows(&mut self) -> Vec<String> {
+    /// Loss episodes closed since the last call, one fec.log row each. The
+    /// oracle's shim does not expose its episodes: empty.
+    fn take_fec_rows(&mut self) -> Vec<FecRow> {
         Vec::new()
     }
     /// Flight-log records WebGs has no home for (drone shed episodes, ground reorder windows,

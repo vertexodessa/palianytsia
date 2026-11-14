@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use pal_core::{Au, RxBody};
+use pal_core::{Au, FecRow, RxBody};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -420,14 +420,14 @@ impl Session {
         self.guard(|s| s.write_refresh_events(evs))
     }
 
-    /// Loss episodes from `GsCore::take_fec_rows`, already in fec.log text.
-    pub fn fec_rows(&mut self, rows: &[String]) -> io::Result<()> {
+    /// Loss episodes from `GsCore::take_fec_rows`.
+    pub fn fec_rows(&mut self, rows: &[FecRow]) -> io::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
         self.guard(|s| {
             for r in rows {
-                writeln!(s.fec, "{r}")?;
+                writeln!(s.fec, "{}", fec_line(r))?;
             }
             Ok(())
         })
@@ -660,7 +660,32 @@ impl FecTotals {
     }
 }
 
-/// Episode rows of a fec.log (`I` / `H` lines and unknown text skipped).
+/// A fec.log episode row in mabur's `feclog 4` text (FecLog::row, which
+/// flightreport.py reads): `t_ms sid mcs bw ov first_seq span missing
+/// recovered retx abandoned stale repairs window`. `read_fec` parses it.
+fn fec_line(r: &FecRow) -> String {
+    let e = &r.ep;
+    format!(
+        "{} {} {} {} {:.2} {} {} {} {} {} {} {} {} {}",
+        r.t_ms,
+        r.sid,
+        r.mcs,
+        r.bw,
+        r.ov,
+        e.first_seq as u32,
+        e.span,
+        e.missing,
+        e.recovered,
+        e.retx,
+        e.abandoned,
+        e.stale,
+        e.repairs,
+        e.window
+    )
+}
+
+/// Episode rows of a fec.log as `fec_line` writes them (`I` / `H` lines
+/// and unknown text skipped).
 fn read_fec(path: &Path) -> io::Result<Option<[FecTotals; 2]>> {
     let f = match File::open(path) {
         Ok(f) => f,
@@ -1037,10 +1062,33 @@ mod tests {
         let root = std::env::temp_dir().join(format!("pal-fl-fec-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut s = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
+        let row = |t_ms, sid, ov, n: [u32; 8], first_seq| {
+            let mut r = FecRow {
+                t_ms,
+                sid,
+                mcs: 2,
+                bw: 20,
+                ov,
+                ..FecRow::default()
+            };
+            let e = &mut r.ep;
+            e.first_seq = first_seq;
+            [
+                e.span,
+                e.missing,
+                e.recovered,
+                e.retx,
+                e.abandoned,
+                e.stale,
+                e.repairs,
+                e.window,
+            ] = n;
+            r
+        };
         s.fec_rows(&[
-            "1000 0 2 20 0.50 100 1 1 1 0 0 0 2 32".into(),
-            "1200 0 2 20 0.50 200 12 7 5 1 1 0 3 32".into(),
-            "1300 1 2 20 0.25 300 4 3 0 0 3 0 1 32".into(),
+            row(1000, 0, 0.5, [1, 1, 1, 0, 0, 0, 2, 32], 100),
+            row(1200, 0, 0.5, [12, 7, 5, 1, 1, 0, 3, 32], 200),
+            row(1300, 1, 0.25, [4, 3, 0, 0, 3, 0, 1, 32], 300),
         ])
         .expect("rows");
         let ev = |kind, t_ms| Event {
@@ -1058,6 +1106,14 @@ mod tests {
         let text = fs::read_to_string(dir.join(FEC_FILE)).expect("fec.log");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "feclog 4");
+        assert_eq!(
+            lines[1..4],
+            [
+                "1000 0 2 20 0.50 100 1 1 1 0 0 0 2 32",
+                "1200 0 2 20 0.50 200 12 7 5 1 1 0 3 32",
+                "1300 1 2 20 0.25 300 4 3 0 0 3 0 1 32",
+            ]
+        );
         assert_eq!(lines[4], "I 1250 lost 4");
         assert_eq!(lines[5], "H 1600 350 1");
         assert_eq!(lines.len(), 6, "no fec.log line for a stuck request");
