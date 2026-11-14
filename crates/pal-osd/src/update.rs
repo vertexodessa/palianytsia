@@ -8,8 +8,8 @@ use crate::json::u64_or;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UpdateView {
-    /// waiting | current | armed | no_lane | busy | error | updating |
-    /// updated | failed
+    /// waiting | current | armed | no_fc | no_lane | busy | error |
+    /// updating | updated | failed | custom_wait
     pub state: String,
     pub step: String,
     /// Bytes of the current upload the drone has, of `total`.
@@ -20,6 +20,8 @@ pub struct UpdateView {
     /// The first 12 hex digits of this app's maburd and the drone's.
     pub app: String,
     pub drone: String,
+    /// Custom payload: `app` is the payload directory's maburd.
+    pub custom: bool,
 }
 
 impl UpdateView {
@@ -34,6 +36,7 @@ impl UpdateView {
             error: s("error"),
             app: s("app"),
             drone: s("drone"),
+            custom: v.get("custom").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
@@ -41,6 +44,7 @@ impl UpdateView {
     /// update runs (the drone's video is off on purpose), once it is done,
     /// and after it failed.
     pub fn banner(&self) -> Option<(String, bool)> {
+        let custom = if self.custom { " (custom maburd)" } else { "" };
         match self.state.as_str() {
             "updating" => {
                 let pct = (100 * self.done.min(self.total))
@@ -48,7 +52,7 @@ impl UpdateView {
                     .map_or(String::new(), |p| format!(" {p}%"));
                 Some((
                     format!(
-                        "UPDATING DRONE: {}{pct}. Keep it powered, the video is back in about a minute",
+                        "UPDATING DRONE{custom}: {}{pct}. Keep it powered, the video is back in about a minute",
                         self.step
                     ),
                     false,
@@ -56,12 +60,17 @@ impl UpdateView {
             }
             "updated" => Some((
                 format!(
-                    "DRONE UPDATED to this app's maburd in {:.0} s",
+                    "DRONE UPDATED to {} in {:.0} s",
+                    if self.custom {
+                        "the custom maburd"
+                    } else {
+                        "this app's maburd"
+                    },
                     self.secs.unwrap_or(0.0)
                 ),
                 false,
             )),
-            "failed" => Some((format!("DRONE UPDATE FAILED: {}", self.error), true)),
+            "failed" => Some((format!("DRONE UPDATE FAILED{custom}: {}", self.error), true)),
             _ => None,
         }
     }
@@ -70,6 +79,22 @@ impl UpdateView {
     pub fn line(&self) -> String {
         if let Some((b, _)) = self.banner() {
             return b;
+        }
+        if self.custom {
+            match self.state.as_str() {
+                "waiting" => {
+                    return format!("custom payload: waiting for the drone; custom maburd {}", self.app)
+                }
+                "current" => {
+                    return format!(
+                        "custom payload: the drone runs the custom maburd {}; remove it from the payload \
+                         directory to go back to this app's own",
+                        self.app
+                    )
+                }
+                "custom_wait" => return format!("custom payload: {}", self.error),
+                _ => {}
+            }
         }
         match self.state.as_str() {
             "waiting" => format!(
@@ -124,6 +149,20 @@ mod tests {
             assert_eq!(v.banner(), None, "{s}");
             assert!(!v.line().is_empty());
         }
+        let custom = view(r#"{"state":"updating","step":"uploading maburd","custom":true}"#);
+        assert!(custom
+            .banner()
+            .unwrap()
+            .0
+            .starts_with("UPDATING DRONE (custom maburd): "));
+        let custom = view(r#"{"state":"updated","secs":40,"custom":true}"#);
+        assert!(custom.banner().unwrap().0.contains("the custom maburd"));
+        for s in ["waiting", "current", "custom_wait"] {
+            let v = view(&format!(r#"{{"state":"{s}","app":"abc","custom":true}}"#));
+            assert_eq!(v.banner(), None, "{s}");
+            assert!(v.line().starts_with("custom payload: "), "{}", v.line());
+        }
+        assert!(!view(r#"{"state":"current","app":"abc"}"#).custom);
         assert!(UpdateView::parse(&serde_json::json!({})).is_none());
     }
 }

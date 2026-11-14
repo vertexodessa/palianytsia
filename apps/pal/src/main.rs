@@ -77,6 +77,8 @@ struct Opts {
     input: Option<PathBuf>,
     /// Live: update the drone from a release's drone/ directory (`--update-drone DIR`).
     update_drone: Option<PathBuf>,
+    /// `--payload-dir DIR`: `update_drone` holds a custom build.
+    update_custom: bool,
     pos: Vec<PathBuf>,
 }
 
@@ -125,6 +127,10 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             "--video-off" => o.video_off = true,
             "--input" => o.input = Some(val().into()),
             "--update-drone" => o.update_drone = Some(val().into()),
+            "--payload-dir" => {
+                o.update_drone = Some(val().into());
+                o.update_custom = true;
+            }
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
             "--capture-mb" => o.capture_mb = val().parse().unwrap_or_else(|_| die("--capture-mb")),
@@ -454,6 +460,7 @@ impl runtime::BodyLoop for Live {
 fn update_drone(
     shared: Arc<runtime::Shared>,
     dir: PathBuf,
+    custom: bool,
     done: Arc<std::sync::atomic::AtomicI32>,
 ) {
     use runtime::drone_update as du;
@@ -475,7 +482,13 @@ fn update_drone(
             }
         }
     }
-    let code = match du::Payload::from_dir(&dir) {
+    let pl = if custom {
+        du::Payload::custom_from_dir(&dir)
+            .and_then(|p| p.ok_or_else(|| format!("no maburd in {}", dir.display())))
+    } else {
+        du::Payload::from_dir(&dir)
+    };
+    let code = match pl {
         Err(e) => {
             eprintln!("pal: update: {e}");
             1
@@ -676,8 +689,8 @@ fn live(o: Opts) {
         let (sh, d) = (shared.clone(), done.clone());
         std::thread::spawn(move || maint_session(sh, cmd, input, d));
     } else if let Some(dir) = o.update_drone.clone() {
-        let (sh, d) = (shared.clone(), done.clone());
-        std::thread::spawn(move || update_drone(sh, dir, d));
+        let (sh, d, custom) = (shared.clone(), done.clone(), o.update_custom);
+        std::thread::spawn(move || update_drone(sh, dir, custom, d));
     }
     let mut close_ticks = 0u32;
     let end = Duration::from_secs(o.secs);

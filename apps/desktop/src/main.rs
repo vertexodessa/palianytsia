@@ -94,6 +94,8 @@ struct Opts {
     rust: bool,
     looping: bool,
     log_dir: Option<PathBuf>,
+    /// `--payload-dir DIR`: the payload directory of `drone_update::spawn_auto`.
+    payload_dir: Option<PathBuf>,
     snapshot: Option<PathBuf>,
     secs: f64,
     /// `--cal-start`: seconds after start, and the sweeps (empty = default).
@@ -200,6 +202,7 @@ fn parse() -> Opts {
             "--idr" => o.idr = Some(true),
             "--no-idr" => o.idr = Some(false),
             "--hwdec" => o.hwdec = val(),
+            "--payload-dir" => o.payload_dir = Some(val().into()),
             "--rf-sim" => runtime::rf_sim::install_spec(&val()).unwrap_or_else(|e| die(&e)),
             "--cal-start" => {
                 let v = val();
@@ -923,8 +926,12 @@ fn main() {
                                 };
                                 let (ch, w) = (o.ch, o.width);
                                 if o.mode == Mode::Gs {
-                                    // Keeps the drone on the maburd this build carries.
-                                    runtime::drone_update::spawn_auto(shared.clone());
+                                    // Keeps the drone on the maburd this build carries,
+                                    // or on the payload directory's.
+                                    runtime::drone_update::spawn_auto(
+                                        shared.clone(),
+                                        o.payload_dir.clone(),
+                                    );
                                 }
                                 if let Err(e) = runtime::run_live(cl, cfg, |chip| {
                                     eprintln!("pal-desktop: card {chip} on ch {ch} / {w} MHz")

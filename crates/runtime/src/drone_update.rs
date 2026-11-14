@@ -20,9 +20,10 @@
 //! reads the drone's maburd and installs its own when they differ, older or
 //! newer.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -44,19 +45,24 @@ pub const FORCED: &[(&str, &str, bool)] = &[
     ("air_clock", "efficiency_40", true),
 ];
 
-/// The drone side of a release.
+const RELEASE_TOML: &[u8] = include_bytes!("../../../release/drone/mabur.toml");
+const RELEASE_S96: &[u8] = include_bytes!("../../../release/drone/S96mabur");
+
+/// The drone side of a release, or of a custom build (`custom`).
 #[derive(Clone)]
 pub struct Payload {
     pub maburd: Vec<u8>,
-    /// The shipped mabur.toml: the source of the forced values, and the
-    /// config of a drone that has none.
+    /// A release: the shipped mabur.toml, the source of the forced values and
+    /// the config of a drone that has none. Custom: the config to install as it
+    /// is, or empty to keep the drone's own.
     pub toml: Vec<u8>,
     pub s96: Vec<u8>,
+    pub custom: bool,
 }
 
 impl Payload {
     /// `dir` holds maburd, mabur.toml and S96mabur (a release's `drone/`).
-    pub fn from_dir(dir: &std::path::Path) -> Result<Self, String> {
+    pub fn from_dir(dir: &Path) -> Result<Self, String> {
         let rd = |n: &str| {
             std::fs::read(dir.join(n)).map_err(|e| format!("{}: {e}", dir.join(n).display()))
         };
@@ -64,20 +70,171 @@ impl Payload {
             maburd: rd("maburd")?,
             toml: rd("mabur.toml")?,
             s96: rd("S96mabur")?,
+            custom: false,
         })
+    }
+
+    /// A custom build in `dir`: maburd, and optionally mabur.toml
+    /// (installed as it is) and S96mabur (else the release's). None when the
+    /// directory has no maburd.
+    pub fn custom_from_dir(dir: &Path) -> Result<Option<Self>, String> {
+        let rd = |n: &str| match std::fs::read(dir.join(n)) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", dir.join(n).display())),
+        };
+        let Some(maburd) = rd("maburd")? else {
+            return Ok(None);
+        };
+        // A wrong file would only be refused by the drone's trial, a minute
+        // of video later.
+        if !maburd.starts_with(b"\x7fELF") {
+            return Err(format!(
+                "{} is not an ELF binary",
+                dir.join("maburd").display()
+            ));
+        }
+        Ok(Some(Self {
+            maburd,
+            toml: rd("mabur.toml")?.unwrap_or_default(),
+            s96: rd("S96mabur")?.unwrap_or_else(|| RELEASE_S96.to_vec()),
+            custom: true,
+        }))
+    }
+
+    /// The config to install on a drone whose /etc/mabur.toml is `drone`, and
+    /// a line per change.
+    fn config_for(&self, drone: &str) -> Result<(String, Vec<String>), String> {
+        if self.custom {
+            if !self.toml.is_empty() {
+                let t = String::from_utf8_lossy(&self.toml).into_owned();
+                let ch = if t == drone {
+                    vec![]
+                } else {
+                    vec!["replaced by the custom mabur.toml".to_string()]
+                };
+                return Ok((t, ch));
+            }
+            if drone.trim().is_empty() {
+                return Err(
+                    "the drone has no /etc/mabur.toml: put one beside the custom maburd"
+                        .to_string(),
+                );
+            }
+            return Ok((drone.to_string(), vec![]));
+        }
+        let base = if drone.trim().is_empty() {
+            String::from_utf8_lossy(&self.toml).into_owned()
+        } else {
+            drone.to_string()
+        };
+        Ok(force_keys(&base, &String::from_utf8_lossy(&self.toml)))
+    }
+
+    /// The config a drone must hold besides the maburd to count as current:
+    /// a custom payload's own, None when the drone's config is kept.
+    fn exact_config(&self) -> Option<String> {
+        (self.custom && !self.toml.is_empty())
+            .then(|| String::from_utf8_lossy(&self.toml).into_owned())
     }
 }
 
 /// The drone files this build carries, or None for a build without
-/// `PAL_MABURD` (a developer's build: it updates no drone). The config and
-/// init script are the release's own (`release/drone`).
+/// `PAL_MABURD` (it updates no drone unless given a payload directory). The config and init script are the release's own
+/// (`release/drone`).
 pub fn embedded() -> Option<Payload> {
     const MABURD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/maburd"));
     (!MABURD.is_empty()).then(|| Payload {
         maburd: MABURD.to_vec(),
-        toml: include_bytes!("../../../release/drone/mabur.toml").to_vec(),
-        s96: include_bytes!("../../../release/drone/S96mabur").to_vec(),
+        toml: RELEASE_TOML.to_vec(),
+        s96: RELEASE_S96.to_vec(),
+        custom: false,
     })
+}
+
+/// How long the payload directory's files must stay unchanged before they are
+/// taken: a build or a copy is not taken half-written.
+pub const STILL: Duration = Duration::from_secs(2);
+
+type Stamp = Vec<Option<(u64, SystemTime)>>;
+/// A custom payload, its maburd's sha256 and a number that changes with each
+/// load.
+type CustomBuild = (Payload, String, u64);
+
+/// The payload directory, watched: its payload once the files are still.
+pub struct PayloadDir {
+    dir: PathBuf,
+    still: Duration,
+    stamp: Stamp,
+    since: Instant,
+    /// The build of `stamp`; None until loaded.
+    loaded: Option<Result<Option<CustomBuild>, String>>,
+    loads: u64,
+}
+
+impl PayloadDir {
+    pub fn new(dir: PathBuf) -> Self {
+        Self::with_still(dir, STILL)
+    }
+
+    fn with_still(dir: PathBuf, still: Duration) -> Self {
+        Self {
+            dir,
+            still,
+            stamp: Vec::new(),
+            since: Instant::now(),
+            loaded: None,
+            loads: 0,
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn stamp_now(&self) -> Stamp {
+        ["maburd", "mabur.toml", "S96mabur"]
+            .iter()
+            .map(|n| {
+                std::fs::metadata(self.dir.join(n))
+                    .ok()
+                    .map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+            })
+            .collect()
+    }
+
+    /// Ok(None): no maburd in the directory (custom payload off). Err: the files
+    /// are changing, or the maburd is no binary.
+    pub fn poll(&mut self) -> Result<Option<(&Payload, &str, u64)>, String> {
+        let s = self.stamp_now();
+        if s != self.stamp {
+            self.stamp = s;
+            self.since = Instant::now();
+            self.loaded = None;
+        }
+        if self.stamp[0].is_none() {
+            return Ok(None);
+        }
+        if self.since.elapsed() < self.still {
+            return Err(format!(
+                "the custom maburd is being written; it is taken once unchanged for {} s",
+                self.still.as_secs()
+            ));
+        }
+        if self.loaded.is_none() {
+            self.loads += 1;
+            let n = self.loads;
+            self.loaded = Some(Payload::custom_from_dir(&self.dir).map(|p| {
+                p.map(|p| (sha256_hex(&p.maburd), p))
+                    .map(|(s, p)| (p, s, n))
+            }));
+        }
+        match self.loaded.as_ref().expect("loaded above") {
+            Ok(Some((p, sha, n))) => Ok(Some((p, sha.as_str(), *n))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.clone()),
+        }
+    }
 }
 
 pub fn sha256_hex(b: &[u8]) -> String {
@@ -366,12 +523,7 @@ pub fn run(
             now.exe
         ));
     }
-    let base = if now.config.trim().is_empty() {
-        String::from_utf8_lossy(&pl.toml).into_owned()
-    } else {
-        now.config.clone()
-    };
-    let (config, config_changes) = force_keys(&base, &String::from_utf8_lossy(&pl.toml));
+    let (config, config_changes) = pl.config_for(&now.config)?;
     if now.sha == new_sha && config == now.config {
         return Err("the drone already runs this maburd with this config".to_string());
     }
@@ -546,8 +698,16 @@ enum Next {
     Update,
 }
 
-/// `fc`: the flight controller's arm state, None when not heard.
-fn decide(p: &Result<Probe, ExecError>, want: &str, tried: bool, fc: Option<bool>) -> Next {
+/// `want`: the maburd's sha256, and the config the drone must hold too (a custom
+/// payload's own; None keeps the drone's). `fc`: the flight controller's arm
+/// state, None when not heard.
+fn decide(
+    p: &Result<Probe, ExecError>,
+    want: (&str, Option<&str>),
+    tried: bool,
+    fc: Option<bool>,
+) -> Next {
+    let (want, config) = want;
     match p {
         Err(ExecError::NoAnswer) => Next::Wait(Duration::from_secs(20), "no_lane"),
         Err(ExecError::Closed(st)) if *st == pal_wire::maint::STATUS_ARMED => {
@@ -557,7 +717,7 @@ fn decide(p: &Result<Probe, ExecError>, want: &str, tried: bool, fc: Option<bool
         // A swap in progress (another GS, or one this app lost): the drone
         // ends it by itself within the swap script's commit wait.
         Ok(p) if p.exe != "/usr/bin/maburd" => Next::Wait(Duration::from_secs(10), "busy"),
-        Ok(p) if p.sha == want => Next::Settled("current"),
+        Ok(p) if p.sha == want && config.is_none_or(|c| c == p.config) => Next::Settled("current"),
         Ok(_) if tried => Next::Keep,
         Ok(_) if fc == Some(true) => Next::Wait(Duration::from_secs(3), "armed"),
         Ok(_) if fc.is_none() => Next::Wait(Duration::from_secs(3), "no_fc"),
@@ -565,8 +725,9 @@ fn decide(p: &Result<Probe, ExecError>, want: &str, tried: bool, fc: Option<bool
     }
 }
 
-/// Drone maburd hashes this process has tried to replace: once each, across
-/// link restarts (a Quest restarts its link when a card comes or goes).
+/// (drone, wanted) pairs this process has tried: each once, across link
+/// restarts (a Quest restarts its link when a card comes or goes). A new custom
+/// build makes a new pair.
 static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// How long "updated" stays on screen.
@@ -575,15 +736,20 @@ const UPDATED_SHOW: Duration = Duration::from_secs(15);
 /// Keeps the drone on this app's maburd while the link runs: a thread that
 /// probes the drone whenever it is heard (a session, or Telems in another
 /// RC version: the lane works across versions) and runs the update when the
-/// drone's maburd differs. Its state goes to `Shared::update`, and from
-/// there to the UI stats line. No-op for a build without a payload.
-pub fn spawn_auto(sh: Arc<Shared>) {
-    let Some(pl) = embedded() else {
+/// drone's maburd differs. A maburd in `custom` (`PayloadDir`) overrides the app's
+/// own. Its state goes to `Shared::update`, and from there to the UI stats
+/// line. No-op for a build without a payload and without a payload directory.
+pub fn spawn_auto(sh: Arc<Shared>, custom: Option<PathBuf>) {
+    let emb = embedded();
+    if emb.is_none() && custom.is_none() {
         return;
-    };
+    }
+    if let Some(d) = &custom {
+        log::info!("drone update: payload directory {}", d.display());
+    }
     let r = std::thread::Builder::new()
         .name("pal-dupdate".into())
-        .spawn(move || auto_loop(&sh, &pl));
+        .spawn(move || auto_loop(&sh, emb, custom.map(PayloadDir::new)));
     if let Err(e) = r {
         log::warn!("drone update thread: {e}");
     }
@@ -619,18 +785,74 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
 }
 
-fn auto_loop(sh: &Shared, pl: &Payload) {
-    let want = sha256_hex(&pl.maburd);
-    let base = |state: &str| serde_json::json!({ "state": state, "app": short(&want) });
-    sh.set_update(base("waiting"));
+/// The TRIED entry of updating the drone of `p` to `want` (plus `config`).
+fn tried_key(p: &Probe, want: &str, config: Option<&str>) -> String {
+    match config {
+        Some(c) => format!(
+            "{} {} > {want} {}",
+            p.sha,
+            sha256_hex(p.config.as_bytes()),
+            sha256_hex(c.as_bytes())
+        ),
+        None => format!("{} > {want}", p.sha),
+    }
+}
+
+fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) {
+    let emb_sha = emb.as_ref().map(|p| sha256_hex(&p.maburd));
+    // The payload in use: 0 the app's own, else the PayloadDir load number.
+    let mut using: Option<u64> = None;
+    let mut wait_shown = String::new();
     let (mut was_heard, mut settled) = (false, false);
     let mut next = Instant::now();
     let mut updated_at: Option<Instant> = None;
     while !sh.quit.load(Ordering::Relaxed) && !sh.core_done.load(Ordering::Acquire) {
+        let picked = match custom.as_mut().map(PayloadDir::poll) {
+            Some(Ok(Some(x))) => Ok(Some(x)),
+            Some(Err(e)) => Err(e),
+            _ => Ok(emb.as_ref().zip(emb_sha.as_deref()).map(|(p, s)| (p, s, 0))),
+        };
+        let (pl, want, id) = match picked {
+            Ok(Some(x)) => x,
+            Ok(None) => {
+                // Custom payload off in a build with no maburd of its own.
+                if using.take().is_some() {
+                    *sh.update.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            Err(e) => {
+                if e != wait_shown {
+                    sh.set_update(
+                        serde_json::json!({ "state": "custom_wait", "custom": true, "error": e }),
+                    );
+                    wait_shown = e;
+                }
+                using = None;
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+        };
+        wait_shown.clear();
+        let base = |state: &str| {
+            let mut v = serde_json::json!({ "state": state, "app": short(want) });
+            if pl.custom {
+                v["custom"] = true.into();
+            }
+            v
+        };
+        if using != Some(id) {
+            using = Some(id);
+            settled = false;
+            next = Instant::now();
+            updated_at = None;
+            sh.set_update(base("waiting"));
+        }
         if updated_at.is_some_and(|t| t.elapsed() > UPDATED_SHOW) {
             updated_at = None;
             let mut v = base("current");
-            v["drone"] = short(&want).into();
+            v["drone"] = short(want).into();
             sh.set_update(v);
         }
         let heard = sh.drone_heard.load(Ordering::Relaxed);
@@ -643,18 +865,20 @@ fn auto_loop(sh: &Shared, pl: &Payload) {
             std::thread::sleep(Duration::from_millis(250));
             continue;
         }
+        let config = pl.exact_config();
         let p = probe(&sh.maint, Duration::from_secs(3));
-        let tried = p.as_ref().is_ok_and(|p| {
-            TRIED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&p.sha)
-        });
+        let key = p
+            .as_ref()
+            .ok()
+            .map(|p| tried_key(p, want, config.as_deref()));
+        let tried = key
+            .as_ref()
+            .is_some_and(|k| TRIED.lock().unwrap_or_else(|e| e.into_inner()).contains(k));
         let mut v = base("");
         if let Ok(p) = &p {
             v["drone"] = short(&p.sha).into();
         }
-        match decide(&p, &want, tried, sh.fc_armed()) {
+        match decide(&p, (want, config.as_deref()), tried, sh.fc_armed()) {
             Next::Wait(d, state) => {
                 v["state"] = state.into();
                 if let Err(e) = &p {
@@ -671,13 +895,10 @@ fn auto_loop(sh: &Shared, pl: &Payload) {
             Next::Keep => settled = true,
             Next::Update => {
                 let from = p.map(|p| p.sha).unwrap_or_default();
-                TRIED
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(from.clone());
+                TRIED.lock().unwrap_or_else(|e| e.into_inner()).extend(key);
                 sh.event(
                     "drone_update",
-                    serde_json::json!({ "from": from, "to": want }),
+                    serde_json::json!({ "from": from, "to": want, "custom": pl.custom }),
                 );
                 let mut prog = AutoProgress {
                     sh,
@@ -750,37 +971,150 @@ mod tests {
         let on_flash = "/usr/bin/maburd";
         let down = Some(false);
         assert_eq!(
-            decide(&drone(on_flash, "aa"), "aa", false, None),
+            decide(&drone(on_flash, "aa"), ("aa", None), false, None),
             Next::Settled("current"),
             "a current drone needs no FC"
         );
         assert_eq!(
-            decide(&drone(on_flash, "bb"), "aa", false, down),
+            decide(&drone(on_flash, "bb"), ("aa", None), false, down),
             Next::Update,
             "older or newer"
         );
-        assert_eq!(decide(&drone(on_flash, "bb"), "aa", true, down), Next::Keep);
+        assert_eq!(
+            decide(&drone(on_flash, "bb"), ("aa", None), true, down),
+            Next::Keep
+        );
         assert!(matches!(
-            decide(&drone(on_flash, "bb"), "aa", false, Some(true)),
+            decide(&drone(on_flash, "bb"), ("aa", None), false, Some(true)),
             Next::Wait(_, "armed")
         ));
         assert!(matches!(
-            decide(&drone(on_flash, "bb"), "aa", false, None),
+            decide(&drone(on_flash, "bb"), ("aa", None), false, None),
             Next::Wait(_, "no_fc")
         ));
         assert!(matches!(
-            decide(&drone("/tmp/mabur-up/maburd", "bb"), "aa", false, down),
+            decide(
+                &drone("/tmp/mabur-up/maburd", "bb"),
+                ("aa", None),
+                false,
+                down
+            ),
             Next::Wait(_, "busy")
         ));
         let armed = Err(ExecError::Closed(pal_wire::maint::STATUS_ARMED));
         assert!(matches!(
-            decide(&armed, "aa", false, down),
+            decide(&armed, ("aa", None), false, down),
             Next::Wait(_, "armed")
         ));
         assert!(matches!(
-            decide(&Err(ExecError::NoAnswer), "aa", false, down),
+            decide(&Err(ExecError::NoAnswer), ("aa", None), false, down),
             Next::Wait(_, "no_lane")
         ));
+        // A custom payload with its own config: a drone with the right maburd
+        // and another config is not current.
+        let mut p = drone(on_flash, "aa");
+        if let Ok(p) = &mut p {
+            p.config = "x = 1\n".into();
+        }
+        assert_eq!(
+            decide(&p, ("aa", Some("x = 1\n")), false, None),
+            Next::Settled("current")
+        );
+        assert_eq!(
+            decide(&p, ("aa", Some("x = 2\n")), false, down),
+            Next::Update
+        );
+    }
+
+    fn payload_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pal-custom-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_payload_directory_gives_its_maburd_its_config_if_any_and_the_release_init_script() {
+        let d = payload_dir("payload");
+        assert!(
+            Payload::custom_from_dir(&d).unwrap().is_none(),
+            "no maburd: off"
+        );
+        std::fs::write(d.join("maburd"), "#!/bin/sh\n").unwrap();
+        let e = Payload::custom_from_dir(&d).err().unwrap();
+        assert!(e.contains("not an ELF"), "{e}");
+        std::fs::write(d.join("maburd"), b"\x7fELF custom build").unwrap();
+        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        assert!(p.custom && p.toml.is_empty());
+        assert_eq!(p.s96, RELEASE_S96);
+        assert_eq!(p.exact_config(), None);
+        let drone = "[radio]\nwall_margin_db = 1.0\n";
+        assert_eq!(
+            p.config_for(drone).unwrap(),
+            (drone.to_string(), vec![]),
+            "the drone's config as it is: no forced keys"
+        );
+        assert!(p.config_for("").is_err(), "nothing to keep");
+
+        std::fs::write(d.join("mabur.toml"), "[venc]\nfps = 90\n").unwrap();
+        std::fs::write(d.join("S96mabur"), "#!/bin/sh\n# custom\n").unwrap();
+        let p = Payload::custom_from_dir(&d).unwrap().unwrap();
+        let (t, ch) = p.config_for(drone).unwrap();
+        assert_eq!((t.as_str(), ch.len()), ("[venc]\nfps = 90\n", 1));
+        assert_eq!(p.exact_config().as_deref(), Some("[venc]\nfps = 90\n"));
+        assert_eq!(p.s96, b"#!/bin/sh\n# custom\n");
+
+        // A release payload still forces its keys.
+        let rel = Payload {
+            custom: false,
+            toml: SHIPPED.as_bytes().to_vec(),
+            ..p.clone()
+        };
+        let (t, _) = rel.config_for(drone).unwrap();
+        assert!(t.contains("wall_margin_db = 6.0"), "{t}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_payload_directory_is_taken_only_once_its_files_stay_unchanged() {
+        let d = payload_dir("watch");
+        let mut w = PayloadDir::with_still(d.clone(), Duration::from_millis(300));
+        assert!(matches!(w.poll(), Ok(None)), "empty: custom payload off");
+        std::fs::write(d.join("maburd"), b"\x7fELF one").unwrap();
+        assert!(w.poll().is_err(), "just written");
+        std::thread::sleep(Duration::from_millis(350));
+        let (sha1, n1) = {
+            let (p, sha, n) = w.poll().unwrap().unwrap();
+            assert_eq!(p.maburd, b"\x7fELF one");
+            (sha.to_string(), n)
+        };
+        assert_eq!(w.poll().unwrap().unwrap().2, n1, "loaded once");
+        std::fs::write(d.join("maburd"), b"\x7fELF two, longer").unwrap();
+        assert!(w.poll().is_err(), "a new build waits again");
+        std::thread::sleep(Duration::from_millis(350));
+        let (p, sha2, n2) = w.poll().unwrap().unwrap();
+        assert_eq!(p.maburd, b"\x7fELF two, longer");
+        assert!(sha2 != sha1 && n2 != n1);
+        std::fs::remove_file(d.join("maburd")).unwrap();
+        assert!(
+            matches!(w.poll(), Ok(None)),
+            "removed: back to the app's own"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_custom_build_is_a_new_try() {
+        let p = Probe {
+            sha: "old".into(),
+            config: "a = 1\n".into(),
+            ..Probe::default()
+        };
+        assert_ne!(tried_key(&p, "one", None), tried_key(&p, "two", None));
+        assert_ne!(
+            tried_key(&p, "one", Some("b = 1\n")),
+            tried_key(&p, "one", Some("b = 2\n"))
+        );
     }
 
     #[test]
