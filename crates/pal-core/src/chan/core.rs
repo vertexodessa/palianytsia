@@ -542,6 +542,14 @@ impl Live {
     }
 }
 
+/// A boot-pick relocate, alive for the one tick it is handed out in.
+#[derive(Clone, Copy)]
+struct Relocate {
+    ch: u8,
+    /// The calibration run's: the confirm lands it, no verify.
+    cal: bool,
+}
+
 pub struct ChannelCore {
     cfg: ChannelCoreCfg,
     live: Arc<Live>,
@@ -597,7 +605,6 @@ pub struct ChannelCore {
 
     link_edge_seen: bool,
     scout_card_died_seen: bool,
-    pending_relocate: Option<u8>,
     frozen_pick: Option<u8>,
     /// The last steer_into_use order.
     steer_ms: Option<f64>,
@@ -638,8 +645,6 @@ pub struct ChannelCore {
     // ---- a calibration run's channel pick ----
     cal_meas: CalMeasure,
     cal_reloc: CalReloc,
-    /// This tick's Relocate is the calibration's.
-    cal_reloc_tick: bool,
     /// The latest verdict window's reading of op: the worst valid card on
     /// op, foreign frames scaled to radio.scan.dwell_ms.
     op_live: Option<CalReading>,
@@ -875,7 +880,6 @@ impl ChannelCore {
             scout_card_down: false,
             link_edge_seen: false,
             scout_card_died_seen: false,
-            pending_relocate: None,
             frozen_pick: pinned.then_some(cfg.start_ch),
             steer_ms: None,
             op_scan: OpScan::default(),
@@ -905,7 +909,6 @@ impl ChannelCore {
             in_session_cur: false,
             cal_meas: CalMeasure::default(),
             cal_reloc: CalReloc::default(),
-            cal_reloc_tick: false,
             op_live: None,
             op_live_ms: -1.0,
             op_fig: None,
@@ -1328,13 +1331,13 @@ impl ChannelCore {
         self.plan
             .tick(inp.now_ms, inp.in_session || inp.cal_running);
         self.step_scout_inputs();
-        self.step_boot_pick(inp, vrx);
+        let reloc = self.step_boot_pick(inp, vrx);
         self.step_store(vrx);
         self.step_gates();
         self.step_hop_edge_and_window(inp, vrx);
         self.step_cal(inp);
-        self.step_lease(inp);
-        self.step_controller(inp, vrx);
+        self.step_lease(inp, reloc.is_some());
+        self.step_controller(inp, vrx, reloc);
         self.step_op_scan(inp);
         self.step_move_edge(inp.now_ms, vrx);
         self.step_drains();
@@ -1478,16 +1481,19 @@ impl ChannelCore {
         }
     }
 
+    /// `relocate`: this tick's controller step was a boot-pick relocate;
+    /// `cal`: that relocate is the calibration run's.
     fn dispatch_hop_action(
         &mut self,
         act: &HopAction,
-        relocate_tick: bool,
+        relocate: bool,
+        cal: bool,
         now_ms: f64,
         vrx: &mut VrxController,
     ) {
         self.apply_hop_action(act, now_ms, vrx);
-        self.boot_pick.note_hop_action(act.kind, relocate_tick);
-        let cal_order = relocate_tick && self.cal_reloc_tick;
+        self.boot_pick.note_hop_action(act.kind, relocate);
+        let cal_order = relocate && cal;
         if cal_order {
             if act.kind == HopActionKind::Order {
                 self.cal_reloc.s = CalRelocState::InFlight;
@@ -1646,7 +1652,6 @@ impl ChannelCore {
         let blocked = self.plan.hopping()
             || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
             || self.boot_pick.relocating()
-            || self.pending_relocate.is_some()
             || card.is_none_or(|c| self.scout_owns_card(c) || !self.live.cards[c].ready());
         let (Some(card), Some(sc), false) = (card, self.scanner.as_mut(), blocked) else {
             self.op_scan.defer(now);
@@ -1715,7 +1720,8 @@ impl ChannelCore {
         ));
     }
 
-    fn step_boot_pick(&mut self, inp: &ChannelTickIn, vrx: &VrxController) {
+    /// Returns the relocate the boot pick hands the controller this tick.
+    fn step_boot_pick(&mut self, inp: &ChannelTickIn, vrx: &VrxController) -> Option<Relocate> {
         let now_ms = inp.now_ms;
         self.steer_into_use(inp);
         let mut bi = BootPickIn {
@@ -1749,8 +1755,8 @@ impl ChannelCore {
         }
         self.link_edge_seen = false;
         self.scout_card_died_seen = false;
-        self.pending_relocate = None;
         self.last_bi = bi;
+        let mut reloc = None;
         let bo = self.boot_pick.tick(&bi);
         let op = self.plan.op();
         match bo {
@@ -1789,9 +1795,10 @@ impl ChannelCore {
                 ));
             }
             BootPickOut::Relocate(ch) => {
-                self.pending_relocate = Some(ch);
-                self.cal_reloc_tick =
-                    self.cal_reloc.s == CalRelocState::Waiting && ch == self.cal_reloc.ch;
+                reloc = Some(Relocate {
+                    ch,
+                    cal: self.cal_reloc.s == CalRelocState::Waiting && ch == self.cal_reloc.ch,
+                });
             }
             BootPickOut::Freeze { reason, accept_op } => {
                 if accept_op {
@@ -1809,6 +1816,7 @@ impl ChannelCore {
             }
             BootPickOut::None => {}
         }
+        reloc
     }
 
     fn step_store(&mut self, vrx: &mut VrxController) {
@@ -1836,7 +1844,7 @@ impl ChannelCore {
             self.hop_was_active = active;
             if !active {
                 let act = self.hopc.on_session_lost(now_ms, self.plan.op());
-                self.dispatch_hop_action(&act, false, now_ms, vrx);
+                self.dispatch_hop_action(&act, false, false, now_ms, vrx);
             }
             self.op_fig = None;
             self.verdict.reset();
@@ -2090,11 +2098,14 @@ impl ChannelCore {
         }
     }
 
-    fn step_controller(&mut self, inp: &ChannelTickIn, vrx: &mut VrxController) {
+    fn step_controller(
+        &mut self,
+        inp: &ChannelTickIn,
+        vrx: &mut VrxController,
+        reloc: Option<Relocate>,
+    ) {
         let now_ms = inp.now_ms;
         if !hop_active(inp.in_session, inp.cal_running) {
-            self.pending_relocate = None;
-            self.cal_reloc_tick = false;
             return;
         }
         let mut ht = HopTick {
@@ -2116,7 +2127,7 @@ impl ChannelCore {
         ht.video_on_target = self.plan.hopping() && self.last_video_ch == self.plan.hop_target();
         ht.rcf_sent_since_order = self.rcf_sent_total.wrapping_sub(self.rcf_sent_at_order) as i32;
         let relocation_owns = self.boot_pick.relocating()
-            || self.pending_relocate.is_some()
+            || reloc.is_some()
             || self.boot_pick.relocation_pending(&self.last_bi);
         // No relay sweeps here: a burst card is always a USB card.
         let burst_card = pick_burst_card(&self.live.can_scout, &[], inp.tx_card);
@@ -2188,14 +2199,14 @@ impl ChannelCore {
         if self.scout_owns() {
             ht.best = None;
             ht.escape = None;
-        } else if let Some(to) = self.pending_relocate {
+        } else if let Some(r) = reloc {
             ht.verdict.trigger = true;
             ht.relocate = true;
             // Onto the pin, or where a calibration run is about to
             // calibrate: the confirm lands it, no verify (the run's
             // cal_running would cut the verify window short anyway).
-            ht.no_verify = !self.reactive || self.cal_reloc_tick;
-            ht.best = Some(to);
+            ht.no_verify = !self.reactive || r.cal;
+            ht.best = Some(r.ch);
             ht.best_score = 0;
             ht.escape = None;
             ht.escape_score = 0;
@@ -2204,21 +2215,21 @@ impl ChannelCore {
             ht.escape = None;
         }
         let act = self.hopc.tick(&ht);
-        self.dispatch_hop_action(&act, ht.relocate, now_ms, vrx);
-        if let (true, Some(to)) = (ht.relocate, self.pending_relocate) {
+        let cal = reloc.is_some_and(|r| r.cal);
+        self.dispatch_hop_action(&act, ht.relocate, cal, now_ms, vrx);
+        if let (true, Some(r)) = (ht.relocate, reloc) {
+            let to = r.ch;
             let op = self.plan.op();
             let what = if act.kind == HopActionKind::Order {
                 "placed"
             } else {
                 "refused (hop cap)"
             };
-            let cal = if self.cal_reloc_tick { " (cal)" } else { "" };
+            let cal = if r.cal { " (cal)" } else { "" };
             self.log(format!(
                 "maburgs channel: relocate {op} -> {to} {what}{cal}"
             ));
         }
-        self.pending_relocate = None;
-        self.cal_reloc_tick = false;
     }
 
     // ---- a calibration run's channel pick (CalPicker; core thread) ----
@@ -2283,7 +2294,6 @@ impl ChannelCore {
             self.plan.set_want(self.now_ms_cur, op);
         }
         self.cal_reloc = CalReloc::default();
-        self.cal_reloc_tick = false;
     }
 
     /// The round's best member; None while it waits or runs, op when the
@@ -2581,7 +2591,8 @@ impl ChannelCore {
         self.lease_round = false;
     }
 
-    fn step_lease(&mut self, inp: &ChannelTickIn) {
+    /// `relocate_due`: the boot pick handed the controller a relocate this tick.
+    fn step_lease(&mut self, inp: &ChannelTickIn, relocate_due: bool) {
         let Some(scout) = self.scout.clone() else {
             return;
         };
@@ -2608,7 +2619,7 @@ impl ChannelCore {
         }
         let st = self.lease_state();
         if st == LeaseState::OneCard {
-            self.step_lease_one_card(inp);
+            self.step_lease_one_card(inp, relocate_due);
             return;
         }
         if st != LeaseState::TwoCard || self.lease_round {
@@ -2625,7 +2636,7 @@ impl ChannelCore {
             || self.plan.hopping()
             || self.dwell_busy()
             || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
-            || self.pending_relocate.is_some()
+            || relocate_due
             || self.boot_pick.relocation_pending(&self.last_bi)
         {
             return;
@@ -2655,7 +2666,7 @@ impl ChannelCore {
     /// flight or due, no reactive hop is being decided (trigger live or the
     /// verdict's references frozen), and nothing else holds the card. The
     /// burst's windows are masked from the verdict.
-    fn step_lease_one_card(&mut self, inp: &ChannelTickIn) {
+    fn step_lease_one_card(&mut self, inp: &ChannelTickIn, relocate_due: bool) {
         let now_ms = inp.now_ms;
         if now_ms - self.last_lease_burst_ms < f64::from(self.cfg.hop.lease_sweep_period_ms) {
             return;
@@ -2667,7 +2678,7 @@ impl ChannelCore {
             || self.plan.hopping()
             || (self.reactive && (lv.trigger || lv.ref_frozen))
             || !matches!(self.hopc.state(), HopState::Idle | HopState::Hold)
-            || self.pending_relocate.is_some()
+            || relocate_due
             || self.boot_pick.relocation_pending(&self.last_bi)
             || self.scout_owns()
             || self.burst_inflight
