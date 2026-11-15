@@ -318,6 +318,10 @@ impl History {
     pub fn last(&self) -> Option<&Snapshot> {
         self.rows.back().map(|(_, s)| s)
     }
+    /// When the newest snapshot came (the console's clock).
+    pub fn last_t(&self) -> Option<f64> {
+        self.rows.back().map(|(t, _)| *t)
+    }
     /// Per-interval deltas of a counter, as (t, value per second).
     fn rate(&self, f: impl Fn(&Snapshot) -> u64) -> Vec<(f64, f64)> {
         self.rows

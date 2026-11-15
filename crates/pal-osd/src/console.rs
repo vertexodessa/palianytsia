@@ -266,6 +266,19 @@ impl Console {
         crate::panel::surface(ctx, panel, i)
     }
 
+    /// The preflight checklist for the newest snapshot (empty before one).
+    pub fn preflight(&self) -> Vec<crate::preflight::Check> {
+        let (Some(s), Some(now)) = (self.hist.last(), self.hist.last_t()) else {
+            return Vec::new();
+        };
+        crate::preflight::checks(
+            s,
+            &self.hist.card_rates(),
+            &self.telem,
+            self.telem.is_fresh(now),
+        )
+    }
+
     /// The panel and what it reads this frame, for a container.
     pub fn panel_parts<'a>(
         &'a mut self,
@@ -273,6 +286,7 @@ impl Console {
         log_info: String,
         channels: &'a [u8],
     ) -> (&'a mut Panel, PanelIn<'a>) {
+        let preflight = self.preflight();
         (
             &mut self.panel,
             PanelIn {
@@ -291,6 +305,7 @@ impl Console {
                 fetch: self.hist.last().and_then(|s| s.fetch.as_ref()),
                 dvr: self.hist.last().and_then(|s| s.dvr.as_ref()),
                 tools_on: self.hist.last().is_some_and(|s| s.tools_on),
+                preflight,
             },
         )
     }

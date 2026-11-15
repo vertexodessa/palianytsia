@@ -14,6 +14,8 @@ pub mod panel;
 pub mod params;
 #[cfg(feature = "ui")]
 pub mod pointer;
+#[cfg(feature = "ui")]
+pub mod preflight;
 pub mod prefs;
 pub mod stall;
 #[cfg(feature = "ui")]

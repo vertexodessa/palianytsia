@@ -201,6 +201,8 @@ pub struct PanelIn<'a> {
     pub dvr: Option<&'a crate::widgets::DvrView>,
     /// The extra tools show (`runtime::drone_update::PayloadDir::tools`).
     pub tools_on: bool,
+    /// The preflight checklist; shown on the Flight tab while disarmed.
+    pub preflight: Vec<crate::preflight::Check>,
 }
 
 #[derive(Default)]
@@ -216,6 +218,32 @@ pub struct PanelOut {
 }
 
 const OK: Color32 = Color32::from_rgb(110, 220, 140);
+
+/// The preflight rows, worst first, one coloured line each.
+fn preflight_ui(ui: &mut Ui, rows: &[crate::preflight::Check]) {
+    use crate::preflight::{worst, Level};
+    let colour = |l: Level| match l {
+        Level::Ok => OK,
+        Level::Warn => WARN,
+        Level::Bad => BAD,
+    };
+    ui.separator();
+    let head = match worst(rows) {
+        Level::Ok => "Preflight: go",
+        Level::Warn => "Preflight: check the amber rows",
+        Level::Bad => "Preflight: NO GO, fix the red rows",
+    };
+    ui.label(RichText::new(head).strong().color(colour(worst(rows))));
+    let mut v: Vec<_> = rows.iter().collect();
+    v.sort_by_key(|c| std::cmp::Reverse(c.level));
+    for c in v {
+        ui.label(
+            RichText::new(format!("{:<6} {}", c.what, c.text))
+                .monospace()
+                .color(colour(c.level)),
+        );
+    }
+}
 const WARN: Color32 = Color32::from_rgb(240, 190, 60);
 const BAD: Color32 = Color32::from_rgb(240, 80, 70);
 
@@ -865,6 +893,9 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
                 ui.label(RichText::new(text).color(if *bad { BAD } else { WARN }));
             }
             ui.label(RichText::new(&i.link_info).monospace());
+            if i.armed != Some(true) && !i.preflight.is_empty() {
+                preflight_ui(ui, &i.preflight);
+            }
             ui.separator();
             let before = i.prefs.clone();
             if p.xr {
