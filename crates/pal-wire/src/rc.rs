@@ -490,9 +490,9 @@ pub fn parse_nack(b: &[u8]) -> Option<Nack> {
         n: cnt as u8,
         ..Default::default()
     };
-    for i in 0..cnt {
+    for (i, e) in n.e.iter_mut().take(cnt).enumerate() {
         let o = NACK_FIXED_LEN + i * NACK_ENTRY_LEN;
-        n.e[i] = NackEntry {
+        *e = NackEntry {
             first_seq: g32(b, o),
             bitmap: g32(b, o + 4),
         };
