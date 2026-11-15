@@ -173,12 +173,11 @@ impl Dvr {
     }
 
     /// The stats line's `dvr` field: state, the open file, MB written, the
-    /// last error. None while nothing was ever recorded or tried.
+    /// files of this session, the last error. Present from the start, so the
+    /// settings panel can tell a GS that records (state "off" until the arm)
+    /// from one that has no DVR (no field).
     pub fn status(&self) -> Option<serde_json::Value> {
         let st = match self.rec.state() {
-            State::Off if self.n == 0 && self.rec.error().is_none() && !self.failed_arm => {
-                return None
-            }
             State::Off => "off",
             State::WaitSync => "wait",
             State::Recording => "rec",
@@ -270,7 +269,8 @@ mod tests {
         );
         let p = nal(1, &[0x80, 0x01]);
         assert!(d.on_au(&au(p.clone(), 0), Some(false), 0).started.is_none());
-        assert!(d.status().is_none(), "nothing recorded: no chip");
+        assert_eq!(d.status().unwrap()["state"], "off", "nothing recorded yet");
+        assert_eq!(d.status().unwrap()["files"], 0);
         let s = d.on_au(&au(p.clone(), 10_000), Some(true), 10_000);
         assert_eq!(s.started, Some(dir.join("fl-1_x-1.mp4")));
         assert_eq!(d.status().unwrap()["state"], "wait");

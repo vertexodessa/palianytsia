@@ -289,6 +289,7 @@ impl Console {
                 armed: self.telem.last_s.map(|_| self.telem.armed),
                 update: self.hist.last().and_then(|s| s.update.as_ref()),
                 fetch: self.hist.last().and_then(|s| s.fetch.as_ref()),
+                dvr: self.hist.last().and_then(|s| s.dvr.as_ref()),
                 tools_on: self.hist.last().is_some_and(|s| s.tools_on),
             },
         )

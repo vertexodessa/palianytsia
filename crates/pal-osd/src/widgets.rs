@@ -57,7 +57,7 @@ pub struct Snapshot {
     /// The write error that stopped the flight log (UI stats line only).
     pub log_err: Option<String>,
     /// The GS DVR (`runtime::dvr::Dvr::status`, UI stats line only); None
-    /// before the first recording.
+    /// when this GS runs no DVR.
     pub dvr: Option<DvrView>,
     /// The automatic drone update; None in a build that carries no maburd
     /// (UI stats line only).
@@ -74,6 +74,8 @@ pub struct DvrView {
     pub state: String,
     pub file: Option<String>,
     pub mb: f64,
+    /// Files recorded in this session.
+    pub files: u64,
     pub error: Option<String>,
 }
 
@@ -83,6 +85,7 @@ impl DvrView {
             state: v.get("state")?.as_str()?.to_string(),
             file: v.get("file").and_then(Value::as_str).map(str::to_string),
             mb: v.get("mb").and_then(Value::as_f64).unwrap_or(0.0),
+            files: v.get("files").and_then(Value::as_u64).unwrap_or(0),
             error: v.get("error").and_then(Value::as_str).map(str::to_string),
         })
     }

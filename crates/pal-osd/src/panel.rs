@@ -197,6 +197,8 @@ pub struct PanelIn<'a> {
     pub update: Option<&'a crate::update::UpdateView>,
     /// The last fetch of the drone's logs.
     pub fetch: Option<&'a crate::update::FetchView>,
+    /// The GS DVR; None when this GS runs none.
+    pub dvr: Option<&'a crate::widgets::DvrView>,
     /// The extra tools show (`runtime::drone_update::PayloadDir::tools`).
     pub tools_on: bool,
 }
@@ -300,6 +302,46 @@ fn step(id: &str) -> f64 {
         "VENC_MIN_IQP" => 2.0,
         _ => 1.0,
     }
+}
+
+/// The only values a numeric row takes, ascending, when they are not every
+/// step: VENC_SLICES must cut the frame into whole 64-px CTU rows of equal
+/// height (the drone's `venc_cfg_slice_rows`), so at 1080 px (17 rows) it
+/// takes 1-6, 9 and 17 and refuses 7. None = step freely.
+fn allowed(id: &str, t: &Table) -> Option<Vec<f64>> {
+    match id {
+        "VENC_SLICES" => {
+            let mode = t
+                .rows
+                .iter()
+                .find(|r| r.id == "VENC_MODE")?
+                .value
+                .as_deref()?;
+            let h = mode_height(mode)?;
+            Some(slice_counts(h).into_iter().map(f64::from).collect())
+        }
+        _ => None,
+    }
+}
+
+/// The encoded height in a VENC_MODE value, `<fps>@<W>x<H>[/readout]`.
+fn mode_height(mode: &str) -> Option<u32> {
+    let size = mode.split('@').nth(1)?.split('/').next()?;
+    size.split('x').nth(1)?.trim().parse().ok()
+}
+
+/// Slice counts the drone accepts at this height: 1 (off) and every count
+/// whose fixed row height reproduces it (mabur `venc_cfg_slice_rows`).
+fn slice_counts(height: u32) -> Vec<u32> {
+    let rows = height.div_ceil(64);
+    let mut out = vec![1];
+    for s in 2..=rows {
+        let k = rows.div_ceil(s);
+        if rows.div_ceil(k) == s {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Choices for string rows on touch. VENC_MODE's come from the drone's
@@ -516,12 +558,24 @@ fn row_control(
                         format!("{:.2}", y)
                     }
                 };
+                let next = |up: bool| match allowed(&r.id, t) {
+                    Some(ok) => {
+                        let pick = if up {
+                            ok.iter().copied().find(|&a| a > x)
+                        } else {
+                            ok.iter().rev().copied().find(|&a| a < x)
+                        };
+                        pick.unwrap_or(x)
+                    }
+                    None if up => x + s,
+                    None => x - s,
+                };
                 if ui.add_enabled(can, egui::Button::new(" - ")).clicked() {
-                    cmd = Some(Cmd::Set(i, fmt(x - s)));
+                    cmd = Some(Cmd::Set(i, fmt(next(false))));
                 }
                 ui.label(RichText::new(&v).monospace());
                 if ui.add_enabled(can, egui::Button::new(" + ")).clicked() {
-                    cmd = Some(Cmd::Set(i, fmt(x + s)));
+                    cmd = Some(Cmd::Set(i, fmt(next(true))));
                 }
             }
             "str" if look.steppers && !presets(&r.id, t).is_empty() => {
@@ -919,7 +973,13 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
             table_status(ui, i.table, i.edits);
             cmd = rows_ui(ui, &RECORDING, i.table, i.edits, look);
             ui.separator();
-            ui.label(RichText::new("Ground DVR: not implemented yet").color(Color32::GRAY));
+            let (line, failed) = ground_dvr_line(i.dvr);
+            let color = if failed {
+                Color32::from_rgb(230, 80, 60)
+            } else {
+                Color32::GRAY
+            };
+            ui.label(RichText::new(line).color(color));
         }
         Tab::Screen => out.prefs_changed = screen_ui(ui, i.prefs, p.xr),
         Tab::System => {
@@ -1175,8 +1235,88 @@ fn channel_menu(
     out
 }
 
+/// The recording tab's ground line and whether it reports a failure.
+fn ground_dvr_line(d: Option<&crate::widgets::DvrView>) -> (String, bool) {
+    let Some(d) = d else {
+        return (
+            "Ground DVR: off in this session (pal-desktop records with --dvr-dir DIR)".into(),
+            false,
+        );
+    };
+    match d.state.as_str() {
+        "rec" => (
+            format!(
+                "Ground DVR: recording {} ({:.0} MB)",
+                d.file.as_deref().unwrap_or("?"),
+                d.mb
+            ),
+            false,
+        ),
+        "wait" => (
+            "Ground DVR: armed, the file opens on the next keyframe".into(),
+            false,
+        ),
+        "error" => (
+            format!("Ground DVR failed: {}", d.error.as_deref().unwrap_or("?")),
+            true,
+        ),
+        _ => (
+            format!(
+                "Ground DVR: records each arm to an MP4 on this device ({} this session)",
+                d.files
+            ),
+            false,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn slices_step_only_to_counts_the_drone_takes() {
+        // Same table as mabur's slice_rows_follow_the_sdk_row_geometry.
+        assert_eq!(slice_counts(1080), vec![1, 2, 3, 4, 5, 6, 9, 17]);
+        assert_eq!(slice_counts(1656), vec![1, 2, 3, 4, 5, 6, 7, 9, 13, 26]);
+        assert_eq!(slice_counts(816), vec![1, 2, 3, 4, 5, 7, 13]);
+        assert_eq!(mode_height("120@1728x816/binned"), Some(816));
+        assert_eq!(mode_height("60@2944x1656"), Some(1656));
+        assert_eq!(mode_height("junk"), None);
+    }
+
+    #[test]
+    fn the_ground_dvr_line_reports_the_recorder_not_a_placeholder() {
+        use crate::widgets::DvrView;
+        let v = |state: &str| DvrView {
+            state: state.into(),
+            file: Some("fl-7_x-2.mp4".into()),
+            mb: 41.6,
+            files: 2,
+            error: Some("500 MB free, 1024 MB needed".into()),
+        };
+        assert!(ground_dvr_line(None).0.contains("--dvr-dir"));
+        assert_eq!(
+            ground_dvr_line(Some(&v("off"))),
+            (
+                "Ground DVR: records each arm to an MP4 on this device (2 this session)".into(),
+                false
+            )
+        );
+        assert_eq!(
+            ground_dvr_line(Some(&v("rec"))).0,
+            "Ground DVR: recording fl-7_x-2.mp4 (42 MB)"
+        );
+        assert!(ground_dvr_line(Some(&v("wait")))
+            .0
+            .contains("next keyframe"));
+        assert_eq!(
+            ground_dvr_line(Some(&v("error"))),
+            (
+                "Ground DVR failed: 500 MB free, 1024 MB needed".into(),
+                true
+            )
+        );
+    }
     use super::*;
 
     #[test]
