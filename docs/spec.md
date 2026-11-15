@@ -738,7 +738,7 @@ The script never flashes, never touches MTD, and is run by the operator, not by 
 
    The worst body at the shipped window 64 costs under 0.5 ms at 20 % loss on both, against an 11.1 ms frame at 90 fps: the per-symbol allocations of the decoder are not worth pooling on these numbers, and the desktop does not need an SSSE3 kernel.
 4. Hardware, before any "replaces PixelPilot" claim: G2G median/p95 on the LED rig, RCF heard %, truncated-AU rate over a fixed 10 min bench run, both apps on the same phone, drone and rung.
-5. CI: fmt, clippy `-D warnings`, `cargo test --locked`, the parity gate, an APK build. Taken from openipc-rs's CI, minus the platforms we do not ship.
+5. CI: fmt, clippy `-D warnings`, `cargo nextest run --locked` (doctests by `cargo test --doc`), the parity gate, an APK build. Taken from openipc-rs's CI, minus the platforms we do not ship.
 
 ## 10 Milestones
 

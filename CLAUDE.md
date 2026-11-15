@@ -26,7 +26,7 @@ status: `docs/spec.md`; read its "Status (2026-11-07)" section first; the dated 
 ## Gates (run all before a commit)
 ```sh
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace && cargo test --workspace --doc   # nextest skips doctests
 tools/m0-parity.sh     # pal-ref == mabur's webgs replay on maburd dry-run files
 tools/m1-replay.sh     # ref == rust: AUs, sent RC bytes, final stats line, --idr path, a copy with bodies re-marked as NACK retransmits
 tools/doc-check.sh     # docs vs tree: .gitmodules branches, MABUR_RELEASE, RC_VERSION, release tag, paths
