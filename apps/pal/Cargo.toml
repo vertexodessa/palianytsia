@@ -16,5 +16,6 @@ runtime.workspace = true
 flightlog.workspace = true
 dvr.workspace = true
 decode.workspace = true
+hevc.workspace = true
 pal-build.workspace = true
 toml = "0.8"

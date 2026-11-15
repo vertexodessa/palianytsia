@@ -2021,6 +2021,7 @@ dependencies = [
  "devourer-sys",
  "dvr",
  "flightlog",
+ "hevc",
  "pal-build",
  "pal-core",
  "pal-ref",
