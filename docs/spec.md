@@ -358,9 +358,11 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   fails only under parallel load: 5/5 alone), ARM build 8822E. Open: on-device CCA readback, bench
   RCF/FEC comparison, benchjam deferral, the wing (Jaguar1) build.
 - mabur pin, 2026-11-15 (pal-mbtz.7): a keyframe-storm guard backs up the P-ceiling floor. A keyframe
-  within 250 ms of the previous one that no IDR request, rate or fps change explains (a request
-  explains one keyframe) lifts the SuperFrame threshold by 5/4, up to 2x; 5 s of calm steps it back
-  by 4/5. Why: at 120@1728x816 the floor (19740 B) sat 1 % above the P p99 of fl-1980 (19560 B, max
+  that no IDR request, rate or fps change explains (a request explains one keyframe) and that is
+  neither the first after bind nor on the periodic GOP lifts the SuperFrame threshold by 5/4, up to
+  2x; 5 s of calm steps it back by 4/5, not below the last storm's lift until 60 s pass without one.
+  Bench, same scene with the threshold forced to 100 % and no floor: 89 keyframes a minute without
+  the guard, 2 with it (p99 capture to complete base frame 47.7 against 28.4 ms). Why: at 120@1728x816 the floor (19740 B) sat 1 % above the P p99 of fl-1980 (19560 B, max
   26299 B), so a busier scene could wedge again. The 2x cap keeps one lifted P frame under one rung-0
   storm keyframe (46-100 kB), so the guard never costs more air than the storm it ends. Debug verb
   `superframe_discard` switches to the unmeasured DISCARD mode for a bench measurement. No config key,
