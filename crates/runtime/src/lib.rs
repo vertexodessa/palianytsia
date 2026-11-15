@@ -687,7 +687,7 @@ impl CoreLoop {
         match c {
             pal_osd::params::Cmd::Set(row, text) => {
                 let t = pal_osd::params::Table::parse(&self.core.params_json(self.sink.now_us));
-                let first = t.and_then(|t| param_order::rec_fps_first(&t, row, &text));
+                let first = t.and_then(|t| param_order::first_needed(&t, row, &text));
                 let r = match first {
                     Some((rec_row, rec_text)) => {
                         self.held = None;
@@ -759,6 +759,19 @@ impl CoreLoop {
             param_order::Step::Wait => {}
             param_order::Step::Send => {
                 let h = self.held.take().expect("held");
+                // A mode can need two sets first (REC_FPS, then
+                // VENC_SLICES): the next one goes out and holds the mode again.
+                if let Some((p_row, p_text)) = param_order::first_needed(&t, h.row, &h.text) {
+                    if self.send_set(p_row, &p_text).is_ok() {
+                        self.held = Some(param_order::Held {
+                            rec_row: p_row,
+                            rec_text: p_text,
+                            since_us: now,
+                            ..h
+                        });
+                        return;
+                    }
+                }
                 let r = self.send_set(h.row, &h.text);
                 let _ = self.ports.set_res_tx.try_send((h.row, r));
             }

@@ -7,6 +7,12 @@
 //! [1, venc.fps]" (the wing, 2026-11-14). A VENC_MODE set under the current
 //! REC_FPS therefore sends REC_FPS = the mode's rate first and holds the
 //! VENC_MODE set until the drone accepted it.
+//!
+//! The loader also checks `venc.slices` against the new frame height: a
+//! count that does not cut that height into whole 64-px CTU rows refuses
+//! the whole mode (26 slices are legal at 1656 px, not at 816). A
+//! VENC_MODE set whose height does not take the current VENC_SLICES sends
+//! the largest legal count at or under it first, the same way.
 
 use pal_osd::params::Table;
 
@@ -40,6 +46,28 @@ pub fn rec_fps_first(t: &Table, row: usize, text: &str) -> Option<(usize, String
     (rec_on && rec_fps > fps).then(|| (rec_row, fps.to_string()))
 }
 
+/// For a VENC_MODE set: the VENC_SLICES row and the count to send before
+/// it when the current count is not legal at the new height, else None.
+pub fn slices_first(t: &Table, row: usize, text: &str) -> Option<(usize, String)> {
+    if t.rows.get(row)?.id != "VENC_MODE" {
+        return None;
+    }
+    let (_, _, h, _) = pal_core::mav::parse_mode_text(text)?;
+    let s_row = t.rows.iter().position(|r| r.id == "VENC_SLICES")?;
+    let cur: u32 = t.rows[s_row].value.as_deref()?.parse().ok()?;
+    let ok = pal_osd::params::slice_counts(u32::try_from(h).ok()?);
+    if ok.contains(&cur) {
+        return None;
+    }
+    let pick = ok.into_iter().filter(|&s| s <= cur).max().unwrap_or(1);
+    Some((s_row, pick.to_string()))
+}
+
+/// The set a VENC_MODE set needs first, if any: REC_FPS, then VENC_SLICES.
+pub fn first_needed(t: &Table, row: usize, text: &str) -> Option<(usize, String)> {
+    rec_fps_first(t, row, text).or_else(|| slices_first(t, row, text))
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Step {
     /// REC_FPS still on its way.
@@ -57,20 +85,21 @@ pub fn step(h: &Held, t: &Table, now: u64) -> Step {
         return Step::Drop("link lost".into());
     }
     let Some(r) = t.rows.get(h.rec_row) else {
-        return Step::Drop("no REC_FPS row".into());
+        return Step::Drop("no prerequisite row".into());
     };
+    let id = &r.id;
     if t.pending.is_none() {
         match r.state.as_str() {
             "accepted" if r.value.as_deref() == Some(h.rec_text.as_str()) => return Step::Send,
-            "accepted" => return Step::Drop(format!("REC_FPS reads {:?}", r.value)),
+            "accepted" => return Step::Drop(format!("{id} reads {:?}", r.value)),
             "failed" | "unsupported" | "timeout" => {
-                return Step::Drop(format!("REC_FPS {}: {}", r.state, r.status));
+                return Step::Drop(format!("{id} {}: {}", r.state, r.status));
             }
             _ => {}
         }
     }
     if now.saturating_sub(h.since_us) >= HOLD_US {
-        return Step::Drop("REC_FPS did not settle".into());
+        return Step::Drop(format!("{id} did not settle"));
     }
     Step::Wait
 }
@@ -100,6 +129,41 @@ mod tests {
             ],
             ..Table::default()
         }
+    }
+
+    fn slices_table(slices: &str) -> Table {
+        Table {
+            linked: true,
+            rows: vec![
+                row("VENC_MODE", Some("60@2944x1656/native"), "idle"),
+                row("VENC_SLICES", Some(slices), "idle"),
+                row("REC_ENABLE", Some("0"), "idle"),
+                row("REC_FPS", Some("60"), "idle"),
+            ],
+            ..Table::default()
+        }
+    }
+
+    #[test]
+    fn a_mode_whose_height_refuses_the_slice_count_lowers_it_first() {
+        // The Quest, 2026-11-16: 26 slices at 1656 px, then 120@1728x816
+        // (13 CTU rows) was refused whole.
+        let t = slices_table("26");
+        assert_eq!(
+            first_needed(&t, 0, "120@1728x816/binned"),
+            Some((1, "13".into()))
+        );
+        // 9 is legal at 1656 and 1080, not at 816 (1-5, 7, 13): down to 7.
+        assert_eq!(
+            slices_first(&slices_table("9"), 0, "120@1728x816/binned"),
+            Some((1, "7".into()))
+        );
+        // A count the new height takes needs nothing.
+        assert_eq!(
+            first_needed(&slices_table("4"), 0, "120@1728x816/binned"),
+            None
+        );
+        assert_eq!(slices_first(&slices_table("26"), 1, "4"), None);
     }
 
     #[test]

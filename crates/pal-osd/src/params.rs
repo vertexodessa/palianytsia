@@ -89,6 +89,20 @@ pub struct Edits {
     pub last: Option<(usize, Result<(), String>)>,
 }
 
+/// Slice counts the drone accepts at this height: 1 (off) and every count
+/// whose fixed row height reproduces it (mabur `venc_cfg_slice_rows`).
+pub fn slice_counts(height: u32) -> Vec<u32> {
+    let rows = height.div_ceil(64);
+    let mut out = vec![1];
+    for s in 2..=rows {
+        let k = rows.div_ceil(s);
+        if rows.div_ceil(k) == s {
+            out.push(s);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

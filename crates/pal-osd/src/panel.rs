@@ -318,7 +318,12 @@ fn allowed(id: &str, t: &Table) -> Option<Vec<f64>> {
                 .value
                 .as_deref()?;
             let h = mode_height(mode)?;
-            Some(slice_counts(h).into_iter().map(f64::from).collect())
+            Some(
+                crate::params::slice_counts(h)
+                    .into_iter()
+                    .map(f64::from)
+                    .collect(),
+            )
         }
         _ => None,
     }
@@ -328,20 +333,6 @@ fn allowed(id: &str, t: &Table) -> Option<Vec<f64>> {
 fn mode_height(mode: &str) -> Option<u32> {
     let size = mode.split('@').nth(1)?.split('/').next()?;
     size.split('x').nth(1)?.trim().parse().ok()
-}
-
-/// Slice counts the drone accepts at this height: 1 (off) and every count
-/// whose fixed row height reproduces it (mabur `venc_cfg_slice_rows`).
-fn slice_counts(height: u32) -> Vec<u32> {
-    let rows = height.div_ceil(64);
-    let mut out = vec![1];
-    for s in 2..=rows {
-        let k = rows.div_ceil(s);
-        if rows.div_ceil(k) == s {
-            out.push(s);
-        }
-    }
-    out
 }
 
 /// Choices for string rows on touch. VENC_MODE's come from the drone's
@@ -1276,9 +1267,15 @@ mod tests {
     #[test]
     fn slices_step_only_to_counts_the_drone_takes() {
         // Same table as mabur's slice_rows_follow_the_sdk_row_geometry.
-        assert_eq!(slice_counts(1080), vec![1, 2, 3, 4, 5, 6, 9, 17]);
-        assert_eq!(slice_counts(1656), vec![1, 2, 3, 4, 5, 6, 7, 9, 13, 26]);
-        assert_eq!(slice_counts(816), vec![1, 2, 3, 4, 5, 7, 13]);
+        assert_eq!(
+            crate::params::slice_counts(1080),
+            vec![1, 2, 3, 4, 5, 6, 9, 17]
+        );
+        assert_eq!(
+            crate::params::slice_counts(1656),
+            vec![1, 2, 3, 4, 5, 6, 7, 9, 13, 26]
+        );
+        assert_eq!(crate::params::slice_counts(816), vec![1, 2, 3, 4, 5, 7, 13]);
         assert_eq!(mode_height("120@1728x816/binned"), Some(816));
         assert_eq!(mode_height("60@2944x1656"), Some(1656));
         assert_eq!(mode_height("junk"), None);
