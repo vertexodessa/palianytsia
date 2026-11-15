@@ -357,6 +357,7 @@ fn kind(path: &str) -> Option<Kind> {
         "link.fade.trigger_ms" => Int(50, 5000),
         "link.fade.min_rung" => Int(0, 15),
         "link.nack.enable" => Bool,
+        "link.ack_rcf" => Bool,
         "link.nack.lookback" => Int(8, 4096),
         "link.nack.repeat_ms" => Int(1, 1000),
         "link.nack.max_tries" => Int(0, 16),
@@ -967,6 +968,7 @@ fn helper_cases() -> Vec<Case> {
         bw,
         channels: chs.to_vec(),
         s3_demote: Some(false),
+        ack_rcf: Some(true),
     };
     let mut v = vec![
         Case {

@@ -3,6 +3,7 @@
 //! frames. Bring-up mirrors mabur's RadioFrontend (see cpp/dv.cpp).
 
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use pal_wire::dot11;
@@ -30,6 +31,16 @@ struct DvCfg {
     channel: u8,
     width_mhz: u8,
     ht40_offset: u8,
+    retry_limit: u8,
+    tx_report: u8,
+}
+
+#[repr(C)]
+struct DvTxRpt {
+    state: u8,
+    bmc: u8,
+    retries: u8,
+    queue_raw: u16,
 }
 
 #[repr(C)]
@@ -89,6 +100,11 @@ extern "C" {
     fn dv_start_rx(c: *mut DvCard, cb: RxCb, user: *mut c_void) -> c_int;
     fn dv_rx_ended(c: *const DvCard) -> c_int;
     fn dv_send_control(c: *mut DvCard, dot11: *const u8, len: usize) -> c_int;
+    fn dv_set_tx_report_cb(
+        c: *mut DvCard,
+        cb: Option<extern "C" fn(*mut c_void, *const DvTxRpt)>,
+        user: *mut c_void,
+    ) -> c_int;
     fn dv_chip(c: *const DvCard) -> *const c_char;
     fn dv_radio(c: *mut DvCard) -> *mut c_void;
     fn dv_close(c: *mut DvCard);
@@ -274,9 +290,16 @@ impl Ctl<'_> {
         }
     }
 
-    /// GS uplink control frame around an RC body.
+    /// GS uplink control frame around an RC body. With hardware-ACKed
+    /// RCFs on (`set_ack_rcf`) an RCF goes to the drone's responder from a
+    /// unicast TA; every other frame stays broadcast.
     pub fn send_control(&mut self, body: &[u8]) -> bool {
-        let f = dot11::control_frame(*self.seq, body);
+        let rcf = body.get(3) == Some(&pal_wire::rc::T_RCF);
+        let f = if rcf && ACK_RCF.load(Ordering::Relaxed) {
+            dot11::control_frame_acked(*self.seq, body)
+        } else {
+            dot11::control_frame(*self.seq, body)
+        };
         // A failed send keeps its number spent, as mabur's RadioFrontend.
         *self.seq = dot11::next_control_seq(*self.seq);
         unsafe { dv_send_control(self.raw, f.as_ptr(), f.len()) == 0 }
@@ -315,6 +338,58 @@ pub struct Config {
     pub width_mhz: u8,
 }
 
+/// Hardware-ACKed RCFs (pal-pzj.40): cards opened after this is set ask
+/// the chip for 2 retransmissions of an unACKed unicast frame and a TX
+/// report per frame; RCFs then go unicast (`Ctl::send_control`). Off by
+/// default; the drone must have its ACK responder armed on
+/// `dot11::ACK_RA` and accept RCFs from `dot11::ACK_TA`.
+static ACK_RCF: AtomicBool = AtomicBool::new(false);
+
+pub fn set_ack_rcf(on: bool) {
+    ACK_RCF.store(on, Ordering::Relaxed);
+}
+
+pub fn ack_rcf() -> bool {
+    ACK_RCF.load(Ordering::Relaxed)
+}
+
+/// Retransmissions of an unACKed RCF in the hardware-ACK mode: two keep a
+/// lost RCF's retries inside a millisecond at MCS 0.
+pub const ACK_RCF_RETRIES: u8 = 2;
+
+/// One CCX TX report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxReport {
+    /// 0 done (ACKed, or completed for a group frame), 1 retry limit hit
+    /// without an ACK, 2/3 firmware-specific.
+    pub state: u8,
+    /// A group frame: no ACK was expected.
+    pub bmc: bool,
+    pub retries: u8,
+    /// Jaguar1: 256 us units.
+    pub queue_raw: u16,
+}
+
+type ReportHandler = Box<dyn Fn(&TxReport) + Send + Sync>;
+
+extern "C" fn rpt_tramp(user: *mut c_void, r: *const DvTxRpt) {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: user is the Box<ReportHandler> the Card owns until
+        // dv_close (or a clear) has returned; r is valid for this call.
+        let h = unsafe { &*(user as *const ReportHandler) };
+        let r = unsafe { &*r };
+        h(&TxReport {
+            state: r.state,
+            bmc: r.bmc != 0,
+            retries: r.retries,
+            queue_raw: r.queue_raw,
+        });
+    }));
+    if res.is_err() {
+        std::process::abort();
+    }
+}
+
 type Handler = Box<dyn FnMut(&RxFrame) + Send>;
 
 pub struct Card {
@@ -324,6 +399,7 @@ pub struct Card {
     tx: Mutex<u16>,
     // Boxed twice so the C side holds a thin pointer that outlives start_rx.
     handler: Option<Box<Handler>>,
+    reports: Option<Box<ReportHandler>>,
 }
 
 // The C side serialises nothing itself; TX goes through `tx`, RX runs on
@@ -373,6 +449,8 @@ impl Card {
             channel: cfg.channel,
             width_mhz: cfg.width_mhz,
             ht40_offset: pal_wire::ht40::ht40_offset(cfg.channel),
+            retry_limit: if ack_rcf() { ACK_RCF_RETRIES } else { 0 },
+            tx_report: u8::from(ack_rcf()),
         };
         let mut err = [0 as c_char; 256];
         let raw = unsafe { dv_open(&c, err.as_mut_ptr(), err.len()) };
@@ -385,6 +463,7 @@ impl Card {
             raw,
             tx: Mutex::new(0),
             handler: None,
+            reports: None,
         })
     }
 
@@ -414,6 +493,19 @@ impl Card {
         Ok(())
     }
 
+    /// Hands every TX report to `f` (on the thread that drains them; keep
+    /// it cheap). Reports flow only on a card opened with `set_ack_rcf`.
+    pub fn on_tx_report(&mut self, f: impl Fn(&TxReport) + Send + Sync + 'static) -> bool {
+        let h: Box<ReportHandler> = Box::new(Box::new(f));
+        let user = &*h as *const ReportHandler as *mut c_void;
+        if unsafe { dv_set_tx_report_cb(self.raw, Some(rpt_tramp), user) } != 0 {
+            return false;
+        }
+        // The old handler (if any) is idle now: the set waits for it.
+        self.reports = Some(h);
+        true
+    }
+
     /// The RX thread has ended: devourer leaves its RX loop when the device
     /// goes away (a card that dropped off the bus). False before `start_rx`.
     pub fn rx_ended(&self) -> bool {
@@ -440,5 +532,6 @@ impl Drop for Card {
         // Joins the RX thread before the handler box is freed.
         unsafe { dv_close(self.raw) };
         self.handler.take();
+        self.reports.take();
     }
 }

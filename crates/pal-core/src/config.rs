@@ -418,6 +418,9 @@ impl Default for NackCfg {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinkCfg {
     pub feedback_ms: i32,
+    /// Hardware-ACKed RCFs (mabur RadioFrontend::Cfg::ack_rcf); the
+    /// Palianytsia apps take it from the panel instead.
+    pub ack_rcf: bool,
     pub beacon_keepalive_ms: i32,
     pub rcf_slot_hold_ms: i32,
     pub arrival_guard_syms: u32,
@@ -438,6 +441,7 @@ impl Default for LinkCfg {
     fn default() -> Self {
         Self {
             feedback_ms: 100,
+            ack_rcf: false,
             beacon_keepalive_ms: 1000,
             rcf_slot_hold_ms: 30,
             arrival_guard_syms: 192,
@@ -876,6 +880,8 @@ pub struct LinkPick {
     pub channels: Vec<u8>,
     /// `link.s3_demote`; None = the config's own.
     pub s3_demote: Option<bool>,
+    /// `link.ack_rcf`; None = the config's own.
+    pub ack_rcf: Option<bool>,
 }
 
 /// `text` with `pick` applied, and one line per choice that could not be
@@ -899,6 +905,12 @@ pub fn with_link_pick(text: &str, pick: LinkPick) -> (String, Vec<String>) {
         match with_link_key(&out, "s3_demote", Value::Boolean(on)) {
             Ok(t) => out = t,
             Err(e) => skipped.push(format!("s3_demote {on} not applied: {e}")),
+        }
+    }
+    if let Some(on) = pick.ack_rcf {
+        match with_ack_rcf(&out, on) {
+            Ok(t) => out = t,
+            Err(e) => skipped.push(format!("ack_rcf {on} not applied: {e}")),
         }
     }
     // The choice was saved against a set and a width: what is no longer a
@@ -1037,6 +1049,11 @@ pub fn with_link_bw(text: &str, bw: u8) -> R<String> {
 }
 
 /// `link.<key>` set to `v`, checked by the config parser.
+/// `text` with `link.ack_rcf` set to `on`.
+pub fn with_ack_rcf(text: &str, on: bool) -> R<String> {
+    with_link_key(text, "ack_rcf", Value::Boolean(on))
+}
+
 fn with_link_key(text: &str, key: &str, v: Value) -> R<String> {
     let mut j = parse_table(text)?;
     ensure_table(&mut j, "link")?.insert(key.into(), v);
@@ -1166,6 +1183,7 @@ const LINK_KEYS: &[&str] = &[
     "nack_residual",
     "key_file",
     "key",
+    "ack_rcf",
 ];
 const RUNG_KEYS: &[&str] = &["mcs", "bw", "overhead_base", "overhead_enh"];
 const PROBE_KEYS: &[&str] = &[
@@ -1332,6 +1350,7 @@ pub fn dump(c: &Config) -> String {
 
     let LinkCfg {
         feedback_ms,
+        ack_rcf,
         beacon_keepalive_ms,
         rcf_slot_hold_ms,
         arrival_guard_syms,
@@ -1348,6 +1367,7 @@ pub fn dump(c: &Config) -> String {
         key_source,
     } = link;
     put("link.feedback_ms", feedback_ms.to_string());
+    put("link.ack_rcf", ack_rcf.to_string());
     put("link.beacon_keepalive_ms", beacon_keepalive_ms.to_string());
     put("link.rcf_slot_hold_ms", rcf_slot_hold_ms.to_string());
     put("link.arrival_guard_syms", arrival_guard_syms.to_string());
@@ -1880,6 +1900,7 @@ fn parse_config(j: &Table) -> R<Config> {
             inline_key = get_str(r, "key", "", "link")?;
         }
         l.feedback_ms = get_i32(r, "feedback_ms", 100, 20, 5000, "link")?;
+        l.ack_rcf = get_bool(r, "ack_rcf", false, "link")?;
         l.rcf_slot_hold_ms = get_i32(r, "rcf_slot_hold_ms", 30, 0, 1000, "link")?;
         l.arrival_guard_syms = get_int(r, "arrival_guard_syms", 192, 16, 512, "link")? as u32;
         l.beacon_keepalive_ms = get_i32(r, "beacon_keepalive_ms", 1000, 100, 60000, "link")?;
@@ -2184,6 +2205,7 @@ mod tests {
             bw,
             channels: chs.to_vec(),
             s3_demote: None,
+            ack_rcf: None,
         };
         let grid20 = with_search_grid(&with_link_bw(&auto, 20).unwrap()).unwrap();
         let (t, skipped) = with_link_pick(&auto, pick(20, &[161]));
@@ -2225,6 +2247,17 @@ mod tests {
         let (t, skipped) = with_link_pick(&auto, off);
         assert!(skipped.is_empty(), "{skipped:?}");
         assert!(!parse_config_str(&t).unwrap().link.ladder_cfg.s3_demote);
+        let on = LinkPick {
+            ack_rcf: Some(true),
+            ..pick(20, &[])
+        };
+        let (t, skipped) = with_link_pick(&auto, on);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(parse_config_str(&t).unwrap().link.ack_rcf);
+        assert!(
+            !parse_config_str(&auto).unwrap().link.ack_rcf,
+            "off by default"
+        );
     }
 
     #[test]

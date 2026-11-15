@@ -36,6 +36,13 @@ typedef struct {
   uint8_t channel;
   uint8_t width_mhz;  /* 20 or 40 */
   uint8_t ht40_offset; /* at 40 MHz: 1 = secondary above, 2 = below */
+  /* devourer tx.retry_limit: hardware retransmissions of a frame to a
+   * unicast addr1 that got no ACK (0 = one try). Group-addressed frames
+   * never wait for an ACK. */
+  uint8_t retry_limit;
+  /* devourer tx.report: 1 = a CCX TX report for every sent frame,
+   * delivered to dv_set_tx_report_cb's callback; 0 = none. */
+  uint8_t tx_report;
 } dv_cfg;
 
 /* NULL on failure; err gets "no device", "claim failed rc=N", "unsupported chip". */
@@ -45,6 +52,19 @@ int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user);
 /* 1 once the RX thread has left devourer's RX loop (the device went away,
  * or dv_close stopped it); 0 while it runs or before dv_start_rx. */
 int dv_rx_ended(const dv_card *c);
+/* One CCX TX report (devourer TxReport). Jaguar1 reports carry no tag:
+ * they come in send order. */
+typedef struct {
+  uint8_t state;      /* 0 done (ACKed, or completed for a group frame), 1 retry limit hit, 2/3 fw */
+  uint8_t bmc;        /* a group frame: no ACK was expected */
+  uint8_t retries;    /* hardware retransmissions used */
+  uint16_t queue_raw; /* Jaguar1: 256 us units */
+} dv_txrpt;
+typedef void (*dv_txrpt_cb)(void *user, const dv_txrpt *r);
+/* Sets (cb non-NULL) or clears the TX report callback. It runs on the
+ * thread that drains C2H (the RX thread on Jaguar1/2, the coex thread on
+ * Jaguar3): cheap and thread-safe. Returns once no earlier callback runs. */
+int dv_set_tx_report_cb(dv_card *c, dv_txrpt_cb cb, void *user);
 /* Sends a dot11 GS uplink control frame behind the MAX_RANGE radiotap. */
 int dv_send_control(dv_card *c, const uint8_t *dot11, size_t len);
 /* What the channel search reads (devourer RxEnergy / NhmBusy /

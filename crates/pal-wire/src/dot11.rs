@@ -38,7 +38,8 @@ pub fn body_offset(d: &[u8]) -> usize {
 }
 
 pub fn sa_canonical(d: &[u8]) -> bool {
-    d.len() >= 16 && d[10..16] == SA
+    // An ACKed RCF from another GS card is ours too, not foreign air.
+    d.len() >= 16 && (d[10..16] == SA || d[10..16] == ACK_TA)
 }
 
 /// RX rate code to HT MCS: Jaguar DESC_RATE 0x0C..0x13 or Kestrel 0x80..0x87.
@@ -84,6 +85,26 @@ pub fn control_frame(seq: u16, body: &[u8]) -> Vec<u8> {
     f
 }
 
+/// Hardware-ACKed RCFs (`link.ack_rcf`, pal-pzj.40): the address the
+/// drone's ACK responder is armed on. Unicast and locally administered
+/// (first octet 0x56); the canonical SA cannot take an ACK, its group bit
+/// is set.
+pub const ACK_RA: [u8; 6] = [0x56, 0x42, 0x75, 0x05, 0xd6, 0x01];
+/// The GS's transmitter address on a hardware-ACKed RCF: unicast, so the
+/// drone's ACK has somewhere to go. Any unicast TA works for the
+/// soliciting side (devourer docs/scheduled-mac.md, 8812AU 1.00 ACK rate
+/// with an arbitrary TA).
+pub const ACK_TA: [u8; 6] = [0x56, 0x42, 0x75, 0x05, 0xd6, 0x00];
+
+/// `control_frame` addressed for a hardware ACK: addr1 the drone's
+/// responder, addr2 the GS's unicast TA, BSSID the canonical SA.
+pub fn control_frame_acked(seq: u16, body: &[u8]) -> Vec<u8> {
+    let mut f = control_frame(seq, body);
+    f[4..10].copy_from_slice(&ACK_RA);
+    f[10..16].copy_from_slice(&ACK_TA);
+    f
+}
+
 /// The sequence number after `seq`, wrapping at the field's 12 bits.
 pub fn next_control_seq(seq: u16) -> u16 {
     seq.wrapping_add(1) & 0xFFF
@@ -101,6 +122,19 @@ mod tests {
         f[22] = sc[0];
         f[23] = sc[1];
         f
+    }
+
+    #[test]
+    fn an_acked_control_frame_is_unicast_both_ways() {
+        let f = control_frame_acked(7, &[1, 2, 3]);
+        assert_eq!(f[4] & 1, 0, "addr1 unicast");
+        assert_eq!(f[10] & 1, 0, "addr2 unicast");
+        assert_eq!(&f[4..10], &ACK_RA);
+        assert_eq!(&f[16..22], &SA);
+        assert_eq!(f[24..], [1, 2, 3]);
+        assert_eq!(control_frame(7, &[1, 2, 3])[22..], f[22..]);
+        // Another GS card hearing it counts it as ours, not foreign air.
+        assert!(sa_canonical(&f));
     }
 
     #[test]

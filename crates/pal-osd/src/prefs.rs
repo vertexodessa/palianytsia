@@ -37,6 +37,10 @@ pub struct HudPrefs {
     /// (`link.s3_demote`), applied when the link starts. On the bench it
     /// caused 15 of 24 demotes with the base layer clean (2026-11-03).
     pub s3_demote: bool,
+    /// Feedback to the drone asks for a radio ACK and the card resends a
+    /// missed one at once (`link.ack_rcf`), applied when the link starts.
+    /// Needs the drone's `radio.ack_rcf`.
+    pub ack_rcf: bool,
     /// Stats chips the operator dragged away from their row: chip label to
     /// offset in points from the video's top-left corner (may lie outside
     /// the video). A chip not in the map keeps its place in the row.
@@ -108,6 +112,7 @@ impl Default for HudPrefs {
             video_filter: VideoFilter::Off,
             quest_view: QuestView::Goggle,
             s3_demote: true,
+            ack_rcf: false,
             chip_pos: Default::default(),
         }
     }
@@ -122,6 +127,7 @@ impl HudPrefs {
             "link_channels": self.link_channels,
             "video_filter": self.video_filter.key(), "quest_view": self.quest_view.key(),
             "s3_demote": self.s3_demote,
+            "ack_rcf": self.ack_rcf,
             "chip_pos": self.chip_pos,
         })
         .to_string()
@@ -163,6 +169,7 @@ impl HudPrefs {
             video_filter: VideoFilter::parse(&str_or(&v, "video_filter", "")),
             quest_view: QuestView::parse(&str_or(&v, "quest_view", "")),
             s3_demote: b("s3_demote", d.s3_demote),
+            ack_rcf: b("ack_rcf", d.ack_rcf),
             chip_pos: v
                 .get("chip_pos")
                 .and_then(Value::as_object)
@@ -207,6 +214,7 @@ mod tests {
             video_filter: super::VideoFilter::Supersample,
             quest_view: super::QuestView::Window,
             s3_demote: false,
+            ack_rcf: true,
             chip_pos: [("loss".to_string(), [-120.5, 40.0])].into(),
             ..Default::default()
         };

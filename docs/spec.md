@@ -368,6 +368,14 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   `superframe_discard` switches to the unmeasured DISCARD mode for a bench measurement. No config key,
   RC 18 unchanged. mabur host suite 259/259, ARM build. Open: the bench run (pal-mbtz.5 arm A with
   floor 0: run ends within 3 frames, txq_wait, truncated AUs) and the DISCARD measurement.
+- mabur pin, 2026-11-15 (pal-pzj.40): hardware-ACKed RCFs, opt-in on both ends (`link.ack_rcf` on
+  the GS, `radio.ack_rcf` on the drone, both default false in code, bundles and
+  `release/drone/mabur.toml`). An RCF goes unicast to the drone's ACK responder
+  (56:42:75:05:d6:01, TA 56:42:75:05:d6:00) and the card retries a missed one up to 2 times; DISCs
+  stay broadcast. The Rust GS has it behind the Link tab's Advanced switch (`HudPrefs.ack_rcf`) and
+  logs the TX reports as `rcf_ack` events. Either end alone still links. mabur host suite 259/259,
+  ARM build. Open: retries seen on air from the 8812AU, the drone's ACKs, and the A/B against the
+  2026-09-05 switch-loss method on the bench.
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).

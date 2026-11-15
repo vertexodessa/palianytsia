@@ -94,6 +94,8 @@ static dv_card *open_card(std::unique_ptr<dv_card> &c, const dv_cfg *cfg, char *
   dc.tuning.disable_cca = false;
   dc.tx.no_cancel_multipkt = true;
   dc.usb.rx_zerocopy = false;
+  dc.tx.retry_limit = cfg->retry_limit;
+  dc.tx.report = cfg->tx_report ? 1 : 0;
   c->driver = std::make_shared<WiFiDriver>(c->logger);
   if (auto r = c->driver->CreateRadio(c->h, c->ctx, c->lock, dc); r && dynamic_cast<IRtlRadio *>(r.get()))
     c->dev.reset(static_cast<IRtlRadio *>(r.release()));
@@ -154,6 +156,26 @@ extern "C" int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user) {
 
 extern "C" int dv_rx_ended(const dv_card *c) {
   return c && c->rx_ended.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+extern "C" int dv_set_tx_report_cb(dv_card *c, dv_txrpt_cb cb, void *user) try {
+  if (!c || !c->dev) return -1;
+  if (!cb) {
+    c->dev->SetTxReportSink({});
+    return 0;
+  }
+  c->dev->SetTxReportSink([cb, user](const devourer::TxReport &r) {
+    if (!r.valid) return;
+    dv_txrpt o;
+    o.state = r.state;
+    o.bmc = r.bmc ? 1 : 0;
+    o.retries = r.data_retries;
+    o.queue_raw = r.queue_time_raw;
+    cb(user, &o);
+  });
+  return 0;
+} catch (...) {
+  return -1;
 }
 
 extern "C" int dv_send_control(dv_card *c, const uint8_t *dot11, size_t len) try {

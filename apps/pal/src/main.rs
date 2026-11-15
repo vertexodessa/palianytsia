@@ -644,6 +644,13 @@ fn maint_session(
 }
 
 fn live(o: Opts) {
+    if let Some(Ok(c)) = o
+        .config
+        .as_deref()
+        .map(|p| pal_core::config::load_config(p, None))
+    {
+        runtime::radio_opts(&c);
+    }
     let core = core(&o, o.ch);
     let mut sink = Sink::new(&o);
     let cap = o.capture.as_ref().map(|p| {

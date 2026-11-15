@@ -347,8 +347,17 @@ fn resolve_config(o: &mut Opts) {
             }
         }
     }
+    if o.live() && !menu {
+        // The menu branch's with_link_pick set it already.
+        let on = runtime::link_pick(&prefs_path()).ack_rcf.unwrap_or(false);
+        match pal_core::config::with_ack_rcf(&text, on) {
+            Ok(t) => text = t,
+            Err(e) => eprintln!("pal-desktop: ack_rcf {on} not applied: {e}"),
+        }
+    }
     o.cfg = pal_core::config::parse_config_str(&text)
         .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+    runtime::radio_opts(&o.cfg);
     if menu {
         o.menu_channels = o.cfg.radio.channels.clone();
         eprintln!(

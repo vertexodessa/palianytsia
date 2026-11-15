@@ -980,6 +980,18 @@ pub fn body(ui: &mut Ui, p: &mut Panel, i: PanelIn) -> PanelOut {
                     .small()
                     .color(Color32::GRAY),
                 );
+                relink |= ui
+                    .checkbox(&mut prefs.ack_rcf, "Radio-acknowledged feedback")
+                    .changed();
+                ui.label(
+                    RichText::new(
+                        "On: the drone's radio acknowledges each feedback frame and a missed \
+                         one is resent at once. Needs radio.ack_rcf on the drone. Restarts \
+                         the link.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
                 c
             });
             if let Some(c) = adv {

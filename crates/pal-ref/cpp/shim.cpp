@@ -156,10 +156,11 @@ class ConfigDump {
   }
 
   void link(const maburgs::LinkCfg& l) {
-    const auto& [feedback_ms, beacon_keepalive_ms, rcf_slot_hold_ms, arrival_guard_syms, nack,
+    const auto& [feedback_ms, ack_rcf, beacon_keepalive_ms, rcf_slot_hold_ms, arrival_guard_syms, nack,
                  nack_residual, static_mcs, static_overhead_base, static_overhead_enh, static_bw,
                  ladder_cfg, key_file, key, key_is_default, key_source] = l;
     i("link.feedback_ms", feedback_ms);
+    b("link.ack_rcf", ack_rcf);
     i("link.beacon_keepalive_ms", beacon_keepalive_ms);
     i("link.rcf_slot_hold_ms", rcf_slot_hold_ms);
     i("link.arrival_guard_syms", arrival_guard_syms);

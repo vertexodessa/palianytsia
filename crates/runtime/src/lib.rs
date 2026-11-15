@@ -36,7 +36,14 @@ pub fn link_pick(prefs: &std::path::Path) -> pal_core::config::LinkPick {
         bw: p.link_bw,
         channels: p.link_channels,
         s3_demote: Some(p.s3_demote),
+        ack_rcf: Some(p.ack_rcf),
     }
+}
+
+/// The card-level settings a parsed config asks for, set before its cards
+/// open (`devourer_sys::set_ack_rcf`).
+pub fn radio_opts(cfg: &pal_core::config::Config) {
+    devourer_sys::set_ack_rcf(cfg.link.ack_rcf);
 }
 
 /// Core tick period.
@@ -97,6 +104,8 @@ pub struct Shared {
     pub peer_rc: PeerRc,
     /// Per-chain RSSI per card, for the preflight's antenna balance.
     pub chains: Chains,
+    /// Hardware-ACKed RCFs' TX reports.
+    pub rcf_ack: RcfAck,
     /// The maintenance lane: shell sessions on the drone, the video-off wish.
     pub maint: maint::Hub,
     /// A drone is heard: a session, or its Telems in another RC version.
@@ -159,6 +168,37 @@ impl Chains {
                 ])
             })
             .collect()
+    }
+}
+
+/// TX reports of hardware-ACKed RCFs (`devourer_sys::set_ack_rcf`), summed
+/// on the thread that drains them: frames ACKed, frames the retry limit
+/// gave up on, and the retransmissions both took. The report's group-frame
+/// bit does not tell a DISC apart (the 8812AU's descriptor marks every
+/// frame BMC), so a DISC counts too, as ACKed with no retry.
+#[derive(Default)]
+pub struct RcfAck {
+    pub acked: AtomicU64,
+    pub dropped: AtomicU64,
+    pub retries: AtomicU64,
+}
+
+impl RcfAck {
+    pub fn note(&self, r: &devourer_sys::TxReport) {
+        match r.state {
+            0 => self.acked.fetch_add(1, Ordering::Relaxed),
+            _ => self.dropped.fetch_add(1, Ordering::Relaxed),
+        };
+        self.retries
+            .fetch_add(u64::from(r.retries), Ordering::Relaxed);
+    }
+
+    fn totals(&self) -> [u64; 3] {
+        [
+            self.acked.load(Ordering::Relaxed),
+            self.dropped.load(Ordering::Relaxed),
+            self.retries.load(Ordering::Relaxed),
+        ]
     }
 }
 
@@ -537,6 +577,8 @@ pub struct CoreLoop {
     cal: CalUi,
     /// Per-card deaf/hearing flips for the flight log.
     deaf: pal_osd::DeafWatch,
+    /// `rcf_ack` totals at the last flight-log event.
+    rcf_ack_last: [u64; 3],
     /// Core time (ms) of the last ladder transition logged as rung_reason.
     rung_seen_ms: Option<i64>,
     /// The flight log's write error has been reported.
@@ -599,6 +641,7 @@ impl CoreLoop {
             last_log_us: 0,
             cal: CalUi::default(),
             deaf: pal_osd::DeafWatch::default(),
+            rcf_ack_last: [0; 3],
             rung_seen_ms: None,
             log_err_told: false,
             params: ParamLog::default(),
@@ -1038,6 +1081,19 @@ impl CoreLoop {
         let mut cards = serde_json::from_str(line).map_or(Vec::new(), |v| pal_osd::cards_of(&v));
         for (c, &o) in cards.iter_mut().zip(off) {
             c.off_link_us = o;
+        }
+        let t = self.sink.shared.rcf_ack.totals();
+        let d: Vec<u64> = t
+            .iter()
+            .zip(self.rcf_ack_last)
+            .map(|(a, b)| a - b)
+            .collect();
+        if d.iter().any(|&x| x > 0) {
+            self.rcf_ack_last = t;
+            self.sink.shared.event(
+                "rcf_ack",
+                serde_json::json!({"acked": d[0], "dropped": d[1], "retries": d[2]}),
+            );
         }
         for c in self.deaf.push(now as f64 / 1e6, &cards) {
             let ev = if c.deaf { "card_deaf" } else { "card_hearing" };
@@ -1526,6 +1582,15 @@ impl CardSet {
             chips.push(card.chip().unwrap_or("?".into()));
             let route = route.clone();
             let card_id = cards.len() as u8;
+            if devourer_sys::ack_rcf() {
+                let route = route.clone();
+                card.on_tx_report(move |rpt| {
+                    let r = route.read().unwrap_or_else(|p| p.into_inner());
+                    if let Some(r) = r.as_ref() {
+                        r.shared.rcf_ack.note(rpt);
+                    }
+                });
+            }
             card.start_rx(move |f| {
                 let r = route.read().unwrap_or_else(|p| p.into_inner());
                 let Some(r) = r.as_ref() else { return };
