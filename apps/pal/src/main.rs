@@ -17,7 +17,7 @@
 //!              [--aus out.aus] [--sends out.sends] [--log-dir DIR]
 //!              [--drop-pct N --seed S] [--core ref|rust] [--decode [--hwdec vdpau|vaapi|cuda]]
 //!              [--param-set T_S,ROW,TEXT ...]   F18 sets; prints `param` results and `params`
-//!   pal log    <fl-NNNN_...>   summarise one flight-log directory
+//!   pal log    <fl-NNNN_...>   summarise one flight-log directory (--kpi: the scorecard, one JSON line)
 //!   pal --version             version, commit, mabur and devourer pins
 //!
 //! Gs mode transmits: the core's RC frames (DISC, RCF, NACK, refresh) go out
@@ -65,6 +65,8 @@ struct Opts {
     rust: bool,
     drop_pct: u32,
     seed: u64,
+    /// Log: only the scorecard numbers, one JSON line.
+    kpi: bool,
     /// Replay: panic after this many bodies, to prove the panic hook. Not
     /// in the usage text: a test switch.
     panic_after: Option<u64>,
@@ -146,6 +148,7 @@ fn parse(args: impl Iterator<Item = String>) -> Opts {
             }
             "--drop-pct" => o.drop_pct = val().parse().unwrap_or_else(|_| die("--drop-pct")),
             "--seed" => o.seed = val().parse().unwrap_or_else(|_| die("--seed")),
+            "--kpi" => o.kpi = true,
             "--panic-after" => {
                 o.panic_after = Some(val().parse().unwrap_or_else(|_| die("--panic-after")))
             }
@@ -911,6 +914,19 @@ fn log_summary(o: Opts) {
     let [dir] = <[PathBuf; 1]>::try_from(o.pos)
         .unwrap_or_else(|_| die("log needs one fl-NNNN_... directory"));
     let s = session::summarize(&dir).unwrap_or_else(|e| die(&format!("{}: {e}", dir.display())));
+    if o.kpi {
+        let mut j = s.kpi.json();
+        j["session"] = dir
+            .file_name()
+            .map_or("?".into(), |n| n.to_string_lossy())
+            .into();
+        if let Some(b) = &s.build {
+            j["version"] = b.get("version").cloned().unwrap_or_default();
+            j["app"] = b.get("app").cloned().unwrap_or_default();
+        }
+        println!("{j}");
+        return;
+    }
     println!("{}", dir.display());
     match &s.build {
         Some(b) => {

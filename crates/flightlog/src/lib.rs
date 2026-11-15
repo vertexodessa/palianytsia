@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod decoder;
 pub mod keyframes;
+pub mod kpi;
 pub mod latency;
 pub mod retain;
 pub mod session;

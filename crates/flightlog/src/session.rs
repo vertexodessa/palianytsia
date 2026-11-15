@@ -629,6 +629,8 @@ pub struct Summary {
     pub latency: crate::latency::Latency,
     /// The Android decode loop's per-second `decoder` records.
     pub decoder: crate::decoder::DecoderTotals,
+    /// The scorecard numbers (`pal log DIR --kpi`).
+    pub kpi: crate::kpi::Kpi,
 }
 
 /// One layer's loss episodes in fec.log.
@@ -758,6 +760,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
         }
         s.keyframes
             .au(t, sid, bytes, flags & 0x01 != 0, complete != 0);
+        s.kpi.au(t, sid, flags & 0x01 != 0, complete != 0);
         t_min = t_min.min(t);
         t_max = t_max.max(t);
         s.aus += 1;
@@ -782,6 +785,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
                 t_max = t_max.max(t);
                 s.keyframes.stats(t, &v);
                 s.latency.stats(t, &v);
+                s.kpi.stats(t, &v);
                 if let Some(us) = v.get("log_max_us").and_then(Value::as_u64) {
                     if s.log_max_us.is_none_or(|(m, _)| us > m) {
                         s.log_max_us = Some((us, t));
@@ -807,6 +811,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
             .to_string();
         s.keyframes.event(&ev, &v);
         s.decoder.event(&ev, &v);
+        s.kpi.event(&ev, &v);
         match ev.as_str() {
             "build" if s.build.is_none() => s.build = Some(v.clone()),
             "cards" => s
@@ -846,6 +851,7 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
     s.keyframes.finish();
     s.latency.finish();
     s.decoder.finish();
+    s.kpi.finish();
     if t_max >= t_min && t_min != u64::MAX {
         s.span_s = (t_max - t_min) as f64 / 1e6;
     }
