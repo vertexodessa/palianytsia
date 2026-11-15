@@ -115,6 +115,7 @@ pairing key.
   v0.16 = maburd from mabur `release/v0.16` (`release/v0.15` + pit mode: `[low_power] pit`/`pit_index`, TX index 1 while disarmed before the first arm), APKs 0.16.0; RC 18 and the parameter table as v0.15, so GS and drone stay compatible.
   v0.16.1 = maburd from mabur `release/v0.16.1` (`release/v0.16` + calibration lifts pit before reading its anchor; v0.16 calibrated at pit power before the first arm), APKs 0.16.1; GS and drone stay compatible with v0.16.
   v0.16.2 = maburd from mabur `release/v0.16.2` (`release/v0.16.1` + the P-frame ceiling floor `venc.superframe_p_floor_kb`, 14 kB per megapixel: below an ordinary P frame the encoder sent a keyframe on every frame at rung 0, in low_power and at boot), APKs 0.16.2; GS and drone stay compatible with v0.16.1.
+  v0.17 = maburd from mabur `release/v0.17` (`palianytsia/base-v2` minus `/sim`: `release/v0.16.2` + EDCCA off, the radio name file, the keyframe-storm guard, hardware-ACKed RCFs opt-in, an IDR after a rebuilt encoder's ring), preflight checklist, skip pictures, the stall keyframe request, APKs 0.17.0; RC 18 and the parameter table as v0.16.x, so GS and drone stay compatible.
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
   `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally and `tools/release_toml_check.py` (every key of

@@ -1,18 +1,35 @@
-# Palianytsia v0.16.2
+# Palianytsia v0.17
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.16.2.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.16.2.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.17.0.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.17.0.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
-| `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
+| `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E and RTL8812AU radios. |
 | `drone/install.py` | Installs maburd on a stock OpenIPC FPV image, updates or rolls it back, or removes it (see below). |
 | `drone/S96mabur` | The init script that runs maburd; `install.py` puts it in place. |
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
+
+## What changed in v0.17
+- **The picture comes back after a camera mode change.** Changing the camera mode or the slice count restarts the drone's encoder. The drone skipped the new encoder's first keyframe and sent only P frames, which the ground station cannot show. Once, on the Quest, the picture stayed dark for 69 s after two changes in a row. The drone now sends a keyframe after every encoder restart: on the bench it arrived within 0.1 s of each of four restarts. The ground station also asks for a keyframe on its own when frames go into its decoder for a second and none come out.
+- **Preflight checklist.** While the drone is disarmed, the Flight tab lists what to check before takeoff: link, uplink, drone temperature, pairing key, and the balance of each card's antennas. An amber or red row says what is wrong. Arming on a red row shows a warning. The antenna row can read amber close to the drone (a multipath null) and turn green when the drone moves.
+- **A whole lost frame no longer stops the picture.** When the link loses a complete frame, the ground station puts an empty "nothing changed" frame in its place, so the decoder keeps going until the next keyframe.
+- **Radio-acknowledged feedback (off by default).** The ground station's feedback to the drone can go as acknowledged radio frames, so the card resends a lost one at once. Switch it on at both ends: on the ground, Link tab, Advanced, "Radio-acknowledged feedback"; on the drone, `radio.ack_rcf = true` in `mabur.toml`. With only the ground switched on, every feedback frame goes out three times. On the bench with both ends on: 508 frames acknowledged, 0 lost, 7 resends.
+- **The drone defers only to real 802.11 traffic.** The drone now defers only to a decodable 802.11 preamble, not to any radio energy on the channel. New drone key `radio.edcca` (false by default).
+- **Keyframe-storm guard.** When the drone's encoder starts sending keyframes nobody asked for, the drone raises its P-frame ceiling for a while, at most 2x. On the bench: 89 keyframes a minute without the guard, 2 with it.
+- **Drone update over the air.** The release maburd carries both radios (RTL8812EU/8822E and RTL8812AU). The ground station installs it only on a drone whose radio it supports. An update that loses the link part-way runs again. On 2026-11-16 the Quest updated the quad in 254 s and the RTL8812AU wing in 64 s.
+- Smaller changes:
+  - The Recording tab shows the ground DVR's state.
+  - The slice row steps only through counts the drone accepts.
+  - A camera mode that needs fewer slices lowers the slice count first.
+  - A decoder that falls behind drops enhancement frames first.
+  - The desktop app reopens a card that drops off the USB bus.
+
+GS and drone stay compatible with v0.16.x back to v0.14 (RC 18, same parameter table), and a v0.17 ground station updates the drone by itself. Bench with the Quest only: not flown, the phone APK not run. Known issue: in a dark room the quad's sensor drops from 60 to about 45 fps.
 
 ## What changed in v0.16.2
 - **No more keyframe storms at low bitrate.** The drone's encoder caps the size of a P frame at twice the average frame at the current bitrate. Where the bitrate is low (the lowest rung, the low-power mode while disarmed, the first seconds after boot or a link loss) that cap was smaller than an ordinary P frame, so the encoder sent a keyframe on every frame; the link could not carry them and the picture ran up to 0.8 s late or stopped (once for 34 s after a disarm, with a good signal). The cap now never goes below 14 kB per megapixel of the picture, set by the new drone key `venc.superframe_p_floor_kb` (0 = off); at the top rungs it works as before. A drone that keeps its own `mabur.toml` on update gets the default.
@@ -40,7 +57,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.16.2.apk    # or the phone APK
+   adb install palianytsia-quest-0.17.0.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
