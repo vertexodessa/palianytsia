@@ -330,6 +330,16 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   walls at pit power. `LivePowerTable::begin_cal` now clears a live pit override before the first sweep
   of a run; the run's restore lands pit again. mabur host suite 258/258 (`ctest -R test_`), mutation
   red. Open: a calibration run under pit on air (drone log line "pit power off for calibration").
+- mabur pin, 2026-11-15 (pal-mbtz.1): the SuperFrame P-frame ceiling never goes below an ordinary P
+  frame. `venc.superframe_p_pct` set it at twice the per-frame budget with no floor, so at rung 0
+  (2700 kbps at 120 fps: 5760 B), in low_power (1000 kbps at 30 fps: 8533 B) and at the MAX_RANGE
+  floor (about 1300 kbps: 2773 B) it fell under ordinary P frames; the SDK then aborts every P and
+  opens a new GOP, a keyframe on every frame. Flight logs of 2026-11-15: fl-1980 61 keyframes in a run
+  of 37 at rung 0 in flight, fl-1978 34 s without a complete frame after a disarm at -40..-74 dBm.
+  New key `venc.superframe_p_floor_kb`, default 14 kB per megapixel in code, bundle and
+  `release/drone/mabur.toml` (19.7 kB at 1728x816, 68 kB at 2944x1656), at least the p99 of
+  full-bitrate P frames per mode that day. mabur host suite 258/258, mutation red, ARM build. Open:
+  the bench check against a reproduced wedge (pal-mbtz.5).
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).

@@ -71,6 +71,7 @@ awb_fps     = 15           # auto-white-balance update rate
 snapshot_quality = 80      # JPEG quality of camera snapshots
 debug_port  = 8301         # local HTTP status port (curl 127.0.0.1:8301/venc)
 superframe_p_pct = 200     # cap a P-frame at this % of the per-frame bitrate budget
+superframe_p_floor_kb = 14 # ...but never below this many kB per megapixel (below an ordinary P frame every frame becomes a keyframe)
 
 [venc.roi]
 # Region of interest: sharper centre, softer edges at low bitrate. Off by
