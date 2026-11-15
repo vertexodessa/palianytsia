@@ -54,6 +54,8 @@ jobs:
           sha=$(tr -d '[:space:]' < release/MABUR_RELEASE)
           git -C third_party/mabur fetch --depth=1 origin "$sha"
           git -C third_party/mabur checkout --detach "$sha"
+      - name: Every key of the release drone toml is known to this maburd
+        run: python3 tools/release_toml_check.py "$(tr -d '[:space:]' < release/MABUR_RELEASE)"
       - name: Host packages
         run: sudo apt-get update && sudo apt-get install -y pkg-config cmake bzip2
       - name: Build maburd (pinned OpenIPC toolchain, sha256-checked)

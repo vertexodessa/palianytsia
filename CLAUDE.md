@@ -117,7 +117,8 @@ pairing key.
   v0.16.2 = maburd from mabur `release/v0.16.2` (`release/v0.16.1` + the P-frame ceiling floor `venc.superframe_p_floor_kb`, 14 kB per megapixel: below an ordinary P frame the encoder sent a keyframe on every frame at rung 0, in low_power and at boot), APKs 0.16.2; GS and drone stay compatible with v0.16.1.
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
-  `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally (CI has no captures and never will: no recordings on GitHub), bump `release/VERSION` (the one version: both APKs' versionName, `pal --version` and each flight log's `build` event read it) and both APKs' `versionCode`, head `release/README.md` with `# Palianytsia <tag>`, write the
+  `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally and `tools/release_toml_check.py` (every key of
+  `release/drone/mabur.toml` known to the maburd at `release/MABUR_RELEASE`; maburd refuses an unknown key and does not start; release.yml runs it too) (CI has no captures and never will: no recordings on GitHub), bump `release/VERSION` (the one version: both APKs' versionName, `pal --version` and each flight log's `build` event read it) and both APKs' `versionCode`, head `release/README.md` with `# Palianytsia <tag>`, write the
   notes, pin the fork commit. The IMX415 driver is an asset of the `deps` release (sha in `release/`). Run workflow_dispatch with a tag
   for a dry run (package as an artifact, nothing published).
 - Video width defaults to 20 MHz (`HudPrefs.link_bw`); the DISC proposes it (`DISC_CAP_WIDTH`) and the drone retunes its receiver.
