@@ -1,11 +1,11 @@
-# Palianytsia v0.16
+# Palianytsia v0.16.1
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.16.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.16.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.16.1.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.16.1.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -13,6 +13,11 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/S96mabur` | The init script that runs maburd; `install.py` puts it in place. |
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
+
+## What changed in v0.16.1
+- **Calibration no longer runs at pit power.** In v0.16 a calibration started before the drone's first arm read the pit power as the drone's reference level, so the whole run was measured around pit power and the drone saved wrong TX power walls. The drone now switches pit off when a calibration starts and back on when it ends. **Repeat any calibration you ran on a v0.16 drone** after updating to v0.16.1.
+
+GS and drone stay compatible with v0.16, v0.15 and v0.14 (RC 18, same parameter table), and a v0.16.1 ground station updates the drone by itself. The fix has host tests only: a calibration was not run with it (the bench is too close to the ground station for one).
 
 ## What changed in v0.16
 - **Pit mode: the drone transmits quietly on the ground.** While the drone is disarmed (the low-power mode, which needs the flight controller's arm state over MSP), it now also drops its TX power to a flat index, 1 by default, until it is armed for the first time after power-up. Next to the ground station a drone at full power overloaded the receiver: on the bench the Quest read up to +10..+14 dBm and lost up to 27 % of frames at +10 dBm (0.5 % at -15 dBm). Arming restores the flown power. A drone that is disarmed after a flight (landed, or down after a crash) keeps the flown power, so it stays easy to find. Two keys in `[low_power]` of the drone's `mabur.toml` choose this: `pit = "pre_arm"` (the default, as above), `"disarmed"` (every disarm, a downed drone included) or `"off"` (the power is never touched), and `pit_index` (0..127; one step is 0.25 dB on the RTL8812EU/8822E). A drone that keeps its own `mabur.toml` on update gets the defaults.
@@ -30,7 +35,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.16.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.16.1.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -139,7 +144,7 @@ Calibrate (Link tab, drone at a distance and disarmed) measures this drone's car
 
 When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, or with a native (not binned) camera mode, the link carries more; if the OSD shows the bitrate at the ceiling on the top rung, raise `ENC_BITRATE_MAX` (the bench drone runs 18000 with `ENC_AIRTIME` 0.75 at 40 MHz). Values above the factory ones were run on one bench drone and not flown.
 
-## Known limits in v0.16
+## Known limits in v0.16.1
 
 - Recording from arm to disarm has been checked on a replayed capture, not with a real arm. The automatic drone update has been run from the Quest and desktop apps on one bench, not in the field. The phone app carries it and was not run against a drone. A power cut during the few seconds of the flash write can leave the drone without maburd; `install.py` from a PC recovers it. Two ground stations of different releases each install their own maburd, once per app start.
 - Pairing uses the default link key on both ends.
@@ -157,14 +162,14 @@ When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, 
 - DFS channels (52-144) are marked in the channel menu but neither end detects radar. Whether you may use them is up to your local rules.
 - On one card the channel scan dwells on the link card itself: one dwell of about 12 ms every 250 ms, two passes, about 12.5 s for the 25-channel grid. On the bench that lost about 5 % of the drone's frames on average, with 16 truncated frames and 18 keyframe requests per scan. So with one card the menu does not scan when it opens; press "scan" on the ground, not in flight. With two cards the spare card scans when the menu opens and the video is not touched.
 - Calibration with two cards measures the channels on the second card. If the second card does not receive, the link drops during the measure and the run fails with "calibration ack timeout". The OSD cards chip shows such a card as DEAF; replug it before calibrating.
-- Pit mode and the disarmed jobs: calibration and the drone update both run only while the drone is disarmed, so before its first arm they run at pit power. At a distance the ground station may then not reach the drone. Arm it once after power-up (props off) and disarm, which ends pit until the next power-up, or set `low_power.pit = "off"` for a calibration session. While a calibration measures, it sets the power itself; when it ends, the drone goes back to pit power.
+- Pit mode and the disarmed jobs: calibration and the drone update both run only while the drone is disarmed. A calibration switches pit off for its run and back on at its end. The drone update runs at pit power before the first arm, so at a distance the ground station may not reach the drone: arm it once after power-up (props off) and disarm, which ends pit until the next power-up, or set `low_power.pit = "off"`.
 - Calibrate in the field with the drone at a distance, never next to the GS. Next to the GS (RSSI around -30 dBm) the receivers overload and the higher MCS rungs fail, so the bitrate ladder also stays low on the bench.
 - The two-card transmit switch, the channel menu and hops between any grid channels are tested on the bench, not yet in flight.
 
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.16` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.15` plus pit mode from `palianytsia/base-v2`, without the bench-only `/sim` endpoint.
+- mabur: fork branch `release/v0.16.1` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.16` plus the calibration fix for pit mode from `palianytsia/base-v2`, without the bench-only `/sim` endpoint.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
