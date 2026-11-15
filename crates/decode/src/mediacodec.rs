@@ -365,8 +365,10 @@ fn output_loop(sh: &Shared) {
 
 impl MediaCodecDecoder {
     /// Queues the AU (waits up to 20 ms for an input buffer). Frames come
-    /// out on the output thread.
-    pub fn decode(&mut self, au: &[u8]) -> Fed {
+    /// out on the output thread. `waited`: how long the AU sat in the queue
+    /// before this call; the stale cap counts it, so a frame that waited
+    /// out its 150 ms behind a slow codec is not shown late.
+    pub fn decode(&mut self, au: &[u8], waited: Duration) -> Fed {
         let sh = &self.sh;
         self.fed += 1;
         if self.starve_every > 0 && self.fed.is_multiple_of(self.starve_every) {
@@ -408,7 +410,12 @@ impl MediaCodecDecoder {
                 sh.queued
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .push_back((self.pts, Instant::now()));
+                    .push_back((
+                        self.pts,
+                        Instant::now()
+                            .checked_sub(waited)
+                            .unwrap_or_else(Instant::now),
+                    ));
                 match sh.codec.queue_input_buffer(b, 0, au.len(), self.pts, 0) {
                     Ok(()) => Fed::Queued,
                     Err(e) => {

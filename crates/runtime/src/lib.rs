@@ -3,7 +3,7 @@
 //! flight log + stats/params out, commands in) and the counters a platform
 //! decoder feeds back. Decoding and drawing stay in the apps.
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,7 @@ use pal_core::refresh::IdrDriver;
 use pal_core::{Au, CoreIo, GsCore, RxBody};
 use pal_wire::dot11;
 
+pub mod au_queue;
 pub mod cam_fps;
 pub mod dev_card;
 pub mod drone_fetch;
@@ -50,6 +51,8 @@ pub fn lat_us() -> u64 {
 #[derive(Default)]
 pub struct Shared {
     pub au_dropped: AtomicU64,
+    /// Enhance AUs left out of a backed-up decoder queue (no keyframe).
+    pub au_skipped: AtomicU64,
     pub frames: AtomicU64,
     pub dec_errors: AtomicU64,
     /// Sink AU number of the AU decoded when `dec_errors` last rose.
@@ -301,7 +304,7 @@ impl Lat {
 pub struct Sink {
     /// AUs to the decoder, tagged with their number (`IdrDriver::aus`) and
     /// the lat_us() they were queued at.
-    pub au_tx: SyncSender<(u64, u64, Vec<u8>)>,
+    pub au_tx: au_queue::AuTx,
     /// The core's capture-clock offset (stats `pts_off_us`), for --lat.
     pub pts_off_us: Option<i64>,
     pub mav_tx: SyncSender<Vec<u8>>,
@@ -377,12 +380,18 @@ impl CoreIo for Sink {
         self.shared
             .au_bytes
             .fetch_add(a.data.len() as u64, Ordering::Relaxed);
-        if let Err(TrySendError::Full(_)) = self.au_tx.try_send((n, lat_us(), a.data)) {
-            self.shared.au_dropped.fetch_add(1, Ordering::Relaxed);
-            // A dropped AU breaks the reference chain until an IRAP: ask for
-            // one now instead of waiting for the decoder to report damage.
-            if let Some(i) = self.idr.as_mut() {
-                i.r.request(pal_core::refresh::Reason::Decoder, self.now_us / 1000);
+        match self.au_tx.offer((n, lat_us(), a.data), a.sid) {
+            au_queue::Offer::Queued | au_queue::Offer::Closed => {}
+            au_queue::Offer::SkippedEnh => {
+                self.shared.au_skipped.fetch_add(1, Ordering::Relaxed);
+            }
+            au_queue::Offer::Dropped => {
+                self.shared.au_dropped.fetch_add(1, Ordering::Relaxed);
+                // A dropped AU breaks the reference chain until an IRAP: ask for
+                // one now instead of waiting for the decoder to report damage.
+                if let Some(i) = self.idr.as_mut() {
+                    i.r.request(pal_core::refresh::Reason::Decoder, self.now_us / 1000);
+                }
             }
         }
     }
@@ -1960,7 +1969,7 @@ mod tests {
     }
 
     fn rig(core: Box<dyn GsCore>, log: Option<Session>) -> Rig {
-        let (au_tx, au_rx) = mpsc::sync_channel(1 << 16);
+        let (au_tx, au_rx) = au_queue::au_queue(1 << 16);
         let (mav_tx, mav_rx) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared::default());
         let sink = Sink {

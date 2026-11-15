@@ -1007,7 +1007,7 @@ fn log_summary(o: Opts) {
     if d.seconds > 0 {
         let ms = |us: u64| us as f64 / 1000.0;
         println!(
-            "  decoder {} s: {} AUs in, {} frames, stale {}, no input {}, oversize {}, errors {}, AU drops {}; queue->out p50 {:.1} ms, worst p99 {:.1} ms, max {:.1} ms; longest AU wait {:.1} ms",
+            "  decoder {} s: {} AUs in, {} frames, stale {}, no input {}, oversize {}, errors {}, AU drops {}, enhance skips {}, deepest queue {}; queue->out p50 {:.1} ms, worst p99 {:.1} ms, max {:.1} ms; longest AU wait {:.1} ms",
             d.seconds,
             d.aus_in,
             d.frames,
@@ -1016,6 +1016,8 @@ fn log_summary(o: Opts) {
             d.oversize,
             d.errors,
             d.au_drops,
+            d.enh_skips,
+            d.q_depth_max,
             ms(d.q_p50_us),
             ms(d.q_p99_max_us),
             ms(d.q_max_us),

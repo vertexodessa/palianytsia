@@ -175,7 +175,7 @@ impl Link {
         let channels = cfg.radio.channels.clone();
         let dec = MediaCodecDecoder::new(win.clone(), DEC_HINT.0, DEC_HINT.1)?;
 
-        let (au_tx, au_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(8);
+        let (au_tx, au_rx) = runtime::au_queue::au_queue(8);
         let (stats_tx, stats_rx) = mpsc::sync_channel(4);
         let (params_tx, params_rx) = mpsc::sync_channel(2);
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -480,7 +480,9 @@ fn note_restart(sh: &Shared, v: Verdict, now_ms: u64, last: DecTotals, open_err:
 /// One second of decoder health for the flight log (pal log sums them up):
 /// AUs in, frames shown, stale and refused AUs, decode errors and AU drops
 /// in the second, the longest channel wait and the queue-to-output
-/// percentiles. None for an idle second, so a parked link writes nothing.
+/// percentiles (queue time included). `queue`: enhance AUs skipped in the
+/// second and the deepest the AU queue was. None for an idle second, so a
+/// parked link writes nothing.
 fn decoder_record(
     aus: u64,
     tot: DecTotals,
@@ -488,9 +490,10 @@ fn decoder_record(
     au_drops: u64,
     wait_max_us: u64,
     mut ages: Vec<u64>,
+    queue: (u64, usize),
 ) -> Option<serde_json::Value> {
     let d = |f: fn(&DecTotals) -> u64| f(&tot).saturating_sub(f(&last));
-    if aus == 0 && ages.is_empty() && au_drops == 0 {
+    if aus == 0 && ages.is_empty() && au_drops == 0 && queue.0 == 0 {
         return None;
     }
     ages.sort_unstable();
@@ -503,6 +506,8 @@ fn decoder_record(
         "oversize": d(|x| x.oversize),
         "errors": d(|x| x.errors),
         "au_drops": au_drops,
+        "enh_skips": queue.0,
+        "q_depth_max": queue.1,
         "wait_max_us": wait_max_us,
         "q_n": ages.len(),
         "q_p50_us": pct(50),
@@ -516,7 +521,7 @@ fn decoder_record(
 fn decode_loop(
     dec: MediaCodecDecoder,
     win: NativeWindow,
-    au_rx: Receiver<(u64, u64, Vec<u8>)>,
+    au_rx: runtime::au_queue::AuRx,
     sh: &Shared,
 ) {
     let t_start = Instant::now();
@@ -536,7 +541,7 @@ fn decode_loop(
     let (mut t, mut aus, mut last) = (Instant::now(), 0u64, DecTotals::default());
     // The decoder record's own window: the longest an AU waited in the
     // channel, and the AU drops at the last record.
-    let (mut wait_max_us, mut last_drops) = (0u64, 0u64);
+    let (mut wait_max_us, mut last_drops, mut last_skips) = (0u64, 0u64, 0u64);
     // Since when no AU has come (after video once flowed): one line and one
     // event per outage, not one a second (60 a minute with the drone off).
     let mut starved: Option<Instant> = None;
@@ -548,7 +553,8 @@ fn decode_loop(
         };
         if let Some((n, t_enq, au)) = got {
             aus += 1;
-            wait_max_us = wait_max_us.max(runtime::lat_us().saturating_sub(t_enq));
+            let waited_us = runtime::lat_us().saturating_sub(t_enq);
+            wait_max_us = wait_max_us.max(waited_us);
             let now = ms();
             if dec.is_none() && rebuild_at.is_some_and(|r| now >= r) {
                 match MediaCodecDecoder::new(win.clone(), DEC_HINT.0, DEC_HINT.1) {
@@ -570,7 +576,7 @@ fn decode_loop(
                 }
             }
             if let Some(d) = dec.as_mut() {
-                let fed = d.decode(&au);
+                let fed = d.decode(&au, Duration::from_micros(waited_us));
                 match wd.fed(now, fed, starts_with_irap(&au), d.output()) {
                     Verdict::Keep { report: true } => {
                         reported = dmg_base + d.damage();
@@ -619,10 +625,14 @@ fn decode_loop(
             sh.dec_dropped
                 .store(tot.stale + tot.no_input + drops, Ordering::Relaxed);
             let ages = dec.as_ref().map(|d| d.take_ages()).unwrap_or_default();
-            if let Some(r) = decoder_record(aus, tot, last, drops - last_drops, wait_max_us, ages) {
+            let skips = sh.au_skipped.load(Ordering::Relaxed);
+            let queue = (skips - last_skips, au_rx.take_high());
+            if let Some(r) =
+                decoder_record(aus, tot, last, drops - last_drops, wait_max_us, ages, queue)
+            {
                 sh.event("decoder", r);
             }
-            (wait_max_us, last_drops) = (0, drops);
+            (wait_max_us, last_drops, last_skips) = (0, drops, skips);
             if aus > 0 {
                 if let Some(s) = starved.take() {
                     let ms = s.elapsed().as_millis() as u64;

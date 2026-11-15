@@ -15,6 +15,10 @@ pub struct DecoderTotals {
     pub oversize: u64,
     pub errors: u64,
     pub au_drops: u64,
+    /// Enhance AUs left out of a backed-up queue (no keyframe needed).
+    pub enh_skips: u64,
+    /// The deepest the AU queue got (0 in logs written before the field existed).
+    pub q_depth_max: u64,
     /// The longest an AU waited for the decode thread (µs).
     pub wait_max_us: u64,
     /// The seconds' queue-to-output p50s, median over the session (µs).
@@ -39,6 +43,8 @@ impl DecoderTotals {
         self.oversize += u("oversize");
         self.errors += u("errors");
         self.au_drops += u("au_drops");
+        self.enh_skips += u("enh_skips");
+        self.q_depth_max = self.q_depth_max.max(u("q_depth_max"));
         self.wait_max_us = self.wait_max_us.max(u("wait_max_us"));
         if u("q_n") > 0 {
             self.p50s.push(u("q_p50_us"));

@@ -474,7 +474,7 @@ fn run_replay(mut cl: CoreLoop, o: &Opts, path: PathBuf, repaint: egui::Context)
 }
 
 fn run_decode(
-    au_rx: Receiver<(u64, u64, Vec<u8>)>,
+    au_rx: runtime::au_queue::AuRx,
     out: Arc<Mutex<Option<Frame>>>,
     shared: Arc<Shared>,
     repaint: egui::Context,
@@ -491,7 +491,7 @@ fn run_decode(
     let mut next: Option<(u64, u64, Vec<u8>)> = None;
     // The plane buffers of the frame the UI no longer holds, for reuse.
     let mut spare: Option<decode::Planes> = None;
-    while let Some((n, t_enq, au)) = next.take().or_else(|| au_rx.recv().ok()) {
+    while let Some((n, t_enq, au)) = next.take().or_else(|| au_rx.recv()) {
         let t_dec0 = lat_us();
         let got = dec.decode(&au);
         let t_dec1 = lat_us();
@@ -512,7 +512,7 @@ fn run_decode(
             continue;
         }
         shared.frames.store(f, Ordering::Relaxed);
-        if let Ok(q) = au_rx.try_recv() {
+        if let Some(q) = au_rx.try_recv() {
             next = Some(q);
             shared.lat.skipped_rgba.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -796,7 +796,7 @@ fn main() {
     // Every dropped AU breaks the reference chain until the next intra
     // refresh (a 2-slot queue dropped 6 AUs at replay start and the
     // decoder logged missing POCs), so the queue absorbs decoder warm-up.
-    let (au_tx, au_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(8);
+    let (au_tx, au_rx) = runtime::au_queue::au_queue(8);
     let (stats_tx, stats_rx) = mpsc::sync_channel::<String>(64);
     let (params_tx, params_rx) = mpsc::sync_channel::<String>(4);
     let (cmd_tx, cmd_rx) = mpsc::channel::<pal_osd::params::Cmd>();
