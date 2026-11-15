@@ -5,5 +5,6 @@ pub mod bits;
 pub mod cabac;
 pub mod nal;
 pub mod ps;
+pub mod skip_pic;
 pub mod skip_slice;
 pub mod slice;

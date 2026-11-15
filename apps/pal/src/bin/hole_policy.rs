@@ -21,11 +21,8 @@
 //! conformance decode with `ffmpeg -err_detect explode`).
 use decode::{AvDecoder, Planes};
 use flightlog::capture::{self, Record};
-use hevc::bits::{ceil_log2, unescape, BitReader};
 use hevc::nal::split_nals;
-use hevc::ps::{ParamTracker, Pps, Sps};
-use hevc::skip_slice::make_skip_slice;
-use hevc::slice::parse_slice_header;
+use hevc::skip_pic::{Params, SkipMaker};
 use pal_core::rust_core::RustCore;
 use pal_core::{Au, CoreIo, CoreOpts, GsCore, Mode, RZ_NONCE};
 use std::collections::HashMap;
@@ -144,283 +141,8 @@ fn run_core(o: &Opts, drop_pct: u32) -> Vec<Au> {
     io.0
 }
 
-/// A short-term RPS: the delta POCs it keeps (negative first), used or not.
-type RpsSet = Vec<i32>;
-
-/// st_ref_pic_set(idx) with the deltas derived (H.265 7.4.8). `sets` are
-/// the SPS's sets before `idx`; `in_slice` for the one a slice header
-/// codes (idx == num_short_term_ref_pic_sets). Some((negative, positive))
-/// unless the syntax is bad.
-fn read_st_rps(
-    r: &mut BitReader,
-    idx: usize,
-    in_slice: bool,
-    sets: &[(Vec<i32>, Vec<i32>)],
-) -> Option<(Vec<i32>, Vec<i32>)> {
-    let inter = idx != 0 && r.flag();
-    if inter {
-        let delta_idx = if in_slice { r.ue() as usize + 1 } else { 1 };
-        let rf = idx.checked_sub(delta_idx)?;
-        let (rneg, rpos) = sets.get(rf)?;
-        let sign = r.u(1);
-        let delta_rps = (1 - 2 * sign as i32) * (r.ue() as i32 + 1);
-        let n = rneg.len() + rpos.len();
-        let mut use_delta = vec![true; n + 1];
-        for u in use_delta.iter_mut() {
-            if !r.flag() {
-                *u = r.flag();
-            }
-        }
-        let (mut neg, mut pos) = (Vec::new(), Vec::new());
-        for j in (0..rpos.len()).rev() {
-            let d = rpos[j] + delta_rps;
-            if d < 0 && use_delta[rneg.len() + j] {
-                neg.push(d);
-            }
-        }
-        if delta_rps < 0 && use_delta[n] {
-            neg.push(delta_rps);
-        }
-        for (j, &rn) in rneg.iter().enumerate() {
-            let d = rn + delta_rps;
-            if d < 0 && use_delta[j] {
-                neg.push(d);
-            }
-        }
-        for j in (0..rneg.len()).rev() {
-            let d = rneg[j] + delta_rps;
-            if d > 0 && use_delta[j] {
-                pos.push(d);
-            }
-        }
-        if delta_rps > 0 && use_delta[n] {
-            pos.push(delta_rps);
-        }
-        for (j, &rp) in rpos.iter().enumerate() {
-            let d = rp + delta_rps;
-            if d > 0 && use_delta[rneg.len() + j] {
-                pos.push(d);
-            }
-        }
-        (!r.bad()).then_some((neg, pos))
-    } else {
-        let nneg = r.ue();
-        let npos = r.ue();
-        if nneg > 16 || npos > 16 {
-            return None;
-        }
-        let (mut neg, mut pos) = (Vec::new(), Vec::new());
-        let mut poc = 0i32;
-        for _ in 0..nneg {
-            poc -= r.ue() as i32 + 1;
-            r.u(1);
-            neg.push(poc);
-        }
-        poc = 0;
-        for _ in 0..npos {
-            poc += r.ue() as i32 + 1;
-            r.u(1);
-            pos.push(poc);
-        }
-        (!r.bad()).then_some((neg, pos))
-    }
-}
-
-/// The SPS's short-term RPS sets with their deltas (hevc::ps keeps only
-/// the counts). `nal` from its 2-byte header, escaped.
-fn sps_rps_sets(nal: &[u8]) -> Option<Vec<(Vec<i32>, Vec<i32>)>> {
-    let rb = unescape(nal.get(2..)?);
-    let mut r = BitReader::new(&rb);
-    r.u(4);
-    let max_sub = r.u(3) as usize;
-    r.u(1);
-    // profile_tier_level(1, max_sub_layers_minus1): 88 bits + level
-    r.u(32);
-    r.u(32);
-    r.u(32);
-    let mut flags = vec![(0, 0); max_sub];
-    for f in flags.iter_mut() {
-        *f = (r.u(1), r.u(1));
-    }
-    if max_sub > 0 {
-        for _ in max_sub..8 {
-            r.u(2);
-        }
-    }
-    for (pp, lp) in flags {
-        if pp != 0 {
-            r.u(32);
-            r.u(32);
-            r.u(24);
-        }
-        if lp != 0 {
-            r.u(8);
-        }
-    }
-    r.ue(); // sps_id
-    let chroma = r.ue();
-    if chroma == 3 {
-        r.u(1);
-    }
-    r.ue();
-    r.ue();
-    if r.flag() {
-        for _ in 0..4 {
-            r.ue();
-        }
-    }
-    r.ue();
-    r.ue();
-    r.ue(); // log2_max_poc_lsb_minus4
-    let sub_info = r.flag();
-    let start = if sub_info { 0 } else { max_sub };
-    for _ in start..=max_sub {
-        r.ue();
-        r.ue();
-        r.ue();
-    }
-    for _ in 0..6 {
-        r.ue();
-    }
-    if r.flag() && r.flag() {
-        return None; // scaling list data: not walked
-    }
-    r.u(1); // amp
-    r.u(1); // sao
-    if r.flag() {
-        r.u(4);
-        r.u(4);
-        r.ue();
-        r.ue();
-        r.u(1);
-    }
-    let n = r.ue() as usize;
-    if n > 64 {
-        return None;
-    }
-    let mut sets = Vec::with_capacity(n);
-    for i in 0..n {
-        let s = read_st_rps(&mut r, i, false, &sets)?;
-        sets.push(s);
-    }
-    (!r.bad()).then_some(sets)
-}
-
-/// The part of a first slice's header the skip rules look at.
-#[derive(Clone, Debug)]
-struct Hdr {
-    nal_type: u8,
-    slice_type: u32,
-    poc_lsb: u32,
-    /// Bit position of slice_pic_order_cnt_lsb in the RBSP.
-    poc_pos: usize,
-    /// Kept delta POCs of the short-term RPS; None for an IDR.
-    rps: Option<RpsSet>,
-    /// How the RPS was coded: Some(idx) for an SPS set, None explicit.
-    rps_idx: Option<u32>,
-}
-
-/// First-slice header fields; `nal` from its 2-byte header, escaped.
-fn parse_hdr(nal: &[u8], sps: &Sps, pps: &Pps, sets: &[(Vec<i32>, Vec<i32>)]) -> Option<Hdr> {
-    if nal.len() < 4 {
-        return None;
-    }
-    let nal_type = hevc::nal::nal_type(nal[0]);
-    let rb = unescape(&nal[2..]);
-    let mut r = BitReader::new(&rb);
-    let first = r.flag();
-    if (16..=23).contains(&nal_type) {
-        r.u(1);
-    }
-    if r.ue() != pps.pps_id {
-        return None;
-    }
-    if !first {
-        if pps.dependent_slices && r.flag() {
-            return None;
-        }
-        r.u(sps.addr_bits());
-    }
-    r.u(pps.extra_bits);
-    let slice_type = r.ue();
-    if pps.output_flag {
-        r.u(1);
-    }
-    let mut h = Hdr {
-        nal_type,
-        slice_type,
-        poc_lsb: 0,
-        poc_pos: r.pos(),
-        rps: None,
-        rps_idx: None,
-    };
-    if nal_type != 19 && nal_type != 20 {
-        h.poc_lsb = r.u(sps.log2_max_poc_lsb);
-        let (neg, pos) = if !r.flag() {
-            read_st_rps(&mut r, sets.len(), true, sets)?
-        } else {
-            let mut idx = 0;
-            if sps.num_st_rps > 1 {
-                idx = r.u(ceil_log2(sps.num_st_rps));
-            }
-            h.rps_idx = Some(idx);
-            sets.get(idx as usize)?.clone()
-        };
-        if sps.long_term {
-            return None;
-        }
-        h.rps = Some(neg.into_iter().chain(pos).collect());
-    }
-    (!r.bad()).then_some(h)
-}
-
-/// The first VCL NAL of an AU (escaped, from its NAL header).
-fn first_vcl(au: &[u8]) -> Option<&[u8]> {
-    split_nals(au)
-        .into_iter()
-        .find(|v| v.ty < 32)
-        .map(|v| &au[v.off..v.off + v.len])
-}
-
 fn is_irap(au: &Au) -> bool {
     (16..=23).contains(&au.vcl_nal) || au.flags & 1 != 0
-}
-
-/// Parameter sets and RPS sets of the complete AUs seen so far.
-#[derive(Default)]
-struct Params {
-    pt: ParamTracker,
-    sets: Vec<(Vec<i32>, Vec<i32>)>,
-}
-
-impl Params {
-    /// Every whole NAL of `au`: all of a complete AU, the NALs before the
-    /// last start code of an incomplete one (a truncated IDR still brings
-    /// its VPS/SPS/PPS).
-    fn feed(&mut self, au: &[u8], complete: bool) {
-        let au = if complete {
-            au
-        } else {
-            match split_nals(au).last() {
-                Some(v) => &au[..v.off.saturating_sub(3)],
-                None => return,
-            }
-        };
-        self.pt.feed(au);
-        for v in split_nals(au) {
-            if v.ty == 33 {
-                if let Some(s) = sps_rps_sets(&au[v.off..v.off + v.len]) {
-                    self.sets = s;
-                }
-            }
-        }
-    }
-    fn hdr(&self, au: &[u8]) -> Option<Hdr> {
-        if !self.pt.usable() {
-            return None;
-        }
-        parse_hdr(first_vcl(au)?, self.pt.sps(), self.pt.pps(), &self.sets)
-    }
 }
 
 fn probe(aus: &[Au]) {
@@ -451,131 +173,6 @@ fn probe(aus: &[Au]) {
     }
 }
 
-/// A P picture the skip decoder fed, as a donor candidate.
-#[derive(Clone)]
-struct Pic {
-    hdr: Hdr,
-    nal: Vec<u8>,
-    pts: u32,
-}
-
-/// Builds the whole-frame skip picture for a damaged AU, or says why not.
-/// Donor rules (waybeam-link): the donor is the newest reference P
-/// picture fed (TRAIL_R, never TRAIL_N); it and the reference P picture
-/// before it carry the same short-term RPS; the skip copies the donor's
-/// slice header (so its L0 count, collocated_ref_idx and TMVP flag) with
-/// only the POC changed, and every picture the copied RPS names must be in
-/// the DPB (the donor itself or one the donor's RPS kept).
-struct SkipMaker {
-    ps: Params,
-    /// The last two reference P pictures fed, oldest first.
-    refs: Vec<Pic>,
-    /// The last two P pictures fed of any kind (the rule read literally).
-    any: Vec<Hdr>,
-    /// "skip" or "skip+missing": the policy it serves, for the counts.
-    id: &'static str,
-    /// Damaged AUs for which the literal rule (last two P pictures of any
-    /// kind share the RPS) failed.
-    literal_fail: u32,
-}
-
-impl SkipMaker {
-    fn new(id: &'static str) -> Self {
-        Self {
-            id,
-            ps: Params::default(),
-            refs: Vec::new(),
-            any: Vec::new(),
-            literal_fail: 0,
-        }
-    }
-
-    /// An AU that went to this decoder: `whole` when complete or a skip
-    /// picture (a skip TRAIL_R picture is a reference like any other).
-    fn fed(&mut self, data: &[u8], complete: bool, whole: bool, pts: u32) {
-        self.ps.feed(data, complete);
-        let Some(h) = self.ps.hdr(data) else { return };
-        if (16..=23).contains(&h.nal_type) {
-            self.refs.clear();
-            self.any.clear();
-            return;
-        }
-        if h.slice_type == 2 || !whole {
-            return;
-        }
-        self.any.push(h.clone());
-        if self.any.len() > 2 {
-            self.any.remove(0);
-        }
-        if h.nal_type % 2 == 1 {
-            self.refs.push(Pic {
-                hdr: h,
-                nal: first_vcl(data).unwrap_or_default().to_vec(),
-                pts,
-            });
-            if self.refs.len() > 2 {
-                self.refs.remove(0);
-            }
-        }
-    }
-
-    fn make(&mut self, damaged: &Au, frame_us: u32) -> Result<Vec<u8>, &'static str> {
-        if self.any.len() == 2 && self.any[0].rps != self.any[1].rps {
-            self.literal_fail += 1;
-        }
-        if !self.ps.pt.usable() {
-            return Err("no_params");
-        }
-        let (sps, pps) = (self.ps.pt.sps().clone(), self.ps.pt.pps().clone());
-        if self.refs.len() < 2 {
-            return Err("no_two_ref_p");
-        }
-        let (prev, donor) = (&self.refs[0], &self.refs[1]);
-        if prev.hdr.rps != donor.hdr.rps {
-            return Err("rps_differs");
-        }
-        if donor.hdr.nal_type != 1 {
-            return Err("donor_not_trail_r");
-        }
-        let deltas = donor.hdr.rps.clone().ok_or("donor_no_rps")?;
-        let max = 1u32 << sps.log2_max_poc_lsb;
-        // The damaged picture's own POC when its first slice header arrived,
-        // else the donor's plus the frame steps its pts says passed.
-        let poc = match self.ps.hdr(&damaged.data) {
-            Some(h) => h.poc_lsb,
-            None => {
-                let steps =
-                    (damaged.pts_us.wrapping_sub(donor.pts) + frame_us / 2) / frame_us.max(1);
-                (donor.hdr.poc_lsb + steps) % max
-            }
-        };
-        let dpoc = ((poc + max - donor.hdr.poc_lsb) % max) as i32;
-        if dpoc == 0 || dpoc > (max / 2) as i32 {
-            return Err("poc_not_after_donor");
-        }
-        for d in &deltas {
-            let want = dpoc + d;
-            if want != 0 && !deltas.contains(&want) {
-                return Err("ref_not_in_dpb");
-            }
-        }
-        let mut tmpl =
-            parse_slice_header(&donor.nal, &sps, &pps).map_err(|_| "donor_unparsable")?;
-        let w = sps.log2_max_poc_lsb as usize;
-        for b in 0..w {
-            let p = donor.hdr.poc_pos + b;
-            let m = 0x80u8 >> (p % 8);
-            if (poc >> (w - 1 - b)) & 1 != 0 {
-                tmpl.rbsp[p / 8] |= m;
-            } else {
-                tmpl.rbsp[p / 8] &= !m;
-            }
-        }
-        let total = sps.pic_w_ctbs() * sps.pic_h_ctbs();
-        make_skip_slice(&sps, &pps, &tmpl, 0, total).ok_or("make_skip_slice")
-    }
-}
-
 /// Y PSNR in dB (capped at 100 for identical planes) and the MSE.
 fn psnr(a: &[u8], b: &[u8]) -> (f64, f64) {
     let se: u64 = a
@@ -598,11 +195,18 @@ fn db(mse: f64) -> f64 {
     }
 }
 
-const POLICIES: [&str; 4] = ["prefix", "drop", "skip", "skip+missing"];
+const POLICIES: [&str; 6] = [
+    "prefix",
+    "drop",
+    "skip",
+    "skip+missing",
+    "prefix+fill",
+    "skip+fill",
+];
 
 /// The skip picture for `au`, counting it or its fallback under `tag`.
 fn try_skip(
-    sk: &mut SkipMaker,
+    (id, sk): (&str, &mut SkipMaker),
     au: &Au,
     frame_us: u32,
     fallback: &mut HashMap<String, u32>,
@@ -618,11 +222,11 @@ fn try_skip(
     let r = if is_irap(au) {
         Err("irap")
     } else {
-        sk.make(au, frame_us)
+        sk.make(&au.data, au.pts_us, frame_us)
     };
     let key = match r {
-        Ok(_) => format!("{}/{tag}/made/{layer}", sk.id),
-        Err(why) => format!("{}/{tag}/{why}/{layer}", sk.id),
+        Ok(_) => format!("{id}/{tag}/made/{layer}"),
+        Err(why) => format!("{id}/{tag}/{why}/{layer}"),
     };
     *fallback.entry(key).or_default() += 1;
     r.ok()
@@ -701,7 +305,7 @@ fn conformance(o: &Opts, reference: &[Au], every: usize) {
         std::fs::File::create(&path).unwrap_or_else(|e| die(&e.to_string())),
     );
     let frame_us = 1;
-    let mut sk = SkipMaker::new("conformance");
+    let mut sk = SkipMaker::default();
     let (mut base, mut made) = (0usize, 0u32);
     let mut why: HashMap<&'static str, u32> = HashMap::new();
     for a in reference {
@@ -711,7 +315,7 @@ fn conformance(o: &Opts, reference: &[Au], every: usize) {
             base += 1;
             if base % every == 0 {
                 // Its own header gives the POC; the rest is the donor's.
-                match sk.make(a, frame_us) {
+                match sk.make(&a.data, a.pts_us, frame_us) {
                     Ok(nal) => {
                         out = nal;
                         skip = true;
@@ -733,6 +337,23 @@ fn conformance(o: &Opts, reference: &[Au], every: usize) {
 
 fn main() {
     let o = opts();
+    if std::env::var_os("PAL_FILL_REF").is_some() {
+        // Where the loss-free run itself lost a base AU on the live air:
+        // skips SkipFill makes there, and the slots to the next IRAP.
+        let reference = run_core(&o, 0);
+        let mut f = runtime::skip_fill::SkipFill::default();
+        for (i, r) in reference.iter().enumerate() {
+            for (pts, _) in f.feed(r).before {
+                let next = reference[i..]
+                    .iter()
+                    .position(is_irap)
+                    .unwrap_or(reference.len() - i);
+                println!("ref_fill slot={i} pts={pts} slots_to_next_irap={next}");
+            }
+        }
+        println!("ref_fill made={} refused={}", f.made, f.refused);
+        return;
+    }
     let reference = run_core(&o, 0);
     if o.probe {
         let aus = if o.drop_pct > 0 {
@@ -789,7 +410,9 @@ fn main() {
             fed: 0,
         })
         .collect();
-    let mut skippers = [SkipMaker::new("skip"), SkipMaker::new("skip+missing")];
+    let mut skippers = [SkipMaker::default(), SkipMaker::default()];
+    let mut fill = runtime::skip_fill::SkipFill::default();
+    let mut fill5 = runtime::skip_fill::SkipFill::new(true);
     let mut fallback: HashMap<String, u32> = HashMap::new();
     let mut n = HashMap::<&str, u32>::new();
     let mut ref_shown: Option<Vec<u8>> = None;
@@ -834,15 +457,25 @@ fn main() {
             data: Vec::new(),
             ..r.clone()
         };
-        let feeds: [Option<Vec<u8>>; 4] = match a {
-            None if is_irap(r) => [None, None, None, None],
+        let feeds: [Option<Vec<u8>>; 6] = match a {
+            None if is_irap(r) => [None, None, None, None, None, None],
             None => [
                 None,
                 None,
                 None,
-                try_skip(&mut skippers[1], &ghost, frame_us, &mut fallback, "missing"),
+                try_skip(
+                    ("skip+missing", &mut skippers[1]),
+                    &ghost,
+                    frame_us,
+                    &mut fallback,
+                    "missing",
+                ),
+                None,
+                None,
             ],
             Some(a) if !hole => [
+                Some(a.data.clone()),
+                Some(a.data.clone()),
                 Some(a.data.clone()),
                 Some(a.data.clone()),
                 Some(a.data.clone()),
@@ -851,10 +484,54 @@ fn main() {
             Some(a) => [
                 Some(a.data.clone()),
                 None,
-                try_skip(&mut skippers[0], a, frame_us, &mut fallback, "hole"),
-                try_skip(&mut skippers[1], a, frame_us, &mut fallback, "hole"),
+                try_skip(
+                    ("skip", &mut skippers[0]),
+                    a,
+                    frame_us,
+                    &mut fallback,
+                    "hole",
+                ),
+                try_skip(
+                    ("skip+missing", &mut skippers[1]),
+                    a,
+                    frame_us,
+                    &mut fallback,
+                    "hole",
+                ),
+                Some(a.data.clone()),
+                Some(a.data.clone()),
             ],
         };
+        // prefix+fill: what the runtime does (runtime::skip_fill), from the
+        // lossy AUs alone: skip pictures for base AUs it infers were lost
+        // go in right before the AU that shows the gap.
+        let mut feeds = feeds;
+        if let Some(a) = a {
+            let fd5 = fill5.feed(a);
+            let p5 = &mut pol[5];
+            for (_, sp) in fd5.before {
+                p5.fed += 1;
+                if let Some(w) = p5.dump.as_mut() {
+                    w.write_all(&sp).unwrap();
+                }
+                if p5.dec.decode(&sp) > 0 && p5.dec.planes(&mut planes) {
+                    p5.shown = Some(planes.y.clone());
+                }
+            }
+            if let Some(x) = fd5.instead {
+                feeds[5] = Some(x);
+            }
+            let p = &mut pol[4];
+            for (_, sp) in fill.feed(a).before {
+                p.fed += 1;
+                if let Some(w) = p.dump.as_mut() {
+                    w.write_all(&sp).unwrap();
+                }
+                if p.dec.decode(&sp) > 0 && p.dec.planes(&mut planes) {
+                    p.shown = Some(planes.y.clone());
+                }
+            }
+        }
         for (k, p) in pol.iter_mut().enumerate() {
             if let Some(f) = &feeds[k] {
                 p.fed += 1;
@@ -864,7 +541,7 @@ fn main() {
                 if p.dec.decode(f) > 0 && p.dec.planes(&mut planes) {
                     p.shown = Some(planes.y.clone());
                 }
-                if k >= 2 {
+                if k == 2 || k == 3 {
                     let complete = a.is_some_and(|a| a.complete);
                     // Fed whole, salvaged (its header is the original's) or
                     // a skip picture: a donor candidate.
@@ -913,8 +590,11 @@ fn main() {
     let mut fb: Vec<_> = fallback.into_iter().collect();
     fb.sort();
     println!("skip_fallback {fb:?}");
-    // Slots where the policies show different pictures: the only ones
-    // that tell them apart.
+    println!("prefix+fill made={} refused={}", fill.made, fill.refused);
+    println!(
+        "skip+fill made={} refused={} replaced={}",
+        fill5.made, fill5.refused, fill5.replaced
+    );
     let differ: Vec<usize> = (0..reference.len())
         .filter(|&i| {
             let a = pol[0].psnr[i];

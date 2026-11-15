@@ -893,6 +893,7 @@ fn main() {
         idr: (o.mode == Mode::Gs && o.idr.unwrap_or(o.live())).then(IdrDriver::default),
         cam_fps: Default::default(),
         dvr,
+        skip_fill: Some(runtime::skip_fill::SkipFill::new(true)),
     };
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

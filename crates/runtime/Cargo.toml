@@ -13,6 +13,7 @@ pal-osd.workspace = true
 devourer-sys.workspace = true
 flightlog.workspace = true
 dvr.workspace = true
+hevc.workspace = true
 serde_json.workspace = true
 pal-build.workspace = true
 log = "0.4"

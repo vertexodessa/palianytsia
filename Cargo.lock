@@ -2466,6 +2466,7 @@ dependencies = [
  "dvr",
  "ed25519-dalek",
  "flightlog",
+ "hevc",
  "libc",
  "log",
  "pal-build",

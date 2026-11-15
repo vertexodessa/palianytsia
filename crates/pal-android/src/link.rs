@@ -266,6 +266,7 @@ impl Link {
             idr: Some(IdrDriver::default()),
             cam_fps: Default::default(),
             dvr: Some(dvr),
+            skip_fill: Some(runtime::skip_fill::SkipFill::new(true)),
         };
         // RustCore is built on the core thread (GsCore is not Send); a
         // config it refuses still shows up in last_error().
@@ -492,23 +493,40 @@ fn frames_record(st: &[decode::mediacodec::Stamp]) -> Option<serde_json::Value> 
     Some(serde_json::json!({ "rows": rows }))
 }
 
+/// The AU path's counts for one second of the decoder record.
+#[derive(Default)]
+struct AuSecond {
+    au_drops: u64,
+    /// The longest channel wait.
+    wait_max_us: u64,
+    /// Enhance AUs the queue skipped, and the deepest it was.
+    enh_skips: u64,
+    q_depth_max: usize,
+    /// Skip pictures fed for lost base AUs, and lost base AUs none could
+    /// be made for (`runtime::skip_fill`).
+    skip_pics: u64,
+    skip_refused: u64,
+}
+
 /// One second of decoder health for the flight log (pal log sums them up):
-/// AUs in, frames shown, stale and refused AUs, decode errors and AU drops
-/// in the second, the longest channel wait and the queue-to-output
-/// percentiles (queue time included). `queue`: enhance AUs skipped in the
-/// second and the deepest the AU queue was. None for an idle second, so a
-/// parked link writes nothing.
+/// AUs in, frames shown, stale and refused AUs, decode errors, the AU path's
+/// counts and the queue-to-output percentiles (queue time included). None
+/// for an idle second, so a parked link writes nothing.
 fn decoder_record(
     aus: u64,
     tot: DecTotals,
     last: DecTotals,
-    au_drops: u64,
-    wait_max_us: u64,
     mut ages: Vec<u64>,
-    queue: (u64, usize),
+    a: AuSecond,
 ) -> Option<serde_json::Value> {
     let d = |f: fn(&DecTotals) -> u64| f(&tot).saturating_sub(f(&last));
-    if aus == 0 && ages.is_empty() && au_drops == 0 && queue.0 == 0 {
+    if aus == 0
+        && ages.is_empty()
+        && a.au_drops == 0
+        && a.enh_skips == 0
+        && a.skip_pics == 0
+        && a.skip_refused == 0
+    {
         return None;
     }
     ages.sort_unstable();
@@ -520,10 +538,12 @@ fn decoder_record(
         "no_input": d(|x| x.no_input),
         "oversize": d(|x| x.oversize),
         "errors": d(|x| x.errors),
-        "au_drops": au_drops,
-        "enh_skips": queue.0,
-        "q_depth_max": queue.1,
-        "wait_max_us": wait_max_us,
+        "au_drops": a.au_drops,
+        "enh_skips": a.enh_skips,
+        "skip_pics": a.skip_pics,
+        "skip_refused": a.skip_refused,
+        "q_depth_max": a.q_depth_max,
+        "wait_max_us": a.wait_max_us,
         "q_n": ages.len(),
         "q_p50_us": pct(50),
         "q_p99_us": pct(99),
@@ -557,6 +577,8 @@ fn decode_loop(
     // The decoder record's own window: the longest an AU waited in the
     // channel, and the AU drops at the last record.
     let (mut wait_max_us, mut last_drops, mut last_skips) = (0u64, 0u64, 0u64);
+    // Skip pictures and refusals at the last record (runtime::skip_fill).
+    let (mut last_sp, mut last_sr) = (0u64, 0u64);
     // Since when no AU has come (after video once flowed): one line and one
     // event per outage, not one a second (60 a minute with the drone off).
     let mut starved: Option<Instant> = None;
@@ -648,10 +670,20 @@ fn decode_loop(
                 .map(|s| u64::from(s.wait_us) + u64::from(s.dec_us))
                 .collect();
             let skips = sh.au_skipped.load(Ordering::Relaxed);
-            let queue = (skips - last_skips, au_rx.take_high());
-            if let Some(r) =
-                decoder_record(aus, tot, last, drops - last_drops, wait_max_us, ages, queue)
-            {
+            let (sp, sr) = (
+                sh.skip_pics.load(Ordering::Relaxed),
+                sh.skip_refused.load(Ordering::Relaxed),
+            );
+            let second = AuSecond {
+                au_drops: drops - last_drops,
+                wait_max_us,
+                enh_skips: skips - last_skips,
+                q_depth_max: au_rx.take_high(),
+                skip_pics: sp - last_sp,
+                skip_refused: sr - last_sr,
+            };
+            (last_sp, last_sr) = (sp, sr);
+            if let Some(r) = decoder_record(aus, tot, last, ages, second) {
                 sh.event("decoder", r);
             }
             (wait_max_us, last_drops, last_skips) = (0, drops, skips);

@@ -22,6 +22,7 @@ pub mod maint;
 pub mod panic_hook;
 pub mod param_order;
 pub mod rf_sim;
+pub mod skip_fill;
 pub mod stats_line;
 
 pub use panic_hook::install_panic_hook;
@@ -53,6 +54,10 @@ pub struct Shared {
     pub au_dropped: AtomicU64,
     /// Enhance AUs left out of a backed-up decoder queue (no keyframe).
     pub au_skipped: AtomicU64,
+    /// Skip pictures queued for base AUs lost whole (`skip_fill`), and
+    /// lost base AUs no skip picture could be made for.
+    pub skip_pics: AtomicU64,
+    pub skip_refused: AtomicU64,
     pub frames: AtomicU64,
     pub dec_errors: AtomicU64,
     /// Sink AU number of the AU decoded when `dec_errors` last rose.
@@ -319,6 +324,9 @@ pub struct Sink {
     pub cam_fps: cam_fps::CamFps,
     /// GS DVR (F12); None = no recording.
     pub dvr: Option<dvr::Dvr>,
+    /// Skip pictures for base AUs lost whole, ahead of the AU that shows
+    /// the gap (pal-pzj.39); None = off.
+    pub skip_fill: Option<skip_fill::SkipFill>,
 }
 
 impl Sink {
@@ -356,7 +364,7 @@ impl Sink {
 }
 
 impl CoreIo for Sink {
-    fn on_au(&mut self, a: Au) {
+    fn on_au(&mut self, mut a: Au) {
         let n = self.idr.as_mut().map_or(0, |i| {
             i.on_au(&a, self.now_us);
             i.aus()
@@ -380,6 +388,23 @@ impl CoreIo for Sink {
         self.shared
             .au_bytes
             .fetch_add(a.data.len() as u64, Ordering::Relaxed);
+        if let Some(f) = self.skip_fill.as_mut() {
+            let refused = f.refused;
+            // Tagged with the AU that showed the gap: the decoder's stamps
+            // then carry that AU's number twice.
+            let fd = f.feed(&a);
+            for (_, p) in fd.before {
+                self.shared.skip_pics.fetch_add(1, Ordering::Relaxed);
+                let _ = self.au_tx.offer((n, lat_us(), p), 0);
+            }
+            self.shared
+                .skip_refused
+                .fetch_add(f.refused - refused, Ordering::Relaxed);
+            if let Some(p) = fd.instead {
+                self.shared.skip_pics.fetch_add(1, Ordering::Relaxed);
+                a.data = p;
+            }
+        }
         match self.au_tx.offer((n, lat_us(), a.data), a.sid) {
             au_queue::Offer::Queued | au_queue::Offer::Closed => {}
             au_queue::Offer::SkippedEnh => {
@@ -2088,6 +2113,7 @@ mod tests {
             idr: None,
             cam_fps: Default::default(),
             dvr: None,
+            skip_fill: None,
         };
         let (stats_tx, stats_rx) = mpsc::sync_channel(1 << 12);
         let (params_tx, params_rx) = mpsc::sync_channel(1 << 12);
@@ -2315,6 +2341,7 @@ mod tests {
             idr: None,
             cam_fps: Default::default(),
             dvr: None,
+            skip_fill: None,
         };
         let prefix = vec![0, 0, 0, 1, 0x26, 0x01, 0xaf, 0x13];
         sink.on_au(Au {
