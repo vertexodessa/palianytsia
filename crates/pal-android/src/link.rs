@@ -477,6 +477,21 @@ fn note_restart(sh: &Shared, v: Verdict, now_ms: u64, last: DecTotals, open_err:
 /// exactly one per rebuild, tagged with the AU at hand: the new codec has no
 /// reference until an IRAP, and one rise arms one keyframe request (its
 /// retries until the IRAP are the requester's). The dying codec's errors are
+/// One second of frames out of the codec, one row per frame:
+/// [AU number, queue to codec input us, codec input to output us, shown 0/1].
+/// The AU number is the session's AU count, so row n joins au.log's n-th
+/// line (t4). None for a second with no frame.
+fn frames_record(st: &[decode::mediacodec::Stamp]) -> Option<serde_json::Value> {
+    if st.is_empty() {
+        return None;
+    }
+    let rows: Vec<_> = st
+        .iter()
+        .map(|s| serde_json::json!([s.tag, s.wait_us, s.dec_us, u8::from(s.shown)]))
+        .collect();
+    Some(serde_json::json!({ "rows": rows }))
+}
+
 /// One second of decoder health for the flight log (pal log sums them up):
 /// AUs in, frames shown, stale and refused AUs, decode errors and AU drops
 /// in the second, the longest channel wait and the queue-to-output
@@ -576,7 +591,7 @@ fn decode_loop(
                 }
             }
             if let Some(d) = dec.as_mut() {
-                let fed = d.decode(&au, Duration::from_micros(waited_us));
+                let fed = d.decode(&au, Duration::from_micros(waited_us), n);
                 match wd.fed(now, fed, starts_with_irap(&au), d.output()) {
                     Verdict::Keep { report: true } => {
                         reported = dmg_base + d.damage();
@@ -624,7 +639,14 @@ fn decode_loop(
             let drops = sh.au_dropped.load(Ordering::Relaxed);
             sh.dec_dropped
                 .store(tot.stale + tot.no_input + drops, Ordering::Relaxed);
-            let ages = dec.as_ref().map(|d| d.take_ages()).unwrap_or_default();
+            let stamps = dec.as_ref().map(|d| d.take_stamps()).unwrap_or_default();
+            if let Some(f) = frames_record(&stamps) {
+                sh.event("frames", f);
+            }
+            let ages = stamps
+                .iter()
+                .map(|s| u64::from(s.wait_us) + u64::from(s.dec_us))
+                .collect();
             let skips = sh.au_skipped.load(Ordering::Relaxed);
             let queue = (skips - last_skips, au_rx.take_high());
             if let Some(r) =

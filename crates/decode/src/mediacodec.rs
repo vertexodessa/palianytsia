@@ -47,8 +47,21 @@ use crate::watchdog::{Fed, LogEvery};
 const STALE_US: u64 = 150_000;
 /// Frames per latency line in the log (~5 s at 60 fps).
 const LAT_WINDOW: usize = 300;
-/// Ages kept for `take_ages`: several seconds at 120 fps.
+/// Stamps kept for `take_stamps`: several seconds at 120 fps.
 const AGES_CAP: usize = 1024;
+
+/// One frame out of the codec, for the flight log's per-AU stage record
+/// (spec 13.2): `tag` is the caller's AU number, `wait_us` the time from
+/// the AU queue to the codec's input (t4 to t5), `dec_us` from the codec's
+/// input to its output (t5 to t6), `shown` false for a frame the stale cap
+/// dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub tag: u64,
+    pub wait_us: u32,
+    pub dec_us: u32,
+    pub shown: bool,
+}
 const DECODER_PROP: &std::ffi::CStr = c"debug.pal.decoder";
 const STARVE_PROP: &std::ffi::CStr = c"debug.pal.dec_starve";
 const BREAK_PROP: &std::ffi::CStr = c"debug.pal.dec_break";
@@ -121,11 +134,12 @@ struct Shared {
     /// AUs dropped for being larger than the input buffer: a buffer size
     /// problem, not a codec fault, so kept apart from `errors`.
     oversize: AtomicU64,
-    /// (pts, queued at) of AUs in flight, oldest first.
-    queued: Mutex<VecDeque<(u64, Instant)>>,
-    /// Queue-to-output ages (µs) since the last `take_ages`, for the
-    /// flight log's decoder record; capped so an unread one stays small.
-    ages: Mutex<Vec<u64>>,
+    /// (pts, queued at, fed to the codec at, tag) of AUs in flight, oldest
+    /// first.
+    queued: Mutex<VecDeque<(u64, Instant, Instant, u64)>>,
+    /// Frames out since the last `take_stamps`, for the flight log;
+    /// capped so an unread one stays small.
+    stamps: Mutex<Vec<Stamp>>,
     /// The output surface, to log the buffer size the codec gave it.
     win: NativeWindow,
     /// Clock of the warning limits.
@@ -220,7 +234,7 @@ impl MediaCodecDecoder {
             no_input: AtomicU64::new(0),
             oversize: AtomicU64::new(0),
             queued: Mutex::new(VecDeque::new()),
-            ages: Mutex::new(Vec::new()),
+            stamps: Mutex::new(Vec::new()),
             win,
             t0: Instant::now(),
         });
@@ -282,9 +296,9 @@ impl MediaCodecDecoder {
         self.sh.stale.load(Ordering::Relaxed)
     }
 
-    /// Queue-to-output ages (µs) of the frames out since the last call.
-    pub fn take_ages(&self) -> Vec<u64> {
-        std::mem::take(&mut *self.sh.ages.lock().unwrap_or_else(|p| p.into_inner()))
+    /// The frames out since the last call.
+    pub fn take_stamps(&self) -> Vec<Stamp> {
+        std::mem::take(&mut *self.sh.stamps.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 
@@ -311,21 +325,28 @@ fn output_loop(sh: &Shared) {
         match sh.codec.dequeue_output_buffer(Duration::from_millis(10)) {
             Ok(Out::Buffer(ob)) => {
                 let pts = ob.info().presentation_time_us() as u64;
-                let age = {
+                let entry = {
                     let mut q = sh.queued.lock().unwrap_or_else(|p| p.into_inner());
                     // Drop entries for AUs that produced no frame.
-                    while q.front().is_some_and(|(p, _)| *p < pts) {
+                    while q.front().is_some_and(|(p, ..)| *p < pts) {
                         q.pop_front();
                     }
-                    q.pop_front()
-                        .filter(|(p, _)| *p == pts)
-                        .map(|(_, t)| t.elapsed().as_micros() as u64)
+                    q.pop_front().filter(|(p, ..)| *p == pts)
                 };
-                if let Some(a) = age {
+                let age = entry.map(|(_, t, ..)| t.elapsed().as_micros() as u64);
+                let show = age.is_none_or(|a| a <= STALE_US);
+                if let (Some(a), Some((_, t_q, t_in, tag))) = (age, entry) {
+                    let us = |d: Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
+                    let st = Stamp {
+                        tag,
+                        wait_us: us(t_in.saturating_duration_since(t_q)),
+                        dec_us: us(t_in.elapsed()),
+                        shown: show,
+                    };
                     {
-                        let mut w = sh.ages.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut w = sh.stamps.lock().unwrap_or_else(|p| p.into_inner());
                         if w.len() < AGES_CAP {
-                            w.push(a);
+                            w.push(st);
                         }
                     }
                     ages.push(a);
@@ -333,7 +354,6 @@ fn output_loop(sh: &Shared) {
                         log_latency(&sh.name, &mut ages);
                     }
                 }
-                let show = age.is_none_or(|a| a <= STALE_US);
                 if sh.codec.release_output_buffer(ob, show).is_err() {
                     sh.errors.fetch_add(1, Ordering::Relaxed);
                 } else if show {
@@ -367,8 +387,9 @@ impl MediaCodecDecoder {
     /// Queues the AU (waits up to 20 ms for an input buffer). Frames come
     /// out on the output thread. `waited`: how long the AU sat in the queue
     /// before this call; the stale cap counts it, so a frame that waited
-    /// out its 150 ms behind a slow codec is not shown late.
-    pub fn decode(&mut self, au: &[u8], waited: Duration) -> Fed {
+    /// out its 150 ms behind a slow codec is not shown late. `tag` comes
+    /// back in the frame's `Stamp`.
+    pub fn decode(&mut self, au: &[u8], waited: Duration, tag: u64) -> Fed {
         let sh = &self.sh;
         self.fed += 1;
         if self.starve_every > 0 && self.fed.is_multiple_of(self.starve_every) {
@@ -415,6 +436,8 @@ impl MediaCodecDecoder {
                         Instant::now()
                             .checked_sub(waited)
                             .unwrap_or_else(Instant::now),
+                        Instant::now(),
+                        tag,
                     ));
                 match sh.codec.queue_input_buffer(b, 0, au.len(), self.pts, 0) {
                     Ok(()) => Fed::Queued,

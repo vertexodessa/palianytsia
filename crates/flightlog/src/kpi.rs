@@ -12,7 +12,10 @@
 //!   reference chain held (or intra refresh mends it) and the heal is 0;
 //!   a request with no heal before the next outage is unhealed;
 //! - complete AUs %, decoder frames shown %, uplink % (median of the
-//!   stats' `uplink_pct`).
+//!   stats' `uplink_pct`);
+//! - the GS stages per frame (spec 13.2) from the `frames` events: queue
+//!   to codec input (t4 to t5) and codec input to output (t5 to t6), p50
+//!   and p99 in µs.
 //!
 //! G2G, RCF heard at a fixed attenuation and GS load need the bench, not
 //! a log.
@@ -41,6 +44,9 @@ pub struct Kpi {
     dec_in: u64,
     dec_shown: u64,
     uplink: Vec<u64>,
+    /// Per frame out of the codec: t4 to t5 and t5 to t6, µs.
+    wait: Vec<u64>,
+    dec: Vec<u64>,
 }
 
 fn pct(v: &mut [u64], q: usize) -> Option<u64> {
@@ -99,6 +105,20 @@ impl Kpi {
                 self.dec_in += u("aus_in");
                 self.dec_shown += u("frames");
             }
+            "frames" => {
+                for r in v
+                    .get("rows")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let c = |i: usize| r.get(i).and_then(Value::as_u64);
+                    if let (Some(w), Some(d)) = (c(1), c(2)) {
+                        self.wait.push(w);
+                        self.dec.push(d);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -140,6 +160,11 @@ impl Kpi {
             "complete_au_pct": share(self.complete, self.aus),
             "shown_pct": share(self.dec_shown, self.dec_in),
             "uplink_pct_p50": pct(&mut self.uplink.clone(), 50),
+            "frames": self.wait.len(),
+            "queue_us_p50": pct(&mut self.wait.clone(), 50),
+            "queue_us_p99": pct(&mut self.wait.clone(), 99),
+            "decode_us_p50": pct(&mut self.dec.clone(), 50),
+            "decode_us_p99": pct(&mut self.dec.clone(), 99),
         })
     }
 }
@@ -147,6 +172,25 @@ impl Kpi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gs_stages_split_queue_from_decode() {
+        let mut k = Kpi::default();
+        k.event(
+            "frames",
+            &json!({"t_us": 1, "rows": [[1, 200, 3000, 1], [2, 400, 3500, 1], [3, 9000, 4000, 0]]}),
+        );
+        k.event(
+            "frames",
+            &json!({"t_us": 2, "rows": [[4, 300, 3200, 1], "junk"]}),
+        );
+        let j = k.json();
+        assert_eq!(j["frames"], 4);
+        assert_eq!(j["queue_us_p50"], 300);
+        assert_eq!(j["queue_us_p99"], 400);
+        assert_eq!(j["decode_us_p50"], 3200);
+        assert_eq!(j["decode_us_p99"], 3500);
+    }
 
     #[test]
     fn picture_time_and_outages_healed_by_request_or_needing_none() {
