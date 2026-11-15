@@ -28,9 +28,11 @@ pub enum Reason {
     Resync,
     Decoder,
     Dvr,
+    /// The decoder takes AUs and puts out no frame (`IdrDriver::on_decoder_output`).
+    Stall,
 }
 
-pub const REASONS: usize = 7;
+pub const REASONS: usize = 8;
 
 impl Reason {
     pub fn as_str(self) -> &'static str {
@@ -42,6 +44,7 @@ impl Reason {
             Self::Resync => "resync",
             Self::Decoder => "decoder",
             Self::Dvr => "dvr",
+            Self::Stall => "stall",
         }
     }
 }
@@ -94,6 +97,17 @@ pub const STUCK_AFTER: u64 = 4;
 /// A stuck request's waits: `RETRY_MAX_MS` doubled per retry this many
 /// times (2 s, then 4 s), or the keyframe's span when that is longer.
 const STUCK_DOUBLINGS: u64 = 2;
+/// A decoder that has put out no frame for this long while AUs kept going
+/// in is waiting for a reference it will not get: a P-only stream after an
+/// encoder restart whose keyframe never came (69 s on the Quest,
+/// 2026-11-16). It asks again at this spacing until frames come.
+pub const STALL_MS: u64 = 1000;
+/// ... and at least this many AUs went in meanwhile (not a link outage).
+pub const STALL_AUS: u64 = 10;
+/// Within a DISCONT run, a pts step past this (or back) is the next
+/// restart: an encoder restarted twice in a row keeps the flag up across
+/// both, and only the gap tells the second one apart.
+const DISCONT_GAP_US: i32 = 250_000;
 
 #[derive(Debug)]
 pub struct RefreshRequester {
@@ -312,6 +326,14 @@ pub struct IdrDriver {
     healed_at: u64,
     started: bool,
     in_discont: bool,
+    /// pts of the last AU (any layer), for a restart inside a DISCONT run.
+    last_pts: Option<u32>,
+    /// Decoder output (`on_decoder_output`): the frame total last seen,
+    /// `aus` and the time when it last rose, and the last stall request.
+    frames_seen: u64,
+    frames_aus: u64,
+    frames_ms: Option<u64>,
+    stall_req_ms: Option<u64>,
 }
 
 impl IdrDriver {
@@ -325,7 +347,12 @@ impl IdrDriver {
         // of a DISCONT run (producer restart: new pts/frame_id base, maybe a
         // new resolution) is the same join, as "resync".
         let discont = a.flags & pal_wire::frame_wire::FLAG_DISCONT != 0;
-        let new_run = discont && !self.in_discont;
+        let jump = self.last_pts.is_some_and(|p| {
+            let d = a.pts_us.wrapping_sub(p) as i32;
+            !(0..=DISCONT_GAP_US).contains(&d)
+        });
+        self.last_pts = Some(a.pts_us);
+        let new_run = discont && (!self.in_discont || jump);
         self.in_discont = discont;
         if !irap && (!self.started || new_run) {
             let r = if self.started {
@@ -369,6 +396,31 @@ impl IdrDriver {
             }
         }
     }
+    /// The decoder's cumulative count of frames put out. A front end that
+    /// never calls this gets no stall requests. Frames that stop while AUs
+    /// keep going in for `STALL_MS` and `STALL_AUS` ask for a keyframe, again
+    /// every `STALL_MS` until a frame comes: no other signal covers a P-only
+    /// stream the decoder silently drops (no error, no hole, no skip).
+    pub fn on_decoder_output(&mut self, frames: u64, now_us: u64) {
+        let now_ms = now_us / 1000;
+        let since = *self.frames_ms.get_or_insert(now_ms);
+        if frames > self.frames_seen {
+            self.frames_seen = frames;
+            self.frames_aus = self.aus;
+            self.frames_ms = Some(now_ms);
+            self.stall_req_ms = None;
+            return;
+        }
+        let quiet = now_ms.saturating_sub(since) >= STALL_MS
+            && self.aus.saturating_sub(self.frames_aus) >= STALL_AUS;
+        let due = self
+            .stall_req_ms
+            .is_none_or(|t| now_ms.saturating_sub(t) >= STALL_MS);
+        if quiet && due {
+            self.stall_req_ms = Some(now_ms);
+            self.r.request(Reason::Stall, now_ms);
+        }
+    }
     /// After each core tick: the retry clock, then the epoch into the core.
     pub fn step(&mut self, now_us: u64, core: &mut dyn crate::GsCore) -> Vec<Event> {
         self.r.poll(now_us / 1000);
@@ -399,6 +451,7 @@ fn link_mbps(mcs: i32, bw: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pal_wire::frame_wire::FLAG_DISCONT;
 
     #[test]
     fn retries_space_out_and_cap() {
@@ -624,6 +677,67 @@ mod tests {
             vcl_nal: nal,
             t_first_us: 0,
         }
+    }
+
+    #[test]
+    fn a_second_restart_inside_a_discont_run_asks_again() {
+        let mut d = IdrDriver::default();
+        let mut a = au(0, true, 0, 19);
+        d.on_au(&a, 0); // clean IRAP start
+        let mut at = |d: &mut IdrDriver, pts: u32, flags: u8, nal: u8, t: u64| {
+            a = au(1, true, flags, nal);
+            a.pts_us = pts;
+            d.on_au(&a, t);
+        };
+        at(&mut d, 33_000, 0, 1, 33_000);
+        // Restart 1 (slices): DISCONT run, P first: resync.
+        at(&mut d, 1_000_000, FLAG_DISCONT, 1, 1_000_000);
+        assert_eq!(d.r.counters().by_reason[Reason::Resync as usize], 1);
+        at(&mut d, 1_033_000, FLAG_DISCONT, 1, 1_033_000);
+        // Restart 2 (mode), 0.7 s later, flag still up: a new run all the same.
+        at(&mut d, 1_733_000, FLAG_DISCONT, 1, 1_733_000);
+        assert_eq!(d.r.counters().by_reason[Reason::Resync as usize], 2);
+        // Within the run, frame steps do not.
+        at(&mut d, 1_766_000, FLAG_DISCONT, 1, 1_766_000);
+        assert_eq!(d.r.counters().by_reason[Reason::Resync as usize], 2);
+    }
+
+    #[test]
+    fn a_decoder_with_no_output_asks_for_a_keyframe_until_frames_come() {
+        let mut d = IdrDriver::default();
+        let stalls = |d: &IdrDriver| d.r.counters().by_reason[Reason::Stall as usize];
+        let mut t = 0u64;
+        let mut frames = 0u64;
+        // 30 fps with frames out: never.
+        for _ in 0..60 {
+            d.on_au(&au(0, true, 0, 1), t);
+            frames += 1;
+            d.on_decoder_output(frames, t);
+            t += 33_000;
+        }
+        assert_eq!(stalls(&d), 0);
+        // AUs go in, nothing comes out: one request after STALL_MS, then
+        // one per STALL_MS.
+        for _ in 0..95 {
+            d.on_au(&au(0, true, 0, 1), t);
+            d.on_decoder_output(frames, t);
+            t += 33_000;
+        }
+        assert_eq!(stalls(&d), 3, "at ~1 s, ~2 s and ~3 s");
+        // Frames again: quiet.
+        for _ in 0..60 {
+            d.on_au(&au(0, true, 0, 1), t);
+            frames += 1;
+            d.on_decoder_output(frames, t);
+            t += 33_000;
+        }
+        assert_eq!(stalls(&d), 3);
+        // No AUs (link down) and no frames: not a decoder stall.
+        for _ in 0..100 {
+            d.on_decoder_output(frames, t);
+            t += 33_000;
+        }
+        assert_eq!(stalls(&d), 3);
     }
 
     #[test]

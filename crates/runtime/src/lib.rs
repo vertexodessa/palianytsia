@@ -802,6 +802,7 @@ impl CoreLoop {
             let sh = &self.sink.shared;
             let e = sh.dec_errors.load(Ordering::Acquire);
             i.on_decoder_errors(e, sh.dec_err_au.load(Ordering::Relaxed), now);
+            i.on_decoder_output(sh.frames.load(Ordering::Relaxed), now);
         }
     }
 
