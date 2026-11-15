@@ -52,7 +52,7 @@ if [[ -n ${FAKE_DROP_AT:-} && $cmd == *"$FAKE_DROP_AT"* ]]; then
   echo "client_loop: send disconnect: Broken pipe" >&2
   exit 255
 fi
-rw() { sed -E "s#(^|[ =\"'>(;])/(usr/bin|etc|tmp|lib|overlay|rom)/#\1$ROOT/\2/#g; s# /overlay( |\$)# $ROOT/overlay\1#g"; }
+rw() { sed -E "s#(^|[ =\"'>(;])/(usr/bin|usr/lib|etc|tmp|lib|overlay|rom)/#\1$ROOT/\2/#g; s# /overlay( |\$)# $ROOT/overlay\1#g"; }
 if [[ -n ${FAKE_CORRUPT:-} && $cmd == "cat > $FAKE_CORRUPT" ]]; then
   { cat; echo corrupt; } > "$(printf '%s' "$FAKE_CORRUPT" | rw)"; exit 0
 fi
@@ -201,9 +201,14 @@ def snapshot(root):
     return out
 
 
+# The SigmaStar MI libraries a full OpenIPC image has; a fake drone carries them
+# unless a scenario takes them away.
+MI_LIBS = ("libmi_sys.so", "libmi_vif.so", "libmi_vpe.so", "libmi_sensor.so", "libmi_venc.so", "libmi_isp.so")
+
+
 def make_drone(root, bin_=BIN_OLD, cfg=CFG_KEY, wrapper="S96mabur", stock=(), ls=LS, ls_orig=None,
-               init_off=(), module=False, log=True, sensors=(), ota=False):
-    for d in ("usr/bin", "etc/init.d", "tmp", "lib/modules/5.10/sigmastar", "lib/modules/5.10/extra", "overlay", "rom"):
+               init_off=(), module=False, log=True, sensors=(), ota=False, mi_libs=MI_LIBS):
+    for d in ("usr/bin", "usr/lib", "etc/init.d", "tmp", "lib/modules/5.10/sigmastar", "lib/modules/5.10/extra", "overlay", "rom"):
         (root / d).mkdir(parents=True, exist_ok=True)
     (root / ".fake-drone").touch()
     if bin_ is not None:
@@ -228,6 +233,8 @@ def make_drone(root, bin_=BIN_OLD, cfg=CFG_KEY, wrapper="S96mabur", stock=(), ls
         for name in sensors:
             (root / "etc/sensors" / name).write_bytes(b"t")
     (root / "lib/modules/5.10/extra/8812eu.ko").write_bytes(b"k")
+    for name in mi_libs:
+        (root / "usr/lib" / name).write_bytes(b"so")
     if ota:
         # Left by an over-the-air update (release/drone/mabur-swap.sh): its
         # boot guard, the fallback set and the flag on the unproven build.
@@ -386,6 +393,34 @@ SCENARIOS = [
           "usr/bin/maburd": "BIN_NEW",
       },
       backup=None, says=["(undo: install.py --remove D)", "== rebooting, waiting for the drone", "== done"]),
+    # An image running devourer_wfb (S99devourer) and msposd: both are parked
+    # with majestic, so neither holds the card or the FC's serial after the reboot.
+    S("first_install_parks_devourer_wfb_and_msposd",
+      drone=dict(bin_=None, cfg=None, wrapper=None, stock=("S95majestic", "S99devourer", "S98msposd")),
+      rc=0, toml=CFG_KEY_STRIPPED,
+      changes={
+          "etc/init.d.off": "dir",
+          "etc/init.d.off/S95majestic": "INIT",
+          "etc/init.d.off/S98msposd": "INIT",
+          "etc/init.d.off/S99devourer": "INIT",
+          "etc/init.d/S95majestic": "deleted",
+          "etc/init.d/S96mabur": "INIT",
+          "etc/init.d/S98msposd": "deleted",
+          "etc/init.d/S99devourer": "deleted",
+          "etc/mabur.toml": CFG_KEY_STRIPPED,
+          "etc/modprobe.d": "dir",
+          "etc/modprobe.d/palianytsia.conf": "blacklist 8812eu\n",
+          "usr/bin/maburd": "BIN_NEW",
+      },
+      backup=None, says=["stock services: S95majestic S99devourer S98msposd", "== done"]),
+    # An image whose majestic carries its own MI libraries ships only two of
+    # them: maburd would exit at start, so the run stops before touching anything.
+    S("image_without_mi_libraries_is_refused_untouched",
+      drone=dict(bin_=None, cfg=None, wrapper=None, stock=("S95majestic", "S99devourer"),
+                 mi_libs=("libmi_sys.so",)),
+      rc=1, toml=None, changes={}, backup=None,
+      says=["lacks SigmaStar MI libraries maburd loads at start: libmi_vif.so libmi_vpe.so libmi_sensor.so libmi_venc.so libmi_isp.so",
+            "Nothing was changed."]),
     # The camera tuning file is fitted to what the drone has under /etc/sensors.
     S("sensor_bin_missing_on_drone_set_to_the_image_file_for_its_sensor",
       drone=dict(bin_=BIN_NEW, cfg=CFG_BIN, sensors=STOCK_BINS), pkg=dict(cfg=None),

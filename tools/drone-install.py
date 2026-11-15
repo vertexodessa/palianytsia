@@ -20,9 +20,13 @@ sensor_imx415_star6e.ko (waybeam's six-mode IMX415 driver: on an imx415 drone
 it is installed next to the stock module and /usr/bin/load_sigmastar loads it
 first, the stock one stays the fallback; maburd's native sensor readout above
 60 fps needs it). A first install on a stock image:
-  - stops majestic, wifibroadcast and waybeam and moves their init scripts to
-    /etc/init.d.off (maburd runs the encoder and the radio itself; two owners
-    of the MI pipeline or the card and neither works);
+  - stops majestic, wifibroadcast, waybeam, devourer_wfb (S99devourer) and
+    msposd and moves their init scripts to /etc/init.d.off (maburd runs the
+    encoder, the radio and the flight controller's MSP itself; two owners of
+    the MI pipeline, the card or the serial port and neither works);
+  - refuses, before changing anything, an image that lacks the SigmaStar MI
+    libraries maburd loads (MI_LIBS; some images ship only a few because their
+    majestic carries its own);
   - blacklists the kernel Wi-Fi drivers in /etc/modprobe.d/palianytsia.conf
     (devourer drives the card from user space; a kernel driver that grabs it
     on USB enumeration locks it out);
@@ -115,10 +119,22 @@ echo "   removed; /etc/mabur.toml kept"
 reboot
 '''
 
+# The image's own services that a first install parks in /etc/init.d.off:
+# majestic owns the MI pipeline, wifibroadcast, waybeam and devourer_wfb
+# (S99devourer, with wfb_tun and alink_drone) the card, msposd the flight
+# controller's serial port that maburd polls for MSP.
+STOCK_SERVICES = "S95majestic S98wifibroadcast S95waybeam S99devourer S98msposd"
+STOCK_PROCESSES = "majestic wfb_tx wfb_rx waybeam devourer_wfb wfb_tun alink_drone msposd"
+# The SigmaStar MI libraries maburd cannot start without (drone/venc dlopens
+# them and exits when one is missing). An image whose majestic carries its own
+# copy ships only a few of them in /usr/lib.
+MI_LIBS = "libmi_sys.so libmi_vif.so libmi_vpe.so libmi_sensor.so libmi_venc.so libmi_isp.so"
+
 PREFLIGHT_SH = r'''echo "soc=$(fw_printenv -n soc 2>/dev/null)"
 echo "sensor=$(fw_printenv -n sensor 2>/dev/null)"
 echo "mabur=$( [ -x /etc/init.d/S96mabur ] || [ -x /etc/init.d/S00mabur ] && echo yes || echo no)"
-echo "stock=$(for s in S95majestic S98wifibroadcast S95waybeam; do [ -e /etc/init.d/$s ] && printf '%s ' $s; done)"
+echo "stock=$(for s in @STOCK@; do [ -e /etc/init.d/$s ] && printf '%s ' $s; done)"
+echo "mi_missing=$(for l in @MI_LIBS@; do [ -e /usr/lib/$l ] || [ -e /lib/$l ] || printf '%s ' $l; done)"
 echo "cards=$(lsusb 2>/dev/null | grep -io '0bda:[0-9a-f]*' | tr '\n' ' ')"
 echo "kmods=$(lsmod 2>/dev/null | awk '{print $1}' | grep -iE '^(88|87|rtl8|8812|8822|8821)' | tr '\n' ' ')"
 echo "free_kb=$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}')"
@@ -127,7 +143,7 @@ echo "mod_sha=$(sha256sum /lib/modules/$(uname -r)/sigmastar/sensor_imx415_star6
 echo "ls_patched=$(grep -c sensor_imx415_star6e /usr/bin/load_sigmastar 2>/dev/null)"
 echo "old_tail=$(grep -c 'frame_end_us/rep=' /usr/bin/maburd 2>/dev/null)"
 echo "sensor_bins=$(for f in /etc/sensors/*.bin; do [ -f "$f" ] && printf '%s ' "${f##*/}"; done)"
-'''
+'''.replace("@STOCK@", STOCK_SERVICES).replace("@MI_LIBS@", MI_LIBS)
 
 # Run with NEW_BIN, HAVE_CFG, NEW_CFG, MOD_TODO, NEW_MOD, LS_TODO, NEW_LS and
 # FRESH set in front of it.
@@ -146,13 +162,13 @@ if [ "$MOD_TODO" = 1 ]; then
 fi
 if [ "$FRESH" = 1 ]; then
   mkdir -p /etc/init.d.off /etc/modprobe.d
-  for s in S95majestic S98wifibroadcast S95waybeam; do
+  for s in @STOCK@; do
     if [ -e /etc/init.d/$s ]; then
       /etc/init.d/$s stop >/dev/null 2>&1 || true
       mv /etc/init.d/$s /etc/init.d.off/
     fi
   done
-  killall majestic wfb_tx wfb_rx waybeam 2>/dev/null || true
+  killall @PROCS@ 2>/dev/null || true
   : > /etc/modprobe.d/palianytsia.conf
   for m in $(ls /lib/modules/*/extra 2>/dev/null | sed -n 's/\.ko$//p' | grep -iE '^(88|87|rtl8|8812|8822|8821)'); do
     echo "blacklist $m" >> /etc/modprobe.d/palianytsia.conf
@@ -220,7 +236,7 @@ else
   W=S96mabur; [ -x /etc/init.d/S96mabur ] || W=S00mabur
   setsid /etc/init.d/$W start </dev/null >/dev/null 2>&1
 fi
-'''
+'''.replace("@STOCK@", STOCK_SERVICES).replace("@PROCS@", STOCK_PROCESSES)
 
 LOAD_SIGMASTAR_BRANCH = b"""\t\timx415)
 \t\t\t# palianytsia: waybeam six-mode IMX415 driver first, stock as the fallback
@@ -577,6 +593,12 @@ def check_drone(info, binary):
         if not fnmatch.fnmatch(soc, "ssc33*") and not fnmatch.fnmatch(soc, "ssc30k*"):
             raise Abort(f"maburd is built for SigmaStar ssc338q (Infinity6E); this drone reports soc '{soc or '?'}'")
         say(f"   warning: maburd is tested on ssc338q only; {soc} is the same family")
+    if info.get("mi_missing"):
+        raise Abort(
+            f"this image lacks SigmaStar MI libraries maburd loads at start: {info['mi_missing'].strip()}\n"
+            "   (its majestic carries its own copy). Put the image's own osdrv libraries in /usr/lib first,\n"
+            "   for ssc338q OpenIPC general/package/sigmastar-osdrv-infinity6e/files/lib, stripped as the\n"
+            "   image's present libmi_sys.so is (compare sha256), then run this again. Nothing was changed.")
     if not info["cards"]:
         say("   warning: no Realtek USB card on the bus; maburd will not start without one")
     need_kb = (binary.stat().st_blocks + 1) // 2 + 64
