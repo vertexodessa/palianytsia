@@ -173,6 +173,7 @@ extern "C" fn on_au_tramp(
             skipped_before,
             vcl_nal,
             salvaged: salvaged != 0,
+            t_first_us: 0,
         });
     })
 }

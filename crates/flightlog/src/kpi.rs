@@ -15,7 +15,8 @@
 //!   stats' `uplink_pct`);
 //! - the GS stages per frame (spec 13.2) from the `frames` events: queue
 //!   to codec input (t4 to t5) and codec input to output (t5 to t6), p50
-//!   and p99 in µs.
+//!   and p99 in µs; and from au.log, a base AU's first body to the AU out
+//!   of the core (t3 to t4).
 //!
 //! G2G, RCF heard at a fixed attenuation and GS load need the bench, not
 //! a log.
@@ -44,6 +45,8 @@ pub struct Kpi {
     dec_in: u64,
     dec_shown: u64,
     uplink: Vec<u64>,
+    /// Per base AU: t3 to t4, µs.
+    asm: Vec<u64>,
     /// Per frame out of the codec: t4 to t5 and t5 to t6, µs.
     wait: Vec<u64>,
     dec: Vec<u64>,
@@ -80,6 +83,10 @@ impl Kpi {
             }
         }
         self.last_base = Some(t);
+    }
+
+    pub(crate) fn asm(&mut self, us: u64) {
+        self.asm.push(us);
     }
 
     pub(crate) fn stats(&mut self, t: u64, v: &Value) {
@@ -160,6 +167,8 @@ impl Kpi {
             "complete_au_pct": share(self.complete, self.aus),
             "shown_pct": share(self.dec_shown, self.dec_in),
             "uplink_pct_p50": pct(&mut self.uplink.clone(), 50),
+            "asm_us_p50": pct(&mut self.asm.clone(), 50),
+            "asm_us_p99": pct(&mut self.asm.clone(), 99),
             "frames": self.wait.len(),
             "queue_us_p50": pct(&mut self.wait.clone(), 50),
             "queue_us_p99": pct(&mut self.wait.clone(), 99),

@@ -17,7 +17,7 @@ sizes = C.defaultdict(list)
 for line in open(d + "/au.log"):
     if line[0] in "a#":
         continue
-    t, sid, nbytes, flags, complete, salv, pts = map(int, line.split())
+    t, sid, nbytes, flags, complete, salv, pts = map(int, line.split()[:7])
     if t > tend:
         break
     n_all += 1

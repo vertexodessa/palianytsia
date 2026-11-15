@@ -27,7 +27,11 @@ use crate::capture;
 
 pub const STATS_FORMAT: &str = "pal-stats";
 pub const EVENTS_FORMAT: &str = "pal-events";
-pub const AULOG_MARKER: &str = "aulog 1";
+/// "aulog 2" added the eighth column, asm_us (t4 - t3: first body of the
+/// AU to the AU out of the core, "-" when the core did not say); readers
+/// take "aulog 1" too.
+pub const AULOG_MARKER: &str = "aulog 2";
+const AULOG_V1: &str = "aulog 1";
 pub const VERSION: u32 = 1;
 /// In the log root: what the panic hook appends to. The next session moves
 /// it into its own directory as `PANIC_PREV_FILE`.
@@ -275,7 +279,7 @@ impl Session {
         }
         let mut au = create(&dir, AU_FILE)?;
         writeln!(au, "{AULOG_MARKER}")?;
-        writeln!(au, "# t_us sid bytes flags complete salvaged pts_us")?;
+        writeln!(au, "# t_us sid bytes flags complete salvaged pts_us asm_us")?;
         let mut fec = create(&dir, FEC_FILE)?;
         writeln!(fec, "{FEC_FORMAT}")?;
         // A release build aborts on a panic without dropping the writers:
@@ -468,13 +472,17 @@ impl Session {
         self.guard(|s| {
             writeln!(
                 s.au,
-                "{t_us} {} {} {} {} {} {}",
+                "{t_us} {} {} {} {} {} {} {}",
                 a.sid,
                 a.data.len(),
                 a.flags,
                 u8::from(a.complete),
                 u8::from(a.salvaged),
-                a.pts_us
+                a.pts_us,
+                match a.t_first_us {
+                    0 => "-".to_string(),
+                    t => t_us.saturating_sub(t).to_string(),
+                }
             )
         })
     }
@@ -740,7 +748,8 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
     let (mut t_min, mut t_max) = (u64::MAX, 0u64);
 
     let mut lines = BufReader::new(File::open(dir.join(AU_FILE))?).lines();
-    if lines.next().transpose()?.as_deref() != Some(AULOG_MARKER) {
+    let marker = lines.next().transpose()?;
+    if !matches!(marker.as_deref(), Some(AULOG_MARKER | AULOG_V1)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "au.log: no aulog marker",
@@ -751,16 +760,25 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
         if l.starts_with('#') {
             continue;
         }
-        let f: Vec<u64> = l.split(' ').filter_map(|x| x.parse().ok()).collect();
+        let mut cols = l.split(' ');
+        let f: Vec<u64> = cols
+            .by_ref()
+            .take(7)
+            .filter_map(|x| x.parse().ok())
+            .collect();
         let [t, sid, bytes, flags, complete, salvaged, pts] = f[..] else {
             continue;
         };
+        let asm_us = cols.next().and_then(|x| x.parse::<u64>().ok());
         if sid == 0 {
             s.latency.au(t, pts, complete != 0);
         }
         s.keyframes
             .au(t, sid, bytes, flags & 0x01 != 0, complete != 0);
         s.kpi.au(t, sid, flags & 0x01 != 0, complete != 0);
+        if let (0, Some(a)) = (sid, asm_us) {
+            s.kpi.asm(a);
+        }
         t_min = t_min.min(t);
         t_max = t_max.max(t);
         s.aus += 1;
@@ -1033,6 +1051,7 @@ mod tests {
                 data: vec![0; 100],
                 flags: 1,
                 complete: true,
+                t_first_us: 1_496_000,
                 ..Au::default()
             };
             s.au(1_500_000, &au).expect("au");
@@ -1040,6 +1059,7 @@ mod tests {
                 1_600_000,
                 &Au {
                     complete: false,
+                    t_first_us: 0,
                     ..au
                 },
             )
@@ -1059,6 +1079,23 @@ mod tests {
         assert!(sum.events.iter().any(|(k, n)| k == "rung" && *n == 1));
         assert!(!sum.events.iter().any(|(k, _)| k == "channel"));
         assert!((sum.span_s - 1.0).abs() < 1e-9);
+        // asm_us: 4 ms for the first AU, "-" (not counted) for the second.
+        let aulog = fs::read_to_string(dir.join(AU_FILE)).expect("au.log");
+        assert!(aulog.starts_with("aulog 2\n"));
+        assert!(aulog.lines().any(|l| l.ends_with(" 4000")));
+        assert!(aulog.lines().any(|l| l.ends_with(" -")));
+        let k = sum.kpi.json();
+        assert_eq!(
+            (k["asm_us_p50"].as_u64(), k["asm_us_p99"].as_u64()),
+            (Some(4000), Some(4000))
+        );
+        // A v1 log (seven columns) still reads.
+        fs::write(
+            dir.join(AU_FILE),
+            "aulog 1\n# t_us sid bytes flags complete salvaged pts_us\n1500000 0 100 1 1 0 0\n",
+        )
+        .expect("v1");
+        assert_eq!(summarize(&dir).expect("v1 summary").aus, 1);
         let second = Session::create(&root, UNIX_EPOCH, 0, &TEST_RUN).expect("create");
         assert!(second.dir().to_string_lossy().contains("fl-0002_"));
         drop(second);

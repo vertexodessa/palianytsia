@@ -622,6 +622,7 @@ mod tests {
             salvaged: false,
             skipped_before: 0,
             vcl_nal: nal,
+            t_first_us: 0,
         }
     }
 

@@ -69,6 +69,10 @@ pub struct Au {
     pub skipped_before: u32,
     /// NAL type of the first slice; 0 when the AU carries none.
     pub vcl_nal: u8,
+    /// Core clock (body `mono_us`) of the earliest body that carried a
+    /// fragment of this AU (spec 13.2 t3); 0 unknown (the ref core does
+    /// not pass it). Logged only: no parity output reads it.
+    pub t_first_us: u64,
 }
 
 /// One closed loss episode with the link setting it closed under: a

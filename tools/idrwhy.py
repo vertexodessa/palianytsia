@@ -28,7 +28,7 @@ rows = []
 for line in open(d + "/au.log"):
     if line[0] in "a#":
         continue
-    t, sid, nb, fl, comp, salv, pts = map(int, line.split())
+    t, sid, nb, fl, comp, salv, pts = map(int, line.split()[:7])
     if t > tend:
         break
     a, z = bisect.bisect_left(vt, t - 600000), bisect.bisect_right(vt, t)
