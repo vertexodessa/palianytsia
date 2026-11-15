@@ -376,6 +376,13 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   logs the TX reports as `rcf_ack` events. Either end alone still links. mabur host suite 259/259,
   ARM build. Open: retries seen on air from the 8812AU, the drone's ACKs, and the A/B against the
   2026-09-05 switch-loss method on the bench.
+- mabur pin, 2026-11-16 (pal-cf5.20): an IDR after maburd joins a rebuilt encoder's ring. A parameter
+  set that restarts the encoder (camera mode, slices) makes the hot thread reattach, and the reattach
+  skipped the new encoder's first IDR with the ring's backlog: the Quest showed no picture for 69 s
+  after two mode changes in a row (fl-0011). The reattach now raises the chain-break flag, so the
+  pacer sends an IDR. The GS side asks too: frames flat for 1 s while AUs go in (reason `stall`), and
+  a pts step over 250 ms inside a DISCONT run counts as a new run. mabur host suite 259/259, ARM
+  build (both radios). Open: the Quest check, two mode changes in a row with the picture back in 2 s.
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).
