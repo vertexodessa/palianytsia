@@ -745,6 +745,9 @@ impl CoreLoop {
             serde_json::json!({"row": row, "id": id, "prev": prev, "value": text,
                 "result": result_text(&r, "sent")}),
         );
+        if r.is_ok() {
+            self.params.sent(row);
+        }
         r
     }
 
@@ -803,6 +806,9 @@ impl CoreLoop {
             let j = self.core.params_json(now);
             if let Some(values) = self.params.note(&j) {
                 self.sink.shared.event("params", values);
+            }
+            for a in self.params.answers() {
+                self.sink.shared.event("param_result", a);
             }
             self.step_held(&j, now);
             let _ = self.ports.params_tx.try_send(j);
@@ -1033,6 +1039,10 @@ struct ParamLog {
     rows: Vec<(String, Option<String>)>,
     /// The {id: value} map last written; None until the next listing.
     logged: Option<serde_json::Map<String, serde_json::Value>>,
+    /// (state, status) per table row, from the last `params_json`.
+    states: Vec<(String, String)>,
+    /// Rows set from this GS whose answer is not logged yet.
+    awaiting: Vec<usize>,
 }
 
 impl ParamLog {
@@ -1047,6 +1057,15 @@ impl ParamLog {
             .as_array()?
             .iter()
             .map(|r| (s(&r["id"]).unwrap_or_default(), s(&r["value"])))
+            .collect();
+        self.states = v["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                let st = s(&r["state"]).unwrap_or_default();
+                (st, s(&r["status"]).unwrap_or_default())
+            })
             .collect();
         let list = v.get("list").and_then(serde_json::Value::as_str);
         if !matches!(list, Some("complete" | "partial")) {
@@ -1064,6 +1083,40 @@ impl ParamLog {
         }
         self.logged = Some(values.clone());
         Some(serde_json::json!({"list": list, "values": values}))
+    }
+
+    /// A set of `row` went out: its answer is logged once it arrives.
+    fn sent(&mut self, row: usize) {
+        if !self.awaiting.contains(&row) {
+            self.awaiting.push(row);
+        }
+    }
+
+    /// The drone's answers to sets since the last call: one
+    /// `param_result` per awaited row that reached a final state, with the
+    /// value it now reads and the drone's reason. Without it the log said
+    /// "sent" for a set the drone refused (pal-pzj.33).
+    fn answers(&mut self) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        let (rows, states) = (&self.rows, &self.states);
+        self.awaiting.retain(|&row| {
+            let Some((st, status)) = states.get(row) else {
+                return true;
+            };
+            if !matches!(
+                st.as_str(),
+                "accepted" | "failed" | "unsupported" | "timeout"
+            ) {
+                return true;
+            }
+            let (id, value) = rows
+                .get(row)
+                .map_or((None, None), |(i, v)| (Some(i), v.as_ref()));
+            out.push(serde_json::json!({"row": row, "id": id, "result": st,
+                "status": status, "value": value}));
+            false
+        });
+        out
     }
 
     /// Row `row`'s id and its value before a set.
@@ -1859,6 +1912,44 @@ mod tests {
             w.pass(66_000_000, 17, 3, false).0,
             None,
             "and it stays clear"
+        );
+    }
+
+    fn set_table(state: &str, status: &str, value: &str) -> String {
+        serde_json::json!({"list": "complete", "rows": [
+            {"id": "RADIO_PWR_MODE", "value": "none", "state": "idle", "status": ""},
+            {"id": "RADIO_WALL_MARGN", "value": value, "state": state, "status": status},
+        ]})
+        .to_string()
+    }
+
+    /// pal-pzj.33: a set the drone refuses is logged as refused with its
+    /// reason, an accepted one as accepted, each once.
+    #[test]
+    fn the_drones_answer_to_a_set_is_logged_once() {
+        let mut p = ParamLog::default();
+        p.note(&set_table("accepted", "", "1.0"));
+        assert!(p.answers().is_empty(), "nothing was set");
+        p.sent(1);
+        p.note(&set_table("in_progress", "", "1.0"));
+        assert!(p.answers().is_empty(), "no answer yet");
+        let why = "power plan refused: no offset power plan";
+        p.note(&set_table("failed", why, "1.0"));
+        let a = p.answers();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0]["id"], "RADIO_WALL_MARGN");
+        assert_eq!(a[0]["result"], "failed");
+        assert_eq!(a[0]["status"], why);
+        assert_eq!(a[0]["value"], "1.0");
+        assert!(p.answers().is_empty(), "logged once");
+        p.sent(1);
+        p.note(&set_table("sending", "", "1.0"));
+        assert!(p.answers().is_empty());
+        p.note(&set_table("accepted", "", "6.0"));
+        let a = p.answers();
+        assert_eq!(
+            (a[0]["result"].as_str(), a[0]["value"].as_str()),
+            (Some("accepted"), Some("6.0"))
         );
     }
 
