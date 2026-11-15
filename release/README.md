@@ -1,11 +1,11 @@
-# Palianytsia v0.16.1
+# Palianytsia v0.16.2
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.16.1.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.16.1.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.16.2.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.16.2.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E radios. |
@@ -13,6 +13,11 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/S96mabur` | The init script that runs maburd; `install.py` puts it in place. |
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
+
+## What changed in v0.16.2
+- **No more keyframe storms at low bitrate.** The drone's encoder caps the size of a P frame at twice the average frame at the current bitrate. Where the bitrate is low (the lowest rung, the low-power mode while disarmed, the first seconds after boot or a link loss) that cap was smaller than an ordinary P frame, so the encoder sent a keyframe on every frame; the link could not carry them and the picture ran up to 0.8 s late or stopped (once for 34 s after a disarm, with a good signal). The cap now never goes below 14 kB per megapixel of the picture, set by the new drone key `venc.superframe_p_floor_kb` (0 = off); at the top rungs it works as before. A drone that keeps its own `mabur.toml` on update gets the default.
+
+GS and drone stay compatible with v0.16.1 back to v0.14 (RC 18, same parameter table), and a v0.16.2 ground station updates the drone by itself. Host tests and the flight logs of 2026-11-15 only: not run on a drone yet, not flown.
 
 ## What changed in v0.16.1
 - **Calibration no longer runs at pit power.** In v0.16 a calibration started before the drone's first arm read the pit power as the drone's reference level, so the whole run was measured around pit power and the drone saved wrong TX power walls. The drone now switches pit off when a calibration starts and back on when it ends. **Repeat any calibration you ran on a v0.16 drone** after updating to v0.16.1.
@@ -35,7 +40,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.16.1.apk    # or the phone APK
+   adb install palianytsia-quest-0.16.2.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -144,7 +149,7 @@ Calibrate (Link tab, drone at a distance and disarmed) measures this drone's car
 
 When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, or with a native (not binned) camera mode, the link carries more; if the OSD shows the bitrate at the ceiling on the top rung, raise `ENC_BITRATE_MAX` (the bench drone runs 18000 with `ENC_AIRTIME` 0.75 at 40 MHz). Values above the factory ones were run on one bench drone and not flown.
 
-## Known limits in v0.16.1
+## Known limits in v0.16.2
 
 - Recording from arm to disarm has been checked on a replayed capture, not with a real arm. The automatic drone update has been run from the Quest and desktop apps on one bench, not in the field. The phone app carries it and was not run against a drone. A power cut during the few seconds of the flash write can leave the drone without maburd; `install.py` from a PC recovers it. Two ground stations of different releases each install their own maburd, once per app start.
 - Pairing uses the default link key on both ends.
@@ -169,7 +174,7 @@ When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, 
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.16.1` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.16` plus the calibration fix for pit mode from `palianytsia/base-v2`, without the bench-only `/sim` endpoint.
+- mabur: fork branch `release/v0.16.2` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.16.1` plus the P-frame ceiling floor from `palianytsia/base-v2`, without the bench-only `/sim` endpoint.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
