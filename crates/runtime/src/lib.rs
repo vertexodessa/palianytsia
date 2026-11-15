@@ -2189,6 +2189,43 @@ mod tests {
         assert!(shared.core_done.load(Ordering::Acquire));
     }
 
+    /// pal-pzj.11: an AU with a hole that salvage could not rebuild goes to
+    /// the decoder as the bytes the core gave, a keyframe included: on the
+    /// hole_policy measurement dropping it made libavcodec invent a gray
+    /// reference (worst of the three policies), and a skip picture gained
+    /// nothing consistent over the prefix.
+    #[test]
+    fn a_truncated_keyframe_reaches_the_decoder_as_its_prefix() {
+        let (au_tx, au_rx) = au_queue::au_queue(8);
+        let (mav_tx, _mav_rx) = mpsc::sync_channel(1);
+        let shared = Arc::new(Shared::default());
+        let mut sink = Sink {
+            au_tx,
+            pts_off_us: None,
+            mav_tx,
+            udp: None,
+            card: None,
+            log: None,
+            now_us: 0,
+            shared: shared.clone(),
+            idr: None,
+            cam_fps: Default::default(),
+            dvr: None,
+        };
+        let prefix = vec![0, 0, 0, 1, 0x26, 0x01, 0xaf, 0x13];
+        sink.on_au(Au {
+            data: prefix.clone(),
+            flags: 0x01,
+            vcl_nal: 19,
+            complete: false,
+            ..Au::default()
+        });
+        let (_, _, got) = au_rx.try_recv().expect("the AU was queued");
+        assert_eq!(got, prefix);
+        assert_eq!(shared.au_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.au_skipped.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn a_full_disk_stops_the_log_once_and_the_ui_line_says_so() {
         let root = std::env::temp_dir().join(format!("pal-rt-logerr-{}", std::process::id()));
