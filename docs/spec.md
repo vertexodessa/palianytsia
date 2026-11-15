@@ -322,7 +322,14 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   and `release/drone/mabur.toml`), no parameter row, RC 18 unchanged; a drone that keeps its
   `mabur.toml` gets the defaults. Why: on the bench the Quest read up to +10..+14 dBm next to the
   drone and lost frames to receiver overload (fl-1970: 0.5 % at -15 dBm, 15.6 % at +5, 27 % at +10).
-  mabur host suite 259/259. Open: the bench RSSI with pit against without is not measured.
+  mabur host suite 259/259. Open: the bench RSSI with pit against without is not measured. Resolved
+  2026-11-15: -41.1 and -40.3 dBm with pit, -27.0 dBm without (ch 149/40, desktop GS).
+- mabur pin, 2026-11-15 (pal-lpwp): calibration lifts pit before the sweep reads its anchor. Under a
+  flat override the TXAGC reference registers read back the override (Jaguar3 0x18e8, Jaguar1 0xc30),
+  so in v0.16 a run started before the first arm read the pit index as its anchor and calibrated the
+  walls at pit power. `LivePowerTable::begin_cal` now clears a live pit override before the first sweep
+  of a run; the run's restore lands pit again. mabur host suite 258/258 (`ctest -R test_`), mutation
+  red. Open: a calibration run under pit on air (drone log line "pit power off for calibration").
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).
