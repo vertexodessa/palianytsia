@@ -95,6 +95,8 @@ pub struct Shared {
     /// Telems heard from a drone on another RC version: the RX threads count them, since the
     /// core takes such a frame for no RC at all.
     pub peer_rc: PeerRc,
+    /// Per-chain RSSI per card, for the preflight's antenna balance.
+    pub chains: Chains,
     /// The maintenance lane: shell sessions on the drone, the video-off wish.
     pub maint: maint::Hub,
     /// A drone is heard: a session, or its Telems in another RC version.
@@ -118,6 +120,47 @@ pub struct Shared {
 /// How old the FC's last HEARTBEAT may be for the drone update to trust it
 /// (the FC sends one a second through maburd).
 pub const FC_ARM_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Cards whose per-chain RSSI is summed (`Chains`).
+pub const CHAIN_CARDS: usize = 4;
+
+/// Per-card, per-antenna-chain RSSI of CRC-good frames heard from the
+/// drone, summed on the RX threads: (sum of chain A, sum of chain B,
+/// frames). Raw chip units (dBm + 110), 0 on a chain the chip did not
+/// report, so only frames with both chains count. The OSD takes the means
+/// over its own window for the preflight's antenna balance; the core sees
+/// only the stronger chain.
+#[derive(Default)]
+pub struct Chains([[AtomicU64; 3]; CHAIN_CARDS]);
+
+impl Chains {
+    pub fn note(&self, card: u8, rssi: [u8; 2]) {
+        let Some(c) = self.0.get(usize::from(card)) else {
+            return;
+        };
+        if rssi[0] == 0 || rssi[1] == 0 {
+            return;
+        }
+        c[0].fetch_add(u64::from(rssi[0]), Ordering::Relaxed);
+        c[1].fetch_add(u64::from(rssi[1]), Ordering::Relaxed);
+        c[2].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// [[sum A, sum B, frames], ...] for the first `n` cards.
+    pub fn json(&self, n: usize) -> serde_json::Value {
+        self.0
+            .iter()
+            .take(n)
+            .map(|c| {
+                serde_json::json!([
+                    c[0].load(Ordering::Relaxed),
+                    c[1].load(Ordering::Relaxed),
+                    c[2].load(Ordering::Relaxed)
+                ])
+            })
+            .collect()
+    }
+}
 
 /// A drone's Telem in another RC version (`rc::foreign_rc_version`), counted on the RX thread.
 #[derive(Default)]
@@ -906,6 +949,13 @@ impl CoreLoop {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // One card has no "cards" list in the stats line; its chains still count.
+        let n_cards = stats
+            .as_ref()
+            .and_then(|s| s.get("cards"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(1, |c| c.len().max(1));
+        let chains = Some(self.sink.shared.chains.json(n_cards));
         let off = (!off.is_empty()).then(|| off.into());
         let idr_stuck = self
             .sink
@@ -922,6 +972,7 @@ impl CoreLoop {
                     ("drone", drone),
                     ("log_err", log_err),
                     ("card_off_us", off),
+                    ("card_chains", chains),
                     ("rf_sim", rf_sim::active().map(|s| s.snapshot())),
                     ("peer_rc", peer_rc),
                     ("idr_stuck", idr_stuck),
@@ -1506,6 +1557,9 @@ impl CardSet {
                         {
                             r.shared.peer_rc.note(ver);
                         }
+                    }
+                    if !f.crc_err {
+                        r.shared.chains.note(card_id, f.rssi);
                     }
                     r.shared.lat.rx_sent.fetch_add(1, Ordering::Relaxed);
                     if r.tx.try_send(rx_body(card_id, f, &p, now, ch)).is_err() {

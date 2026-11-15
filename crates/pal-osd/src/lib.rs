@@ -110,6 +110,25 @@ pub fn card_rates(old: &[CardRx], new: &[CardRx], dt: f64) -> Vec<CardRate> {
         .collect()
 }
 
+/// Frames a card must deliver in the window before its chains are compared.
+const CHAIN_MIN_FRAMES: u64 = 50;
+
+/// Per card, chain A and chain B mean RSSI (dBm) between two cumulative
+/// `card_chains` samples; a card missing from `old` counts from zero.
+pub fn chain_means(old: &[[u64; 3]], new: &[[u64; 3]]) -> Vec<Option<(f64, f64)>> {
+    new.iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let o = old.get(i).copied().unwrap_or([0; 3]);
+            let f = n[2].saturating_sub(o[2]);
+            (f >= CHAIN_MIN_FRAMES).then(|| {
+                let m = |k: usize| n[k].saturating_sub(o[k]) as f64 / f as f64 - 110.0;
+                (m(0), m(1))
+            })
+        })
+        .collect()
+}
+
 /// A card going deaf or hearing again, for the flight log.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeafChange {
@@ -312,6 +331,21 @@ mod tests {
         // verdict, so no flip either way.
         let now = run(12, 1500.0, |t| if t > 4 { 1.0 } else { 0.0 }, true);
         assert!(now.is_empty(), "{now:?}");
+    }
+
+    #[test]
+    fn chain_means_are_taken_over_the_window() {
+        // 100 frames at chain A raw 80 (-30 dBm) and B raw 67 (-43 dBm).
+        let old = [[1000, 1000, 10]];
+        let new = [[1000 + 100 * 80, 1000 + 100 * 67, 110]];
+        let m = chain_means(&old, &new);
+        assert_eq!(m, vec![Some((-30.0, -43.0))]);
+        // Too few frames, and a card new since the old sample.
+        assert_eq!(chain_means(&[[0, 0, 0]], &[[800, 800, 10]]), vec![None]);
+        assert_eq!(
+            chain_means(&[], &[[80 * 60, 80 * 60, 60]]),
+            vec![Some((-30.0, -30.0))]
+        );
     }
 
     #[test]

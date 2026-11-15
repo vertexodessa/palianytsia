@@ -65,6 +65,9 @@ pub struct Snapshot {
     pub fetch: Option<crate::update::FetchView>,
     /// The extra tools show (a signed tools file in the payload directory).
     pub tools_on: bool,
+    /// Per card: summed RSSI of antenna chains A and B and the frames
+    /// summed (`runtime::Chains`, raw chip units, UI stats line only).
+    pub chains: Vec<[u64; 3]>,
 }
 
 /// The GS DVR's state for the REC chip.
@@ -268,6 +271,10 @@ impl Snapshot {
             update: v.get("update").and_then(crate::update::UpdateView::parse),
             fetch: v.get("fetch").and_then(crate::update::FetchView::parse),
             tools_on: v.get("tools").and_then(Value::as_bool).unwrap_or(false),
+            chains: crate::json::list(&v, "card_chains", |c| {
+                let n = |i| c.get(i).and_then(Value::as_u64).unwrap_or(0);
+                [n(0), n(1), n(2)]
+            }),
         })
     }
 }
@@ -333,6 +340,17 @@ impl History {
             })
             .collect()
     }
+    /// Per card, the mean RSSI (dBm) of antenna chains A and B over the
+    /// last `CARD_WINDOW_S`; None for a card with too few frames in it.
+    pub fn chain_means(&self) -> Vec<Option<(f64, f64)>> {
+        let Some((t1, new)) = self.rows.back() else {
+            return Vec::new();
+        };
+        let start = self.rows.partition_point(|(t, _)| t1 - t > CARD_WINDOW_S);
+        let old = self.rows.get(start).map(|(_, s)| s.chains.as_slice());
+        chain_means(old.unwrap_or(&[]), &new.chains)
+    }
+
     /// Per-card rates over the last `CARD_WINDOW_S` (empty with fewer
     /// than two cards or one snapshot).
     pub fn card_rates(&self) -> Vec<CardRate> {
@@ -564,6 +582,17 @@ pub fn key_banner(ui: &mut Ui, h: &History) {
         .inner_margin(Vec2::new(10.0, 5.0))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(text).strong().color(fg));
+        });
+}
+
+/// A red banner on the video (the arming cue).
+pub fn alarm_banner(ui: &mut Ui, text: &str) {
+    egui::Frame::NONE
+        .fill(BAD)
+        .corner_radius(4.0)
+        .inner_margin(Vec2::new(10.0, 5.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).strong().color(Color32::WHITE));
         });
 }
 

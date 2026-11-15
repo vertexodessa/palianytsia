@@ -204,6 +204,83 @@ pub fn checks(s: &Snapshot, rates: &[CardRate], t: &Telemetry, telem_fresh: bool
     v
 }
 
+/// Two chains of one card on the same air within this many dB: more is an
+/// antenna off, broken or cross-polarised (the Quest's LHCP antenna read
+/// 13 dB under its neighbour).
+pub const CHAIN_SPREAD_DB: f64 = 8.0;
+
+/// The antenna row from each card's chain means (`History::chain_means`);
+/// None while no card has enough frames to judge.
+pub fn antennas(chains: &[Option<(f64, f64)>]) -> Option<Check> {
+    let judged: Vec<(usize, f64, f64)> = chains
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.map(|(a, b)| (i, a, b)))
+        .collect();
+    if judged.is_empty() {
+        return None;
+    }
+    let worst = judged
+        .iter()
+        .max_by(|x, y| (x.1 - x.2).abs().total_cmp(&(y.1 - y.2).abs()))?;
+    let (i, a, b) = *worst;
+    let d = (a - b).abs();
+    Some(if d > CHAIN_SPREAD_DB {
+        let low = if a < b { "A" } else { "B" };
+        row(
+            Level::Warn,
+            "ant",
+            format!(
+                "card {i} antenna {low} is {d:.0} dB under the other: check it is on, whole and of the same polarisation"
+            ),
+        )
+    } else {
+        row(
+            Level::Ok,
+            "ant",
+            format!("antennas balanced (worst {d:.0} dB, card {i})"),
+        )
+    })
+}
+
+/// How long the arming cue stays on the video.
+pub const ARM_CUE_S: f64 = 8.0;
+
+/// The cue for arming with a red row: on the disarmed-to-armed edge, the
+/// red rows' names stay on the video for `ARM_CUE_S`. A cue only: the
+/// arm itself is the FC's.
+#[derive(Default)]
+pub struct ArmCue {
+    armed: bool,
+    shown: Option<(f64, String)>,
+}
+
+impl ArmCue {
+    /// Feeds the arm state and the checklist at `now_s`; the cue text
+    /// while it is up.
+    pub fn update(&mut self, armed: bool, now_s: f64, rows: &[Check]) -> Option<&str> {
+        if armed && !self.armed {
+            let red: Vec<&str> = rows
+                .iter()
+                .filter(|c| c.level == Level::Bad)
+                .map(|c| c.what)
+                .collect();
+            if !red.is_empty() {
+                self.shown = Some((now_s, format!("ARMED ON A NO-GO: {}", red.join(", "))));
+            }
+        }
+        self.armed = armed;
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|(t, _)| !armed || now_s - t > ARM_CUE_S)
+        {
+            self.shown = None;
+        }
+        self.shown.as_ref().map(|(_, s)| s.as_str())
+    }
+}
+
 /// The worst level of the list (Ok for an empty one).
 pub fn worst(v: &[Check]) -> Level {
     v.iter().map(|c| c.level).max().unwrap_or(Level::Ok)
@@ -235,6 +312,39 @@ mod tests {
 
     fn level_of(v: &[Check], what: &str) -> Option<Level> {
         v.iter().find(|c| c.what == what).map(|c| c.level)
+    }
+
+    #[test]
+    fn arming_on_a_red_row_raises_the_cue_for_a_while() {
+        let red = vec![row(Level::Bad, "cards", "x"), row(Level::Warn, "key", "y")];
+        let mut c = ArmCue::default();
+        assert_eq!(c.update(false, 0.0, &red), None);
+        assert_eq!(c.update(true, 1.0, &red), Some("ARMED ON A NO-GO: cards"));
+        assert!(c.update(true, 1.0 + ARM_CUE_S - 0.5, &[]).is_some(), "held");
+        assert_eq!(
+            c.update(true, 1.0 + ARM_CUE_S + 0.5, &[]),
+            None,
+            "timed out"
+        );
+        // Already armed when the rows turn red: no cue; amber rows never cue.
+        assert_eq!(c.update(true, 20.0, &red), None);
+        c.update(false, 21.0, &[]);
+        assert_eq!(c.update(true, 22.0, &[row(Level::Warn, "key", "y")]), None);
+    }
+
+    #[test]
+    fn an_antenna_far_under_its_neighbour_is_amber() {
+        assert_eq!(antennas(&[None, None]), None, "nothing judged yet");
+        let ok = antennas(&[Some((-30.0, -34.0))]).unwrap();
+        assert_eq!(ok.level, Level::Ok);
+        // The Quest LHCP case: one chain 13 dB down on the second card.
+        let bad = antennas(&[Some((-30.0, -33.0)), Some((-44.0, -31.0))]).unwrap();
+        assert_eq!(bad.level, Level::Warn);
+        assert!(
+            bad.text.contains("card 1 antenna A is 13 dB"),
+            "{}",
+            bad.text
+        );
     }
 
     #[test]

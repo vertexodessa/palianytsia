@@ -82,6 +82,7 @@ pub struct Console {
     age: FrameAge,
     stall: Stall,
     dropped: DropWatch,
+    arm_cue: crate::preflight::ArmCue,
 }
 
 impl Console {
@@ -100,6 +101,7 @@ impl Console {
             age: FrameAge::default(),
             stall: Stall::None,
             dropped: DropWatch::default(),
+            arm_cue: Default::default(),
         }
     }
 
@@ -200,8 +202,14 @@ impl Console {
         // On the video itself, whatever the HUD prefs: it cannot be hidden.
         crate::hud::stall(ui, o.video, self.stall, self.prefs.scale);
         let mismatch = self.hist.last().is_some_and(|s| s.key_mismatch);
+        let rows = self.preflight();
+        let now = self.hist.last_t().unwrap_or(0.0);
+        let cue = self
+            .arm_cue
+            .update(self.telem.armed, now, &rows)
+            .map(str::to_string);
         let mut moved = false;
-        if self.prefs.stats || mismatch || o.status.is_some() {
+        if self.prefs.stats || mismatch || o.status.is_some() || cue.is_some() {
             let base = if o.chips_in_hud { r } else { o.video };
             let mut top = base.shrink(8.0).translate(egui::vec2(0.0, o.top_offset));
             // Below the HUD's top line, whatever its size: a TELEMETRY LOST
@@ -224,6 +232,9 @@ impl Console {
                     );
                 }
                 crate::key_banner(ui, &self.hist);
+                if let Some(c) = &cue {
+                    crate::alarm_banner(ui, c);
+                }
             });
         }
         moved
@@ -271,12 +282,14 @@ impl Console {
         let (Some(s), Some(now)) = (self.hist.last(), self.hist.last_t()) else {
             return Vec::new();
         };
-        crate::preflight::checks(
+        let mut v = crate::preflight::checks(
             s,
             &self.hist.card_rates(),
             &self.telem,
             self.telem.is_fresh(now),
-        )
+        );
+        v.extend(crate::preflight::antennas(&self.hist.chain_means()));
+        v
     }
 
     /// The panel and what it reads this frame, for a container.
