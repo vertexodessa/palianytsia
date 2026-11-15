@@ -314,6 +314,17 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   (devourer opens it without close-on-exec), so the trial maburd and then the rollback were refused
   ("adapter in use") and the wing went dark until the S96 loop was restarted by hand. Test
   `swap_script_does_not_pass_inherited_descriptors_on`. Owed: close-on-exec on devourer's lock.
+- Drone update, 2026-11-15 (pal-go9s): the build matches the drone's radio too. Every release since
+  v0.14 carried an 8822E-only maburd and the platform check passed it to the wing (RTL8812AU): its
+  trial cannot open the card and the update rolls back, video cut for the trial. Now a SigmaStar
+  maburd goes only to a drone whose radio driver it carries: the probe reads `/tmp/mabur-radio`
+  (maburd writes it at start, `chip=<die> generation=<family>`), else the `maburd radio caps:` line
+  of its log, else a USB id only the RTL8812EU uses (`0bda:a81a`; `0bda:881a` names no die); the
+  drivers of a build are read from devourer's strings in the binary. A drone whose radio nothing
+  names, or one Palianytsia does not support (RTL8812CU), gets System `other_platform` with the
+  reason. The release maburd carries both supported radios (`MABUR_RADIOS=8822e,jaguar1`, 1.95 MB
+  against 1.46 MB; `tools/build-maburd.sh` refuses a binary that lacks either). Host tests only:
+  the probe parse, the driver marks, quad and wing against an 8822E-only and a two-radio build.
 - mabur pin, 2026-11-15 (pal-x48e): pit mode. The drone's disarmed low-power mode can also drop TX
   power to a flat index, `low_power.pit_index` (default 1): `low_power.pit = "pre_arm"` (default)
   only until the first ARMED report of the maburd process, so a downed aircraft and a spurious
@@ -660,7 +671,7 @@ the shas are in the README's Sources section):
 |---|---|
 | `palianytsia-phone-vX.Y.Z-arm64.apk`, `palianytsia-quest-vX.Y.Z.apk` | this repo |
 | `palianytsia-vX.Y.Z-linux-x86_64` | the desktop GS |
-| `maburd-vX.Y.Z-ssc338q-8822e` | `third_party/mabur` `tools/build-arm.sh`. At the current pin this builds **8822E only** (`build-arm.sh:85-87`), which fits the quad. The wing (8812AU) needs the chip switch (backport row A1) in the fork first; until then the wing stays on its own build and is not part of a Palianytsia release. |
+| `maburd-vX.Y.Z-ssc338q` | `third_party/mabur` `tools/build-arm.sh` with `MABUR_RADIOS=8822e,jaguar1` (`tools/build-maburd.sh`): the drivers of both supported drone radios, the RTL8812EU (quad) and the RTL8812AU (wing), 1.95 MB stripped. `build-maburd.sh` refuses a binary that lacks either. |
 | `mabur.default.toml`, `S96mabur` | `third_party/mabur/bundle/`, unchanged |
 | `pal-vX.Y.Z-linux-x86_64` (+ aarch64) | the CLI |
 | `PAIR.txt` | mabur sha, devourer sha, `RC_VERSION`, sha256 of every asset |

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Builds the drone half of a matched pair from the pinned submodules:
-# dist/maburd-<ver>-ssc338q-8822e, the bundle files, and dist/PAIR.txt.
+# dist/maburd-<ver>-ssc338q, the bundle files, and dist/PAIR.txt. The maburd
+# carries both drone radios Palianytsia supports, the RTL8812EU (8822E driver)
+# and the RTL8812AU (Jaguar1): the apps install it on every drone they meet.
 #
 # Toolchain: OPENIPC_HOST_BIN if set; with PAL_FETCH_TOOLCHAIN=1 the pinned
 # OpenIPC archive is downloaded, checked against TOOLCHAIN_SHA256 and used.
@@ -37,10 +39,21 @@ if ! command -v nix-build >/dev/null && [ ! -e "$MABUR/toolchain/pkg-config" ]; 
 fi
 
 # build-arm.sh resolves ../devourer, which is third_party/devourer here.
-(cd "$MABUR" && tools/build-arm.sh)
+(cd "$MABUR" && MABUR_RADIOS=8822e,jaguar1 tools/build-arm.sh)
+
+# A mabur older than MABUR_RADIOS builds the 8822E driver alone without a
+# word; such a maburd must not reach the wing. The same marks the GS reads
+# (crates/runtime/src/drone_update.rs Radio::marks).
+has() { grep -q -a -F "$1" "$MABUR/out/arm/maburd"; }
+for m in config_phydm_switch_channel_8822e 15RtlJaguarDevice; do
+  has "$m" || { echo "error: maburd lacks a radio driver ($m)" >&2; exit 1; }
+done
+for m in "RTL8822E (chip-id 0x17) support not compiled in" "Jaguar1 support not compiled in"; do
+  has "$m" && { echo "error: maburd lacks a radio driver ($m)" >&2; exit 1; }
+done
 
 mkdir -p "$DIST"
-BIN=maburd-$VER-ssc338q-8822e
+BIN=maburd-$VER-ssc338q
 cp "$MABUR/out/arm/maburd" "$DIST/$BIN"
 cp "$MABUR/bundle/mabur.default.toml" "$MABUR/bundle/S96mabur" "$DIST/"
 
@@ -50,7 +63,7 @@ RC=$(sed -n 's/.*constexpr uint8_t RC_VERSION = \([0-9]*\);.*/\1/p' "$MABUR/comm
   echo "mabur $(git -C "$MABUR" rev-parse HEAD)"
   echo "devourer $(git -C "$DEVOURER" rev-parse HEAD)"
   echo "RC_VERSION $RC"
-  echo "chips 8822E"
+  echo "chips 8822E 8812A"
   echo
   (cd "$DIST" && sha256sum -- "$BIN" mabur.default.toml S96mabur)
 } > "$DIST/PAIR.txt"

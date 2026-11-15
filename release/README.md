@@ -79,7 +79,7 @@ cd drone
 ./install.py 192.168.1.10          # or root@<drone-ip>
 ```
 
-It asks for the drone's root password once. The drone must be a SigmaStar ssc338q camera with an RTL8812EU or RTL8822E card (tested with the imx415 sensor). The script checks the SoC, the card and the free flash first and stops on a mismatch before changing anything.
+It asks for the drone's root password once. The drone must be a SigmaStar ssc338q camera with an RTL8812EU (RTL8822E) or RTL8812AU card (tested with the imx415 sensor). The script checks the SoC, the card and the free flash first and stops on a mismatch before changing anything.
 
 On a stock OpenIPC FPV image (first install) it:
 

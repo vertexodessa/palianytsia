@@ -572,6 +572,110 @@ struct Probe {
     /// The U-Boot `soc` variable (what tools/drone-install.py checks too):
     /// "ssc338q" on the SigmaStar drones, "hi3516cv610" on the HiSi camera.
     soc: String,
+    /// The radio die maburd brought up ("RTL8822E", "RTL8812A"), empty when
+    /// nothing on the drone names it (`radio_of`).
+    radio: String,
+}
+
+/// The radio die from the probe's three sources, most direct first: the file
+/// maburd writes at start (`/tmp/mabur-radio`, `chip=RTL8822E generation=...`),
+/// the `maburd radio caps: RTL8822E jaguar3 ...` line of its log (every maburd
+/// since the caps line, but the log's rotation can drop it), and a USB id only
+/// one family uses. A USB id is no proof in general: `0bda:881a` ships on the
+/// RTL8812AU (Jaguar1) and on other dies, and devourer picks the driver by the
+/// chip-id register, not by the id.
+fn radio_of(file: &str, caps: &str, usb: &str) -> String {
+    let file_chip = file
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("chip="))
+        .filter(|c| *c != "?");
+    let caps_chip = caps
+        .split_once("maburd radio caps:")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .filter(|c| *c != "?");
+    let usb_chip = usb
+        .split_whitespace()
+        .any(|id| id.eq_ignore_ascii_case("0bda:a81a"))
+        .then_some("RTL8822E");
+    file_chip
+        .or(caps_chip)
+        .or(usb_chip)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The drone radios Palianytsia supports, as devourer builds their drivers in
+/// or out (DEVOURER_JAGUAR3_8822E, DEVOURER_JAGUAR1). Any other die (an
+/// RTL8812CU's RTL8822C among them) gets no update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Radio {
+    /// RTL8822E (RTL8812EU modules): Jaguar3, the 8822E variant.
+    R8822e,
+    /// RTL8812A/8811A/8821A (RTL8812AU): Jaguar1.
+    Jaguar1,
+}
+
+impl Radio {
+    const ALL: [Self; 2] = [Self::R8822e, Self::Jaguar1];
+
+    /// The driver for the die maburd names in its caps line (devourer's
+    /// AdapterCaps chip_name).
+    fn of_chip(chip: &str) -> Option<Self> {
+        match chip {
+            "RTL8822E" => Some(Self::R8822e),
+            "RTL8812A" | "RTL8811A" | "RTL8821A" => Some(Self::Jaguar1),
+            _ => None,
+        }
+    }
+
+    /// Text devourer leaves in a build that has this driver, and the refusal it
+    /// compiles in when the driver is left out (WiFiDriver.cpp). Both must
+    /// agree, so a renamed string reads as "not carried", never as carried.
+    fn marks(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            Self::R8822e => (
+                b"config_phydm_switch_channel_8822e",
+                b"RTL8822E (chip-id 0x17) support not compiled in",
+            ),
+            Self::Jaguar1 => (b"15RtlJaguarDevice", b"Jaguar1 support not compiled in"),
+        }
+    }
+
+    /// The drivers this maburd carries.
+    pub fn in_maburd(bin: &[u8]) -> Vec<Self> {
+        let has = |n: &[u8]| bin.windows(n.len()).any(|w| w == n);
+        Self::ALL
+            .into_iter()
+            .filter(|r| {
+                let (with, without) = r.marks();
+                has(with) && !has(without)
+            })
+            .collect()
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::R8822e => "RTL8822E",
+            Self::Jaguar1 => "RTL8812AU (Jaguar1)",
+        }
+    }
+}
+
+/// What a maburd is built for: its SoC family and, on SigmaStar, the radio
+/// drivers it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Build {
+    pub platform: Option<Platform>,
+    pub radios: Vec<Radio>,
+}
+
+impl Build {
+    pub fn of_maburd(bin: &[u8]) -> Self {
+        Self {
+            platform: Platform::of_maburd(bin),
+            radios: Radio::in_maburd(bin),
+        }
+    }
 }
 
 /// The SoC families maburd is built for. A build runs on one only: the
@@ -615,8 +719,43 @@ impl Platform {
 
 /// Whether a maburd built for `build` runs on the drone of `p`; the reason
 /// when not. A drone or a build of no known family gets nothing: a wrong
-/// binary would only fail its trial, but it cuts the video for a minute.
-fn fits(p: &Probe, build: Option<Platform>) -> Result<(), String> {
+/// binary would only fail its trial, but it cuts the video for a minute. On
+/// SigmaStar the radio counts
+/// too: a build without the drone's radio driver cannot open the card, and a
+/// drone whose radio nothing names gets nothing either.
+fn fits(p: &Probe, build: &Build) -> Result<(), String> {
+    fits_platform(p, build.platform)?;
+    if build.platform != Some(Platform::Star6e) {
+        return Ok(());
+    }
+    let carried = || {
+        build
+            .radios
+            .iter()
+            .map(|r| r.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match Radio::of_chip(&p.radio) {
+        Some(r) if build.radios.contains(&r) => Ok(()),
+        Some(r) => Err(format!(
+            "this maburd has no driver for the drone's radio {} (it carries {})",
+            r.name(),
+            carried()
+        )),
+        None if p.radio.is_empty() => Err(
+            "the drone's radio is unknown (no /tmp/mabur-radio, no caps line in its log, \
+             no USB id of one family): restart the drone's maburd so it names its card"
+                .into(),
+        ),
+        None => Err(format!(
+            "the drone's radio {} is none this app's maburd can carry",
+            p.radio
+        )),
+    }
+}
+
+fn fits_platform(p: &Probe, build: Option<Platform>) -> Result<(), String> {
     match (Platform::of_soc(&p.soc), build) {
         (Some(d), Some(b)) if d == b => Ok(()),
         (Some(d), Some(b)) => Err(format!(
@@ -644,7 +783,11 @@ const PROBE: &str = "e=$(readlink /proc/$PPID/exe); f=/etc/mabur.unproven; \
     echo \"exe=$e\"; \
     echo \"sha=$(sha256sum /usr/bin/maburd 2>/dev/null | cut -d' ' -f1)\"; \
     echo \"state=$(cat /tmp/mabur-up/state 2>/dev/null)\"; \
-    echo \"soc=$(fw_printenv -n soc 2>/dev/null)\"; echo ---; cat /etc/mabur.toml";
+    echo \"soc=$(fw_printenv -n soc 2>/dev/null)\"; \
+    echo \"radio=$(head -n 1 /tmp/mabur-radio 2>/dev/null)\"; \
+    echo \"caps=$(grep -h -m 1 'maburd radio caps:' /tmp/mabur.log /tmp/mabur.log.prev 2>/dev/null | head -n 1)\"; \
+    echo \"usb=$(for d in /sys/bus/usb/devices/*; do [ -f $d/idProduct ] && printf '%s:%s ' $(cat $d/idVendor) $(cat $d/idProduct); done)\"; \
+    echo ---; cat /etc/mabur.toml";
 
 fn probe(hub: &Hub, answer: Duration) -> Result<Probe, ExecError> {
     let (st, out) = exec(hub, PROBE, &[], answer, Duration::from_secs(10), |_| {})?;
@@ -653,10 +796,15 @@ fn probe(hub: &Hub, answer: Duration) -> Result<Probe, ExecError> {
     }
     let text = String::from_utf8_lossy(&out);
     let (head, config) = text.split_once("---\n").unwrap_or((&text, ""));
+    Ok(parse_probe(head, config))
+}
+
+fn parse_probe(head: &str, config: &str) -> Probe {
     let mut p = Probe {
         config: config.to_string(),
         ..Probe::default()
     };
+    let (mut file, mut caps, mut usb) = ("", "", "");
     for l in head.lines() {
         if let Some((k, v)) = l.split_once('=') {
             match k {
@@ -664,11 +812,15 @@ fn probe(hub: &Hub, answer: Duration) -> Result<Probe, ExecError> {
                 "sha" => p.sha = v.to_string(),
                 "state" => p.state = v.to_string(),
                 "soc" => p.soc = v.to_string(),
+                "radio" => file = v,
+                "caps" => caps = v,
+                "usb" => usb = v,
                 _ => {}
             }
         }
     }
-    Ok(p)
+    p.radio = radio_of(file, caps, usb);
+    p
 }
 
 /// Probes until `ok` holds, the swap script reports a rollback, or `limit` passes.
@@ -724,7 +876,7 @@ pub fn run(
             now.exe
         ));
     }
-    fits(&now, Platform::of_maburd(&pl.maburd))?;
+    fits(&now, &Build::of_maburd(&pl.maburd))?;
     let (config, config_changes) = pl.config_for(&now.config)?;
     if now.sha == new_sha && config == now.config {
         return Err("the drone already runs this maburd with this config".to_string());
@@ -907,7 +1059,7 @@ enum Next {
 fn decide(
     p: &Result<Probe, ExecError>,
     want: (&str, Option<&str>),
-    build: Option<Platform>,
+    build: &Build,
     tried: bool,
     fc: Option<bool>,
 ) -> Next {
@@ -1089,8 +1241,8 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
                 v["fallback"] = true.into();
             }
         }
-        let build = Platform::of_maburd(&pl.maburd);
-        match decide(&p, (want, config.as_deref()), build, tried, sh.fc_armed()) {
+        let build = Build::of_maburd(&pl.maburd);
+        match decide(&p, (want, config.as_deref()), &build, tried, sh.fc_armed()) {
             Next::Wait(d, state) => {
                 v["state"] = state.into();
                 if let Err(e) = &p {
@@ -1101,7 +1253,7 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
             }
             Next::Settled(state) => {
                 v["state"] = state.into();
-                if let Some(Err(e)) = p.as_ref().ok().map(|p| fits(p, build)) {
+                if let Some(Err(e)) = p.as_ref().ok().map(|p| fits(p, &build)) {
                     v["error"] = e.into();
                 }
                 sh.set_update(v);
@@ -1187,11 +1339,15 @@ mod tests {
                 exe: exe.into(),
                 sha: sha.into(),
                 soc: "ssc338q".into(),
+                radio: "RTL8822E".into(),
                 ..Probe::default()
             })
         };
         let on_flash = "/usr/bin/maburd";
-        let star = Some(Platform::Star6e);
+        let star = &Build {
+            platform: Some(Platform::Star6e),
+            radios: vec![Radio::R8822e],
+        };
         let down = Some(false);
         assert_eq!(
             decide(&drone(on_flash, "aa"), ("aa", None), star, false, None),
@@ -1225,7 +1381,10 @@ mod tests {
             decide(
                 &drone(on_flash, "bb"),
                 ("aa", None),
-                Some(Platform::Cv610),
+                &Build {
+                    platform: Some(Platform::Cv610),
+                    radios: vec![],
+                },
                 false,
                 down
             ),
@@ -1233,7 +1392,16 @@ mod tests {
             "a camera build never goes on a SigmaStar drone"
         );
         assert_eq!(
-            decide(&drone(on_flash, "bb"), ("aa", None), None, false, down),
+            decide(
+                &drone(on_flash, "bb"),
+                ("aa", None),
+                &Build {
+                    platform: None,
+                    radios: vec![Radio::R8822e],
+                },
+                false,
+                down
+            ),
             Next::Settled("other_platform"),
             "nor a build of no known platform"
         );
@@ -1283,15 +1451,122 @@ mod tests {
             soc: soc.into(),
             ..Probe::default()
         };
-        assert_eq!(fits(&on("ssc338q"), Some(Platform::Star6e)), Ok(()));
-        assert_eq!(fits(&on("hi3516cv610\n"), Some(Platform::Cv610)), Ok(()));
-        let e = fits(&on("hi3516cv610"), Some(Platform::Star6e)).unwrap_err();
+        assert_eq!(
+            fits_platform(&on("ssc338q"), Some(Platform::Star6e)),
+            Ok(())
+        );
+        assert_eq!(
+            fits_platform(&on("hi3516cv610\n"), Some(Platform::Cv610)),
+            Ok(())
+        );
+        let e = fits_platform(&on("hi3516cv610"), Some(Platform::Star6e)).unwrap_err();
         assert!(
             e.contains("built for SigmaStar") && e.contains("Hi3516CV610"),
             "{e}"
         );
-        assert!(fits(&on(""), Some(Platform::Star6e)).is_err(), "SoC unread");
-        assert!(fits(&on("ssc338q"), None).is_err());
+        assert!(
+            fits_platform(&on(""), Some(Platform::Star6e)).is_err(),
+            "SoC unread"
+        );
+        assert!(fits_platform(&on("ssc338q"), None).is_err());
+    }
+
+    // The two drones of the bench: the quad (RTL8812EU, 0bda:a81a) and the
+    // wing (RTL8812AU, 0bda:881a). What a probe printed, from an older maburd
+    // with no radio file and a rotated log, and from one with both.
+    const QUAD_BARE: &str = "exe=/usr/bin/maburd\nsha=aa\nstate=\nsoc=ssc338q\nradio=\ncaps=\n\
+        usb=1d6b:0002 0bda:a81a \n";
+    const WING_BARE: &str = "exe=/usr/bin/maburd\nsha=aa\nstate=\nsoc=ssc338q\nradio=\ncaps=\n\
+        usb=1d6b:0002 0bda:881a \n";
+    const WING_CAPS: &str = "exe=/usr/bin/maburd\nsha=aa\nstate=\nsoc=ssc338q\nradio=\n\
+        caps=maburd radio caps: RTL8812A jaguar1 2x2 bw=3 tune5g=5170-5835 fast_retune=0 \
+        sensors fa=1 igi=1 nhm=0 floor=0\nusb=1d6b:0002 0bda:881a \n";
+
+    fn maburd_with(radios: &[Radio]) -> Vec<u8> {
+        let mut b = b"\x7fELF..libstdc++.so.6\0libmi_sys.so\0".to_vec();
+        for r in Radio::ALL {
+            let (with, without) = r.marks();
+            b.extend_from_slice(if radios.contains(&r) { with } else { without });
+            b.push(0);
+        }
+        b
+    }
+
+    #[test]
+    fn the_probe_names_the_radio_by_file_then_log_then_a_one_family_usb_id() {
+        assert_eq!(parse_probe(QUAD_BARE, "").radio, "RTL8822E");
+        assert_eq!(parse_probe(WING_BARE, "").radio, "", "881a is no proof");
+        assert_eq!(parse_probe(WING_CAPS, "").radio, "RTL8812A");
+        let both = WING_CAPS.replace("radio=\n", "radio=chip=RTL8822E generation=jaguar3\n");
+        assert_eq!(parse_probe(&both, "").radio, "RTL8822E", "the file wins");
+        assert_eq!(radio_of("chip=? generation=?", "", "0bda:a81a"), "RTL8822E");
+        let p = parse_probe(QUAD_BARE, "[radio]\n");
+        assert_eq!(
+            (p.soc.as_str(), p.config.as_str()),
+            ("ssc338q", "[radio]\n")
+        );
+    }
+
+    #[test]
+    fn a_maburd_names_the_radio_drivers_it_carries() {
+        let all = [Radio::R8822e, Radio::Jaguar1];
+        assert_eq!(Radio::in_maburd(&maburd_with(&all)), all.to_vec());
+        assert_eq!(
+            Radio::in_maburd(&maburd_with(&[Radio::R8822e])),
+            vec![Radio::R8822e]
+        );
+        // Both marks (a renamed refusal string would read the same way): not carried.
+        let mut b = maburd_with(&[Radio::Jaguar1]);
+        b.extend_from_slice(Radio::Jaguar1.marks().1);
+        assert_eq!(Radio::in_maburd(&b), vec![]);
+    }
+
+    #[test]
+    fn an_8822e_only_maburd_never_goes_to_the_wing_and_a_two_radio_one_goes_to_both() {
+        let e_only = Build::of_maburd(&maburd_with(&[Radio::R8822e]));
+        let both_radios = Build::of_maburd(&maburd_with(&Radio::ALL));
+        assert_eq!(e_only.platform, Some(Platform::Star6e));
+        let quad = parse_probe(QUAD_BARE, "");
+        let wing = parse_probe(WING_BARE, "");
+        let wing_named = parse_probe(WING_CAPS, "");
+        assert_eq!(fits(&quad, &e_only), Ok(()));
+        assert_eq!(fits(&quad, &both_radios), Ok(()));
+        let e = fits(&wing, &e_only).unwrap_err();
+        assert!(e.contains("radio is unknown"), "{e}");
+        let e = fits(&wing_named, &e_only).unwrap_err();
+        assert!(e.contains("no driver") && e.contains("RTL8812AU"), "{e}");
+        assert_eq!(fits(&wing_named, &both_radios), Ok(()));
+        assert!(
+            fits(&wing, &both_radios).is_err(),
+            "an unnamed radio gets nothing"
+        );
+        // An RTL8812CU drone is not supported: nothing goes to it.
+        let cu = parse_probe(
+            &WING_CAPS.replace("RTL8812A jaguar1", "RTL8822C jaguar3"),
+            "",
+        );
+        let e = fits(&cu, &both_radios).unwrap_err();
+        assert!(e.contains("RTL8822C"), "{e}");
+        // Through the decision the automatic update takes.
+        let down = Some(false);
+        assert_eq!(
+            decide(&Ok(wing_named), ("bb", None), &e_only, false, down),
+            Next::Settled("other_platform")
+        );
+        assert_eq!(
+            decide(&Ok(quad), ("bb", None), &e_only, false, down),
+            Next::Update
+        );
+        // A camera build carries no Realtek driver and needs none.
+        let cam = Build {
+            platform: Some(Platform::Cv610),
+            radios: vec![],
+        };
+        let p = Probe {
+            soc: "hi3516cv610".into(),
+            ..Probe::default()
+        };
+        assert_eq!(fits(&p, &cam), Ok(()));
     }
 
     fn payload_dir(name: &str) -> PathBuf {
