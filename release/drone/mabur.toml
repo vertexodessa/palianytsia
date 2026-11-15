@@ -106,6 +106,9 @@ enable       = true
 bitrate_kbps = 1000
 fps          = 30
 stale_ms     = 2000        # no arm-state report for this long = assume armed, full power
+pit          = "pre_arm"   # TX power in this mode: "off" = keep the flown power, "pre_arm" = pit_index until the
+                           # first arm since boot (a downed drone keeps full power), "disarmed" = on every disarm
+pit_index    = 1           # flat TX power index across all rates while pit is on (0..127)
 
 [ampdu]
 # Frame aggregation: packs several frames into one transmission at the

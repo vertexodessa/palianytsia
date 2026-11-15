@@ -314,6 +314,15 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   (devourer opens it without close-on-exec), so the trial maburd and then the rollback were refused
   ("adapter in use") and the wing went dark until the S96 loop was restarted by hand. Test
   `swap_script_does_not_pass_inherited_descriptors_on`. Owed: close-on-exec on devourer's lock.
+- mabur pin, 2026-11-15 (pal-x48e): pit mode. The drone's disarmed low-power mode can also drop TX
+  power to a flat index, `low_power.pit_index` (default 1): `low_power.pit = "pre_arm"` (default)
+  only until the first ARMED report of the maburd process, so a downed aircraft and a spurious
+  DISARMED in flight keep the flown power; `"disarmed"` on every disarm; `"off"` never. Calibration
+  keeps its own override while it runs and its restore lands the pit index. Config keys only (bundle
+  and `release/drone/mabur.toml`), no parameter row, RC 18 unchanged; a drone that keeps its
+  `mabur.toml` gets the defaults. Why: on the bench the Quest read up to +10..+14 dBm next to the
+  drone and lost frames to receiver overload (fl-1970: 0.5 % at -15 dBm, 15.6 % at +5, 27 % at +10).
+  mabur host suite 259/259. Open: the bench RSSI with pit against without is not measured.
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).
