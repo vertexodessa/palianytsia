@@ -523,11 +523,27 @@ pub fn exec(
     input: &[u8],
     answer: Duration,
     limit: Duration,
+    on_bytes: impl FnMut(u64),
+) -> Result<(i16, Vec<u8>), ExecError> {
+    exec_until_stall(hub, cmd, input, answer, limit, limit, on_bytes)
+}
+
+/// [`exec`] that also gives up once `stall` passes with no stdin byte acked
+/// and no output byte read: a session whose link went away (a card that
+/// dropped off the bus, a link restart) ends there instead of at `limit`.
+fn exec_until_stall(
+    hub: &Hub,
+    cmd: &str,
+    input: &[u8],
+    answer: Duration,
+    limit: Duration,
+    stall: Duration,
     mut on_bytes: impl FnMut(u64),
 ) -> Result<(i16, Vec<u8>), ExecError> {
     let id = hub.open(cmd);
     let t0 = Instant::now();
     let (mut off, mut out) = (0usize, Vec::new());
+    let (mut seen, mut moved) = ((0usize, 0usize), Instant::now());
     let r = loop {
         if off < input.len() {
             off += hub.write(id, &input[off..]);
@@ -539,7 +555,12 @@ pub fn exec(
         let Some(i) = hub.info(id) else {
             break Err(ExecError::Other("session lost".to_string()));
         };
-        on_bytes((off - hub.unacked(id)) as u64);
+        let acked = off - hub.unacked(id);
+        on_bytes(acked as u64);
+        if (acked, out.len()) != seen {
+            seen = (acked, out.len());
+            moved = Instant::now();
+        }
         match i.state {
             State::Exited(st) => {
                 hub.read(id, &mut out);
@@ -547,6 +568,13 @@ pub fn exec(
             }
             State::Closed(st) => break Err(ExecError::Closed(st)),
             State::Opening if t0.elapsed() > answer => break Err(ExecError::NoAnswer),
+            State::Opening => {}
+            _ if moved.elapsed() > stall => {
+                break Err(ExecError::Other(format!(
+                    "`{cmd}` made no progress for {} s",
+                    stall.as_secs()
+                )))
+            }
             _ if t0.elapsed() > limit => {
                 break Err(ExecError::Other(format!(
                     "`{cmd}` did not end in {} s",
@@ -894,6 +922,15 @@ pub fn run(
     })
 }
 
+/// An upload ends this long after its last acked byte.
+const UPLOAD_STALL: Duration = Duration::from_secs(20);
+
+/// The whole-upload bound: 4 kB/s plus 30 s. A Quest moved a 1445636 B maburd
+/// in 85.6 s (16.9 kB/s, 2026-11-15); the old 20 kB/s bound gave it 102 s.
+fn upload_limit(total: u64) -> Duration {
+    Duration::from_secs(30 + total / 4_000)
+}
+
 fn upload_and_swap(
     hub: &Hub,
     pl: &Payload,
@@ -920,13 +957,13 @@ fn upload_and_swap(
     for (name, data) in files {
         prog.step(&format!("uploading {name}"));
         let total = data.len() as u64;
-        let limit = Duration::from_secs(30 + total / 20_000);
-        let (st, _) = exec(
+        let (st, _) = exec_until_stall(
             hub,
             &format!("cat > {UP}/{name}"),
             data,
             Duration::from_secs(5),
-            limit,
+            upload_limit(total),
+            UPLOAD_STALL,
             |d| prog.bytes(d, total),
         )?;
         if st != 0 {
@@ -1081,10 +1118,36 @@ fn decide(
     }
 }
 
-/// (drone, wanted) pairs this process has tried: each once, across link
-/// restarts (a Quest restarts its link when a card comes or goes). A new custom
-/// build makes a new pair.
+/// (drone, wanted) pairs this process is trying or has tried, across link
+/// restarts (a Quest restarts its link when a card comes or goes): a pair
+/// whose try reached the trial is not tried again; one that failed before
+/// it goes back out of here ([`try_again`]). A new custom build makes a new pair.
 static TRIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// One entry per failed try of a TRIED key, for [`try_again`].
+static FAILED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Tries of one (drone, wanted) pair when each failed before the trial.
+const TRIES_BEFORE_TRIAL: usize = 3;
+
+/// Whether a try that failed at `step`, the `fails`th failure of its pair,
+/// is tried again. Up to the trial start the drone is untouched (it still
+/// runs its maburd; the uploads go to /tmp), so a lost link or a slow lane is
+/// worth another go. From the trial on, the drone took part: a broken
+/// build is not pushed at it again.
+fn try_again(step: &str, fails: usize) -> bool {
+    let untouched = step == "reading the drone"
+        || step.starts_with("uploading ")
+        || step == "checking the uploads";
+    untouched && fails < TRIES_BEFORE_TRIAL
+}
+
+/// How soon a failed try that [`try_again`] allows runs again.
+const RETRY_AFTER: Duration = Duration::from_secs(10);
+
+/// How often a pair this process already tried is probed again: another
+/// link session's thread may still hold it, or give it back for a retry.
+const TRIED_RECHECK: Duration = Duration::from_secs(30);
 
 /// How long "updated" stays on screen.
 const UPDATED_SHOW: Duration = Duration::from_secs(15);
@@ -1259,14 +1322,18 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
                 sh.set_update(v);
                 settled = true;
             }
-            Next::Keep => settled = true,
+            Next::Keep => next = Instant::now() + TRIED_RECHECK,
             Next::Update => {
                 let from = p.map(|p| p.sha).unwrap_or_default();
-                TRIED.lock().unwrap_or_else(|e| e.into_inner()).extend(key);
+                TRIED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(key.clone());
                 sh.event(
                     "drone_update",
                     serde_json::json!({ "from": from, "to": want, "custom": pl.custom }),
                 );
+                let mut retry = false;
                 let mut prog = AutoProgress {
                     sh,
                     base: v.clone(),
@@ -1290,13 +1357,34 @@ fn auto_loop(sh: &Shared, emb: Option<Payload>, mut custom: Option<PayloadDir>) 
                     }
                     Err(e) => {
                         log::warn!("drone update: {e}");
+                        let fails = {
+                            let mut f = FAILED.lock().unwrap_or_else(|e| e.into_inner());
+                            f.extend(key.clone());
+                            key.as_ref()
+                                .map_or(0, |k| f.iter().filter(|x| *x == k).count())
+                        };
+                        let again = key.is_some() && try_again(&prog.step, fails);
                         v["state"] = "failed".into();
-                        v["error"] = e.as_str().into();
-                        sh.event("drone_update", serde_json::json!({ "failed": e }));
+                        if again {
+                            TRIED
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .retain(|k| Some(k) != key.as_ref());
+                            v["error"] =
+                                format!("{e}; trying again in {} s", RETRY_AFTER.as_secs()).into();
+                            next = Instant::now() + RETRY_AFTER;
+                            retry = true;
+                        } else {
+                            v["error"] = e.as_str().into();
+                        }
+                        sh.event(
+                            "drone_update",
+                            serde_json::json!({ "failed": e, "again": again }),
+                        );
                     }
                 }
                 sh.set_update(v);
-                settled = true;
+                settled = !retry;
             }
         }
     }
@@ -1309,6 +1397,35 @@ mod tests {
     const SHIPPED: &str =
         "[venc]\nmin_iqp = 42   # floor\n[ampdu]\nmax_num = 0\n[radio]\nwall_margin_db = 6.0\n\
         [air_clock]\nefficiency_20 = [1, 2]\nefficiency_40 = [3, 4]\n";
+
+    #[test]
+    fn a_try_that_failed_before_the_trial_runs_again_up_to_three_times() {
+        for step in [
+            "reading the drone",
+            "uploading maburd",
+            "uploading swap.sh",
+            "checking the uploads",
+        ] {
+            assert!(try_again(step, 1), "{step}");
+            assert!(try_again(step, 2), "{step}");
+            assert!(!try_again(step, 3), "{step}");
+        }
+        for step in [
+            "starting the new maburd (trial, flash untouched)",
+            "checking video from the new maburd",
+            "committing: the old maburd is deleted, the new one written to flash",
+            "",
+        ] {
+            assert!(!try_again(step, 1), "{step}");
+        }
+    }
+
+    #[test]
+    fn the_upload_bound_leaves_a_slow_quest_lane_room() {
+        // 2026-11-15: 1445636 B in 85.6 s; the old bound was 102 s.
+        assert!(upload_limit(1_445_636) >= Duration::from_secs(3 * 86));
+        assert_eq!(upload_limit(0), Duration::from_secs(30));
+    }
 
     #[test]
     fn force_keys_replaces_in_place_adds_missing_and_skips_calibrated_tables() {
