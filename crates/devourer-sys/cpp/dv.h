@@ -42,6 +42,9 @@ typedef struct {
 dv_card *dv_open(const dv_cfg *cfg, char *err, size_t err_cap);
 /* Starts the RX thread; cb runs on it. */
 int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user);
+/* 1 once the RX thread has left devourer's RX loop (the device went away,
+ * or dv_close stopped it); 0 while it runs or before dv_start_rx. */
+int dv_rx_ended(const dv_card *c);
 /* Sends a dot11 GS uplink control frame behind the MAX_RANGE radiotap. */
 int dv_send_control(dv_card *c, const uint8_t *dot11, size_t len);
 /* What the channel search reads (devourer RxEnergy / NhmBusy /

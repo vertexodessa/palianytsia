@@ -41,6 +41,9 @@ struct dv_card {
   std::shared_ptr<WiFiDriver> driver;
   std::shared_ptr<IRtlRadio> dev;
   std::thread rx;
+  // Set when StartRxLoop returns while the card is open: devourer leaves the
+  // loop when the device is gone (NO_DEVICE), so a dropped card shows here.
+  std::atomic<bool> rx_ended{false};
   std::string chip;
   std::vector<uint8_t> radiotap;
 };
@@ -144,8 +147,13 @@ extern "C" int dv_start_rx(dv_card *c, dv_rx_cb cb, void *user) {
       r.sgi = a.sgi != 0;
       cb(user, &r);
     });
+    c->rx_ended.store(true, std::memory_order_release);
   });
   return 0;
+}
+
+extern "C" int dv_rx_ended(const dv_card *c) {
+  return c && c->rx_ended.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 extern "C" int dv_send_control(dv_card *c, const uint8_t *dot11, size_t len) try {

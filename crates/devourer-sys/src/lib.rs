@@ -87,6 +87,7 @@ type RxCb = extern "C" fn(*mut c_void, *const DvRx);
 extern "C" {
     fn dv_open(cfg: *const DvCfg, err: *mut c_char, cap: usize) -> *mut DvCard;
     fn dv_start_rx(c: *mut DvCard, cb: RxCb, user: *mut c_void) -> c_int;
+    fn dv_rx_ended(c: *const DvCard) -> c_int;
     fn dv_send_control(c: *mut DvCard, dot11: *const u8, len: usize) -> c_int;
     fn dv_chip(c: *const DvCard) -> *const c_char;
     fn dv_radio(c: *mut DvCard) -> *mut c_void;
@@ -411,6 +412,12 @@ impl Card {
         }
         self.handler = Some(h);
         Ok(())
+    }
+
+    /// The RX thread has ended: devourer leaves its RX loop when the device
+    /// goes away (a card that dropped off the bus). False before `start_rx`.
+    pub fn rx_ended(&self) -> bool {
+        self.handler.is_some() && unsafe { dv_rx_ended(self.raw) } != 0
     }
 
     /// The control plane, exclusively until the guard drops. Never take it

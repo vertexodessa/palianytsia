@@ -57,7 +57,7 @@ use pal_core::rust_core::RustCore;
 use pal_core::CoreOpts;
 use pal_core::{GsCore, Mode, RZ_NONCE};
 use pal_ref::RefCore;
-use runtime::{lat_us, CoreLoop, Drive, LiveCfg, LoopPorts, Search, Shared, Sink};
+use runtime::{lat_us, CoreLoop, Drive, LoopPorts, Search, Shared, Sink};
 
 #[derive(Clone, Default)]
 struct Opts {
@@ -942,12 +942,6 @@ fn main() {
                         match o.replay.clone() {
                             Some(p) => run_replay(cl, &o, p, ctx),
                             None => {
-                                let cfg = LiveCfg {
-                                    select: devourer_sys::Select::Scan { index: o.card },
-                                    ch: o.ch,
-                                    width: o.width,
-                                    drive: drive(&o),
-                                };
                                 let (ch, w) = (o.ch, o.width);
                                 if o.mode == Mode::Gs {
                                     // Keeps the drone on the maburd this build carries,
@@ -957,9 +951,18 @@ fn main() {
                                         o.payload_dir.clone(),
                                     );
                                 }
-                                if let Err(e) = runtime::run_live(cl, cfg, |chip| {
-                                    eprintln!("pal-desktop: card {chip} on ch {ch} / {w} MHz")
-                                }) {
+                                // A card that drops off the bus (or is not there yet) is
+                                // opened again; the window and the flight log stay.
+                                if let Err(e) = runtime::run_live_reopening(
+                                    cl,
+                                    devourer_sys::Select::Scan { index: o.card },
+                                    ch,
+                                    w,
+                                    || drive(&o),
+                                    |chip| {
+                                        eprintln!("pal-desktop: card {chip} on ch {ch} / {w} MHz")
+                                    },
+                                ) {
                                     die(&e);
                                 }
                             }

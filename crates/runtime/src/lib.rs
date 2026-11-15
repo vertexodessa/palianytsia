@@ -1464,6 +1464,111 @@ impl CardSet {
     }
 }
 
+impl CardSet {
+    /// Err once a card's RX thread has ended: devourer leaves its RX loop
+    /// when the device goes away, so this is a card that dropped off the bus.
+    pub fn check_lost(&self) -> Result<(), String> {
+        match self.cards.iter().position(|c| c.rx_ended()) {
+            Some(i) => Err(format!("{CARD_LOST}: card {i}")),
+            None => Ok(()),
+        }
+    }
+}
+
+/// How a session that ended on a dropped card begins its error.
+pub const CARD_LOST: &str = "card lost";
+
+/// Between sessions: a core that holds no card and does nothing.
+struct IdleCore;
+
+impl GsCore for IdleCore {
+    fn on_rx(&mut self, _body: &RxBody, _io: &mut dyn CoreIo) {}
+    fn tick(&mut self, _now_us: u64, _io: &mut dyn CoreIo) {}
+    fn stats_json(&self) -> String {
+        "{}".into()
+    }
+    fn link_op(&self) -> (i32, i32) {
+        (-1, -1)
+    }
+}
+
+/// How long a GS waits between tries to open a card that is not there.
+pub const CARD_RETRY: Duration = Duration::from_secs(3);
+
+/// `run_live` that outlives the card: when a card drops off the bus (or no
+/// card is there at the start) it waits and opens the cards again, with the
+/// same core loop, flight log session and UI channels. `drive` makes each
+/// session's `Drive` (an `Attach` is used once). Events `card_lost` and
+/// `card_back` (with the outage in ms) mark the gap. Ends when
+/// `Shared::quit` is set, or on an error that is not a lost card.
+pub fn run_live_reopening(
+    mut cl: CoreLoop,
+    select: devourer_sys::Select,
+    ch: u8,
+    width: u8,
+    mut drive: impl FnMut() -> Drive,
+    mut on_open: impl FnMut(&str),
+) -> Result<(), String> {
+    let shared = cl.sink.shared.clone();
+    let quit = || shared.quit.load(Ordering::Relaxed);
+    let nap = |d: Duration| {
+        let t0 = Instant::now();
+        while t0.elapsed() < d && !quit() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let mut lost_at: Option<Instant> = None;
+    let mut told = String::new();
+    while !quit() {
+        let d = drive();
+        let mut selects = vec![select.clone()];
+        if let Drive::Core { extra, .. } = &d {
+            selects.extend(extra.iter().cloned());
+        }
+        let set = match CardSet::open(selects, ch, width) {
+            Ok(s) => s,
+            Err(e) => {
+                if e != told {
+                    eprintln!(
+                        "pal: no card ({e}); trying again every {} s",
+                        CARD_RETRY.as_secs()
+                    );
+                    shared.event("card_wait", serde_json::json!({ "err": e }));
+                    told = e;
+                }
+                nap(CARD_RETRY);
+                continue;
+            }
+        };
+        told.clear();
+        on_open(set.chips());
+        if let Some(t) = lost_at.take() {
+            shared.event(
+                "card_back",
+                serde_json::json!({ "after_ms": t.elapsed().as_millis() as u64 }),
+            );
+        }
+        let r = match d {
+            Drive::Core { attach, .. } => core_session(&mut cl, &set, ch, width, attach),
+            Drive::Pinned { gs } => owned_session(&mut cl, &set, ch, width, gs, None),
+            Drive::Sweep(mut search) => {
+                owned_session(&mut cl, &set, ch, width, false, Some(&mut search))
+            }
+        };
+        drop(set);
+        match r {
+            Err(e) if e.starts_with(CARD_LOST) && !quit() => {
+                eprintln!("pal: {e}; reopening");
+                shared.event("card_lost", serde_json::json!({ "err": e }));
+                lost_at = Some(Instant::now());
+                nap(CARD_RETRY);
+            }
+            r => return r,
+        }
+    }
+    Ok(())
+}
+
 /// A session's hold on the cards' RX: dropped, frames drop until the next
 /// session begins.
 pub struct SessionRoute<'a>(&'a CardSet);
@@ -1480,6 +1585,23 @@ impl Drop for SessionRoute<'_> {
 /// session (`run_live` drops it at once).
 pub fn run_core_on(
     mut cl: CoreLoop,
+    set: &CardSet,
+    ch: u8,
+    width: u8,
+    attach: Attach,
+) -> Result<(), String> {
+    let r = core_session(&mut cl, set, ch, width, attach);
+    // The core's threads use the cards: they stop before the next session
+    // (or the set's owner) takes them.
+    drop(cl);
+    r
+}
+
+/// One session of a core that owns the cards; on return the loop holds no
+/// card (an idle core, no taps), so the set can close and a new session
+/// can attach a new core to new cards.
+fn core_session(
+    cl: &mut CoreLoop,
     set: &CardSet,
     ch: u8,
     width: u8,
@@ -1505,7 +1627,7 @@ pub fn run_core_on(
     let link = at.taps.first().cloned();
     let _ = tap.set((at.taps, at.clock));
     let r = pump(
-        &mut cl,
+        cl,
         &rx,
         clock,
         &shared,
@@ -1514,11 +1636,10 @@ pub fn run_core_on(
                 shared.channel.store(t.channel(), Ordering::Relaxed);
             }
         },
-        |_, _| Ok(true),
+        |_, _| set.check_lost().map(|()| true),
     );
-    // The core's threads use the cards: they stop before the next session
-    // (or the set's owner) takes them.
-    drop(cl);
+    cl.set_core(Box::new(IdleCore));
+    cl.watch_cards(Vec::new());
     drop(link);
     r
 }
@@ -1531,7 +1652,22 @@ fn run_runtime_owned(
     ch: u8,
     width: u8,
     gs: bool,
-    search: Option<Search>,
+    mut search: Option<Search>,
+) -> Result<(), String> {
+    let r = owned_session(&mut cl, set, ch, width, gs, search.as_mut());
+    drop(cl);
+    r
+}
+
+/// One session with the runtime holding the card; on return the sink holds
+/// no card.
+fn owned_session(
+    cl: &mut CoreLoop,
+    set: &CardSet,
+    ch: u8,
+    width: u8,
+    gs: bool,
+    search: Option<&mut Search>,
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::sync_channel::<RxBody>(4096);
     // The channel RX frames are stamped with; 0 while the card retunes.
@@ -1576,7 +1712,7 @@ fn run_runtime_owned(
         }
         Ok(true)
     };
-    if searching && !find(&mut cl, &mut core_ch)? {
+    if searching && !find(cl, &mut core_ch)? {
         return Ok(());
     }
     if gs {
@@ -1584,12 +1720,13 @@ fn run_runtime_owned(
     }
     let mut seen = sweep::Heard::new(hits.load(Ordering::Relaxed), clock());
     let r = pump(
-        &mut cl,
+        cl,
         &rx,
         clock,
         &shared,
         |_, _| {},
         |cl, now| {
+            set.check_lost()?;
             if seen.lost(hits.load(Ordering::Relaxed), now) && searching {
                 cl.sink
                     .shared
@@ -1602,7 +1739,7 @@ fn run_runtime_owned(
             Ok(true)
         },
     );
-    drop(cl);
+    cl.sink.card = None;
     r
 }
 
