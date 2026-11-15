@@ -351,6 +351,12 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   `release/drone/mabur.toml` (19.7 kB at 1728x816, 68 kB at 2944x1656), at least the p99 of
   full-bitrate P frames per mode that day. mabur host suite 258/258, mutation red, ARM build. Open:
   the bench check against a reproduced wedge (pal-mbtz.5).
+- mabur pin, 2026-11-15 (pal-ed3n, pal-go9s): EDCCA off, preamble carrier sense on (`radio.edcca`,
+  default false in code, bundle and `release/drone/mabur.toml`): the drone defers only to decodable
+  802.11 preambles, not to raw in-band energy. maburd also names its radio in `/tmp/mabur-radio`
+  (the GS's radio check in the drone update reads it). mabur host suite 258/259 (test_sw_encoder_async
+  fails only under parallel load: 5/5 alone), ARM build 8822E. Open: on-device CCA readback, bench
+  RCF/FEC comparison, benchjam deferral, the wing (Jaguar1) build.
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).
