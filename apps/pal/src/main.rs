@@ -1112,6 +1112,7 @@ fn print_latency(l: &flightlog::latency::Latency) {
 /// 10 s and IRAP sizes per rung (what a keyframe budget is sized from).
 fn print_keyframes(k: &flightlog::keyframes::Keyframes, span_s: f64) {
     use flightlog::keyframes::pct;
+    print_keyframe_runs(k);
     if k.requests() == 0 && k.bytes_by_rung.is_empty() {
         return;
     }
@@ -1154,6 +1155,44 @@ fn print_keyframes(k: &flightlog::keyframes::Keyframes, span_s: f64) {
             b.len(),
             pct(b, 50),
             pct(b, 100)
+        );
+    }
+}
+
+/// Runs of base keyframes in a row (a wedged encoder sends nothing else) and
+/// the full-power P frames per video mode against the drone's ceiling floor.
+fn print_keyframe_runs(k: &flightlog::keyframes::Keyframes) {
+    use flightlog::keyframes::{mode_pixels, pct, P_FLOOR_KB, RUN_MIN, WEDGE_MIN};
+    if !k.runs.is_empty() {
+        let wedges = k.runs.iter().filter(|r| r.wedge()).count();
+        let longest = k.runs.iter().max_by_key(|r| r.n).expect("not empty");
+        println!(
+            "  keyframe runs ({RUN_MIN}+ base keyframes in a row): {}, unrequested {}, longest {} at {:.1} s; \
+             wedges ({WEDGE_MIN}+ unrequested): {wedges}{}",
+            k.runs.len(),
+            k.runs.iter().filter(|r| !r.requested).count(),
+            longest.n,
+            longest.start_us as f64 / 1e6,
+            if wedges > 0 { "  KEYFRAME STORM" } else { "" }
+        );
+        for r in k.runs.iter().filter(|r| r.wedge()).take(8) {
+            println!(
+                "    wedge at {:.1} s: {} keyframes, {} complete",
+                r.start_us as f64 / 1e6,
+                r.n,
+                r.complete
+            );
+        }
+    }
+    for (mode, p) in &k.p_by_mode {
+        let floor = mode_pixels(mode).map(|(w, h)| P_FLOOR_KB * w * h / 1000);
+        let p99 = pct(p, 99);
+        println!(
+            "  P frames at full power, {mode}: {}, p99 {p99} B, max {} B; floor {P_FLOOR_KB} kB/Mpx = {}{}",
+            p.len(),
+            pct(p, 100),
+            floor.map_or("?".into(), |f| format!("{f} B")),
+            if floor.is_some_and(|f| p99 > f) { "  P99 ABOVE THE FLOOR" } else { "" }
         );
     }
 }

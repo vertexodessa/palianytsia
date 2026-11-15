@@ -756,6 +756,8 @@ pub fn summarize(dir: &Path) -> io::Result<Summary> {
         if sid == 0 {
             s.latency.au(t, pts, complete != 0);
         }
+        s.keyframes
+            .au(t, sid, bytes, flags & 0x01 != 0, complete != 0);
         t_min = t_min.min(t);
         t_max = t_max.max(t);
         s.aus += 1;
