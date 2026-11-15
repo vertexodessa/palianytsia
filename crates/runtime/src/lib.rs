@@ -193,12 +193,26 @@ impl RcfAck {
             .fetch_add(u64::from(r.retries), Ordering::Relaxed);
     }
 
-    fn totals(&self) -> [u64; 3] {
-        [
-            self.acked.load(Ordering::Relaxed),
-            self.dropped.load(Ordering::Relaxed),
-            self.retries.load(Ordering::Relaxed),
-        ]
+    /// The counts since the last take, and zero again; None when nothing
+    /// was reported.
+    pub fn take(&self) -> Option<[u64; 3]> {
+        let t = [
+            self.acked.swap(0, Ordering::Relaxed),
+            self.dropped.swap(0, Ordering::Relaxed),
+            self.retries.swap(0, Ordering::Relaxed),
+        ];
+        t.iter().any(|&x| x > 0).then_some(t)
+    }
+}
+
+/// Queues the `rcf_ack` flight-log event for the reports since the last
+/// call; each front end's loop calls it once a second.
+pub fn log_rcf_ack(shared: &Shared) {
+    if let Some([acked, dropped, retries]) = shared.rcf_ack.take() {
+        shared.event(
+            "rcf_ack",
+            serde_json::json!({"acked": acked, "dropped": dropped, "retries": retries}),
+        );
     }
 }
 
@@ -577,8 +591,6 @@ pub struct CoreLoop {
     cal: CalUi,
     /// Per-card deaf/hearing flips for the flight log.
     deaf: pal_osd::DeafWatch,
-    /// `rcf_ack` totals at the last flight-log event.
-    rcf_ack_last: [u64; 3],
     /// Core time (ms) of the last ladder transition logged as rung_reason.
     rung_seen_ms: Option<i64>,
     /// The flight log's write error has been reported.
@@ -641,7 +653,6 @@ impl CoreLoop {
             last_log_us: 0,
             cal: CalUi::default(),
             deaf: pal_osd::DeafWatch::default(),
-            rcf_ack_last: [0; 3],
             rung_seen_ms: None,
             log_err_told: false,
             params: ParamLog::default(),
@@ -1082,19 +1093,7 @@ impl CoreLoop {
         for (c, &o) in cards.iter_mut().zip(off) {
             c.off_link_us = o;
         }
-        let t = self.sink.shared.rcf_ack.totals();
-        let d: Vec<u64> = t
-            .iter()
-            .zip(self.rcf_ack_last)
-            .map(|(a, b)| a - b)
-            .collect();
-        if d.iter().any(|&x| x > 0) {
-            self.rcf_ack_last = t;
-            self.sink.shared.event(
-                "rcf_ack",
-                serde_json::json!({"acked": d[0], "dropped": d[1], "retries": d[2]}),
-            );
-        }
+        log_rcf_ack(&self.sink.shared);
         for c in self.deaf.push(now as f64 / 1e6, &cards) {
             let ev = if c.deaf { "card_deaf" } else { "card_hearing" };
             eprintln!(
@@ -2021,6 +2020,24 @@ pub fn pump<L: BodyLoop>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rcf_ack_counts_are_taken_once() {
+        let a = RcfAck::default();
+        assert_eq!(a.take(), None);
+        let rpt = |state, retries| devourer_sys::TxReport {
+            state,
+            bmc: true,
+            retries,
+            queue_raw: 0,
+        };
+        a.note(&rpt(1, 2));
+        a.note(&rpt(1, 2));
+        a.note(&rpt(0, 0));
+        assert_eq!(a.take(), Some([1, 2, 4]));
+        assert_eq!(a.take(), None, "a second take sees nothing new");
+    }
+
     use std::io::Write;
 
     /// Nothing until a foreign Telem is counted; then the UI view until 60 s after the last

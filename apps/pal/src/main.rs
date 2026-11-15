@@ -284,6 +284,9 @@ impl Sink {
     fn log_stats(&mut self, now_us: u64, last: &mut u64, core: &dyn GsCore) {
         if self.log.is_some() && now_us >= *last + 1_000_000 {
             *last = now_us;
+            if let Some(s) = &self.shared {
+                runtime::log_rcf_ack(s);
+            }
             let line = core.stats_json();
             self.log
                 .as_mut()
