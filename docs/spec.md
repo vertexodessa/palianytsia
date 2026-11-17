@@ -395,6 +395,13 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   per key) instead of upstream's `radio.cca`, which turns both gates on or off and which our maburd
   refuses as an unknown key. GS sources (`gs/src`, `web/src`, `gs/player/src`) are byte-identical
   to the old pin; the drone gains upstream's HEVC level bound in `parse_sps`.
+- Probe bodies with a bad FCS reach ProbeTrack again, 2026-11-17 (pal-0n7y): the clean-stream rule
+  above dropped every FCS-bad probe once no probe was FCS-good for 500 ms while video was clean; the
+  probe flies a rung above the link, so near the edge that booked each as a full `bpb` loss and
+  saturated `link.rungs[].probe_u`, holding the ladder down (upstream's reason for 4d9a48fe). Both
+  cores now exempt the probe stream; video and MSP stay gated. Unit tests in both cores. Not measured
+  on the bench: `probe_u` and time on the top rung near the edge (`--rf-sim atten=`), with and
+  without.
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).

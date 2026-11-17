@@ -280,8 +280,14 @@ impl Aggregator {
         // CLEAN_STREAM_US; otherwise it stays a crc_fail and goes nowhere. In
         // a fade with no FCS-good video body for that long, salvage is the
         // only source left, so every FCS-bad body is routed by its peeked id
-        // as before.
-        if !m.crc_ok && heard_within(self.any_clean_us, m.mono_us) {
+        // as before. A body naming the probe stream is not gated: the probe
+        // flies a rung above the link, so at the edge none of its PPDUs may
+        // be clean for long stretches, and dropping them would book each as a
+        // full bpb loss and saturate probe_u (mabur-ground aggregator.cpp).
+        if !m.crc_ok
+            && stream_id != Some(sbi::PROBE_STREAM_ID)
+            && heard_within(self.any_clean_us, m.mono_us)
+        {
             let seen = stream_id.map_or(0, |sid| self.sid_clean_us[usize::from(sid)]);
             if !heard_within(seen, m.mono_us) {
                 return Route::Dropped;
@@ -347,6 +353,35 @@ mod tests {
         }
         // 591 ms without a clean video body: a fade, route as named.
         assert!(matches!(a.on_rx_body(&at(601, false, 0)), Route::Video(_)));
+    }
+
+    /// mabur-ground `crc_failed_probe_body_is_not_gated_by_the_clean_stream_rule`:
+    /// video alive, the probe never FCS-good, and every FCS-bad probe body
+    /// still reaches ProbeTrack; an FCS-bad enh body with no clean enh does not.
+    #[test]
+    fn crc_failed_probe_body_is_not_gated_by_the_clean_stream_rule() {
+        let body = |sid: u8| {
+            pal_wire::sbi::Packer::new(16, 1, sid)
+                .add(&[0x5a; 16])
+                .unwrap()
+        };
+        let at = |ms: u64, crc_ok: bool, sid: u8| RxBody {
+            crc_ok,
+            mono_us: ms * 1000,
+            mac_seq: ms as u16,
+            body: body(sid),
+            ..Default::default()
+        };
+        let mut a = agg();
+        a.on_rx_body(&at(11, true, 0));
+        for ms in (12..900).step_by(40) {
+            assert!(matches!(
+                a.on_rx_body(&at(ms, false, sbi::PROBE_STREAM_ID)),
+                Route::Probe
+            ));
+            a.on_rx_body(&at(ms + 1, true, 0));
+        }
+        assert!(matches!(a.on_rx_body(&at(901, false, 1)), Route::Dropped));
     }
 
     #[test]
