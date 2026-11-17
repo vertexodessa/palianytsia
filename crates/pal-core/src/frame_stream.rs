@@ -107,6 +107,46 @@ fn key(sid: u8, fseq: u16) -> u32 {
     (u32::from(sid) << 16) | u32::from(fseq)
 }
 
+/// The slice assembler's remainder into `out`: its slices as data, a
+/// passthrough remainder as tail, in the order it produces them.
+fn drain_slices(sa: &mut SliceAssembler, chunks: &ChunkMap, out: &mut dyn FrameOut) {
+    let out = std::cell::RefCell::new(out);
+    sa.finish(chunks, &mut |b| out.borrow_mut().data(b), &mut |b| {
+        out.borrow_mut().tail(b)
+    });
+}
+
+/// Length of the Annex B start code at `at` (4 or 3 bytes), if one is there
+/// with at least one byte after it.
+fn start_code_len(b: &[u8], at: usize) -> Option<usize> {
+    if b.len() >= at + 5 && b[at..at + 4] == [0, 0, 0, 1] {
+        Some(4)
+    } else if b.len() >= at + 4 && b[at..at + 3] == [0, 0, 1] {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// A frame that opens with a parameter set (VPS/SPS/PPS): its bytes from
+/// the first chunk on, through the first chunk where a VCL NAL starts. None
+/// when it opens otherwise or a chunk before that is missing.
+fn leading_param_sets(s: &Slot) -> Option<Vec<u8>> {
+    let b = s.chunks.get(&0)?;
+    let sc = start_code_len(b, HDR_LEN)?;
+    if !(32..=34).contains(&hevc::nal::nal_type(b[HDR_LEN + sc])) {
+        return None;
+    }
+    let mut head = b[HDR_LEN..].to_vec();
+    let vcl_started = |head: &[u8]| split_nals(head).iter().any(|v| v.ty < 32);
+    let mut i = 1u16;
+    while i < s.count && !vcl_started(&head) {
+        head.extend_from_slice(s.chunks.get(&i)?);
+        i += 1;
+    }
+    Some(head)
+}
+
 /// What try_emit does with a head above the emit cursor.
 enum Gap {
     Go,
@@ -561,23 +601,7 @@ impl FrameStream {
 
     fn finish(&mut self, mut s: Slot, complete: bool, out: &mut dyn FrameOut) {
         if let Some(sa) = s.sa.as_mut() {
-            // Two sinks into one `out`: route through a small enum buffer.
-            let mut pieces: Vec<(bool, Vec<u8>)> = Vec::new();
-            {
-                let cell = std::cell::RefCell::new(&mut pieces);
-                sa.finish(
-                    &s.chunks,
-                    &mut |b| cell.borrow_mut().push((false, b.to_vec())),
-                    &mut |b| cell.borrow_mut().push((true, b.to_vec())),
-                );
-            }
-            for (tail, b) in &pieces {
-                if *tail {
-                    out.tail(b)
-                } else {
-                    out.data(b)
-                }
-            }
+            drain_slices(sa, &s.chunks, out);
             s.lat.slice = *sa.result();
         } else if !complete && s.hdr.slice_rows > 0 {
             s.lat.slice.fallback = if self.params.unsupported() {
@@ -589,14 +613,7 @@ impl FrameStream {
         if complete {
             self.feed_params(&mut s);
         }
-        if s.lat.slice.salvaged {
-            self.st.slice_salvaged += 1;
-            self.st.slices_kept += u64::from(s.lat.slice.kept);
-            self.st.slices_filled += u64::from(s.lat.slice.filled);
-            self.st.slices_after_hole += u64::from(s.lat.slice.kept_after_hole);
-        } else if !complete && s.lat.slice.fallback != SliceFallback::None {
-            self.st.slice_fallback[s.lat.slice.fallback as usize] += 1;
-        }
+        self.count_slices(&s.lat, complete);
         out.end(complete, &s.lat);
         if complete {
             self.st.clean += 1;
@@ -608,30 +625,24 @@ impl FrameStream {
         self.discont_seen_since_emit = false;
     }
 
+    /// The slice outcome of a finished frame into the stats.
+    fn count_slices(&mut self, lat: &AuLat, complete: bool) {
+        if lat.slice.salvaged {
+            self.st.slice_salvaged += 1;
+            self.st.slices_kept += u64::from(lat.slice.kept);
+            self.st.slices_filled += u64::from(lat.slice.filled);
+            self.st.slices_after_hole += u64::from(lat.slice.kept_after_hole);
+        } else if !complete && lat.slice.fallback != SliceFallback::None {
+            self.st.slice_fallback[lat.slice.fallback as usize] += 1;
+        }
+    }
+
     /// A complete AU opening with a parameter set feeds the salvage tracker;
     /// only the leading parameter sets are copied, never the slice data.
     fn feed_params(&mut self, s: &mut Slot) {
-        let Some(b) = s.chunks.get(&0) else { return };
-        let h = HDR_LEN;
-        let p = if b.len() >= h + 5 && b[h..h + 4] == [0, 0, 0, 1] {
-            h + 4
-        } else if b.len() >= h + 4 && b[h..h + 3] == [0, 0, 1] {
-            h + 3
-        } else {
+        let Some(head) = leading_param_sets(s) else {
             return;
         };
-        let ty = hevc::nal::nal_type(b[p]);
-        if !(32..=34).contains(&ty) {
-            return;
-        }
-        let mut head = b[h..].to_vec();
-        let vcl_started = |head: &[u8]| split_nals(head).iter().any(|v| v.ty < 32);
-        let mut i = 1u16;
-        while i < s.count && !vcl_started(&head) {
-            let Some(c) = s.chunks.get(&i) else { return };
-            head.extend_from_slice(c);
-            i += 1;
-        }
         if let Some(v) = split_nals(&head).iter().find(|v| v.ty < 32) {
             s.lat.vcl_nal = v.ty;
         }
