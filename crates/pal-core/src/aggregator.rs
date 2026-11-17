@@ -8,15 +8,6 @@ use crate::RxBody;
 use pal_wire::{rc, sbi};
 
 const MAX_SEQ_GAP: u16 = 512;
-/// How recently a stream must have been heard FCS-good for an FCS-bad body
-/// naming it to be routed: ten probe periods, a few hundred video bodies.
-const CLEAN_STREAM_US: u64 = 500_000;
-
-/// True when the last FCS-good body (stamp + 1, 0 = never) is within
-/// CLEAN_STREAM_US of now.
-fn heard_within(stamp: u64, now_us: u64) -> bool {
-    stamp != 0 && now_us + 1 >= stamp && now_us + 1 - stamp <= CLEAN_STREAM_US
-}
 const EMA_ALPHA: f64 = 0.1;
 
 pub const RF_S0: usize = 0;
@@ -147,10 +138,6 @@ pub struct Aggregator {
     bad_card_msgs: u64,
     last_video_us: u64,
     last_video_seq: u16,
-    /// mono_us + 1 of the last FCS-good SBI body, per stream id and of any
-    /// stream, on any card (0 = never): the routing gate for FCS-bad bodies.
-    sid_clean_us: [u64; 128],
-    any_clean_us: u64,
 }
 
 impl Aggregator {
@@ -166,8 +153,6 @@ impl Aggregator {
             bad_card_msgs: 0,
             last_video_us: 0,
             last_video_seq: 0,
-            sid_clean_us: [0; 128],
-            any_clean_us: 0,
         }
     }
     pub fn decoder(&self) -> &UepDecoder {
@@ -219,14 +204,6 @@ impl Aggregator {
         if !m.crc_ok {
             c.crc_fail += 1;
         } else {
-            if let Some(sid) = stream_id {
-                self.sid_clean_us[usize::from(sid)] = m.mono_us + 1;
-                // Only video ends a fade: MSP flies at the robust control
-                // modulation and stays FCS-good while every video body fails.
-                if sid <= 1 {
-                    self.any_clean_us = m.mono_us + 1;
-                }
-            }
             c.agg_pos = if m.phy_valid { 0 } else { c.agg_pos + 1 };
             if c.has_seq {
                 let adv = m.mac_seq.wrapping_sub(c.last_seq) & 0x0FFF;
@@ -273,27 +250,8 @@ impl Aggregator {
             c.rc_frames += 1;
             return Route::Rc;
         }
-        // The SBI header has no CRC of its own and the sub-blocks keep
-        // theirs, so one bit error in the stream id byte of an FCS-bad body
-        // would move its CRC-good blocks to another stream. Such a body is
-        // routed only to a stream some card heard FCS-good within
-        // CLEAN_STREAM_US; otherwise it stays a crc_fail and goes nowhere. In
-        // a fade with no FCS-good video body for that long, salvage is the
-        // only source left, so every FCS-bad body is routed by its peeked id
-        // as before. A body naming the probe stream is not gated: the probe
-        // flies a rung above the link, so near the edge none of it may be
-        // clean for long stretches, and the rule would book every probe
-        // lost (probe_u saturates). A video body flipped into the probe id
-        // only reaches ProbeTrack, which drops what does not parse.
-        if !m.crc_ok
-            && stream_id != Some(sbi::PROBE_STREAM_ID)
-            && heard_within(self.any_clean_us, m.mono_us)
-        {
-            let seen = stream_id.map_or(0, |sid| self.sid_clean_us[usize::from(sid)]);
-            if !heard_within(seen, m.mono_us) {
-                return Route::Dropped;
-            }
-        }
+        // An FCS-bad body goes where its SBI header says; its CRC-good
+        // sub-blocks are salvaged there.
         match stream_id {
             Some(sbi::MSP_STREAM_ID) => return Route::Msp,
             Some(sbi::PROBE_STREAM_ID) => return Route::Probe,
@@ -330,11 +288,11 @@ mod tests {
         (c.self_frames, c.seq_received, c.seq_expected)
     }
 
-    /// mabur `clean_msp_does_not_end_a_fade`: MSP stays FCS-good through a
-    /// fade that fails every video body; the corrupt video bodies are all
-    /// salvage has left, so a clean MSP body must not shut the gate.
+    /// mabur-ground `crc_failed_probe_body_is_delivered_for_salvage`: an
+    /// FCS-bad body is routed by the stream its header names, whatever was
+    /// heard clean before.
     #[test]
-    fn clean_msp_does_not_end_a_fade() {
+    fn crc_failed_body_is_routed_by_its_header() {
         let body = |sid: u8| {
             pal_wire::sbi::Packer::new(16, 1, sid)
                 .add(&[0x5a; 16])
@@ -348,46 +306,18 @@ mod tests {
             ..Default::default()
         };
         let mut a = agg();
-        a.on_rx_body(&at(10, true, 0)); // video clean once
-        for ms in (100..=600).step_by(50) {
-            assert!(matches!(a.on_rx_body(&at(ms, true, 4)), Route::Msp));
-        }
-        // 591 ms without a clean video body: a fade, route as named.
-        assert!(matches!(a.on_rx_body(&at(601, false, 0)), Route::Video(_)));
-    }
-
-    /// mabur-ground `crc_failed_probe_body_is_not_gated_by_the_clean_stream_rule`:
-    /// with video clean and the probe never clean, every FCS-bad probe body
-    /// still reaches ProbeTrack.
-    #[test]
-    fn crc_failed_probe_body_is_not_gated_by_the_clean_stream_rule() {
-        let body = |sid: u8| {
-            pal_wire::sbi::Packer::new(16, 1, sid)
-                .add(&[0x5a; 16])
-                .unwrap()
-        };
-        let at = |ms: u64, crc_ok: bool, sid: u8| RxBody {
-            crc_ok,
-            mono_us: ms * 1000,
-            mac_seq: ms as u16,
-            body: body(sid),
-            ..Default::default()
-        };
-        let mut a = agg();
-        a.on_rx_body(&at(11, true, 0));
-        let mut probes = 0;
-        for ms in (12..900).step_by(40) {
-            if matches!(
-                a.on_rx_body(&at(ms, false, sbi::PROBE_STREAM_ID)),
-                Route::Probe
-            ) {
-                probes += 1;
-            }
-            a.on_rx_body(&at(ms + 1, true, 0));
-        }
-        assert_eq!(probes, 23);
-        // The rule still holds for a video stream never heard clean.
-        assert!(matches!(a.on_rx_body(&at(901, false, 1)), Route::Dropped));
+        a.on_rx_body(&at(10, true, 0)); // base heard clean
+        assert!(matches!(
+            a.on_rx_body(&at(11, false, sbi::PROBE_STREAM_ID)),
+            Route::Probe
+        ));
+        assert!(matches!(
+            a.on_rx_body(&at(12, false, sbi::MSP_STREAM_ID)),
+            Route::Msp
+        ));
+        // enh never heard clean: routed all the same.
+        assert!(matches!(a.on_rx_body(&at(13, false, 1)), Route::Video(_)));
+        assert_eq!(a.cards()[0].crc_fail, 3);
     }
 
     #[test]
