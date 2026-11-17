@@ -1,5 +1,6 @@
-//! mabur's golden vectors, read in place from the pinned submodule.
-use pal_wire::{crc16, profile};
+//! mabur's golden vectors, read in place from the pinned submodule, and the
+//! MAVLink goldens in `tests/vectors/` (made by pymavlink, see mavlink_gen.py).
+use pal_wire::{crc16, mavlink, profile, sbi};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -204,4 +205,184 @@ fn rc_nack_mav_roundtrip() {
         assert_eq!(parse_mav(&w, tagged), Some(m.clone()));
         assert!(parse_mav(&w, !tagged).is_none());
     }
+}
+
+fn local_vectors(name: &str) -> Value {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/vectors")
+        .join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    serde_json::from_str(&text).unwrap()
+}
+
+/// Every pymavlink frame parses once, as Ok, on its last byte, with its
+/// header fields; an unsigned MAVLink 2 frame packs back to the same bytes;
+/// the FC HEARTBEATs give their arm state.
+#[test]
+fn mavlink_matches_pymavlink_goldens() {
+    let v = local_vectors("mavlink");
+    let frames = v["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 8);
+    let (mut v1, mut signed, mut repacked) = (0, 0, 0);
+    for f in frames {
+        let name = f["name"].as_str().unwrap();
+        let w = unhex(f["hex"].as_str().unwrap());
+        let mut p = mavlink::Parser::default();
+        let r: Vec<mavlink::Framing> = w.iter().map(|&b| p.feed(b)).collect();
+        let oks: Vec<usize> = (0..r.len())
+            .filter(|&i| r[i] == mavlink::Framing::Ok)
+            .collect();
+        assert_eq!(
+            oks,
+            vec![w.len() - 1],
+            "{name}: Ok exactly on the last byte"
+        );
+        assert!(p.is_idle(), "{name}");
+        let m = p.message();
+        assert_eq!(u64::from(m.msgid), f["msgid"].as_u64().unwrap(), "{name}");
+        assert_eq!(u64::from(m.sysid), f["sysid"].as_u64().unwrap(), "{name}");
+        assert_eq!(u64::from(m.compid), f["compid"].as_u64().unwrap(), "{name}");
+        assert_eq!(m.v1, f["v1"].as_bool().unwrap(), "{name}");
+        v1 += usize::from(m.v1);
+        signed += usize::from(f["signed"].as_bool().unwrap());
+        if f["repack"].as_bool().unwrap() {
+            let (_, _, max) = mavlink::entry(m.msgid).unwrap();
+            let again = mavlink::pack_v2(
+                m.msgid,
+                m.sysid,
+                m.compid,
+                m.seq,
+                &m.payload[..usize::from(max)],
+            );
+            assert_eq!(
+                hex(&again),
+                hex(&w),
+                "{name}: pack_v2 of the parsed payload"
+            );
+            repacked += 1;
+        }
+        let armed = mavlink::fc_heartbeat_armed(&w);
+        let want = match name {
+            "heartbeat_fc_armed" | "heartbeat_v1_armed" | "heartbeat_signed_armed" => Some(true),
+            "heartbeat_fc_disarmed" => Some(false),
+            _ => None,
+        };
+        assert_eq!(armed, want, "{name}");
+    }
+    assert_eq!((v1, signed, repacked), (1, 1, 6));
+}
+
+/// A corrupted signature byte does not fail the frame (no signing context:
+/// the check passes, as mavlink_signature_check); a corrupted CRC byte of the
+/// signed frame does.
+#[test]
+fn mavlink_signed_golden_signature_unchecked_crc_checked() {
+    let v = local_vectors("mavlink");
+    let f = v["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["signed"].as_bool().unwrap())
+        .unwrap();
+    let w = unhex(f["hex"].as_str().unwrap());
+    let last = |w: &[u8]| {
+        let mut p = mavlink::Parser::default();
+        w.iter().map(|&b| p.feed(b)).last().unwrap()
+    };
+    let mut sig = w.clone();
+    *sig.last_mut().unwrap() ^= 0xFF;
+    assert_eq!(last(&sig), mavlink::Framing::Ok);
+    let mut crc = w.clone();
+    let n = crc.len();
+    crc[n - 13 - 1] ^= 0xFF;
+    assert_eq!(last(&crc), mavlink::Framing::BadCrc);
+}
+
+fn sbi_case_survivors(c: &Value) -> Vec<String> {
+    c["survivors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// mabur's sbi_unpack.json: survivors, failures and header verdict per body.
+#[test]
+fn sbi_unpack_matches_vectors() {
+    let v = vectors("sbi_unpack");
+    let cases = v["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 10);
+    for c in cases {
+        let name = c["name"].as_str().unwrap();
+        let body = unhex(c["body"].as_str().unwrap());
+        let bp = c["block_payload"].as_u64().unwrap() as usize;
+        let u = sbi::unpack(&body, bp);
+        assert_eq!(u.header_ok, c["header_ok"].as_bool().unwrap(), "{name}");
+        assert_eq!(u.n_failed as u64, c["n_failed"].as_u64().unwrap(), "{name}");
+        let got: Vec<String> = u.survivors.iter().map(|s| hex(s)).collect();
+        assert_eq!(got, sbi_case_survivors(c), "{name}");
+        if u.header_ok {
+            let sid = c["stream_id"].as_u64().unwrap() as u8;
+            assert_eq!(sbi::peek_stream_id(&body), Some(sid), "{name}");
+        }
+    }
+}
+
+/// mabur's sbi.json: the Rust Packer makes the same bodies from the same
+/// envelopes (full bodies, then the flushed remainder).
+#[test]
+fn sbi_pack_matches_vectors() {
+    let v = vectors("sbi");
+    let bp = v["block_payload"].as_u64().unwrap() as usize;
+    let per = v["blocks_per_body"].as_u64().unwrap() as usize;
+    let sid = v["stream_id"].as_u64().unwrap() as u8;
+    let mut p = sbi::Packer::new(bp, per, sid);
+    let mut stream = Vec::new();
+    for e in v["envelopes"].as_array().unwrap() {
+        if let Some(b) = p.add(&unhex(e.as_str().unwrap())) {
+            stream.push(hex(&b));
+        }
+    }
+    let want: Vec<String> = v["stream"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(stream, want);
+    let flush: Vec<String> = p.flush().iter().map(|b| hex(b)).collect();
+    let want: Vec<String> = v["flush"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(flush, want);
+}
+
+/// The ver-2 header fields by their byte position in mabur's sbi.cpp
+/// (magic, ver, stream id, block_payload, n_blocks, q_ms, enc_us, air_ms;
+/// u16 little-endian), written by hand so swapped offsets in sbi.rs fail.
+#[test]
+fn sbi_header_timing_fields_by_position() {
+    let env = [0x5Au8; 8];
+    let crc = crc16::crc16_ccitt(&env).to_le_bytes();
+    let mut body = vec![
+        0xB0, 0xF5, // magic
+        2,    // ver
+        0x82, // stream 2, retransmit mark
+        8, 0, // block_payload
+        1, // n_blocks
+        0x34, 0x12, // q_ms
+        0x78, 0x56, // enc_us
+        0xBC, 0x9A, // air_ms
+    ];
+    body.extend_from_slice(&crc);
+    body.extend_from_slice(&env);
+    let u = sbi::unpack(&body, 8);
+    assert!(u.header_ok && u.retx);
+    assert_eq!((u.q_ms, u.enc_us, u.air_ms), (0x1234, 0x5678, 0x9ABC));
+    assert_eq!(u.survivors, vec![&env[..]]);
+    assert_eq!(sbi::peek_stream_id(&body), Some(2));
 }

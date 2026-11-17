@@ -554,6 +554,54 @@ mod tests {
         assert_eq!(p.message().sysid, 255);
     }
 
+    /// HEARTBEAT payload: custom_mode u32, type, autopilot, base_mode,
+    /// system_status, mavlink_version.
+    fn heartbeat(base_mode: u8, status: u8, version: u8) -> [u8; 9] {
+        [0x39, 0x30, 0, 0, 2, 3, base_mode, status, version]
+    }
+
+    #[test]
+    fn fc_heartbeat_armed_reads_base_mode() {
+        let fc = |p: &[u8]| pack_v2(MSG_HEARTBEAT, FC_SYS, FC_COMP, 0, p);
+        assert_eq!(fc_heartbeat_armed(&fc(&heartbeat(0x81, 4, 3))), Some(true));
+        assert_eq!(fc_heartbeat_armed(&fc(&heartbeat(0x01, 4, 3))), Some(false));
+        assert_eq!(fc_heartbeat_armed(&fc(&heartbeat(0x00, 4, 3))), Some(false));
+        // system_status and mavlink_version 0 are trimmed off the wire
+        // (MAVLink 2); base_mode is then the last byte sent.
+        let trimmed = fc(&heartbeat(0x80, 0, 0));
+        assert_eq!(trimmed[1], 7);
+        assert_eq!(fc_heartbeat_armed(&trimmed), Some(true));
+    }
+
+    #[test]
+    fn fc_heartbeat_armed_none_for_other_senders_and_messages() {
+        let hb = heartbeat(0x80, 4, 3);
+        // The GS (255/190) and the camera (1/100) are not the FC.
+        assert_eq!(
+            fc_heartbeat_armed(&pack_v2(MSG_HEARTBEAT, 255, 190, 0, &hb)),
+            None
+        );
+        assert_eq!(
+            fc_heartbeat_armed(&pack_v2(MSG_HEARTBEAT, FC_SYS, 100, 0, &hb)),
+            None
+        );
+        // A non-HEARTBEAT message from the FC with the bit set at [6].
+        let st = pack_v2(
+            MSG_STATUSTEXT,
+            FC_SYS,
+            FC_COMP,
+            0,
+            &[4, 0, 0, 0, 0, 0, 0x80, 1],
+        );
+        assert_eq!(fc_heartbeat_armed(&st), None);
+        // A HEARTBEAT with a broken CRC.
+        let mut bad = pack_v2(MSG_HEARTBEAT, FC_SYS, FC_COMP, 0, &hb);
+        let n = bad.len();
+        bad[n - 1] ^= 0xFF;
+        assert_eq!(fc_heartbeat_armed(&bad), None);
+        assert_eq!(fc_heartbeat_armed(&[]), None);
+    }
+
     #[test]
     fn unknown_id_is_bad_crc() {
         let w = pack_v2(40000, 1, 1, 0, &[1, 2, 3]);
