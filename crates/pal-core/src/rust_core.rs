@@ -27,6 +27,7 @@ use crate::link_health::{LhTick, LinkHealthAssembler, LinkHealthInputs, OpPoint}
 use crate::mav::MavTunnel;
 use crate::nack::{NackInputs, NackTailView};
 use crate::tx_selector::{effective_tx_card, CardSnapshot, TxSelector, TxSelectorCfg};
+use crate::uep::DecodedFrag;
 use crate::uplink::{RttEstimator, UplinkDelivery, UplinkState};
 use crate::vrx::{RcfSlotCfg, RcfSlotter, SlotFrame, VrxCfg, VrxController, VrxState};
 use crate::CoreOpts;
@@ -147,6 +148,99 @@ struct Gs {
 }
 
 impl Gs {
+    /// A T_MAV frame: each MAVLink packet to the app, the parameter client
+    /// and the calibration session (the drone replies whatever the
+    /// session's state; it ignores what does not fit).
+    fn on_mav_frame(&mut self, body: &[u8], now_ms: u64, us: u64, io: &mut dyn CoreIo) {
+        for pkt in self.mav.on_rc_frame(body) {
+            io.on_mav(&pkt);
+            self.params.client.on_packet(&pkt, now_ms);
+            for m in cal::decode_all(&pkt) {
+                self.cal.session.on_mav(&m, us / 1000);
+            }
+        }
+        self.params.drain(&mut self.mav);
+    }
+
+    /// The drone's telemetry: RTT pairs its echoes with our own sends, the
+    /// uplink delivery count, the NACK lane.
+    fn on_telem(&mut self, t: &rc::Telem, us: u64) {
+        self.rtt.on_telem(
+            t.rcf_seq_echo,
+            t.flags & rc::TELEM_FLAG_ECHO_VALID != 0,
+            t.rcf_age_ms,
+            t.pts_at_build,
+            us,
+        );
+        self.uplink
+            .on_telem(t.tlm_seq, t.rcf_rx, t.state, us / 1000);
+        if let Some(n) = self.nack.as_mut() {
+            n.on_telem(t);
+        }
+    }
+
+    /// Any other RC frame goes to the controller; a DISC_ACK also carries
+    /// the agreed width, and the ack that OPENED the session links where it
+    /// was heard (on_rc_body handed the core its rx channel).
+    fn on_link_frame(&mut self, ft: Option<u8>, body: &[u8], us: u64) {
+        let was_session = self.linked();
+        self.vrx.on_rc_frame(body, us as f64 / 1000.0);
+        let ack = (ft == Some(rc::T_DISC_ACK))
+            .then(|| rc::parse_disc_ack(body))
+            .flatten();
+        if let Some(ack) = &ack {
+            self.cal.peer_width = ack.agreed_width;
+        }
+        let opened = !was_session && self.linked();
+        if let (true, Some(ack), Some(c)) = (opened, &ack, self.chan.as_mut()) {
+            c.on_session_opened(ack, us as f64 / 1000.0, &mut self.vrx);
+        }
+    }
+
+    /// The MAVLink side of a tick: the session tag, the parameter client,
+    /// then calibration first, so a run's message leaves this tick ahead of
+    /// any live MAVLink backlog, then the backlog.
+    fn tick_mavlink(&mut self, now_ms: u64, now_us: u64, io: &mut dyn CoreIo) {
+        // Tag outbound MAVLink under the live session only.
+        let linked = self.linked();
+        self.mav.set_session(if linked {
+            self.vrx.session_ctx()
+        } else {
+            rc::TagCtx::default()
+        });
+        let nonce = self.vrx.session_ctx().vtx_nonce;
+        self.params.tick(linked, nonce, now_ms, &mut self.mav);
+        self.sync_cal_peer();
+        self.cal.tick(now_ms, self.chan.as_mut(), &mut self.mav);
+        for frame in self.mav.flush_cal() {
+            let sf = SlotFrame {
+                frame,
+                offered_ms: now_ms,
+                card: self.sel.selected() as i32,
+                ..SlotFrame::default()
+            };
+            self.send_now(&sf, now_us, io);
+        }
+        let frames = self.mav.flush();
+        self.send_mav_frames(frames, now_us, io);
+    }
+
+    /// A clean video body: only real video heard where the link lives
+    /// refreshes the rendezvous silence timer (ChannelPlan::is_link_video),
+    /// and hop confirmation reads the stamp.
+    fn note_video(&mut self, m: &RxBody) {
+        if self
+            .chan
+            .as_ref()
+            .is_none_or(|c| c.is_link_video(m.rx_channel))
+        {
+            self.vrx.on_video(m.mono_us as f64 / 1000.0);
+        }
+        if let Some(c) = self.chan.as_mut() {
+            c.note_video(m.rx_channel);
+        }
+    }
+
     /// In SESSION: the one reading of the link state every lane gates on.
     fn linked(&self) -> bool {
         self.vrx.link_state() == VrxState::Session
@@ -712,69 +806,43 @@ impl RustCore {
 
     fn on_rc(&mut self, body: &[u8], us: u64, io: &mut dyn CoreIo) {
         let ft = rc::frame_type(body);
-        if let (Some(rc::T_MAV), Some(g)) = (ft, self.gs.as_mut()) {
-            for pkt in g.mav.on_rc_frame(body) {
-                io.on_mav(&pkt);
-                g.params.client.on_packet(&pkt, self.now_us / 1000);
-                // The drone replies whatever the session's state; it
-                // ignores what does not fit.
-                for m in cal::decode_all(&pkt) {
-                    g.cal.session.on_mav(&m, us / 1000);
-                }
+        if ft == Some(rc::T_MAV) {
+            let now_ms = self.now_us / 1000;
+            if let Some(g) = self.gs.as_mut() {
+                g.on_mav_frame(body, now_ms, us, io);
             }
-            g.params.drain(&mut g.mav);
             return;
         }
         if ft == Some(rc::T_TELEM) {
-            if let Some(t) = rc::parse_telem(body) {
-                let (seq, state, flags) = (t.tlm_seq, t.state, t.flags);
-                self.telem_rx_us = us;
-                self.note_shed(
-                    flags & rc::TELEM_FLAG_CONGESTION_SHED != 0,
-                    t.txq_wait_max_ms,
-                    us / 1000,
-                );
-                // A maburd restart (new seqs, frame_ids from 0) is the one
-                // discontinuity a spotter can see.
-                if self.gs.is_none() && self.restart.on_telem(seq, us as f64 / 1000.0) {
-                    self.telem = Some(t);
-                    self.reset_video(io);
-                    return;
-                }
-                if let Some(g) = self.gs.as_mut() {
-                    // RTT pairs telem echoes with our own sends.
-                    g.rtt.on_telem(
-                        t.rcf_seq_echo,
-                        flags & rc::TELEM_FLAG_ECHO_VALID != 0,
-                        t.rcf_age_ms,
-                        t.pts_at_build,
-                        us,
-                    );
-                    g.uplink.on_telem(seq, t.rcf_rx, state, us / 1000);
-                    if let Some(n) = g.nack.as_mut() {
-                        n.on_telem(&t);
-                    }
-                }
-                self.telem = Some(t);
-            }
+            self.on_telem(body, us, io);
             return;
         }
         if let Some(g) = self.gs.as_mut() {
-            let was_session = g.linked();
-            g.vrx.on_rc_frame(body, us as f64 / 1000.0);
-            let ack = (ft == Some(rc::T_DISC_ACK))
-                .then(|| rc::parse_disc_ack(body))
-                .flatten();
-            if let Some(ack) = &ack {
-                g.cal.peer_width = ack.agreed_width;
-            }
-            // The ack that OPENED the session links where it was heard
-            // (on_rc_body handed the core its rx channel).
-            let opened = !was_session && g.linked();
-            if let (true, Some(ack), Some(c)) = (opened, &ack, g.chan.as_mut()) {
-                c.on_session_opened(ack, us as f64 / 1000.0, &mut g.vrx);
-            }
+            g.on_link_frame(ft, body, us);
         }
+    }
+
+    fn on_telem(&mut self, body: &[u8], us: u64, io: &mut dyn CoreIo) {
+        let Some(t) = rc::parse_telem(body) else {
+            return;
+        };
+        self.telem_rx_us = us;
+        self.note_shed(
+            t.flags & rc::TELEM_FLAG_CONGESTION_SHED != 0,
+            t.txq_wait_max_ms,
+            us / 1000,
+        );
+        // A maburd restart (new seqs, frame_ids from 0) is the one
+        // discontinuity a spotter can see.
+        if self.gs.is_none() && self.restart.on_telem(t.tlm_seq, us as f64 / 1000.0) {
+            self.telem = Some(t);
+            self.reset_video(io);
+            return;
+        }
+        if let Some(g) = self.gs.as_mut() {
+            g.on_telem(&t, us);
+        }
+        self.telem = Some(t);
     }
 
     /// Base-layer selective repeat: direct send, never slotted (a slotted
@@ -861,72 +929,59 @@ impl RustCore {
     pub fn frame_gap_timeout_ms(&self) -> u64 {
         self.fs.gap_ms(0)
     }
-}
 
-impl GsCore for RustCore {
-    /// A spotter sends nothing.
-    fn send_raw(&mut self, body: &[u8], now_us: u64, io: &mut dyn CoreIo) {
+    /// A calibration sweep frame is its own body type: it must never reach
+    /// the decoder as garbage video. CRC-bad ones too (tallied as corrupt);
+    /// one whose corruption breaks the stamp fails the parse and falls
+    /// through as ordinary traffic. True when the frame was taken.
+    fn take_cal_frame(&mut self, m: &RxBody) -> bool {
+        let Some(g) = self.gs.as_mut() else {
+            return false;
+        };
+        let Some(info) = cal::parse_payload(&m.body) else {
+            return false;
+        };
+        let rssi = i32::from(m.rssi[0].max(m.rssi[1])) - 110;
+        g.cal.session.on_cal_frame(
+            usize::from(m.card_id),
+            &info,
+            rssi,
+            m.crc_ok,
+            CAL_DOT11_HEADER_LEN + info.len + CAL_FCS_LEN,
+            m.mono_us / 1000,
+        );
+        self.c.cal_frames += 1;
+        true
+    }
+
+    fn on_probe(&mut self, m: &RxBody) {
         if let Some(g) = self.gs.as_mut() {
-            g.send_raw(body, now_us, io);
+            g.slot.on_probe_tail(self.now_us / 1000);
+        }
+        self.lha.on_probe_body(m.card_id, m);
+    }
+
+    fn on_video_frags(&mut self, frags: Vec<DecodedFrag>, io: &mut dyn CoreIo) {
+        let now_ms = self.now_us / 1000;
+        let mut out = au_out!(self, io);
+        for f in frags {
+            let arr = FragArrival {
+                body_mono_us: f.body_mono_us,
+                q_ms: f.q_ms,
+                enc_us: f.enc_us,
+                air_ms: f.air_ms,
+                sw_seq: Some(f.sw_seq),
+                retx: f.retx,
+                ..FragArrival::default()
+            };
+            self.fs
+                .push_fragment(f.stream_id, &f.frag, now_ms, &arr, &mut out);
         }
     }
 
-    fn on_rx(&mut self, m: &RxBody, io: &mut dyn CoreIo) {
-        self.now_us = self.now_us.max(m.mono_us);
-        self.c.bodies += 1;
-        // A calibration sweep frame is its own body type: it must never
-        // reach the decoder as garbage video. CRC-bad ones too (tallied as
-        // corrupt); one whose corruption breaks the stamp fails the parse
-        // and falls through as ordinary traffic.
-        if let Some(g) = self.gs.as_mut() {
-            if let Some(info) = cal::parse_payload(&m.body) {
-                let rssi = i32::from(m.rssi[0].max(m.rssi[1])) - 110;
-                g.cal.session.on_cal_frame(
-                    usize::from(m.card_id),
-                    &info,
-                    rssi,
-                    m.crc_ok,
-                    CAL_DOT11_HEADER_LEN + info.len + CAL_FCS_LEN,
-                    m.mono_us / 1000,
-                );
-                self.c.cal_frames += 1;
-                return;
-            }
-        }
-        // Before the aggregator routes it: the rc path reads it.
-        if let Some(c) = self.gs.as_mut().and_then(|g| g.chan.as_mut()) {
-            c.on_rc_body(m.rx_channel);
-        }
-        match self.agg.on_rx_body(m) {
-            Route::Rc => self.on_rc(&m.body, m.mono_us, io),
-            Route::Probe => {
-                if let Some(g) = self.gs.as_mut() {
-                    g.slot.on_probe_tail(self.now_us / 1000);
-                }
-                self.lha.on_probe_body(m.card_id, m);
-            }
-            Route::Video(frags) if self.frame_wire => {
-                let now_ms = self.now_us / 1000;
-                let mut out = au_out!(self, io);
-                for f in frags {
-                    let arr = FragArrival {
-                        body_mono_us: f.body_mono_us,
-                        q_ms: f.q_ms,
-                        enc_us: f.enc_us,
-                        air_ms: f.air_ms,
-                        sw_seq: Some(f.sw_seq),
-                        retx: f.retx,
-                        ..FragArrival::default()
-                    };
-                    self.fs
-                        .push_fragment(f.stream_id, &f.frag, now_ms, &arr, &mut out);
-                }
-            }
-            _ => {}
-        }
-        if !m.crc_ok {
-            return;
-        }
+    /// An FCS-good body: the air MCS readout and, for video, the reorder
+    /// diagnostics and the link's video stamps.
+    fn on_clean_rx(&mut self, m: &RxBody) {
         let sid = sbi::peek_stream_id(&m.body);
         // MCS readout off the air: base-stream bodies only.
         if sid == Some(0) && m.mcs != 255 {
@@ -935,123 +990,96 @@ impl GsCore for RustCore {
         let is_video = rc::frame_type(&m.body).is_none()
             && sid != Some(sbi::MSP_STREAM_ID)
             && sid != Some(sbi::PROBE_STREAM_ID);
-        if is_video {
-            self.diag
-                .order
-                .on_frame(m.mac_seq, m.card_id, self.now_us / 1000);
+        if !is_video {
+            return;
         }
-        if let (true, Some(g)) = (is_video, self.gs.as_mut()) {
-            // Only real video heard where the link lives refreshes the
-            // rendezvous silence timer (ChannelPlan::is_link_video).
-            if g.chan
-                .as_ref()
-                .is_none_or(|c| c.is_link_video(m.rx_channel))
-            {
-                g.vrx.on_video(m.mono_us as f64 / 1000.0);
-            }
-            // Hop confirmation reads the stamp.
-            if let Some(c) = g.chan.as_mut() {
-                c.note_video(m.rx_channel);
-            }
+        self.diag
+            .order
+            .on_frame(m.mac_seq, m.card_id, self.now_us / 1000);
+        if let Some(g) = self.gs.as_mut() {
+            g.note_video(m);
         }
     }
 
-    fn tick(&mut self, now_us: u64, io: &mut dyn CoreIo) {
-        self.now_us = self.now_us.max(now_us);
-        let now_ms = self.now_us / 1000;
-        if self.opts.adaptive_gap && now_ms >= self.gap_update_ms + 1000 {
-            self.gap_update_ms = now_ms;
-            for s in 0..2 {
-                let d = self.agg.decoder();
-                self.gap
-                    .update(s, d.newest_seq(s), d.repair_window_recent(s), now_ms);
-                self.fs.set_gap_timeout(s, self.gap.timeout_ms(s));
-                self.fs.set_gap_frame_span(
-                    s,
-                    self.gap.us_per_symbol(s),
-                    GapTimeoutPolicy::margin_ms(),
-                    self.gap.cap_ms(),
-                );
-            }
+    /// Once a second: each stream's gap timeout and frame span from its
+    /// recent sequence numbers and repair window.
+    fn update_gap_timeouts(&mut self, now_ms: u64) {
+        self.gap_update_ms = now_ms;
+        for s in 0..2 {
+            let d = self.agg.decoder();
+            self.gap
+                .update(s, d.newest_seq(s), d.repair_window_recent(s), now_ms);
+            self.fs.set_gap_timeout(s, self.gap.timeout_ms(s));
+            self.fs.set_gap_frame_span(
+                s,
+                self.gap.us_per_symbol(s),
+                GapTimeoutPolicy::margin_ms(),
+                self.gap.cap_ms(),
+            );
         }
-        if let Some(g) = self.gs.as_mut() {
-            let in_session = g.linked();
-            if let Some(c) = g.chan.as_mut() {
-                // maburgs main.cpp's per-tick block, on the TX selector's
-                // card as it stood after the last RCF step.
-                let tx = g.sel.selected();
-                let cin = ChannelTickIn {
-                    now_ms: now_ms as f64,
-                    in_session,
-                    cal_running: g.cal.session.running(),
-                    tx_card: tx,
-                    agg: Some(&self.agg),
-                };
-                c.tick(&cin, &mut g.vrx);
-            }
-        }
-        if let Some(g) = self.gs.as_ref() {
-            // Video tail only in SESSION with a CAP_FRAME_WIRE peer; any
-            // change drops FRAG-seq continuity and half-assembled frames.
-            let fw = g.peer_can(rc::CAP_FRAME_WIRE);
-            if fw != self.frame_wire {
-                self.frame_wire = fw;
-                self.reset_video(io);
-            }
-        }
-        if self.frame_wire {
-            self.fs.poll(now_ms, &mut au_out!(self, io));
-        }
-        if self.gs.as_ref().is_some_and(|g| g.nack.is_some()) {
-            self.poll_nack(now_ms, io);
-            if let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) {
-                let (rows, capped) = n.take_rows(now_ms);
-                if !rows.is_empty() || capped > 0 {
-                    let dq = self.fresh_telem().map(|t| t.txq_wait_max_ms);
-                    self.diag.nack_rows(&rows, capped, dq);
-                }
-            }
-        }
-        self.diag.order_window(now_ms);
-        if !self.telem_recent() {
-            if let Some(dur) = self.diag.shed.active_ms(now_ms) {
-                self.diag.shed.forget();
-                let mut o = J::obj();
-                o.set("on", false);
-                o.set("dur_ms", dur);
-                o.set("telem_lost", true);
-                self.diag.push("drone_shed", o);
-            }
-        }
-        let now_us = self.now_us;
-        if let Some(g) = self.gs.as_mut() {
-            // Tag outbound MAVLink under the live session only.
-            let linked = g.linked();
-            g.mav.set_session(if linked {
-                g.vrx.session_ctx()
-            } else {
-                rc::TagCtx::default()
-            });
-            let nonce = g.vrx.session_ctx().vtx_nonce;
-            g.params.tick(linked, nonce, now_ms, &mut g.mav);
-            // Calibration first, so a run's message leaves this tick, ahead
-            // of any live MAVLink backlog.
-            g.sync_cal_peer();
-            g.cal.tick(now_ms, g.chan.as_mut(), &mut g.mav);
-            for frame in g.mav.flush_cal() {
-                let sf = SlotFrame {
-                    frame,
-                    offered_ms: now_ms,
-                    card: g.sel.selected() as i32,
-                    ..SlotFrame::default()
-                };
-                g.send_now(&sf, now_us, io);
-            }
-            let frames = g.mav.flush();
-            g.send_mav_frames(frames, now_us, io);
-        }
+    }
 
-        let inp = match self.gs.as_ref() {
+    /// maburgs main.cpp's per-tick block, on the TX selector's card as it
+    /// stood after the last RCF step.
+    fn tick_channel(&mut self, now_ms: u64) {
+        let Some(g) = self.gs.as_mut() else {
+            return;
+        };
+        let in_session = g.linked();
+        let Some(c) = g.chan.as_mut() else {
+            return;
+        };
+        let cin = ChannelTickIn {
+            now_ms: now_ms as f64,
+            in_session,
+            cal_running: g.cal.session.running(),
+            tx_card: g.sel.selected(),
+            agg: Some(&self.agg),
+        };
+        c.tick(&cin, &mut g.vrx);
+    }
+
+    /// Video tail only in SESSION with a CAP_FRAME_WIRE peer; any change
+    /// drops FRAG-seq continuity and half-assembled frames.
+    fn sync_frame_wire(&mut self, io: &mut dyn CoreIo) {
+        let Some(g) = self.gs.as_ref() else {
+            return;
+        };
+        let fw = g.peer_can(rc::CAP_FRAME_WIRE);
+        if fw != self.frame_wire {
+            self.frame_wire = fw;
+            self.reset_video(io);
+        }
+    }
+
+    fn tick_nack(&mut self, now_ms: u64, io: &mut dyn CoreIo) {
+        self.poll_nack(now_ms, io);
+        let Some(n) = self.gs.as_mut().and_then(|g| g.nack.as_mut()) else {
+            return;
+        };
+        let (rows, capped) = n.take_rows(now_ms);
+        if !rows.is_empty() || capped > 0 {
+            let dq = self.fresh_telem().map(|t| t.txq_wait_max_ms);
+            self.diag.nack_rows(&rows, capped, dq);
+        }
+    }
+
+    /// A shed still open when the drone's telemetry went quiet is closed
+    /// here, marked telem_lost.
+    fn end_shed_on_lost_telem(&mut self, now_ms: u64) {
+        let Some(dur) = self.diag.shed.active_ms(now_ms) else {
+            return;
+        };
+        self.diag.shed.forget();
+        let mut o = J::obj();
+        o.set("on", false);
+        o.set("dur_ms", dur);
+        o.set("telem_lost", true);
+        self.diag.push("drone_shed", o);
+    }
+
+    fn link_health_inputs(&self) -> LinkHealthInputs {
+        match self.gs.as_ref() {
             Some(g) => LinkHealthInputs {
                 op: *g.vrx.cur_op(),
                 probe_profile: g.vrx.probe_profile(),
@@ -1065,35 +1093,97 @@ impl GsCore for RustCore {
                 probe_rung: -1,
                 nack_late_fills: 0,
             },
+        }
+    }
+
+    /// The controller's step on this tick's link health (an RCF or a DISC
+    /// to offer), then whatever the slotter has due.
+    fn step_link(&mut self, lh: &LhTick, now_ms: u64, now_us: u64, io: &mut dyn CoreIo) {
+        let Some(g) = self.gs.as_mut() else {
+            return;
         };
-        let lh = self.lha.tick(now_ms as f64, &mut self.agg, &inp);
-        self.queue_fec_rows(now_ms, &inp.op);
-        if let Some(g) = self.gs.as_mut() {
-            if let Some(t) = lh.probe_tail_ms {
-                g.slot.set_probe_tail_ms(t);
+        if let Some(t) = lh.probe_tail_ms {
+            g.slot.set_probe_tail_ms(t);
+        }
+        if let Some(out) = g.vrx.step(now_ms as f64, &lh.health) {
+            if !out.is_disc {
+                self.lha.on_step_sent(&self.agg);
             }
-            if let Some(out) = g.vrx.step(now_ms as f64, &lh.health) {
-                if !out.is_disc {
-                    self.lha.on_step_sent(&self.agg);
-                }
-                let tx = g.pick_tx(&self.agg, now_ms);
-                // rcf_seq() IS this frame's seq; DISCs are not matchable
-                // RTT sends.
-                for (card, frame) in g.step_frames(&out.frame, out.is_disc, tx) {
-                    let sf = SlotFrame {
-                        frame,
-                        seq: g.vrx.rcf_seq(),
-                        card: card as i32,
-                        stamp_rtt: !out.is_disc,
-                        ..SlotFrame::default()
-                    };
-                    g.offer_or_send(sf, now_us, io);
-                }
-            }
-            for f in g.slot.take_due(now_ms) {
-                g.send(&f, now_us, io);
+            let tx = g.pick_tx(&self.agg, now_ms);
+            // rcf_seq() IS this frame's seq; DISCs are not matchable RTT
+            // sends.
+            for (card, frame) in g.step_frames(&out.frame, out.is_disc, tx) {
+                let sf = SlotFrame {
+                    frame,
+                    seq: g.vrx.rcf_seq(),
+                    card: card as i32,
+                    stamp_rtt: !out.is_disc,
+                    ..SlotFrame::default()
+                };
+                g.offer_or_send(sf, now_us, io);
             }
         }
+        for f in g.slot.take_due(now_ms) {
+            g.send(&f, now_us, io);
+        }
+    }
+}
+
+impl GsCore for RustCore {
+    /// A spotter sends nothing.
+    fn send_raw(&mut self, body: &[u8], now_us: u64, io: &mut dyn CoreIo) {
+        if let Some(g) = self.gs.as_mut() {
+            g.send_raw(body, now_us, io);
+        }
+    }
+
+    fn on_rx(&mut self, m: &RxBody, io: &mut dyn CoreIo) {
+        self.now_us = self.now_us.max(m.mono_us);
+        self.c.bodies += 1;
+        if self.take_cal_frame(m) {
+            return;
+        }
+        // Before the aggregator routes it: the rc path reads it.
+        if let Some(c) = self.gs.as_mut().and_then(|g| g.chan.as_mut()) {
+            c.on_rc_body(m.rx_channel);
+        }
+        match self.agg.on_rx_body(m) {
+            Route::Rc => self.on_rc(&m.body, m.mono_us, io),
+            Route::Probe => self.on_probe(m),
+            Route::Video(frags) if self.frame_wire => self.on_video_frags(frags, io),
+            _ => {}
+        }
+        if m.crc_ok {
+            self.on_clean_rx(m);
+        }
+    }
+
+    fn tick(&mut self, now_us: u64, io: &mut dyn CoreIo) {
+        self.now_us = self.now_us.max(now_us);
+        let now_ms = self.now_us / 1000;
+        if self.opts.adaptive_gap && now_ms >= self.gap_update_ms + 1000 {
+            self.update_gap_timeouts(now_ms);
+        }
+        self.tick_channel(now_ms);
+        self.sync_frame_wire(io);
+        if self.frame_wire {
+            self.fs.poll(now_ms, &mut au_out!(self, io));
+        }
+        if self.gs.as_ref().is_some_and(|g| g.nack.is_some()) {
+            self.tick_nack(now_ms, io);
+        }
+        self.diag.order_window(now_ms);
+        if !self.telem_recent() {
+            self.end_shed_on_lost_telem(now_ms);
+        }
+        let now_us = self.now_us;
+        if let Some(g) = self.gs.as_mut() {
+            g.tick_mavlink(now_ms, now_us, io);
+        }
+        let inp = self.link_health_inputs();
+        let lh = self.lha.tick(now_ms as f64, &mut self.agg, &inp);
+        self.queue_fec_rows(now_ms, &inp.op);
+        self.step_link(&lh, now_ms, now_us, io);
         self.last_lh = lh;
     }
 

@@ -98,6 +98,11 @@ impl RfTrack {
         }
         self.fold_evm(m.evm[0], m.evm[1]);
     }
+    fn count_and_fold(&mut self, m: &RxBody, rssi: f64, snr: f64) {
+        self.frames += 1;
+        self.bytes += m.body.len() as u64;
+        self.fold(m, rssi, snr);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -120,9 +125,83 @@ pub struct CardTrack {
     pub rf_pool: RfTrack,
 }
 
+impl CardTrack {
+    /// Every frame that is not our own, FCS-good or not.
+    fn count_frame(&mut self, m: &RxBody) {
+        self.frames += 1;
+        self.rx_bytes += m.body.len() as u64;
+        self.last_frame_us = m.mono_us;
+        if !m.crc_ok {
+            self.crc_fail += 1;
+        }
+    }
+
+    /// An FCS-good frame: the aggregation position, the sequence walk, and
+    /// the RF EMAs of the card, of its class and (video) of the pool.
+    fn on_clean_frame(&mut self, m: &RxBody, class: Option<usize>) {
+        self.agg_pos = if m.phy_valid { 0 } else { self.agg_pos + 1 };
+        self.walk_seq(m.mac_seq);
+        let rssi = f64::from(m.rssi[0].max(m.rssi[1]));
+        let snr = f64::from(m.snr[0].max(m.snr[1]));
+        self.rf.fold(m, rssi, snr);
+        if let Some(ci) = class {
+            self.cls[ci].count_and_fold(m, rssi, snr);
+            if ci == RF_S0 || ci == RF_S1 {
+                self.rf_pool.count_and_fold(m, rssi, snr);
+            }
+        }
+    }
+
+    /// The 802.11 sequence walk: a retry is one delivered frame, a jump
+    /// beyond MAX_SEQ_GAP counts one, a step back (>= 2048) counts one
+    /// received and none expected.
+    fn walk_seq(&mut self, seq: u16) {
+        self.seq_received += 1;
+        if !self.has_seq {
+            self.seq_expected += 1;
+            self.has_seq = true;
+            self.last_seq = seq;
+            return;
+        }
+        let adv = seq.wrapping_sub(self.last_seq) & 0x0FFF;
+        if adv == 0 {
+            self.seq_expected += 1; // retry: one delivered frame
+        } else if adv < 2048 {
+            self.seq_expected += if adv > MAX_SEQ_GAP { 1 } else { u64::from(adv) };
+            self.last_seq = seq;
+        }
+    }
+}
+
+/// Every type the GS sends, heard back on its own capture: RCF, DISC, NACK,
+/// and its own (tagged) T_MAV; the drone's T_MAV is untagged. A self frame
+/// carries the GS's seq counter: let into the walk, one landing ahead of the
+/// drone's mark stalls the card's expected count while received climbs.
+fn is_self_frame(m: &RxBody, rc_t: Option<u8>) -> bool {
+    m.crc_ok
+        && match rc_t {
+            Some(rc::T_RCF | rc::T_DISC | rc::T_NACK) => true,
+            Some(rc::T_MAV) => rc::parse_mav(&m.body, true).is_some(),
+            _ => false,
+        }
+}
+
+/// The RF class an FCS-good frame folds into: control, MSP, probe, base or
+/// enhancement; None for any other stream id.
+fn rf_class(rc_t: Option<u8>, stream_id: Option<u8>) -> Option<usize> {
+    if rc_t.is_some() {
+        return Some(RF_CTRL);
+    }
+    match stream_id {
+        Some(sbi::MSP_STREAM_ID) => Some(RF_MSP),
+        Some(sbi::PROBE_STREAM_ID) => Some(RF_PROBE),
+        Some(s) if s < 2 => Some(usize::from(s)),
+        _ => None,
+    }
+}
+
 pub enum Route {
-    /// Unknown card, or an FCS-bad body of a stream not heard FCS-good
-    /// recently while others were.
+    /// A body from an unknown card.
     Dropped,
     /// An RC frame (CRC not checked for foreign frames; own RCF/DISC only
     /// when CRC-good, as mabur).
@@ -180,71 +259,17 @@ impl Aggregator {
             return Route::Dropped;
         };
         let rc_t = rc::frame_type(&m.body);
-        // Every type the GS sends, heard back on its own capture: RCF, DISC,
-        // NACK, and its own (tagged) T_MAV; the drone's T_MAV is untagged.
-        // A self frame carries the GS's seq counter: let into the walk, one
-        // landing ahead of the drone's mark stalls the card's expected count
-        // while received climbs.
-        let is_self = m.crc_ok
-            && match rc_t {
-                Some(rc::T_RCF | rc::T_DISC | rc::T_NACK) => true,
-                Some(rc::T_MAV) => rc::parse_mav(&m.body, true).is_some(),
-                _ => false,
-            };
-        if is_self {
+        if is_self_frame(m, rc_t) {
             // Our own control frames heard back.
             c.self_frames += 1;
             c.rc_frames += 1;
             return Route::Rc;
         }
         let stream_id = sbi::peek_stream_id(&m.body);
-        c.frames += 1;
-        c.rx_bytes += m.body.len() as u64;
-        c.last_frame_us = m.mono_us;
-        if !m.crc_ok {
-            c.crc_fail += 1;
-        } else {
-            c.agg_pos = if m.phy_valid { 0 } else { c.agg_pos + 1 };
-            if c.has_seq {
-                let adv = m.mac_seq.wrapping_sub(c.last_seq) & 0x0FFF;
-                if adv == 0 {
-                    c.seq_expected += 1; // retry: one delivered frame
-                } else if adv < 2048 {
-                    c.seq_expected += if adv > MAX_SEQ_GAP { 1 } else { u64::from(adv) };
-                    c.last_seq = m.mac_seq;
-                }
-            } else {
-                c.seq_expected += 1;
-                c.has_seq = true;
-                c.last_seq = m.mac_seq;
-            }
-            c.seq_received += 1;
+        c.count_frame(m);
+        if m.crc_ok {
+            c.on_clean_frame(m, rf_class(rc_t, stream_id));
             self.last_video_seq = m.mac_seq;
-            let rssi = f64::from(m.rssi[0].max(m.rssi[1]));
-            let snr = f64::from(m.snr[0].max(m.snr[1]));
-            c.rf.fold(m, rssi, snr);
-            let class = if rc_t.is_some() {
-                Some(RF_CTRL)
-            } else {
-                match stream_id {
-                    Some(sbi::MSP_STREAM_ID) => Some(RF_MSP),
-                    Some(sbi::PROBE_STREAM_ID) => Some(RF_PROBE),
-                    Some(s) if s < 2 => Some(usize::from(s)),
-                    _ => None,
-                }
-            };
-            if let Some(ci) = class {
-                let ct = &mut c.cls[ci];
-                ct.frames += 1;
-                ct.bytes += m.body.len() as u64;
-                ct.fold(m, rssi, snr);
-                if ci == RF_S0 || ci == RF_S1 {
-                    let pt = &mut c.rf_pool;
-                    pt.frames += 1;
-                    pt.bytes += m.body.len() as u64;
-                    pt.fold(m, rssi, snr);
-                }
-            }
         }
         if rc_t.is_some() {
             c.rc_frames += 1;
