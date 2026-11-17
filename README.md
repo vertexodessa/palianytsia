@@ -16,7 +16,7 @@ the decisions and the milestones are in [docs/spec.md](docs/spec.md).
 | `crates/pal-wire` | wire formats: 802.11, SBI, RC frames, MAVLink 2 framer, the 5 GHz channel grid |
 | `crates/pal-fec` | GF(256) and the sliding-window RLC decoder |
 | `crates/pal-core` | the GS core: link state, bitrate ladder, NACK repair, MAVLink tunnel, IDR refresh, channel core (search, pick, hops), TX-power calibration |
-| `crates/pal-ref` | mabur's C++ WebGs behind the same `GsCore` trait: the test oracle (desktop/host only) |
+| `crates/pal-ref` | mabur's C++ WebGs (from mabur-ground) behind the same `GsCore` trait: the test oracle (desktop/host only) |
 | `crates/devourer-sys` | devourer through a C shim |
 | `crates/runtime` | what the apps share: card RX thread, the core loop, flight log, stats |
 | `crates/pal-osd` | the egui OSD and settings panel all three apps draw |
@@ -27,7 +27,7 @@ the decisions and the milestones are in [docs/spec.md](docs/spec.md).
 | `apps/phone` | phone app: Rust cdylib + Java shell |
 | `apps/quest` | Quest 3 app: Rust NativeActivity (OpenXR) |
 | `release/` | what a release carries besides the builds: package README, notes per tag, drone config and init script, the fork commit maburd is built from |
-| `third_party/mabur`, `third_party/devourer` | pinned submodules of the vertexodessa forks: mabur on branch `palianytsia/base-v2` (upstream master plus Palianytsia's commits, RC_VERSION 18), devourer on `palianytsia/base` |
+| `third_party/mabur`, `third_party/mabur-ground`, `third_party/devourer` | pinned submodules of the vertexodessa forks: mabur (the drone, wire formats, FEC) on branch `palianytsia/base-v2` (upstream master plus Palianytsia's commits, RC_VERSION 18), mabur-ground (mabur's GS, split out of mabur upstream; pal-ref builds it against our mabur) on `palianytsia/base`, devourer on `palianytsia/base` |
 | `third_party/libusb` | upstream libusb v1.0.27, Android builds only |
 
 Clone with submodules:

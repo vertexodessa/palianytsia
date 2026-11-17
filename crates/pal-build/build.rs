@@ -74,9 +74,10 @@ fn main() {
     let ours = git(&root, &["rev-parse", "--show-toplevel"])
         .and_then(|t| Path::new(&t).canonicalize().ok())
         .is_some_and(|t| t == root);
-    let (mut sha, mut dirty, mut mabur, mut devourer) = (
+    let (mut sha, mut dirty, mut mabur, mut ground, mut devourer) = (
         UNKNOWN.to_string(),
         UNKNOWN,
+        UNKNOWN.to_string(),
         UNKNOWN.to_string(),
         UNKNOWN.to_string(),
     );
@@ -115,6 +116,7 @@ fn main() {
             dirty = if s.is_empty() { "0" } else { "1" };
         }
         mabur = pin(&root, "third_party/mabur").unwrap_or_else(|| UNKNOWN.into());
+        ground = pin(&root, "third_party/mabur-ground").unwrap_or_else(|| UNKNOWN.into());
         devourer = pin(&root, "third_party/devourer").unwrap_or_else(|| UNKNOWN.into());
     }
 
@@ -127,6 +129,7 @@ fn main() {
     println!("cargo:rustc-env=PAL_GIT_SHA={sha}");
     println!("cargo:rustc-env=PAL_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=PAL_MABUR_PIN={mabur}");
+    println!("cargo:rustc-env=PAL_MABUR_GROUND_PIN={ground}");
     println!("cargo:rustc-env=PAL_DEVOURER_PIN={devourer}");
     println!("cargo:rustc-env=PAL_BUILD_ID={id}");
 }

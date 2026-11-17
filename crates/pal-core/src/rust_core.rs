@@ -1475,7 +1475,7 @@ mod tests {
         let mut c = load_config(
             Path::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../third_party/mabur/gs/bundle/maburgs.default.toml"
+                "/../../third_party/mabur-ground/gs/bundle/maburgs.default.toml"
             )),
             None,
         )

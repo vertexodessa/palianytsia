@@ -383,6 +383,18 @@ their "not ported" / "still owed" lines are superseded by later ones. The curren
   pacer sends an IDR. The GS side asks too: frames flat for 1 s while AUs go in (reason `stall`), and
   a pts step over 250 ms inside a DISCONT run counts as a new run. mabur host suite 259/259, ARM
   build (both radios). Open: the Quest check, two mode changes in a row with the picture back in 2 s.
+- mabur and mabur-ground pins, 2026-11-17 (pal-svbz): upstream split the GS (`gs/`, `web/`) into
+  gilankpam/mabur-ground (#124, #125, #127), and the forks follow. mabur `palianytsia/base-v2` is
+  rebased onto upstream master without its GS halves (the old line kept as branch
+  `palianytsia/base-v2-pre-2026-11-17`); the GS halves of our commits sit on mabur-ground
+  `palianytsia/base`, upstream master plus those commits, as the new submodule
+  `third_party/mabur-ground`. pal-ref builds mabur-ground's CMake with our `third_party/mabur` as
+  its subproject (`MABUR_DIR`), not mabur-ground's own nested pin. Where upstream differs, the fork
+  keeps our behaviour: mabur-ground reverts upstream's drop of the clean-stream rule for FCS-bad
+  bodies and of the width resync retry, and the drone keeps `radio.edcca` (primary CCA on, EDCCA
+  per key) instead of upstream's `radio.cca`, which turns both gates on or off and which our maburd
+  refuses as an unknown key. GS sources (`gs/src`, `web/src`, `gs/player/src`) are byte-identical
+  to the old pin; the drone gains upstream's HEVC level bound in `parse_sps`.
 - Pins: the submodule gitlinks (`git submodule status`), each on the branch `.gitmodules` names; a release
   builds maburd from `release/MABUR_RELEASE`. `tools/doc-check.sh` checks both, so no sha is copied here.
 - Owed in software: the review pass over the ported channel core (docs/channel-core-port.md, level 5).

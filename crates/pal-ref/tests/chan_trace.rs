@@ -32,7 +32,7 @@ use pal_wire::rc::{self, DiscAck};
 
 const CONFIG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../third_party/mabur/gs/bundle/maburgs.default.toml"
+    "/../../third_party/mabur-ground/gs/bundle/maburgs.default.toml"
 );
 const NONCE: u32 = 0x5a17_c0de;
 

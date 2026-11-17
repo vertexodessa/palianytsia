@@ -7,8 +7,9 @@
 #   4. the latest release/notes tag heads release/README.md, is release/VERSION (the one
 #      version: both APKs' versionName and the native builds read it, no other copy) and is
 #      named in docs/spec.md Status and CLAUDE.md;
-#   5. every repo path in backticks in the docs exists, here or in third_party/mabur (the spec
-#      quotes mabur's own docs/ and tools/ by their mabur paths).
+#   5. every repo path in backticks in the docs exists, here, in third_party/mabur or in
+#      third_party/mabur-ground (the spec quotes mabur's own docs/ and tools/ by their mabur
+#      paths, and the GS's gs/ and web/ moved to mabur-ground in upstream's split).
 # Checks 1-2 need the fork remotes. Offline they warn; with CI set they fail.
 #   tools/doc-check.sh
 set -uo pipefail
@@ -104,7 +105,8 @@ for p in docs:
                 w = re.sub(r":\d+(-\d+)?$", "", w)
                 for x in expand(w):
                     if not (pathlib.Path(x).exists() or
-                            pathlib.Path("third_party/mabur", x).exists()):
+                            pathlib.Path("third_party/mabur", x).exists() or
+                            pathlib.Path("third_party/mabur-ground", x).exists()):
                         bad.append(f"{p}:{n}: `{x}` does not exist")
 for b in bad: print("doc-check:", b, file=sys.stderr)
 sys.exit(1 if bad else 0)

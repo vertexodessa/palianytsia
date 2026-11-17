@@ -13,8 +13,10 @@ pub const VERSION: &str = env!("PAL_VERSION");
 pub const GIT_SHA: &str = env!("PAL_GIT_SHA");
 /// "1" with uncommitted changes to tracked files, "0", or "unknown".
 pub const GIT_DIRTY: &str = env!("PAL_GIT_DIRTY");
-/// The commits third_party/mabur and third_party/devourer are pinned to.
+/// The commits third_party/mabur, third_party/mabur-ground (the GS the
+/// Rust core is checked against) and third_party/devourer are pinned to.
 pub const MABUR_PIN: &str = env!("PAL_MABUR_PIN");
+pub const MABUR_GROUND_PIN: &str = env!("PAL_MABUR_GROUND_PIN");
 pub const DEVOURER_PIN: &str = env!("PAL_DEVOURER_PIN");
 /// "0.11.0 9c5838f1a2b3" (12 hex digits, "-dirty" appended when dirty).
 pub const ID: &str = env!("PAL_BUILD_ID");
@@ -22,7 +24,8 @@ pub const ID: &str = env!("PAL_BUILD_ID");
 /// The `--version` text: the id, then the commit and the pins in full.
 pub fn version_text(app: &str) -> String {
     format!(
-        "{app} {ID}\ncommit {GIT_SHA} dirty={GIT_DIRTY}\nmabur {MABUR_PIN}\ndevourer {DEVOURER_PIN}"
+        "{app} {ID}\ncommit {GIT_SHA} dirty={GIT_DIRTY}\nmabur {MABUR_PIN}\n\
+         mabur-ground {MABUR_GROUND_PIN}\ndevourer {DEVOURER_PIN}"
     )
 }
 

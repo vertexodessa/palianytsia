@@ -3,17 +3,20 @@
 # as mabur's own `webgs replay` on maburd --dry-run frame files. This checks
 # the wrapper (FFI, callbacks, the replay loop), not a port.
 #
-# Builds mabur's host tools from the pinned submodule into target/mabur-host
-# (webgs, maburd for the frame generator), then runs every case below.
+# Builds the host tools into target/mabur-ground-host with mabur-ground's CMake
+# (webgs) and our pinned mabur as its subproject (maburd for the frame
+# generator), then runs every case below.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MABUR=$ROOT/third_party/mabur
-BUILD=$ROOT/target/mabur-host
+GROUND=$ROOT/third_party/mabur-ground
+BUILD=$ROOT/target/mabur-ground-host   # not mabur-host: that cache is configured on mabur alone
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-cmake -S "$MABUR" -B "$BUILD" -DDEVOURER_DIR="$ROOT/third_party/devourer" \
-  -DMABUR_BUILD_LINKBENCH=OFF -DCMAKE_BUILD_TYPE=Release >"$TMP/configure.log" 2>&1 \
+cmake -S "$GROUND" -B "$BUILD" -DMABUR_DIR="$MABUR" -DDEVOURER_DIR="$ROOT/third_party/devourer" \
+  -DGROUND_BUILD_TESTS=OFF -DGROUND_BUILD_MABURD=ON -DMABUR_BUILD_LINKBENCH=OFF \
+  -DCMAKE_BUILD_TYPE=Release >"$TMP/configure.log" 2>&1 \
   || { cat "$TMP/configure.log"; exit 1; }
 cmake --build "$BUILD" -j"$(nproc)" --target webgs maburd >"$TMP/build.log" 2>&1 \
   || { tail -30 "$TMP/build.log"; exit 1; }
@@ -21,7 +24,7 @@ cargo build -q --manifest-path "$ROOT/Cargo.toml" -p pal-ref --bin pal-ref-repla
 PAL=$ROOT/target/debug/pal-ref-replay
 
 # frames.bin + gs.toml, exactly as mabur's web_au_parity gate makes them.
-(cd "$MABUR" && BUILD=$BUILD bash tests/integration/web_frames_gen.sh "$TMP")
+(cd "$GROUND" && BUILD=$BUILD MABUR_DIR=$MABUR bash tests/integration/web_frames_gen.sh "$TMP")
 
 fail=0
 run_case() {  # name, then the shared replay flags
@@ -77,7 +80,7 @@ done
 # Row-sliced 1080p frames (mabur's slices4 fixture): truncated AUs go
 # through slice salvage, which the 13-AU fixture never reaches.
 python3 "$ROOT/tools/slices-frames.py" "$MABUR/tests/fixtures/slices4_1080p.h265" "$TMP/slices.in" 240 >/dev/null
-(cd "$MABUR" && BUILD=$BUILD bash tests/integration/web_frames_gen.sh "$TMP" "$TMP/slices.in")
+(cd "$GROUND" && BUILD=$BUILD MABUR_DIR=$MABUR bash tests/integration/web_frames_gen.sh "$TMP" "$TMP/slices.in")
 for spec in "0 1" "10 7" "20 3" "30 11"; do
   set -- $spec
   run_case "slices ref  drop=$1 seed=$2" --mode spotter --fixed-gap --drop-pct "$1" --seed "$2"
@@ -140,14 +143,14 @@ done
 # us per body) a window spans longer than the 50 ms gap floor. Only the
 # adaptive-gap cases reach the rule.
 python3 "$ROOT/tools/window-frames.py" "$MABUR/tests/fixtures/slices4_1080p.h265" "$TMP/win.in" >/dev/null
-(cd "$MABUR" && BUILD=$BUILD bash tests/integration/web_frames_gen.sh "$TMP" "$TMP/win.in")
+(cd "$GROUND" && BUILD=$BUILD MABUR_DIR=$MABUR bash tests/integration/web_frames_gen.sh "$TMP" "$TMP/win.in")
 sed -e '/^\[fec\]/,/^\[/ s|^window *= *[0-9]*|window = 32|' \
     -e '/^\[fec\]/,/^\[/ s|^blocks_per_body *= *\[[0-9, ]*\]|blocks_per_body = [1, 1]|' \
     "$MABUR/bundle/mabur.default.toml" >"$TMP/win-drone.toml"
 sed -n '/^\[fec\]/,/^\[/p' "$TMP/win-drone.toml" | grep -Eq '^window = 32( |$)' \
   && sed -n '/^\[fec\]/,/^\[/p' "$TMP/win-drone.toml" | grep -Eq '^blocks_per_body = \[1, 1\]( |$)' \
   || { echo "FAIL: [fec] window/blocks_per_body sed did not match -- bundle layout changed"; exit 1; }
-"$BUILD/drone/maburd" -c "$TMP/win-drone.toml" --dry-run --in "$TMP/win.in" --out "$TMP/frames.bin" \
+"$BUILD/mabur/drone/maburd" -c "$TMP/win-drone.toml" --dry-run --in "$TMP/win.in" --out "$TMP/frames.bin" \
   --rc-in "$TMP/rc.bin" >/dev/null 2>&1
 # Without at least two windows on the base stream these cases test nothing.
 python3 "$ROOT/tools/fec-windows.py" "$TMP/frames.bin" --min-distinct 2 100 >"$TMP/windows.txt" \

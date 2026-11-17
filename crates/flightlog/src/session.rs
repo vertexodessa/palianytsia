@@ -68,6 +68,7 @@ pub fn build_record(run: &Run) -> Value {
         "commit": pal_build::GIT_SHA,
         "dirty": pal_build::GIT_DIRTY,
         "mabur": pal_build::MABUR_PIN,
+        "mabur_ground": pal_build::MABUR_GROUND_PIN,
         "devourer": pal_build::DEVOURER_PIN,
         "app": run.app,
         "core": run.core,

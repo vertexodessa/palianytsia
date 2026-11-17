@@ -951,8 +951,9 @@ fn log_summary(o: Opts) {
                 f("mode")
             );
             println!(
-                "  pins: mabur {}, devourer {}; config sha256 {}",
+                "  pins: mabur {}, mabur-ground {}, devourer {}; config sha256 {}",
                 f("mabur"),
+                f("mabur_ground"),
                 f("devourer"),
                 f("config_sha256")
             );
