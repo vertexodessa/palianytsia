@@ -85,37 +85,12 @@ pairing key.
   the quad from 40 to 144 (both cores, 2026-11-01).
 - Release APKs: `PAL_RELEASE=1 tools/{phone,quest}-apk.sh`, signed from
   `~/.config/palianytsia/release-signing.properties` (key `~/.android/palianytsia-release.jks`, never in the
-  repo; without it the APK is unsigned). v0.1 package: `dist/palianytsia-v0.1/` (drone maburd from mabur
-  `release/v0.1` = `palianytsia/base` minus the bench `/sim` commit). `gs.toml` stays pinned for the parity gates.
+  repo; without it the APK is unsigned). `gs.toml` stays pinned for the parity gates.
 - Release desktop: `tools/ffmpeg-static.sh` once, then `PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release -p pal-desktop`
-  (HEVC + swscale linked in, no hwaccel; the system-FFmpeg build did not start on QA's machine). v0.2 package:
-  `dist/palianytsia-v0.2/` (maburd from mabur `release/v0.2` = `release/v0.1` + DISC width agreement 7c3e2cf9);
-  v0.3 = same maburd, `tools/drone-install.py` (a shell script until 2026-11-08) that also does a first install on a stock OpenIPC FPV image
-  (`--fresh` forces those steps, `--remove` undoes them; an update keeps the drone's mabur.toml), GPU decode in the desktop;
-  v0.4 = maburd from mabur `release/v0.4` (24e9d368 = `release/v0.2` + native readout), `sensor_imx415_star6e.ko`
-  installed by `drone-install.sh` (patches the drone's `load_sigmastar`, original kept as `.palianytsia`), APKs 0.4.0.
-  v0.5 = maburd from mabur `release/v0.5` (61dba4ee = `release/v0.4` + RADIO_PWR_MODE + any 5 GHz grid channel), APKs 0.5.0;
-  the drone toml and S96mabur are carried over from v0.4 (the release branch bundle files are older than base's).
-  v0.6 = maburd from mabur `release/v0.6` (8d2056a0, + VENC_MODES), the six-mode driver of waybeam_venc 581804a, APKs 0.6.0.
-  v0.7 = maburd from mabur `release/v0.7` (ae590193 = upstream master c8e2d20e + `palianytsia/base-v2` minus `/sim`),
-  APKs 0.7.0; drone parameters renumbered after row 11, so GS and drone must be updated together.
-  v0.7.1 = GS only (movable OSD chips, Quest OSD quad 1.5x the video), same maburd as v0.7, APKs 0.7.1.
-  v0.8 = maburd from mabur `release/v0.8` (`release/v0.7` + FEC repairs at frame end, `fec.repairs_with_frame`), bundle
-  `fec.window = 64`, APKs 0.8.0; GS and drone stay compatible with v0.7.x.
-  v0.8.1 = `release/v0.8` + a config without `repairs_with_frame` gets the mode with window raised to 64 (a drone config kept on update), APKs 0.8.1.
-  v0.9 = maburd from mabur `release/v0.9` (upstream master + PR #119, the frame-tail FEC rule, + `palianytsia/base-v2` minus `/sim`), `fec.repairs_with_frame` removed from the drone toml, `drone/install.py` replaces `install.sh`, APKs 0.9.0; GS and drone stay compatible with v0.8.x.
-  v0.10 = maburd from mabur `release/v0.10` (`release/v0.9` + the per-frame FEC repair window), the matching GS wait in the Rust core, APKs 0.10.0; GS and drone stay wire compatible with v0.9.
-  v0.11 = maburd from mabur `release/v0.11` (`release/v0.10` + rung change hold, air clock bound, `VENC_MIN_IQP`), the matching Rust core, Quest window mode, APKs 0.11.0; parameter table gains a row, so GS and drone update together (video stays wire compatible with v0.10).
-  v0.12 = maburd from mabur `release/v0.12` (`release/v0.11` + the `radio.wide_tx_igi_floor` key; the drone toml ships A-MPDU off, single-frame efficiency tables and `min_iqp` 42), the NACK residual rule in the Rust core, the panel tabs and the Quest menu quad, APKs 0.12.0; GS and drone stay compatible with v0.11.
-  v0.12.1 = same maburd as v0.12; `install.py` renames a kept config's `radio.rate_walls_rel` to `rate_walls_rel_20` (v0.12 maburd refused it and did not start), APKs 0.12.1.
-  v0.13 = maburd from mabur `release/v0.13` (`release/v0.12` + calibration of both widths with the floor sweep, the FEC ring-row backstop, `VENC_GOP_S` and `VENC_IREFRESH`), the matching Rust core and panel rows, APKs 0.13.0; the parameter table gains two rows, so GS and drone update together (video stays wire compatible with v0.12).
-  v0.13.1 = GS only: the channel menu in pal-desktop (the apps' link pick: grid, saved channels, s3_demote), same maburd as v0.13, APKs 0.13.1.
-  v0.14 = maburd from mabur `release/v0.14` (`palianytsia/base-v2` at the maintenance lane minus `/sim`: upstream #120-#123, the shed bitrate step, the lane), the apps and the release desktop carry it and update a disarmed drone over the air (`PAL_MABURD`), APKs 0.14.0; RC 18 and the parameter table as v0.13, so GS and drone stay compatible, but only a v0.14 drone can be updated by a GS.
-  v0.15 = maburd from mabur `release/v0.15` (`release/v0.14` + the arm word for the swap script, CLM busy airtime, the boot relocation rule), GS DVR, the drone update never in the air with the boot guard and the platform check, APKs 0.15.0; RC 18 and the parameter table as v0.14, so GS and drone stay compatible.
-  v0.16 = maburd from mabur `release/v0.16` (`release/v0.15` + pit mode: `[low_power] pit`/`pit_index`, TX index 1 while disarmed before the first arm), APKs 0.16.0; RC 18 and the parameter table as v0.15, so GS and drone stay compatible.
-  v0.16.1 = maburd from mabur `release/v0.16.1` (`release/v0.16` + calibration lifts pit before reading its anchor; v0.16 calibrated at pit power before the first arm), APKs 0.16.1; GS and drone stay compatible with v0.16.
-  v0.16.2 = maburd from mabur `release/v0.16.2` (`release/v0.16.1` + the P-frame ceiling floor `venc.superframe_p_floor_kb`, 14 kB per megapixel: below an ordinary P frame the encoder sent a keyframe on every frame at rung 0, in low_power and at boot), APKs 0.16.2; GS and drone stay compatible with v0.16.1.
-  v0.17 = maburd from mabur `release/v0.17` (`palianytsia/base-v2` minus `/sim`: `release/v0.16.2` + EDCCA off, the radio name file, the keyframe-storm guard, hardware-ACKed RCFs opt-in, an IDR after a rebuilt encoder's ring), preflight checklist, skip pictures, the stall keyframe request, APKs 0.17.0; RC 18 and the parameter table as v0.16.x, so GS and drone stay compatible.
+  (HEVC + swscale linked in, no hwaccel; the system-FFmpeg build did not start on QA's machine).
+- Release history: `release/notes/<tag>.md` (what each tag carries, which maburd, GS/drone compatibility);
+  the current release is v0.17 (`release/VERSION`, maburd pin in `release/MABUR_RELEASE`). GS and drone had to be
+  updated together at v0.7, v0.11 and v0.13 (parameter table changes); a GS updates a drone over the air from v0.14 on.
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
   `release/notes/<tag>.md`. Before tagging: run `tools/m1-replay.sh` locally and `tools/release_toml_check.py` (every key of
@@ -152,7 +127,7 @@ pairing key.
 
 ## Rules
 - Commit with `git -c user.email=ivlev.igor@gmail.com commit`; no AI attribution.
-- Do not push while the GitHub repo is being recreated (2026-11-01); ask first.
+- Push only on Ihor's explicit word for that push.
 - Keep the beads board current without being asked: `bd update <id> --status in_progress` before the first
   edit or measurement, `--append-notes` with the numbers as each step lands, `bd close` only when proven,
   back to open with a note when stopped or blocked.
