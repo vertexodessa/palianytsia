@@ -1015,7 +1015,7 @@ fn bundled_cases() -> Vec<Case> {
         "configs/gs.toml",
         "configs/gs-auto.toml",
         "configs/bench-ch40.toml",
-        "third_party/mabur/gs/bundle/maburgs.default.toml",
+        "third_party/mabur-ground/gs/bundle/maburgs.default.toml",
     ]
     .iter()
     .map(|f| Case {

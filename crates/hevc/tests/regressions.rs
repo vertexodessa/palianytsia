@@ -91,3 +91,73 @@ fn slice_long_term_count_sum_past_u32() {
     let nal = [2, 1, 208, 0, 4, 96, 0, 0, 3, 0, 63, 255, 255, 255, 224];
     let _ = parse_slice_header(&nal, &sps, &pps);
 }
+
+/// A minimal SPS (one sub-layer, 4:2:0, 8x8 min CB, 64x64 CTB) behind a
+/// type-33 NAL header, as mabur's `test_hevc_ps.cpp` builds it.
+fn sps_nal(width: u32, height: u32) -> Vec<u8> {
+    use hevc::bits::{escape, BitWriter};
+    fn ue(w: &mut BitWriter, v: u32) {
+        let n = u64::from(v) + 1;
+        let len = 64 - n.leading_zeros();
+        w.u(0, len - 1);
+        for i in (0..len).rev() {
+            w.put((n >> i) & 1 != 0);
+        }
+    }
+    let mut w = BitWriter::default();
+    w.u(0, 4); // vps id
+    w.u(0, 3); // max_sub_layers_minus1
+    w.u(1, 1); // temporal id nesting
+    for _ in 0..3 {
+        w.u(0, 32); // profile_tier_level, general only
+    }
+    ue(&mut w, 0); // sps id
+    ue(&mut w, 1); // chroma_format_idc
+    ue(&mut w, width);
+    ue(&mut w, height);
+    w.u(0, 1); // no conformance window
+    for v in [0, 0, 4] {
+        ue(&mut w, v); // bit depths, log2_max_poc_lsb_minus4
+    }
+    w.u(1, 1); // sub-layer ordering info
+    for _ in 0..3 {
+        ue(&mut w, 0);
+    }
+    ue(&mut w, 0); // min CB 8
+    ue(&mut w, 3); // CTB 64
+    for _ in 0..4 {
+        ue(&mut w, 0); // transform sizes and depths
+    }
+    w.u(0b0010, 4); // scaling list, amp, sao, pcm
+    ue(&mut w, 0); // no st_rps
+    w.u(0b01, 2); // no long-term, tmvp
+    w.put(true);
+    w.align_zero();
+    let mut nal = vec![0x42, 0x01];
+    nal.extend(escape(w.bytes()));
+    nal
+}
+
+/// mabur `sps_of_a_picture_no_level_allows_is_unsupported`: the SPS is
+/// whatever the stream delivered and its users size buffers by it, so a
+/// picture no HEVC level allows (level 6.2: 16 888 px a side, 35 651 584
+/// luma samples) is unsupported at the parse.
+#[test]
+fn sps_of_a_picture_no_level_allows_is_unsupported() {
+    use hevc::ps::PsStatus;
+    let ok = parse_sps(&sps_nal(1920, 1080)).expect("1080p parses");
+    assert_eq!((ok.width, ok.height, ok.log2_ctb), (1920, 1080, 6));
+    assert!(parse_sps(&sps_nal(8192, 4320)).is_ok());
+    assert_eq!(
+        parse_sps(&sps_nal(16896, 64)).err(),
+        Some(PsStatus::Unsupported)
+    );
+    assert_eq!(
+        parse_sps(&sps_nal(8192, 8192)).err(),
+        Some(PsStatus::Unsupported)
+    );
+    assert_eq!(
+        parse_sps(&sps_nal(1 << 31, 1080)).err(),
+        Some(PsStatus::Unsupported)
+    );
+}

@@ -2354,7 +2354,7 @@ mod tests {
         assert_eq!(c.radio.pin, Some(144));
         assert_eq!(c.rx_width(), 40);
         let m = load_config(
-            &repo("third_party/mabur/gs/bundle/maburgs.default.toml"),
+            &repo("third_party/mabur-ground/gs/bundle/maburgs.default.toml"),
             None,
         )
         .unwrap();

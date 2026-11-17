@@ -9,3 +9,7 @@
 [submodule "third_party/libusb"]
 	path = third_party/libusb
 	url = https://github.com/libusb/libusb.git
+[submodule "third_party/mabur-ground"]
+	path = third_party/mabur-ground
+	url = https://github.com/vertexodessa/mabur-ground.git
+	branch = palianytsia/base

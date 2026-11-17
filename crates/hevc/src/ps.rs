@@ -317,7 +317,26 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps, PsStatus> {
     {
         return Err(PsStatus::Malformed);
     }
+    // The SPS is whatever the stream delivered (video bodies carry no key
+    // tag), and every user sizes buffers or multiplies by its dimensions: the
+    // CTB count, the slice-address width, a slice span, a skip fill's grid.
+    // A picture no HEVC level allows is refused here, before any of them.
+    if !level_allows(s.width, s.height) {
+        return Err(PsStatus::Unsupported);
+    }
     Ok(s)
+}
+
+/// Level 6.2 of H.265 (Table A.8): MaxLumaPs, and the longest side it
+/// permits, sqrt(8 * MaxLumaPs). No HEVC level allows a larger picture.
+pub const MAX_LUMA_PS: u64 = 35_651_584;
+pub const MAX_PIC_SIDE: u32 = 16_888;
+
+/// True when some HEVC level allows a `width` x `height` picture.
+pub fn level_allows(width: u32, height: u32) -> bool {
+    width <= MAX_PIC_SIDE
+        && height <= MAX_PIC_SIDE
+        && u64::from(width) * u64::from(height) <= MAX_LUMA_PS
 }
 
 pub fn parse_pps(nal: &[u8]) -> Result<Pps, PsStatus> {
