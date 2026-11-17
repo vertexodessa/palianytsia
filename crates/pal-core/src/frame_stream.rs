@@ -107,6 +107,94 @@ fn key(sid: u8, fseq: u16) -> u32 {
     (u32::from(sid) << 16) | u32::from(fseq)
 }
 
+/// What try_emit does with a head above the emit cursor.
+enum Gap {
+    Go,
+    Hold,
+    DropHead,
+}
+
+/// The fragment header: frame seq, chunk index, chunk count.
+#[derive(Clone, Copy)]
+struct FragHead {
+    fseq: u16,
+    idx: u16,
+    count: u16,
+}
+
+impl FragHead {
+    /// `pkt` holds at least FRAG_HDR_LEN bytes.
+    fn parse(pkt: &[u8]) -> Self {
+        Self {
+            fseq: u16::from_le_bytes([pkt[0], pkt[1]]),
+            idx: u16::from_le_bytes([pkt[2], pkt[3]]),
+            count: u16::from_le_bytes([pkt[4], pkt[5]]),
+        }
+    }
+}
+
+impl AuLat {
+    /// The earliest and latest body arrivals, and the newest push stamp
+    /// with its drain stamp.
+    fn note_arrival(&mut self, arr: &FragArrival) {
+        if arr.body_mono_us != 0 && (self.t_first_us == 0 || arr.body_mono_us < self.t_first_us) {
+            self.t_first_us = arr.body_mono_us;
+        }
+        if arr.body_mono_us > self.t_last_arr_us {
+            self.t_last_arr_us = arr.body_mono_us;
+        }
+        if arr.push_mono_us != 0 && arr.push_mono_us >= self.t_push_us {
+            self.t_push_us = arr.push_mono_us;
+            self.t_drain_us = arr.drain_mono_us;
+        }
+    }
+}
+
+impl Slot {
+    /// One chunk in: the slot opens on its first, a retransmit that fills a
+    /// hole marks the frame, the SW seq of the highest index is kept.
+    fn add_chunk(&mut self, sid: u8, fh: FragHead, data: &[u8], arr: &FragArrival, now_ms: u64) {
+        if self.chunks.is_empty() {
+            self.sid = sid;
+            self.fseq = fh.fseq;
+            self.first_ms = now_ms;
+            self.last_progress_ms = now_ms;
+            self.count = fh.count;
+        }
+        if arr.retx && !self.chunks.contains_key(&fh.idx) {
+            self.lat.retx_fill = true;
+        }
+        self.chunks.insert(fh.idx, data.to_vec());
+        if let Some(seq) = arr.sw_seq {
+            if !self.have_seq_at_max || fh.idx > self.max_idx {
+                self.max_idx = fh.idx;
+                self.seq_at_max = seq;
+                self.have_seq_at_max = true;
+            }
+        }
+        self.last_arrival_ms = now_ms;
+        self.lat.note_arrival(arr);
+    }
+
+    /// Emits the chunks contiguous from the cursor (through the slice
+    /// assembler when there is one; the frame header skipped otherwise).
+    fn emit_ready(&mut self, now_ms: u64, out: &mut dyn FrameOut) {
+        while let Some(c) = self.chunks.get(&self.emitted_upto) {
+            if self.sa.is_none() {
+                let skip = if self.emitted_upto == 0 { HDR_LEN } else { 0 };
+                if c.len() > skip {
+                    out.data(&c[skip..]);
+                }
+            }
+            self.emitted_upto += 1;
+            self.last_progress_ms = now_ms;
+        }
+        if let Some(sa) = self.sa.as_mut() {
+            sa.drain(&self.chunks, &mut |b| out.data(b));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStreamStats {
     pub clean: u64,
@@ -219,90 +307,74 @@ impl FrameStream {
             self.st.bad_frags += 1;
             return;
         }
-        if self.stall_armed
-            && self.cfg.stall_reset_ms != 0
-            && now_ms - self.stall_arm_ms >= self.cfg.stall_reset_ms
-        {
-            if self.last_stall_log_ms == 0 || now_ms - self.last_stall_log_ms >= 5000 {
-                self.last_stall_log_ms = now_ms;
-                eprintln!(
-                    "pal: frame stall: no emit for {} ms with frames arriving (next_emit={} last_id64={} discont_seen={}) -> reset",
-                    now_ms - self.stall_arm_ms,
-                    self.next_emit_id64,
-                    self.last_id64,
-                    u8::from(self.discont_seen_since_emit)
-                );
-            }
-            self.st.stall_resets += 1;
-            self.reset(out);
-        }
-        let fseq = u16::from_le_bytes([pkt[0], pkt[1]]);
-        let idx = u16::from_le_bytes([pkt[2], pkt[3]]);
-        let count = u16::from_le_bytes([pkt[4], pkt[5]]);
-        if count == 0 || idx >= count {
+        self.check_stall(now_ms, out);
+        let fh = FragHead::parse(pkt);
+        if fh.count == 0 || fh.idx >= fh.count {
             self.st.bad_frags += 1;
             return;
         }
-        let k = key(sid, fseq);
+        let k = key(sid, fh.fseq);
         let s = self.slots.entry(k).or_default();
-        if s.chunks.is_empty() {
-            s.sid = sid;
-            s.fseq = fseq;
-            s.first_ms = now_ms;
-            s.last_progress_ms = now_ms;
-            s.count = count;
-        }
-        if arr.retx && !s.chunks.contains_key(&idx) {
-            s.lat.retx_fill = true;
-        }
-        s.chunks.insert(idx, pkt[FRAG_HDR_LEN..].to_vec());
-        if let Some(seq) = arr.sw_seq {
-            if !s.have_seq_at_max || idx > s.max_idx {
-                s.max_idx = idx;
-                s.seq_at_max = seq;
-                s.have_seq_at_max = true;
-            }
-        }
-        s.last_arrival_ms = now_ms;
-        if arr.body_mono_us != 0 && (s.lat.t_first_us == 0 || arr.body_mono_us < s.lat.t_first_us) {
-            s.lat.t_first_us = arr.body_mono_us;
-        }
-        if arr.body_mono_us > s.lat.t_last_arr_us {
-            s.lat.t_last_arr_us = arr.body_mono_us;
-        }
-        if arr.push_mono_us != 0 && arr.push_mono_us >= s.lat.t_push_us {
-            s.lat.t_push_us = arr.push_mono_us;
-            s.lat.t_drain_us = arr.drain_mono_us;
-        }
-        if idx == 0 && !s.have_hdr {
-            let Some(h) = FrameHdr::parse(&s.chunks[&0]) else {
-                self.st.bad_frags += 1;
-                self.slots.remove(&k);
-                return;
-            };
-            s.have_hdr = true;
-            s.lat.drone_q_ms = arr.q_ms;
-            s.lat.enc_us = arr.enc_us;
-            s.lat.drone_air_ms = arr.air_ms;
-            s.lat.hdr_retx = arr.retx;
-            s.hdr = h;
-            let (id64, rebased) = self.unwrap_id(h.frame_id, h.flags);
-            let s = self.slots.get_mut(&k).expect("slot");
-            s.id64 = id64;
-            s.discont = rebased;
-            s.emits_at_hdr = self.st.clean + self.st.truncated;
-            if rebased {
-                self.params.reset(); // a producer restart may change resolution
-            }
-            if h.flags & FLAG_DISCONT != 0 {
-                self.discont_seen_since_emit = true;
-            }
-            if self.have_next_emit && !self.stall_armed {
-                self.stall_armed = true;
-                self.stall_arm_ms = now_ms;
-            }
+        s.add_chunk(sid, fh, &pkt[FRAG_HDR_LEN..], arr, now_ms);
+        if fh.idx == 0 && !s.have_hdr && !self.take_header(k, arr, now_ms) {
+            return;
         }
         self.try_emit(now_ms, out);
+    }
+
+    /// Frames arriving with nothing emitted for stall_reset_ms: reset.
+    fn check_stall(&mut self, now_ms: u64, out: &mut dyn FrameOut) {
+        if !(self.stall_armed
+            && self.cfg.stall_reset_ms != 0
+            && now_ms - self.stall_arm_ms >= self.cfg.stall_reset_ms)
+        {
+            return;
+        }
+        if self.last_stall_log_ms == 0 || now_ms - self.last_stall_log_ms >= 5000 {
+            self.last_stall_log_ms = now_ms;
+            eprintln!(
+                "pal: frame stall: no emit for {} ms with frames arriving (next_emit={} last_id64={} discont_seen={}) -> reset",
+                now_ms - self.stall_arm_ms,
+                self.next_emit_id64,
+                self.last_id64,
+                u8::from(self.discont_seen_since_emit)
+            );
+        }
+        self.st.stall_resets += 1;
+        self.reset(out);
+    }
+
+    /// The first chunk of a frame carries its header: parse it, stamp the
+    /// slot, unwrap the id. False when it does not parse (the slot goes).
+    fn take_header(&mut self, k: u32, arr: &FragArrival, now_ms: u64) -> bool {
+        let s = self.slots.get_mut(&k).expect("slot");
+        let Some(h) = FrameHdr::parse(&s.chunks[&0]) else {
+            self.st.bad_frags += 1;
+            self.slots.remove(&k);
+            return false;
+        };
+        s.have_hdr = true;
+        s.lat.drone_q_ms = arr.q_ms;
+        s.lat.enc_us = arr.enc_us;
+        s.lat.drone_air_ms = arr.air_ms;
+        s.lat.hdr_retx = arr.retx;
+        s.hdr = h;
+        let (id64, rebased) = self.unwrap_id(h.frame_id, h.flags);
+        let s = self.slots.get_mut(&k).expect("slot");
+        s.id64 = id64;
+        s.discont = rebased;
+        s.emits_at_hdr = self.st.clean + self.st.truncated;
+        if rebased {
+            self.params.reset(); // a producer restart may change resolution
+        }
+        if h.flags & FLAG_DISCONT != 0 {
+            self.discont_seen_since_emit = true;
+        }
+        if self.have_next_emit && !self.stall_armed {
+            self.stall_armed = true;
+            self.stall_arm_ms = now_ms;
+        }
+        true
     }
 
     fn unwrap_id(&mut self, id: u16, flags: u8) -> (u64, bool) {
@@ -333,114 +405,142 @@ impl FrameStream {
 
     fn try_emit(&mut self, now_ms: u64, out: &mut dyn FrameOut) {
         loop {
-            // Late arrivals behind the emit cursor are never emitted.
-            if self.have_next_emit {
-                let ne = self.next_emit_id64;
-                let before = self.slots.len();
-                self.slots
-                    .retain(|_, s| !(s.have_hdr && s.id64 < ne && !s.began));
-                self.st.dropped += (before - self.slots.len()) as u64;
-            }
-            // Head of line: the known-header slot with the lowest id64. Of two
-            // slots with one id (a repeated frame id on another fseq or layer:
-            // forged, or a corrupt header the block CRC let through) the one
-            // already begun stays the head, so a second frame never begins
-            // inside an open one; the other is late once the head finishes.
-            // Lone frames (see `lone`) do not count as the stream having run
-            // ahead.
-            let mut head: Option<(u32, u64)> = None;
-            let mut max_known = 0u64;
-            for (k, s) in &self.slots {
-                if !s.have_hdr {
-                    continue;
-                }
-                if s.id64 > max_known && !self.lone(s) {
-                    max_known = s.id64;
-                }
-                if head.is_none_or(|(_, id)| s.id64 < id || (s.id64 == id && s.began)) {
-                    head = Some((*k, s.id64));
-                }
-            }
-            let Some((hk, _)) = head else { return };
+            self.drop_late();
+            let Some((hk, max_known)) = self.find_head() else {
+                return;
+            };
             let head_lone = self.lone(&self.slots[&hk]);
             let mut h = self.slots.remove(&hk).expect("head");
-            if self.have_next_emit && h.id64 > self.next_emit_id64 {
-                if h.discont {
-                    // Synthetic jump of a re-base, not lost frames.
-                    self.next_emit_id64 = h.id64;
-                } else {
-                    let stale = now_ms >= h.first_ms + self.gap_ms_max();
-                    if head_lone {
-                        if !stale {
-                            self.slots.insert(hk, h);
-                            return;
-                        }
-                        // Frames were emitted after this one arrived, so the
-                        // stream is alive below it: the far id is forged or
-                        // corrupt, not the next frame after an outage.
-                        // Skipping to it would make every real frame late
-                        // until the stall watchdog fired.
-                        if self.st.clean + self.st.truncated != h.emits_at_hdr {
-                            self.st.dropped += 1;
-                            continue;
-                        }
-                    } else {
-                        let ahead = max_known >= self.next_emit_id64 + self.cfg.lookahead;
-                        if !stale && !ahead {
-                            self.slots.insert(hk, h);
-                            return;
-                        }
-                    }
-                    self.st.dropped += h.id64 - self.next_emit_id64;
-                    h.lat.skipped_before += (h.id64 - self.next_emit_id64) as u32;
-                    self.next_emit_id64 = h.id64;
+            match self.cross_gap(&mut h, head_lone, max_known, now_ms) {
+                Gap::Hold => {
+                    self.slots.insert(hk, h);
+                    return;
                 }
+                Gap::DropHead => {
+                    self.st.dropped += 1;
+                    continue;
+                }
+                Gap::Go => {}
             }
             if !self.have_next_emit {
                 self.have_next_emit = true;
                 self.next_emit_id64 = h.id64;
             }
             if !h.began {
-                h.began = true;
-                if h.hdr.slice_rows > 0 && self.params.usable() {
-                    h.sa = Some(SliceAssembler::new(
-                        self.params.sps(),
-                        self.params.pps(),
-                        h.hdr.slice_rows,
-                        h.count,
-                        HDR_LEN,
-                    ));
-                }
-                let ns = h.sa.as_ref().map_or(1, SliceAssembler::slices);
-                out.begin(&h.hdr, h.sid, ns);
+                self.begin_frame(&mut h, out);
             }
-            while let Some(c) = h.chunks.get(&h.emitted_upto) {
-                if h.sa.is_none() {
-                    let skip = if h.emitted_upto == 0 { HDR_LEN } else { 0 };
-                    if c.len() > skip {
-                        out.data(&c[skip..]);
-                    }
-                }
-                h.emitted_upto += 1;
-                h.last_progress_ms = now_ms;
-            }
-            if let Some(sa) = h.sa.as_mut() {
-                sa.drain(&h.chunks, &mut |b| out.data(b));
-            }
+            h.emit_ready(now_ms, out);
             if h.emitted_upto == h.count {
                 self.finish(h, true, out);
                 continue;
             }
-            let left = h.count.saturating_sub(h.emitted_upto);
-            let stale = now_ms >= h.last_progress_ms + self.span.wait_ms(&self.gap_ms, h.sid, left);
-            let ahead = max_known >= h.id64 + self.cfg.lookahead;
-            if stale || ahead {
+            if self.expired(&h, max_known, now_ms) {
                 self.finish(h, false, out);
                 continue;
             }
             self.slots.insert(hk, h);
             return;
         }
+    }
+
+    /// Late arrivals behind the emit cursor are never emitted.
+    fn drop_late(&mut self) {
+        if !self.have_next_emit {
+            return;
+        }
+        let ne = self.next_emit_id64;
+        let before = self.slots.len();
+        self.slots
+            .retain(|_, s| !(s.have_hdr && s.id64 < ne && !s.began));
+        self.st.dropped += (before - self.slots.len()) as u64;
+    }
+
+    /// Head of line: the known-header slot with the lowest id64. Of two
+    /// slots with one id (a repeated frame id on another fseq or layer:
+    /// forged, or a corrupt header the block CRC let through) the one
+    /// already begun stays the head, so a second frame never begins
+    /// inside an open one; the other is late once the head finishes.
+    /// Returns the head's key and the highest id64 among the frames that
+    /// are not lone (see `lone`): those do not count as the stream having
+    /// run ahead.
+    fn find_head(&self) -> Option<(u32, u64)> {
+        let mut head: Option<(u32, u64)> = None;
+        let mut max_known = 0u64;
+        for (k, s) in &self.slots {
+            if !s.have_hdr {
+                continue;
+            }
+            if s.id64 > max_known && !self.lone(s) {
+                max_known = s.id64;
+            }
+            if head.is_none_or(|(_, id)| s.id64 < id || (s.id64 == id && s.began)) {
+                head = Some((*k, s.id64));
+            }
+        }
+        head.map(|(k, _)| (k, max_known))
+    }
+
+    /// A head above the emit cursor: a re-base jumps to it; otherwise the
+    /// frames between are skipped once the head is stale or (not lone) the
+    /// stream ran lookahead frames ahead, and held until then.
+    fn cross_gap(&mut self, h: &mut Slot, head_lone: bool, max_known: u64, now_ms: u64) -> Gap {
+        if !self.have_next_emit || h.id64 <= self.next_emit_id64 {
+            return Gap::Go;
+        }
+        if h.discont {
+            // Synthetic jump of a re-base, not lost frames.
+            self.next_emit_id64 = h.id64;
+            return Gap::Go;
+        }
+        let stale = now_ms >= h.first_ms + self.gap_ms_max();
+        if head_lone {
+            if !stale {
+                return Gap::Hold;
+            }
+            // Frames were emitted after this one arrived, so the
+            // stream is alive below it: the far id is forged or
+            // corrupt, not the next frame after an outage.
+            // Skipping to it would make every real frame late
+            // until the stall watchdog fired.
+            if self.st.clean + self.st.truncated != h.emits_at_hdr {
+                return Gap::DropHead;
+            }
+        } else {
+            let ahead = max_known >= self.next_emit_id64 + self.cfg.lookahead;
+            if !stale && !ahead {
+                return Gap::Hold;
+            }
+        }
+        self.st.dropped += h.id64 - self.next_emit_id64;
+        h.lat.skipped_before += (h.id64 - self.next_emit_id64) as u32;
+        self.next_emit_id64 = h.id64;
+        Gap::Go
+    }
+
+    /// The frame's begin: a slice assembler when the frame is sliced and the
+    /// parameter sets are known, then out.begin with its slice count.
+    fn begin_frame(&mut self, h: &mut Slot, out: &mut dyn FrameOut) {
+        h.began = true;
+        if h.hdr.slice_rows > 0 && self.params.usable() {
+            h.sa = Some(SliceAssembler::new(
+                self.params.sps(),
+                self.params.pps(),
+                h.hdr.slice_rows,
+                h.count,
+                HDR_LEN,
+            ));
+        }
+        let ns = h.sa.as_ref().map_or(1, SliceAssembler::slices);
+        out.begin(&h.hdr, h.sid, ns);
+    }
+
+    /// An open frame ends truncated when it made no progress for its wait,
+    /// or the stream ran lookahead frames past it.
+    fn expired(&self, h: &Slot, max_known: u64, now_ms: u64) -> bool {
+        let left = h.count.saturating_sub(h.emitted_upto);
+        let stale = now_ms >= h.last_progress_ms + self.span.wait_ms(&self.gap_ms, h.sid, left);
+        let ahead = max_known >= h.id64 + self.cfg.lookahead;
+        stale || ahead
     }
 
     /// A frame at least lookahead ids past the emit cursor, without the
