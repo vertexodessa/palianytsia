@@ -104,12 +104,24 @@ impl Rig {
     }
     /// `width` = the link's receiver width (cfg.width_mhz).
     fn build(n: usize, pinned: bool, start: u8, use_: &[u8], width: u8) -> Self {
+        Self::build_with(n, pinned, start, use_, width, |_| {})
+    }
+    /// `tweak` edits the bundle config after the rig's own settings.
+    fn build_with(
+        n: usize,
+        pinned: bool,
+        start: u8,
+        use_: &[u8],
+        width: u8,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Self {
         let mut cfg = bundle();
         cfg.radio.channels = vec![40, 64, 112, 144];
         cfg.radio.use_ = use_.to_vec();
         if pinned {
             cfg.radio.pin = Some(if start != 0 { start } else { 40 });
         }
+        tweak(&mut cfg);
         let start_ch = if start != 0 { start } else { 40 };
         let clk = FakeClock::default();
         let cards: Vec<Arc<FakeCard>> = (0..n)
@@ -581,6 +593,25 @@ fn one_card_prelude_commits_before_first_disc() {
     assert_eq!(g.vrx.proposal(), g.core.op());
     assert!(g.has_move(MoveReason::Commit));
     assert_eq!(g.core.snapshot(0).scan_state, "scouting");
+}
+
+/// A card reopen (runtime `relink_cfg`): one card, no prelude, starting on
+/// the channel the lost session was linked on. The pick acks at once and
+/// keeps that channel, so the first op window runs there with no 5 s of
+/// silent dwells first (2026-11-18 desktop pull: 5.2 s of a 5.4 s recovery).
+#[test]
+fn one_card_without_prelude_keeps_the_start_channel() {
+    let mut g = Rig::build_with(1, false, 144, &[], 40, |c| c.radio.scan.one_card_ms = 0);
+    g.cards[0].s().nhm_busy_pct_on[144] = 100; // would lose any ranking
+    g.until(50, false, "one-card prelude ranking picks");
+    assert!(
+        g.has_line("one-card prelude ranking picks 144 (op 144)"),
+        "{:?}",
+        g.rec().lines
+    );
+    assert!(g.ms() < 500.0, "acked after {} ms", g.ms());
+    assert_eq!(g.core.op(), 144);
+    assert!(!g.has_move(MoveReason::Commit));
 }
 
 /// radio.use narrowed to one member that nothing has ranked yet: the

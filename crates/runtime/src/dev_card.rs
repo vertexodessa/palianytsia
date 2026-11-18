@@ -438,6 +438,18 @@ impl LinkCard for DevCard {
 /// scouts on another and every card's bodies feed the aggregator. The
 /// core's threads run on real time: `mono_default`, the clock the RX
 /// stamps and ticks use.
+/// The config of a session that reopens a lost card while the drone is
+/// still on `ch`: no one-card prelude (the lost session's ranking already
+/// chose `ch`; ranking again cost 5.2 s of a 5.4 s recovery on the
+/// 2026-11-18 desktop pull). The boot pick acks at once on the start
+/// channel; the scout keeps ranking between op windows and the search
+/// still finds a drone that moved. The caller opens the core on `ch`.
+pub fn relink_cfg(cfg: &Config) -> Config {
+    let mut c = cfg.clone();
+    c.radio.scan.one_card_ms = 0;
+    c
+}
+
 pub fn rust_channel_core(cfg: Config, opts: CoreOpts, width: u8) -> Attach {
     Box::new(move |cards| {
         let book = Arc::new(ChannelBook::new(cards.len(), opts.channel, mono_default()));

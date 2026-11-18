@@ -1738,7 +1738,10 @@ pub const CARD_RETRY: Duration = Duration::from_secs(3);
 /// `run_live` that outlives the card: when a card drops off the bus (or no
 /// card is there at the start) it waits and opens the cards again, with the
 /// same core loop, flight log session and UI channels. `drive` makes each
-/// session's `Drive` (an `Attach` is used once). Events `card_lost` and
+/// session's `Drive` (an `Attach` is used once); its argument is the channel
+/// to relink on: after a lost card whose session heard the drone, the
+/// channel it was on (the session opens there, see `dev_card::relink_cfg`),
+/// else None (open on `ch`). Events `card_lost` and
 /// `card_back` (with the outage in ms) mark the gap. Ends when
 /// `Shared::quit` is set, or on an error that is not a lost card.
 pub fn run_live_reopening(
@@ -1746,7 +1749,7 @@ pub fn run_live_reopening(
     select: devourer_sys::Select,
     ch: u8,
     width: u8,
-    mut drive: impl FnMut() -> Drive,
+    mut drive: impl FnMut(Option<u8>) -> Drive,
     mut on_open: impl FnMut(&str),
 ) -> Result<(), String> {
     let shared = cl.sink.shared.clone();
@@ -1759,8 +1762,10 @@ pub fn run_live_reopening(
     };
     let mut lost_at: Option<Instant> = None;
     let mut told = String::new();
+    let mut relink: Option<u8> = None;
     while !quit() {
-        let d = drive();
+        let d = drive(relink);
+        let ch = relink.unwrap_or(ch);
         let mut selects = vec![select.clone()];
         if let Drive::Core { extra, .. } = &d {
             selects.extend(extra.iter().cloned());
@@ -1799,7 +1804,12 @@ pub fn run_live_reopening(
         match r {
             Err(e) if e.starts_with(CARD_LOST) && !quit() => {
                 eprintln!("pal: {e}; reopening");
-                cl.event_now("card_lost", serde_json::json!({ "err": e }));
+                let on = shared.channel.load(Ordering::Relaxed);
+                relink = (shared.drone_heard.load(Ordering::Relaxed) && on != 0).then_some(on);
+                cl.event_now(
+                    "card_lost",
+                    serde_json::json!({ "err": e, "relink_ch": relink }),
+                );
                 lost_at = Some(Instant::now());
                 nap(CARD_RETRY);
             }

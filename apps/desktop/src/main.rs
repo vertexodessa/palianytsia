@@ -375,16 +375,23 @@ fn resolve_config(o: &mut Opts) {
 /// Who tunes the card(s) on a live run: without --ch a GS hands the cards
 /// to its channel core (see `channel_core`); otherwise the runtime holds
 /// the channel, sweeping for the drone when `o.search` is set.
-fn drive(o: &Opts) -> Drive {
+/// `relink`: the channel a lost card's session was linked on
+/// (`runtime::run_live_reopening`); the Rust core reopens there with no
+/// prelude, the C++ one starts over.
+fn drive(o: &Opts, relink: Option<u8>) -> Drive {
     if o.channel_core {
         let attach = if o.rust {
             let opts = CoreOpts {
                 mode: Mode::Gs,
                 adaptive_gap: true,
                 rz_nonce: RZ_NONCE,
-                channel: o.ch,
+                channel: relink.unwrap_or(o.ch),
             };
-            runtime::dev_card::rust_channel_core(o.cfg.clone(), opts, o.width)
+            let cfg = match relink {
+                Some(_) => runtime::dev_card::relink_cfg(&o.cfg),
+                None => o.cfg.clone(),
+            };
+            runtime::dev_card::rust_channel_core(cfg, opts, o.width)
         } else {
             pal_ref::live::channel_core(o.config.clone(), o.ch, o.width)
         };
@@ -968,7 +975,7 @@ fn main() {
                                     devourer_sys::Select::Scan { index: o.card },
                                     ch,
                                     w,
-                                    || drive(&o),
+                                    |relink| drive(&o, relink),
                                     |chip| {
                                         eprintln!("pal-desktop: card {chip} on ch {ch} / {w} MHz")
                                     },
