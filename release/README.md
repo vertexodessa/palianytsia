@@ -1,11 +1,11 @@
-# Palianytsia v0.17
+# Palianytsia v0.17.1
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.17.0.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.17.0.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.17.1.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.17.1.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E and RTL8812AU radios. |
@@ -13,6 +13,13 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/S96mabur` | The init script that runs maburd; `install.py` puts it in place. |
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
+
+## What changed in v0.17.1
+- **The desktop app is back on the picture sooner after a card drops off the USB bus.** v0.17 reopened the card but first ranked every channel again, about 5 s, before it returned to the channel the drone was already on. It now reopens on that channel at once. On the bench on 2026-11-18, with v0.17, the picture came back 5.4 s after the card was plugged back in. The faster path has host tests only and has not been run on the bench yet. The Quest and phone apps reopen as before.
+- **Flight logs date a lost card correctly.** The desktop app's `card_lost` and `card_wait` events were stamped with the time the card came back, 10 s late on the bench. They now carry the time the card was lost.
+- **Frames with a damaged checksum are routed as in upstream mabur again.** Their intact blocks go to the stream their header names, instead of being held back.
+
+The drone is unchanged (the v0.17 maburd). GS and drone stay compatible with v0.17 back to v0.14 (RC 18, same parameter table), and a v0.17.1 ground station updates the drone by itself. Host tests and replays; the relink change not yet run on the bench, not flown.
 
 ## What changed in v0.17
 - **The picture comes back after a camera mode change.** Changing the camera mode or the slice count restarts the drone's encoder. The drone skipped the new encoder's first keyframe and sent only P frames, which the ground station cannot show. Once, on the Quest, the picture stayed dark for 69 s after two changes in a row. The drone now sends a keyframe after every encoder restart: on the bench it arrived within 0.1 s of each of four restarts. The ground station also asks for a keyframe on its own when frames go into its decoder for a second and none come out.
@@ -57,7 +64,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.17.0.apk    # or the phone APK
+   adb install palianytsia-quest-0.17.1.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:

@@ -89,7 +89,7 @@ pairing key.
 - Release desktop: `tools/ffmpeg-static.sh` once, then `PAL_FFMPEG_STATIC=$PWD/target/ffmpeg-static cargo build --release -p pal-desktop`
   (HEVC + swscale linked in, no hwaccel; the system-FFmpeg build did not start on QA's machine).
 - Release history: `release/notes/<tag>.md` (what each tag carries, which maburd, GS/drone compatibility);
-  the current release is v0.17 (`release/VERSION`, maburd pin in `release/MABUR_RELEASE`). GS and drone had to be
+  the current release is v0.17.1 (`release/VERSION`, maburd pin in `release/MABUR_RELEASE`). GS and drone had to be
   updated together at v0.7, v0.11 and v0.13 (parameter table changes); a GS updates a drone over the air from v0.14 on.
 - Releases: a tag `vX.Y`/`vX.Y.Z` runs `.github/workflows/release.yml` (gates, maburd from `release/MABUR_RELEASE`, signed APKs from the
   `PAL_RELEASE_*` secrets, static desktop) and `tools/pack-release.sh` publishes `dist/palianytsia-<tag>` as a GitHub release with
