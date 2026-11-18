@@ -602,6 +602,9 @@ pub struct CoreLoop {
     /// The cards the core drives, in card order (`watch_cards`).
     taps: Vec<Arc<dyn RxTap>>,
     peer_rc: PeerRcWatch,
+    /// Core time of the last tick and when it ran, so a thread that runs
+    /// while no tick does (a card reopen) can stamp its events (`clock_now`).
+    last_tick: Option<(u64, Instant)>,
     /// Declared last, so it drops after `sink` and its Session.
     _done: DoneMark,
 }
@@ -637,6 +640,22 @@ struct CalUi {
 
 impl CoreLoop {
     /// `lat`: the --lat latency report on stderr.
+    /// The core clock now, extrapolated from the last tick; `None` before the
+    /// first one.
+    pub fn clock_now(&self) -> Option<u64> {
+        self.last_tick
+            .map(|(t, at)| t + at.elapsed().as_micros() as u64)
+    }
+
+    /// An event of the thread that owns this loop, stamped on the core clock:
+    /// between sessions no tick runs, and the next one would stamp it late.
+    fn event_now(&self, ev: &'static str, detail: serde_json::Value) {
+        match self.clock_now() {
+            Some(t) => self.sink.shared.event_at(t, ev, detail),
+            None => self.sink.shared.event(ev, detail),
+        }
+    }
+
     pub fn new(core: Box<dyn GsCore>, sink: Sink, ports: LoopPorts, lat: bool) -> Self {
         warn_low_log_space(&sink);
         let done = DoneMark(sink.shared.clone());
@@ -659,6 +678,7 @@ impl CoreLoop {
             held: None,
             taps: Vec::new(),
             peer_rc: PeerRcWatch::default(),
+            last_tick: None,
             _done: done,
         }
     }
@@ -792,6 +812,7 @@ impl CoreLoop {
     }
 
     fn drain_events(&mut self, now: u64) {
+        self.last_tick = Some((now, Instant::now()));
         log_shared_events(&self.sink.shared, self.sink.log.as_mut(), now);
     }
 
@@ -1752,7 +1773,7 @@ pub fn run_live_reopening(
                         "pal: no card ({e}); trying again every {} s",
                         CARD_RETRY.as_secs()
                     );
-                    shared.event("card_wait", serde_json::json!({ "err": e }));
+                    cl.event_now("card_wait", serde_json::json!({ "err": e }));
                     told = e;
                 }
                 nap(CARD_RETRY);
@@ -1762,7 +1783,7 @@ pub fn run_live_reopening(
         told.clear();
         on_open(set.chips());
         if let Some(t) = lost_at.take() {
-            shared.event(
+            cl.event_now(
                 "card_back",
                 serde_json::json!({ "after_ms": t.elapsed().as_millis() as u64 }),
             );
@@ -1778,7 +1799,7 @@ pub fn run_live_reopening(
         match r {
             Err(e) if e.starts_with(CARD_LOST) && !quit() => {
                 eprintln!("pal: {e}; reopening");
-                shared.event("card_lost", serde_json::json!({ "err": e }));
+                cl.event_now("card_lost", serde_json::json!({ "err": e }));
                 lost_at = Some(Instant::now());
                 nap(CARD_RETRY);
             }
@@ -2297,6 +2318,27 @@ mod tests {
                 r#"{{"rung":1,"top":4,"last_reason":"demote_loss","last_from":2,"last_to":1,"last_age_ms":{age}}}"#
             ))
         }
+    }
+
+    /// A card reopen runs while no tick does: its events carry the core time
+    /// of the moment they happened, not of the tick after the card is back
+    /// (on the 2026-11-18 pull all three landed 10 s late, at the reopen).
+    #[test]
+    fn reopen_events_are_stamped_when_raised() {
+        let Rig { mut cl, shared, .. } = rig(Box::new(IdleCore), None);
+        cl.event_now("card_wait", serde_json::json!({}));
+        cl.tick(31_000_000);
+        cl.event_now("card_lost", serde_json::json!({}));
+        let q: Vec<_> = shared.events.lock().unwrap().drain(..).collect();
+        let at: Vec<_> = q.iter().map(|(ev, _, at)| (*ev, *at)).collect();
+        assert_eq!(
+            at.len(),
+            1,
+            "card_wait before a tick is logged by it: {at:?}"
+        );
+        assert_eq!(at[0].0, "card_lost");
+        let t = at[0].1.expect("stamped");
+        assert!((31_000_000..32_000_000).contains(&t), "{t}");
     }
 
     #[test]
