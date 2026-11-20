@@ -1,11 +1,11 @@
-# Palianytsia v0.17.1
+# Palianytsia v0.17.2
 
 A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 
 | File | What it is |
 |---|---|
-| `gs/palianytsia-quest-0.17.1.apk` | Meta Quest 3 app (OpenXR). |
-| `gs/palianytsia-phone-0.17.1.apk` | Android phone app (arm64, Android 10+). |
+| `gs/palianytsia-quest-0.17.2.apk` | Meta Quest 3 app (OpenXR). |
+| `gs/palianytsia-phone-0.17.2.apk` | Android phone app (arm64, Android 10+). |
 | `gs/pal-desktop-linux-x86_64` | Linux desktop GS. |
 | `gs/gs.toml` | The GS config the APKs carry. Pass it to the desktop app with `-c`. |
 | `drone/maburd` | Drone daemon (OpenIPC SigmaStar, armv7 glibc). RC_VERSION 18; supports RTL8812EU/8822E and RTL8812AU radios. |
@@ -13,6 +13,12 @@ A ground station for the mabur FPV link, plus the drone daemon it pairs with.
 | `drone/S96mabur` | The init script that runs maburd; `install.py` puts it in place. |
 | `drone/mabur.toml` | Drone config: 1920x1080@90 binned (`venc.binning = true`), 4 slices, channels 40/64/112/144. `radio.width = 40` lets the GS pick 20 or 40. |
 | `drone/sensor_imx415_star6e.ko` | waybeam's six-mode IMX415 sensor driver (native 1:1 windows up to 100 fps). `install.py` installs it on an imx415 drone. |
+
+## What changed in v0.17.2
+- **The drone uses about a fifth less CPU.** maburd now builds FEC repair blocks with the Cortex-A7's carry-less multiply, scans each video frame once instead of three times, and computes CRC16 eight bytes at a time. These changes come from upstream mabur (gilankpam/mabur PR #139). Upstream measured them on a bench drone (SSC338Q, 1080p60): maburd went from 72-74 % to about 59.5 % of a core at 17 Mb/s, and from 103-109 % to 81-82 % at the top rate. The repair output is byte-identical. We checked the frame scan and the repair arithmetic on the host against the old code: 0 mismatches.
+- **Upstream fixes since v0.17.1.** The software encoder no longer keeps ring slack for synchronous encoders.
+
+The ground station is unchanged from v0.17.1. GS and drone stay compatible with v0.17.x back to v0.14 (RC 18, same parameter table), and a v0.17.2 ground station updates the drone by itself. Host tests only: this maburd is not yet run on our drones, not flown.
 
 ## What changed in v0.17.1
 - **The desktop app is back on the picture sooner after a card drops off the USB bus.** v0.17 reopened the card but first ranked every channel again, about 5 s, before it returned to the channel the drone was already on. It now reopens on that channel at once. On the bench on 2026-11-18, with v0.17, the picture came back 5.4 s after the card was plugged back in. The faster path has host tests only and has not been run on the bench yet. The Quest and phone apps reopen as before.
@@ -64,7 +70,7 @@ Plug an RTL8812AU/8812EU card into the headset or phone with a USB-C OTG adapter
 1. Install:
 
    ```
-   adb install palianytsia-quest-0.17.1.apk    # or the phone APK
+   adb install palianytsia-quest-0.17.2.apk    # or the phone APK
    ```
 
    The APKs are signed with the Palianytsia release key (SHA-256 `81f44154...b7a6`). A device that has a debug build must uninstall it first:
@@ -198,7 +204,7 @@ When to raise the bitrate ceiling: 14 Mbit/s fits 1080p90 at 20 MHz. At 40 MHz, 
 ## Sources
 
 - palianytsia: `main` @ @PAL_SHA@.
-- mabur: fork branch `release/v0.16.2` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `release/v0.16.1` plus the P-frame ceiling floor from `palianytsia/base-v2`, without the bench-only `/sim` endpoint.
+- mabur: fork branch `release/v0.17.2` @ @MABUR_SHA@ (`release/MABUR_RELEASE`): `palianytsia/base-v2` (upstream master + PR #139 + our commits) without the bench-only `/sim` endpoint.
 - `sensor_imx415_star6e.ko`: waybeam's six-mode IMX415 driver (sha256 `d9b09101...`; waybeam_venc 581804a, as shipped in openipc-builder's mabur image at 49087b5f): native 2944x1656 at 60.57 Hz and 2272x1278 at 100.52 Hz (the build before it, `c639856a...`, had 2304x1296 at 99.63 Hz).
 - devourer: @DEVOURER_SHA@.
 - FFmpeg 6.1.2 (LGPL), HEVC decoder, its nvdec/vaapi/vdpau hwaccels and swscale, linked into the desktop app (`tools/ffmpeg-static.sh`).
